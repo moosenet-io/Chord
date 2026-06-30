@@ -1,0 +1,202 @@
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tracing::{info, warn};
+
+use chord_proxy::{
+    agentic::AgenticExecutor,
+    audit::AuditLogger,
+    config::Config,
+    fallback::build_fallback_registry,
+    mcp_proxy::McpProxy,
+    models::eviction::{new_disk_op_lock, run_eviction_sweep, FsLocalEvictor},
+    models::registry::ModelRegistry,
+    models::transfer::{PullCoordinator, StatvfsProbe},
+    rate_limiter::ProxyRateLimiter,
+    routes::{build_router, AppState},
+};
+
+#[tokio::main]
+async fn main() {
+    // Version flag — handled before any logging or service startup.
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("{}", chord_proxy::version::version_line());
+        return;
+    }
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("chord_proxy=info".parse().unwrap()),
+        )
+        .init();
+
+    let config = Config::from_env().unwrap_or_else(|e| {
+        eprintln!("Configuration error: {e}");
+        std::process::exit(1);
+    });
+
+    let port = config.listen_port;
+    let jwt_secret = config.jwt_secret.clone();
+    let llm_backend_url = config.llm_backend_url.clone();
+    let model_aliases = config.model_aliases.clone();
+    if !model_aliases.is_empty() {
+        info!("model aliases loaded: {} mapping(s)", model_aliases.len());
+    }
+    match &llm_backend_url {
+        Some(url) => info!("LLM proxy enabled → {url}"),
+        None => info!("LLM proxy disabled (CHORD_LLM_URL unset) — /v1/chat/completions returns 503"),
+    }
+
+    // Build terminus-rs registry with all compiled-in Rust tools
+    let mut terminus = terminus_rs::ToolRegistry::new();
+    terminus_rs::register_all(&mut terminus);
+    info!("terminus-rs: {} tools registered", terminus.len());
+
+    let fallback = Arc::new(build_fallback_registry(terminus));
+    let proxy = McpProxy::new(&config, fallback);
+    let proxy_arc = Arc::new(McpProxy::new(
+        &config,
+        Arc::new(chord_proxy::fallback::build_fallback_registry({
+            let mut t = terminus_rs::ToolRegistry::new();
+            terminus_rs::register_all(&mut t);
+            t
+        })),
+    ));
+    let agentic_executor = Arc::new(AgenticExecutor::new(proxy_arc));
+    let audit_logger = Arc::new(AuditLogger::from_env());
+    let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(config.rate_limits.clone())));
+    let http_client = reqwest::Client::builder()
+        .build()
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to build HTTP client: {e}");
+            std::process::exit(1);
+        });
+
+    // ── Model registry + pull coordinator (TIER-01/02) ──
+    // load_or_new never fails (corrupt JSON rebuilds empty); reconcile()/save()
+    // are best-effort and must NOT crash startup.
+    let mut model_registry = ModelRegistry::load_or_new(
+        std::path::PathBuf::from(&config.model_registry_path),
+        std::path::PathBuf::from(&config.model_local_path),
+        std::path::PathBuf::from(&config.model_archive_path),
+        config.model_protected.clone(),
+    );
+    model_registry.reconcile();
+    // S80 DGEM-03: register DiffusionGemma (non-Ollama, llama-diffusion-daemon) after the Ollama-driven
+    // reconcile, so it survives re-tiering and shows up in the control API / counts.
+    model_registry.register_diffusiongemma_from_env();
+    let (hot, warm, cold) = model_registry.tier_counts();
+    info!("model registry: {warm} warm, {cold} cold, {hot} hot");
+    if let Err(e) = model_registry.save() {
+        warn!("model registry: failed to persist after reconcile: {e}");
+    }
+    let model_registry = Arc::new(Mutex::new(model_registry));
+
+    // ── TIER-03 eviction wiring ──
+    // A shared disk-operation lock serialises the background sweep with pre-pull
+    // eviction so their destructive filesystem ops never interleave.
+    let disk_op_lock = new_disk_op_lock();
+    let local_evictor: Arc<dyn chord_proxy::models::eviction::LocalEvictor> = Arc::new(
+        FsLocalEvictor::new(std::path::PathBuf::from(&config.model_local_path)),
+    );
+
+    let pull_coordinator = Arc::new(
+        PullCoordinator::new(
+            model_registry.clone(),
+            std::time::Duration::from_secs(config.model_pull_timeout_secs),
+        )
+        .with_eviction(local_evictor.clone(), disk_op_lock.clone()),
+    );
+
+    // Background disk-pressure eviction sweep (non-fatal; logs and continues).
+    {
+        let registry = model_registry.clone();
+        let evictor = local_evictor.clone();
+        let lock = disk_op_lock.clone();
+        let threshold = config.model_disk_pressure_percent;
+        let interval = config.model_sweep_interval_secs;
+        let cooldown_hours = config.model_warm_cooldown_hours;
+        if cooldown_hours == 0 {
+            warn!("MODEL_WARM_COOLDOWN_HOURS=0; cooldown eviction (warm→cold after inactivity) is DISABLED");
+        }
+        info!("eviction sweep task started, interval={interval}s, cooldown_hours={cooldown_hours}");
+        tokio::spawn(async move {
+            let probe = StatvfsProbe;
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval.max(1)));
+            loop {
+                ticker.tick().await;
+                run_eviction_sweep(
+                    &registry,
+                    threshold,
+                    cooldown_hours,
+                    &probe,
+                    evictor.as_ref(),
+                    &lock,
+                )
+                .await;
+            }
+        });
+    }
+
+    // ── P5 idle-stop sweep: stop on-demand GPU backends when idle (no
+    // perpetual holds). Lightweight (a registry snapshot every 60s).
+    {
+        let registry = Arc::clone(&model_registry);
+        info!("backend idle-stop sweep started, interval=60s");
+        tokio::spawn(async move {
+            chord_proxy::models::routing::idle_stop_sweep(
+                registry,
+                std::time::Duration::from_secs(60),
+            )
+            .await;
+        });
+    }
+
+    let state = Arc::new(AppState {
+        proxy,
+        jwt_secret,
+        audit_logger,
+        rate_limiter,
+        agentic_executor,
+        llm_backend_url,
+        model_aliases,
+        http_client,
+        model_registry,
+        pull_coordinator,
+        local_evictor,
+        disk_op_lock,
+        disk_probe: std::sync::Arc::new(StatvfsProbe),
+        disk_pressure_percent: config.model_disk_pressure_percent,
+        model_warm_cooldown_hours: config.model_warm_cooldown_hours,
+    });
+    // TIER-05: the model-tier control API runs on a SECOND listener (control port,
+    // default 8090), sharing the same AppState. Build it before `state` is moved
+    // into the proxy router.
+    let control_port = config.control_port;
+    let control_router = chord_proxy::control::build_control_router(state.clone());
+
+    let router = build_router(state);
+
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to bind port {port}: {e}");
+            std::process::exit(1);
+        });
+
+    // Control API server: a bind/serve failure here must NOT take down the proxy.
+    tokio::spawn(async move {
+        match tokio::net::TcpListener::bind(format!("0.0.0.0:{control_port}")).await {
+            Ok(l) => {
+                info!("chord-proxy control API listening on port {control_port}");
+                if let Err(e) = axum::serve(l, control_router).await {
+                    warn!("control API server error: {e}");
+                }
+            }
+            Err(e) => warn!("failed to bind control API on port {control_port}: {e}"),
+        }
+    });
+
+    info!("chord-proxy listening on port {port}");
+    axum::serve(listener, router).await.unwrap();
+}
