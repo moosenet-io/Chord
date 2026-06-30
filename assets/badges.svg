@@ -1,0 +1,70 @@
+<svg width="760" height="40" viewBox="0 0 760 40" xmlns="http://www.w3.org/2000/svg" font-family="'DejaVu Sans', Verdana, Helvetica, sans-serif" font-size="11">
+  <defs>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Each badge: [label | value]. Label dark, value accent. Rounded, flat-modern. -->
+
+  <!-- build: passing -->
+  <g>
+    <rect x="0" y="8" width="108" height="22" rx="5" fill="#2a2342"/>
+    <rect x="52" y="8" width="56" height="22" rx="5" fill="#10b981"/>
+    <rect x="52" y="8" width="12" height="22" fill="#10b981"/>
+    <rect x="0" y="8" width="108" height="11" rx="5" fill="url(#sheen)"/>
+    <text x="26" y="23" text-anchor="middle" fill="#cbc4e6">build</text>
+    <text x="80" y="23" text-anchor="middle" fill="#062b1f" font-weight="bold">passing</text>
+  </g>
+
+  <!-- tests: green -->
+  <g transform="translate(118,0)">
+    <rect x="0" y="8" width="120" height="22" rx="5" fill="#2a2342"/>
+    <rect x="46" y="8" width="74" height="22" rx="5" fill="#10b981"/>
+    <rect x="46" y="8" width="12" height="22" fill="#10b981"/>
+    <rect x="0" y="8" width="120" height="11" rx="5" fill="url(#sheen)"/>
+    <text x="23" y="23" text-anchor="middle" fill="#cbc4e6">tests</text>
+    <text x="83" y="23" text-anchor="middle" fill="#062b1f" font-weight="bold">628 green</text>
+  </g>
+
+  <!-- rust edition -->
+  <g transform="translate(248,0)">
+    <rect x="0" y="8" width="104" height="22" rx="5" fill="#2a2342"/>
+    <rect x="42" y="8" width="62" height="22" rx="5" fill="#7c5cff"/>
+    <rect x="42" y="8" width="12" height="22" fill="#7c5cff"/>
+    <rect x="0" y="8" width="104" height="11" rx="5" fill="url(#sheen)"/>
+    <text x="21" y="23" text-anchor="middle" fill="#cbc4e6">rust</text>
+    <text x="73" y="23" text-anchor="middle" fill="#ffffff" font-weight="bold">2024 ed</text>
+  </g>
+
+  <!-- license MIT -->
+  <g transform="translate(362,0)">
+    <rect x="0" y="8" width="96" height="22" rx="5" fill="#2a2342"/>
+    <rect x="52" y="8" width="44" height="22" rx="5" fill="#4a6cf6"/>
+    <rect x="52" y="8" width="12" height="22" fill="#4a6cf6"/>
+    <rect x="0" y="8" width="96" height="11" rx="5" fill="url(#sheen)"/>
+    <text x="26" y="23" text-anchor="middle" fill="#cbc4e6">license</text>
+    <text x="74" y="23" text-anchor="middle" fill="#ffffff" font-weight="bold">MIT</text>
+  </g>
+
+  <!-- version  (EDIT to real crate version) -->
+  <g transform="translate(468,0)">
+    <rect x="0" y="8" width="96" height="22" rx="5" fill="#2a2342"/>
+    <rect x="54" y="8" width="42" height="22" rx="5" fill="#7c5cff"/>
+    <rect x="54" y="8" width="12" height="22" fill="#7c5cff"/>
+    <rect x="0" y="8" width="96" height="11" rx="5" fill="url(#sheen)"/>
+    <text x="27" y="23" text-anchor="middle" fill="#cbc4e6">version</text>
+    <text x="75" y="23" text-anchor="middle" fill="#ffffff" font-weight="bold">v1.0</text>
+  </g>
+
+  <!-- local-first -->
+  <g transform="translate(574,0)">
+    <rect x="0" y="8" width="118" height="22" rx="5" fill="#2a2342"/>
+    <rect x="62" y="8" width="56" height="22" rx="5" fill="#10b981"/>
+    <rect x="62" y="8" width="12" height="22" fill="#10b981"/>
+    <rect x="0" y="8" width="118" height="11" rx="5" fill="url(#sheen)"/>
+    <text x="31" y="23" text-anchor="middle" fill="#cbc4e6">sovereign</text>
+    <text x="90" y="23" text-anchor="middle" fill="#062b1f" font-weight="bold">local</text>
+  </g>
+</svg>
