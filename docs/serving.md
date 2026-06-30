@@ -190,6 +190,16 @@ operating regime survives a reboot.
 
 Legend: ✅ implemented in the extracted `src/`.
 
+## Launch-env scrub & egress policy (S88 ISO-01)
+
+The runtime supervisor's launch-environment scrub and egress-policy *config
+surface* are documented separately in [egress.md](./egress.md). In short: every
+cold-launch's env is scrubbed (minimal base + telemetry-off/offline opt-outs +
+proxy-strip via `supervisor::launch_env::build_runtime_env`), and a per-launch
+egress posture is declared (`Serve` → Denied, `Pull` → allow-list-or-Denied via
+`supervisor::egress_policy::posture_for`). **ISO-01 is ADVISORY** (relies on tools
+honouring opt-outs); the kernel netns guarantee is ISO-02 and is not yet built.
+
 ## Test Results
 
 Serving behaviour is covered by the `tests/serving_*.rs` integration suites

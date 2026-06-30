@@ -39,6 +39,9 @@ use async_trait::async_trait;
 use terminus_rs::config;
 use terminus_rs::intake::serving::{ModelId, Runtime};
 
+use crate::config::Config;
+use crate::supervisor::{build_runtime_env, RuntimeClass};
+
 use super::profile::{EnvSpec, ProfileLoadError, RouteEntry};
 
 /// A constructed runtime launch: the binary, its argv, the env pairs, and the
@@ -375,6 +378,30 @@ pub fn build_launch_command(
     }
 }
 
+/// Compose a [`LaunchCommand`] that carries the **scrubbed** S88 ISO-01 launch
+/// environment for a runtime of `class`, with the command's own runtime-specific
+/// env (the gfx override etc.) layered ON TOP.
+///
+/// This is the ISO-01 integration seam: the scrubbed base (minimal env +
+/// telemetry-off/offline opt-outs + proxy-strip) is built by
+/// [`build_runtime_env`], then `cmd.env` (the gfx/cpu-lib pairs the launcher
+/// already computed) is appended so a per-launch override always wins over the
+/// scrubbed base. Behaviour is additive: the only NEW vars on an existing launch
+/// are the telemetry-off/offline ones; nothing the launcher previously set is
+/// dropped.
+///
+/// `class` is [`RuntimeClass::Serve`] for the normal cold-launch / warm-slot serve
+/// path (a serving runtime needs no egress). A model-PULL path (not the launcher's
+/// concern today) would pass [`RuntimeClass::Pull`].
+pub fn scrub_launch_env(mut cmd: LaunchCommand, class: RuntimeClass, cfg: &Config) -> LaunchCommand {
+    let mut scrubbed = build_runtime_env(class, cfg);
+    // The launcher's own runtime env (gfx override / cpu lib) layers on top so an
+    // explicit per-launch value always wins over the scrubbed base.
+    scrubbed.append(&mut cmd.env);
+    cmd.env = scrubbed;
+    cmd
+}
+
 /// The SRV-04 launcher: holds the injected spawner / health-checker / failure
 /// recorder and the residency manager. `serve_model` is the single entry point.
 pub struct Launcher<'a> {
@@ -382,10 +409,14 @@ pub struct Launcher<'a> {
     health: &'a dyn HealthChecker,
     recorder: &'a dyn FailureRecorder,
     residency: &'a dyn ResidencyManager,
+    /// S88 ISO-01 config for launch-env scrubbing. `None` ⇒ no scrub is applied
+    /// (the legacy behaviour, used by the pre-ISO-01 unit tests); `Some(cfg)` ⇒
+    /// every cold-launch's env is scrubbed via [`scrub_launch_env`] before spawn.
+    cfg: Option<&'a Config>,
 }
 
 impl<'a> Launcher<'a> {
-    /// Build a launcher from its collaborators.
+    /// Build a launcher from its collaborators (no ISO-01 env scrub — legacy ctor).
     pub fn new(
         spawner: &'a dyn RuntimeSpawner,
         health: &'a dyn HealthChecker,
@@ -397,6 +428,25 @@ impl<'a> Launcher<'a> {
             health,
             recorder,
             residency,
+            cfg: None,
+        }
+    }
+
+    /// Build a launcher that applies the S88 ISO-01 launch-env scrub (telemetry-off
+    /// / offline opt-outs + proxy-strip) to every cold-launch using `cfg`.
+    pub fn with_scrub(
+        spawner: &'a dyn RuntimeSpawner,
+        health: &'a dyn HealthChecker,
+        recorder: &'a dyn FailureRecorder,
+        residency: &'a dyn ResidencyManager,
+        cfg: &'a Config,
+    ) -> Self {
+        Launcher {
+            spawner,
+            health,
+            recorder,
+            residency,
+            cfg: Some(cfg),
         }
     }
 
@@ -493,6 +543,14 @@ impl<'a> Launcher<'a> {
                     .record_failure(model_str, runtime, "runtime-not-configured");
                 return Err(e);
             }
+        };
+
+        // S88 ISO-01: scrub the launch env (telemetry-off / offline opt-outs +
+        // proxy-strip) before spawning. Serving a model needs no egress → Serve
+        // class. Additive: when no cfg is wired the legacy env is used unchanged.
+        let cmd = match self.cfg {
+            Some(cfg) => scrub_launch_env(cmd, RuntimeClass::Serve, cfg),
+            None => cmd,
         };
 
         if let Err(_detail) = self.spawner.spawn(&cmd).await {
@@ -1139,6 +1197,68 @@ mod tests {
         // Never attempted a launch.
         assert!(spawner.calls.lock().unwrap().is_empty());
         std::env::remove_var("HOST_RAM_BUDGET_GB");
+    }
+
+    #[test]
+    #[serial]
+    fn scrub_layers_telemetry_off_under_runtime_env() {
+        // The gfx override (a runtime-specific env pair) must SURVIVE the scrub and
+        // sit ON TOP of the telemetry-off base.
+        set_runtime_endpoints();
+        let e = entry(
+            "g",
+            ServingBackend::OllamaGpu,
+            Runtime::Ollama,
+            r#"{"gfx_override":"11.0.0"}"#,
+            false,
+            None,
+        );
+        let cmd = build_launch_command(&e, Runtime::Ollama, "ignored").unwrap();
+        let cfg = Config::test_default();
+        let scrubbed = scrub_launch_env(cmd, RuntimeClass::Serve, &cfg);
+        // Telemetry-off vars present.
+        assert!(scrubbed
+            .env
+            .iter()
+            .any(|(k, v)| k == "DO_NOT_TRACK" && v == "1"));
+        assert!(scrubbed
+            .env
+            .iter()
+            .any(|(k, v)| k == "HF_HUB_OFFLINE" && v == "1"));
+        // The runtime-specific gfx override survived the layering.
+        assert!(scrubbed
+            .env
+            .iter()
+            .any(|(k, v)| k == GFX_OVERRIDE_ENV && v == "11.0.0"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn launcher_with_scrub_spawns_scrubbed_env() {
+        // End-to-end through the launcher: the spawned command carries the ISO-01
+        // telemetry-off vars when the launcher is built `with_scrub`.
+        set_runtime_endpoints();
+        struct CapturingSpawner {
+            env: Mutex<Vec<(String, String)>>,
+        }
+        #[async_trait]
+        impl RuntimeSpawner for CapturingSpawner {
+            async fn spawn(&self, cmd: &LaunchCommand) -> Result<(), String> {
+                *self.env.lock().unwrap() = cmd.env.clone();
+                Ok(())
+            }
+        }
+        let spawner = CapturingSpawner { env: Mutex::new(vec![]) };
+        let health = ScriptedHealth { healthy: true };
+        let rec = CountingRecorder { failures: Mutex::new(vec![]) };
+        let resi = NeverResidency;
+        let cfg = Config::test_default();
+        let l = Launcher::with_scrub(&spawner, &health, &rec, &resi, &cfg);
+        let e = entry("m", ServingBackend::LlamaGpu, Runtime::LlamaCpp, "{}", false, None);
+        l.serve_model(&ModelId::from("m"), &e, "/w/m.gguf").await.unwrap();
+        let env = spawner.env.lock().unwrap();
+        assert!(env.iter().any(|(k, v)| k == "DO_NOT_TRACK" && v == "1"));
+        assert!(env.iter().any(|(k, v)| k == "TRANSFORMERS_OFFLINE" && v == "1"));
     }
 
     #[tokio::test]

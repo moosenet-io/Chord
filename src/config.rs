@@ -112,6 +112,33 @@ pub struct Config {
     /// pressure. Reads MODEL_WARM_COOLDOWN_HOURS (default 168 = 7 days). A value
     /// of `0` disables cooldown eviction entirely (a startup warning is logged).
     pub model_warm_cooldown_hours: u64,
+    /// S88 ISO-01: the egress allow-list of model-source hosts/domains a `Pull`
+    /// runtime may reach. Reads `MODEL_SOURCE_ALLOWLIST` (comma/space separated).
+    /// **UNSET → empty**, which makes every pull `Denied` (FAIL CLOSED). This is
+    /// CONFIG, never a baked-in host; an empty list NEVER means allow-all.
+    pub model_source_allowlist: Vec<String>,
+    /// S88 ISO-01: an explicit Chord outbound proxy URL. Reads `CHORD_OUTBOUND_PROXY`.
+    /// `None` (unset/blank) → runtime launches strip ALL proxy vars (they are never
+    /// inherited from the supervisor). When set, an allow-listed `Pull` launch is
+    /// given this proxy. `Serve` launches never get a proxy (no egress).
+    pub outbound_proxy: Option<String>,
+    /// S88 ISO-01: master toggle for the launch-env telemetry-off / offline opt-outs.
+    /// Reads `CHORD_RUNTIME_TELEMETRY_OFF` (default `true`). When `false` the
+    /// telemetry-off vars are still applied by [`crate::supervisor::launch_env`]
+    /// unless a caller honours this flag — it is exposed for operators who must
+    /// debug a runtime that misbehaves with the opt-outs set.
+    pub runtime_telemetry_off: bool,
+}
+
+/// Parse a comma/space-separated `MODEL_SOURCE_ALLOWLIST` value into a list of
+/// host/domain strings, trimming whitespace and dropping empties. An empty result
+/// (unset or blank) means NO source is allowed — the caller fails closed (never
+/// allow-all). This is the S88 ISO-01 egress config surface.
+pub fn parse_model_source_allowlist(raw: &str) -> Vec<String> {
+    raw.split([',', ' ', '\t', '\n'])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// Parse a comma-separated `MODEL_PROTECTED` value into a list of names,
@@ -215,6 +242,14 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(168u64);
 
+        // S88 ISO-01: egress config surface. Allow-list is loud-on-empty (fail closed).
+        let model_source_allowlist = model_source_allowlist();
+        let outbound_proxy = std::env::var("CHORD_OUTBOUND_PROXY")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let runtime_telemetry_off = runtime_telemetry_off();
+
         Ok(Config {
             mcp_backend_url,
             jwt_secret,
@@ -233,7 +268,82 @@ impl Config {
             model_disk_pressure_percent,
             model_sweep_interval_secs,
             model_warm_cooldown_hours,
+            model_source_allowlist,
+            outbound_proxy,
+            runtime_telemetry_off,
         })
+    }
+
+    /// A minimal `Config` for unit tests that need a `Config` value without reading
+    /// the process environment. All fields take their documented defaults; ISO-01
+    /// fields default to the FAIL-CLOSED posture (empty allow-list, no proxy).
+    #[cfg(test)]
+    pub fn test_default() -> Self {
+        Config {
+            mcp_backend_url: "http://mcp.invalid:3200".into(),
+            jwt_secret: String::new(),
+            tool_timeout_secs: 30,
+            catalog_cache_secs: 300,
+            listen_port: 9099,
+            control_port: 8090,
+            rate_limits: RateLimitConfig::default(),
+            llm_backend_url: None,
+            model_aliases: HashMap::new(),
+            model_archive_path: "/var/lib/model-archive".into(),
+            model_local_path: "/opt/ollama-models".into(),
+            model_protected: Vec::new(),
+            model_pull_timeout_secs: 600,
+            model_registry_path: "<path>/model-registry.json".into(),
+            model_disk_pressure_percent: 80,
+            model_sweep_interval_secs: 1800,
+            model_warm_cooldown_hours: 168,
+            model_source_allowlist: Vec::new(),
+            outbound_proxy: None,
+            runtime_telemetry_off: true,
+        }
+    }
+}
+
+/// S88 ISO-01 egress config surface: read `MODEL_SOURCE_ALLOWLIST` into the list of
+/// model-source hosts a `Pull` may reach (comma/space split).
+///
+/// **UNSET → empty list + a loud `tracing::warn!`** that all pulls will be Denied
+/// until the allow-list is configured. This NEVER defaults to allow-all: an
+/// unconfigured Chord fails closed. A deployment's real value comes from its egress
+/// audit; the examples in `.env.example` (registry.ollama.ai, huggingface.co) are
+/// public placeholders only.
+pub fn model_source_allowlist() -> Vec<String> {
+    match std::env::var("MODEL_SOURCE_ALLOWLIST") {
+        Ok(raw) => {
+            let list = parse_model_source_allowlist(&raw);
+            if list.is_empty() {
+                tracing::warn!(
+                    target: "chord.supervisor",
+                    "MODEL_SOURCE_ALLOWLIST is set but empty after parsing — all model \
+                     pulls will be DENIED (egress fail-closed) until it is configured"
+                );
+            }
+            list
+        }
+        Err(_) => {
+            tracing::warn!(
+                target: "chord.supervisor",
+                "MODEL_SOURCE_ALLOWLIST is unset — all model pulls will be DENIED \
+                 (egress fail-closed) until it is configured; ISO-01 never defaults \
+                 to allow-all"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// S88 ISO-01 telemetry toggle: read `CHORD_RUNTIME_TELEMETRY_OFF` (default `true`).
+/// Controls whether runtime launches advertise the telemetry-off / offline opt-outs.
+/// Any value other than a case-insensitive `false`/`0`/`no` keeps the opt-outs ON.
+pub fn runtime_telemetry_off() -> bool {
+    match std::env::var("CHORD_RUNTIME_TELEMETRY_OFF") {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no" | "off"),
+        Err(_) => true,
     }
 }
 
