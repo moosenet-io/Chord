@@ -146,43 +146,51 @@ or the configured `MODEL_PROTECTED` set — are never demoted to `Cold`
 
 ### Memory / residency management
 
-> **Spec mapping (important).** The diagram labels a "**Memory Coordinator**" box
-> with "substrate-aware", "SeparateCeilings", "UnifiedPool", "admission", and
-> "tier-aware eviction", and a "**Clean-Swap Launcher**" box with "teardown →",
-> "verify release →", "orphan force-kill", "false-OOM guard", and
-> "launch w/ explicit `-c`". **Those exact types are not present in this extracted
-> `src/`.** A repo-wide search finds no `SeparateCeilings`, `UnifiedPool`,
-> `MemoryCoordinator`, `CleanSwap`, `admission`, `substrate`, `orphan`, or
-> `false-OOM` symbols. What *does* ship is the closely-related residency
-> machinery, split across the modules below; the serving subsystem doc
+> **Spec mapping.** The diagram labels a "**Memory Coordinator**" box
+> ("substrate-aware", "SeparateCeilings", "UnifiedPool", "admission",
+> "tier-aware eviction"), a "**Clean-Swap Launcher**" box ("teardown →",
+> "verify release →", "orphan force-kill", "false-OOM guard",
+> "launch w/ explicit `-c`"), and a "**Mode Controller**" box. As of
+> chord-proxy 1.1.0 all three ship in [`src/serving/`](../src/serving) —
+> `SeparateCeilings`, `UnifiedPool`, the `VramResidencyManager` coordinator, the
+> `clean_swap` barrier with `verify_release` (orphan kill + false-OOM guard), and
+> the persisted `ModeController` are all real types. The serving subsystem doc
 > ([serving.md](serving.md)) walks through them in detail.
 
-In this crate, residency / memory behaviour is realised by:
+Residency / memory behaviour spans the VRAM serving layer and the storage layer:
 
+- **VRAM Memory Coordinator** — [`serving::residency::VramResidencyManager`](../src/serving/residency.rs)
+  owns the resident set, in-flight reservations, the pinned chat model, and the
+  operating mode behind one lock. `register_resident` is the admission entry: it
+  sizes admissible free VRAM through the active substrate accounting model
+  ([`serving::memory_model`](../src/serving/memory_model.rs): `SeparateCeilings`
+  for a fixed carveout, `UnifiedPool` for dynamic-GTT), asks
+  [`serving::eviction::plan_admission`](../src/serving/eviction.rs) for a
+  tier-aware plan (transient → keep-warm LRU; the `Tier::Chat` pin is never
+  evicted), claims victims under the lock to avoid a double-eviction race, and
+  reclaims their VRAM outside it. Any unreadable counter is fail-safe "won't fit".
+- **Clean-Swap Launcher** — [`serving::swap::clean_swap`](../src/serving/swap.rs)
+  enforces teardown → verify-release → launch. [`serving::release_verify::verify_release`](../src/serving/release_verify.rs)
+  confirms the device returned to `baseline + tolerance`, force-kills an orphaned
+  backend, and refuses to launch onto a polluted device (the false-OOM guard).
+  Every swap launches with an explicit `-c <n_ctx>`
+  ([`serving::launcher`](../src/serving/launcher.rs) builds the command; a missing
+  profile ctx is filled by `default_ctx_for_footprint`).
+- **Mode Controller** — [`serving::mode::ModeController`](../src/serving/mode.rs)
+  with `OperatingMode::{AssistantLive, BatchCoder}`; switching off assistant-live
+  requires explicit confirm, and the mode is persisted via
+  `residency::read_persisted_mode` so it survives a restart.
 - **Tier-aware eviction (storage)** — [`models::eviction`](../src/models/eviction.rs).
   `evict_to_archive` performs an archive-first, verify-then-delete, GC-aware
-  warm → cold eviction. `run_eviction_sweep` runs a cooldown pass (idle-too-long
-  archival) then a disk-pressure pass (LRU eviction above
-  `MODEL_DISK_PRESSURE_PERCENT`). `evict_for_space` is the targeted pre-pull
-  variant. A shared `DiskOpLock` serialises all destructive disk ops. This is the
-  real "tier-aware eviction" — it operates on the **disk** tier (warm↔cold), not a
-  VRAM admission ceiling.
+  warm → cold eviction. `run_eviction_sweep` runs a cooldown pass then a
+  disk-pressure pass (LRU above `MODEL_DISK_PRESSURE_PERCENT`); `evict_for_space`
+  is the targeted pre-pull variant. A shared `DiskOpLock` serialises destructive
+  disk ops. This is the **disk** tier (warm↔cold), distinct from the VRAM ceiling.
 - **Archive pull / admission-by-space** — [`models::transfer`](../src/models/transfer.rs).
-  `PullCoordinator::ensure_local` is the cold → warm copy with a **disk precheck
-  that fails fast** if free space is insufficient (a `DiskSpaceProbe` /
-  `StatvfsProbe` reports free/total bytes), per-model dedup locking, timeout, and
-  partial-file cleanup. The "admission" that actually exists here is *disk-space*
-  admission before a pull, not VRAM-ceiling admission.
-- **VRAM swap (residency)** — [`harness::vram_lifecycle`](../src/harness/vram_lifecycle.rs).
-  `HarnessVramManager` makes a model VRAM-resident by calling Chord's own
-  lifecycle control API (`POST /api/lifecycle/swap` / `…/restore`); a swap evicts
-  whatever was previously loaded. A `tokio::sync::Mutex` serialises rotations so
-  only one touches VRAM at a time. This is the warm → hot step the registry/pull
-  path explicitly does *not* perform itself.
+  `PullCoordinator::ensure_local` is the cold → warm copy with a disk precheck that
+  fails fast, per-model dedup locking, timeout, and partial-file cleanup.
 
-See [serving.md](serving.md) for how these map onto the diagram's
-Memory-Coordinator / Clean-Swap / Mode-Controller boxes and exactly which spec'd
-pieces are present vs. absent.
+See [serving.md](serving.md) for the full module-by-module walkthrough.
 
 ### Control API (operator / dashboard surface)
 

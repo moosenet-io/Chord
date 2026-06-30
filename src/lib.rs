@@ -13,5 +13,6 @@ pub mod models;
 pub mod rate_limiter;
 pub mod routes;
 pub mod routing;
+pub mod serving;
 pub mod session;
 pub mod version;

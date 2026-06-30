@@ -237,6 +237,188 @@ impl Config {
     }
 }
 
+// ── S85 SRV-05: residency / VRAM-admission config helpers ─────────────────────
+//
+// The residency manager must read the host's FREE VRAM counter and persist a
+// residency state file — both via env-sourced paths, NEVER a literal (S77 /
+// pii_gate). A `None`/unreadable free-VRAM value is the FAIL-SAFE trigger (the
+// caller treats it as "won't fit" and queues rather than risk an OOM launch), so
+// these helpers must never invent a path or a number.
+
+/// Read a trimmed, non-empty env var; `None` when unset or blank.
+fn srv05_env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Max cold-load (seconds) a model may have to be eligible as the PINNED,
+/// interactive Lumina chat alias (SRV-06's latency guard). A model whose serving
+/// profile cold-loads slower than this is too slow on first use to be the live
+/// chat model — UNLESS it is `keep_warm` (held resident), in which case it is
+/// allowed but flagged (warm residency mitigates steady-state latency; the first
+/// cold-start still applies). From `CHORD_CHAT_PIN_MAX_COLD_LOAD_S`, default 300
+/// (5 min) — generous enough for a warmed mid-size model, far below the ~8–10 min
+/// big-MoE cold load that makes an interactive alias wrong.
+pub fn chat_pin_max_cold_load_s() -> f64 {
+    srv05_env_nonempty("CHORD_CHAT_PIN_MAX_COLD_LOAD_S")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300.0)
+}
+
+/// Filesystem path of the sysfs counter exposing the GPU's FREE VRAM in BYTES
+/// (e.g. the amdgpu `mem_info_vram_used`/`..._total` pair surfaced as a single
+/// free counter by the operator's wrapper). From `CHORD_VRAM_FREE_SYSFS_PATH`;
+/// `None` ⇒ no counter configured → the residency manager FAILS SAFE (treats free
+/// VRAM as unreadable). No path is ever guessed (pii_gate).
+pub fn vram_free_sysfs_path() -> Option<String> {
+    srv05_env_nonempty("CHORD_VRAM_FREE_SYSFS_PATH")
+}
+
+/// Read the host's FREE VRAM in GB via the sysfs counter at
+/// [`vram_free_sysfs_path`]. The counter file holds an integer number of BYTES.
+///
+/// Returns `None` (the FAIL-SAFE signal) when: no path is configured, the file
+/// cannot be read (sysfs hiccup), or its contents do not parse as a byte count.
+/// The residency manager turns any `None` into "won't fit → queue", never an
+/// OOM-risking launch.
+pub fn read_free_vram_gb() -> Option<f64> {
+    let path = vram_free_sysfs_path()?;
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let bytes: f64 = raw.trim().parse().ok()?;
+    if bytes.is_finite() && bytes >= 0.0 {
+        Some(bytes / 1_073_741_824.0) // bytes → GiB
+    } else {
+        None
+    }
+}
+
+/// The SRV-12 release-verification tunables, from env (no literals): device idle
+/// baseline + tolerance (GB), and the wait budget / poll interval. Defaults are
+/// conservative — a generous timeout (cold backends can be slow to release) and a
+/// 500 ms poll.
+pub fn release_config() -> crate::serving::release_verify::ReleaseConfig {
+    crate::serving::release_verify::ReleaseConfig {
+        baseline_gb: srv05_env_nonempty("CHORD_RELEASE_BASELINE_GB")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.3),
+        tolerance_gb: srv05_env_nonempty("CHORD_RELEASE_TOLERANCE_GB")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.5),
+        timeout: std::time::Duration::from_millis(
+            srv05_env_nonempty("CHORD_RELEASE_TIMEOUT_MS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30_000),
+        ),
+        poll_interval: std::time::Duration::from_millis(
+            srv05_env_nonempty("CHORD_RELEASE_POLL_MS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(500),
+        ),
+    }
+}
+
+/// The SRV-12 explicit-context defaults used when a model's profile carries no
+/// `n_ctx` — a SAFE explicit context (never the backend's auto-fit). From env.
+pub fn swap_context_defaults() -> crate::serving::swap::ContextDefaults {
+    crate::serving::swap::ContextDefaults {
+        base_ctx: srv05_env_nonempty("CHORD_SWAP_BASE_CTX")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32768),
+        min_ctx: srv05_env_nonempty("CHORD_SWAP_MIN_CTX")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8192),
+        large_model_gb: srv05_env_nonempty("CHORD_SWAP_LARGE_MODEL_GB")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(40.0),
+    }
+}
+
+/// Free system RAM in GB, from `/proc/meminfo`'s `MemAvailable` line — the CPU
+/// pool's free counter for the SRV-11 memory model (the genuine-CPU backend draws
+/// system RAM). `/proc/meminfo` is a universal kernel interface, not infra, so it
+/// is read directly. `None` ⇒ unreadable → the memory model FAILS SAFE.
+pub fn read_cpu_free_gb() -> Option<f64> {
+    let raw = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            // Format: `MemAvailable:   28986336 kB`
+            let kb: f64 = rest.split_whitespace().next()?.parse().ok()?;
+            if kb.is_finite() && kb >= 0.0 {
+                return Some(kb / 1_048_576.0); // kB → GiB
+            }
+        }
+    }
+    None
+}
+
+/// Sysfs path to the GPU's TOTAL VRAM carveout counter (`mem_info_vram_total`),
+/// from `CHORD_VRAM_TOTAL_SYSFS_PATH`. Used only at boot for SRV-11 substrate
+/// detection; `None` ⇒ detection cannot run → caller defaults to the safer model.
+pub fn vram_total_sysfs_path() -> Option<String> {
+    srv05_env_nonempty("CHORD_VRAM_TOTAL_SYSFS_PATH")
+}
+
+/// Sysfs path to the GPU's TOTAL GTT counter (`mem_info_gtt_total`), from
+/// `CHORD_GTT_TOTAL_SYSFS_PATH`. Boot-time SRV-11 detection only.
+pub fn gtt_total_sysfs_path() -> Option<String> {
+    srv05_env_nonempty("CHORD_GTT_TOTAL_SYSFS_PATH")
+}
+
+/// Read a sysfs byte counter into GiB (shared by the total-VRAM/GTT readers).
+fn read_sysfs_bytes_gb(path: &str) -> Option<f64> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let bytes: f64 = raw.trim().parse().ok()?;
+    (bytes.is_finite() && bytes >= 0.0).then_some(bytes / 1_073_741_824.0)
+}
+
+/// Total system RAM in GB from `/proc/meminfo` `MemTotal` (boot-time detection).
+fn read_system_ram_gb() -> Option<f64> {
+    let raw = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: f64 = rest.split_whitespace().next()?.parse().ok()?;
+            return (kb.is_finite() && kb >= 0.0).then_some(kb / 1_048_576.0);
+        }
+    }
+    None
+}
+
+/// Read the host's substrate facts (VRAM carveout, GTT total, system RAM) for
+/// boot-time SRV-11 memory-model detection. `None` if any counter is unconfigured
+/// or unreadable — the caller then defaults to the safer accounting model.
+pub fn read_substrate_info() -> Option<crate::serving::memory_model::SubstrateInfo> {
+    let vram = read_sysfs_bytes_gb(&vram_total_sysfs_path()?)?;
+    let gtt = read_sysfs_bytes_gb(&gtt_total_sysfs_path()?)?;
+    let ram = read_system_ram_gb()?;
+    Some(crate::serving::memory_model::SubstrateInfo {
+        vram_carveout_gb: vram,
+        gtt_total_gb: gtt,
+        system_ram_gb: ram,
+    })
+}
+
+/// Path to the JSON residency-state file the manager writes atomically
+/// (tempfile + rename) on every admit/queue/evict. From
+/// `CHORD_RESIDENCY_STATE_PATH`; `None` ⇒ state-file persistence is disabled (the
+/// manager still admits/evicts in memory — it just does not mirror to disk). No
+/// path is guessed (pii_gate).
+pub fn residency_state_path() -> Option<String> {
+    srv05_env_nonempty("CHORD_RESIDENCY_STATE_PATH")
+}
+
+/// Bounded wait (milliseconds) the manager queues a keep-warm-contended launch
+/// before it falls back to evicting an LRU keep-warm resident (and, if nothing is
+/// evictable, denies admission). From `CHORD_RESIDENCY_WAIT_THRESHOLD_MS`,
+/// default 30000 (30 s) — long enough to let a short generation finish, short
+/// enough not to stall live Lumina.
+pub fn residency_wait_threshold_ms() -> u64 {
+    srv05_env_nonempty("CHORD_RESIDENCY_WAIT_THRESHOLD_MS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30_000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
