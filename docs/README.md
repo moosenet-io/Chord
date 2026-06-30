@@ -16,6 +16,12 @@ and names the real modules and types behind each component.
   diagram's **Memory Coordinator** (SRV-11), **Clean-Swap Launcher** (SRV-12), and
   **Mode Controller** (SRV-13) boxes map onto the code that actually ships, with an
   explicit present/partial/absent table.
+- **[egress.md](egress.md)** — runtime isolation: ISO-01 env-scrub + egress policy
+  and the ISO-02 per-runtime network-namespace kernel enforcement (serve = no
+  route, pull = allow-list), fail-closed posture, and honest scope.
+- **[snap-persistence.md](snap-persistence.md)** — the optional, default-off
+  (`CHORD_SNAP_PERSIST`) SNAP → Postgres persistence of the analytics, inventory,
+  activity, and VRAM observability streams.
 
 ## Test Results
 

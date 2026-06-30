@@ -48,6 +48,28 @@ is built from four cooperating components:
   *assistant-live* (pin a model and swap the rest around it) versus
   *batch-coder* (give the GPU fully to one model at a time).
 
+Two cross-cutting subsystems wrap the core:
+
+- **SNAP — observability & inventory** ([`src/snap`](src/snap)): a real GPU VRAM
+  reader (sysfs / rocm-smi / Ollama) and engine-health poller, an on-disk GGUF +
+  Ollama manifest scanner with quant detection, passive per-model activity
+  observation, and a request-analytics logger with imputed cloud-cost / savings.
+  It exposes a read-only observability surface on distinct paths behind Chord's
+  own JWT auth, and includes a vLLM engine adapter. SNAP can optionally persist
+  its streams (analytics, inventory, activity, VRAM samples) to Postgres; this is
+  **default-off**, gated behind `CHORD_SNAP_PERSIST`, best-effort, and never
+  fails or slows a proxied request.
+- **Runtime isolation (ISO)** ([`src/supervisor`](src/supervisor)): every runtime
+  Chord launches is spawned with a scrubbed environment and an explicit egress
+  posture. ISO-01 scrubs telemetry/online env vars and declares the policy
+  (advisory); ISO-02 enforces it in the kernel with a per-runtime network
+  namespace — a `Serve` runtime gets **no route** (every external `connect()`
+  fails at the kernel, so it cannot phone home even if it ignores the opt-outs),
+  while a `Pull` runtime gets a constrained, nftables-filtered path to the
+  configured model-source allow-list only. It is **fail-closed**: without
+  `CAP_NET_ADMIN` the launch is refused rather than run with full host egress
+  (an explicit, loud `CHORD_ALLOW_UNISOLATED=1` override exists, off by default).
+
 These route across a **three-tier backend stack**:
 
 1. **llama.cpp-rocm** — the GPU tier; broadest model support and most
@@ -62,8 +84,12 @@ the CPU tier.
 
 ## Status
 
-Early — separation from the monorepo is in progress. Chord ships as the Rust
-crate `chord-proxy`. Version **1.0**.
+Chord ships as the standalone Rust crate `chord-proxy`, version **1.4**. It
+depends on `terminus-rs` 1.1 (the serving-profile types + intake DB config) from
+the Gitea crate registry. The core inference manager — routing, the substrate-aware
+Memory Coordinator, the verified Clean-Swap Launcher, the Mode Controller, the
+SNAP observability subsystem, and per-runtime kernel egress isolation — is in
+place; the coder benchmark charts are the remaining pending item.
 
 ## Documentation
 
@@ -77,6 +103,11 @@ Component explainers (written from the source in [`src/`](src)) live in
 - **[docs/serving.md](docs/serving.md)** — the serving / coordinator subsystem
   (Memory Coordinator, Clean-Swap Launcher, Mode Controller) mapped to the code
   that actually ships, with a present/partial/absent table.
+- **[docs/egress.md](docs/egress.md)** — the runtime isolation model: ISO-01
+  env-scrub + egress policy and ISO-02 per-runtime network-namespace enforcement,
+  the fail-closed posture, and the honest scope boundaries.
+- **[docs/snap-persistence.md](docs/snap-persistence.md)** — the optional,
+  default-off SNAP → Postgres persistence layer (`CHORD_SNAP_PERSIST`).
 - **[docs/README.md](docs/README.md)** — the docs index.
 
 ## Test Results
