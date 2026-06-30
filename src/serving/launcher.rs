@@ -40,6 +40,8 @@ use terminus_rs::config;
 use terminus_rs::intake::serving::{ModelId, Runtime};
 
 use crate::config::Config;
+use crate::supervisor::egress_policy::posture_for;
+use crate::supervisor::launch_isolation::{decide_isolation, IsolationDecision};
 use crate::supervisor::{build_runtime_env, RuntimeClass};
 
 use super::profile::{EnvSpec, ProfileLoadError, RouteEntry};
@@ -90,6 +92,10 @@ pub enum LaunchError {
     CpuModelExceedsHostRam(String),
     /// The serving profile store could not be read.
     ProfileStoreUnavailable,
+    /// S88 ISO-02: network-namespace isolation could not be established and there
+    /// was no explicit operator override → the launch is REFUSED (fail closed). The
+    /// runtime is NOT spawned with full host egress.
+    IsolationRefused(String),
 }
 
 impl std::fmt::Display for LaunchError {
@@ -115,6 +121,11 @@ impl std::fmt::Display for LaunchError {
             LaunchError::ProfileStoreUnavailable => {
                 f.write_str("serving profile store is temporarily unavailable")
             }
+            LaunchError::IsolationRefused(m) => write!(
+                f,
+                "refusing to serve model '{m}': network-namespace isolation unavailable \
+                 and no operator override (failing closed, not launching with host egress)"
+            ),
         }
     }
 }
@@ -143,6 +154,11 @@ pub struct ServeHandle {
     /// True when this serve came from a warm residency slot rather than a cold
     /// launch (keep-warm models).
     pub from_warm_slot: bool,
+    /// S88 ISO-02: the network namespace this runtime was spawned into, if any
+    /// (`Some(name)` when isolated; `None` when isolation was disabled by config or
+    /// the operator override was used). The SRV-12 clean swap tears this down when
+    /// the runtime is swapped out — see [`netns_to_teardown`].
+    pub netns: Option<String>,
 }
 
 /// An acquired warm-residency slot for a keep-warm model. Returned by
@@ -156,6 +172,9 @@ pub struct Slot {
     pub runtime: Runtime,
     /// The (already health-checked, resident) endpoint to route requests to.
     pub endpoint: String,
+    /// S88 ISO-02: the network namespace the resident runtime was spawned into, if
+    /// any. Torn down when the slot is evicted/swapped out.
+    pub netns: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -483,6 +502,7 @@ impl<'a> Launcher<'a> {
                 runtime: slot.runtime,
                 endpoint: slot.endpoint,
                 from_warm_slot: true,
+                netns: slot.netns,
             });
         }
 
@@ -553,14 +573,33 @@ impl<'a> Launcher<'a> {
             None => cmd,
         };
 
+        // S88 ISO-02: enforce the egress posture with a per-runtime network
+        // namespace. A serving runtime is the `Serve` class → `Denied` posture →
+        // a netns with NO route (the kernel guarantee). FAIL CLOSED: a `Refused`
+        // decision aborts the launch rather than spawn with full host egress. Only
+        // applied when a cfg is wired (the legacy ctor keeps the un-isolated path
+        // for the existing unit tests / non-privileged dev).
+        let (cmd, netns_name) = match self.cfg {
+            Some(cfg) => match self.isolate_command(model_str, runtime, cmd, RuntimeClass::Serve, cfg)
+            {
+                Ok(pair) => pair,
+                Err(e) => return Err(e),
+            },
+            None => (cmd, None),
+        };
+
         if let Err(_detail) = self.spawner.spawn(&cmd).await {
             // _detail is intentionally dropped from the surfaced error (S77).
+            // A namespace we created for a launch that then failed to spawn must
+            // not leak — tear it down (idempotent) before returning.
+            teardown_netns(netns_name.as_deref());
             self.recorder
                 .record_failure(model_str, runtime, "launch-failed");
             return Err(LaunchError::AllRuntimesFailed(model_str.to_string()));
         }
 
         if !self.health.check(&cmd.health_url).await {
+            teardown_netns(netns_name.as_deref());
             self.recorder
                 .record_failure(model_str, runtime, "health-check-failed");
             return Err(LaunchError::AllRuntimesFailed(model_str.to_string()));
@@ -571,7 +610,82 @@ impl<'a> Launcher<'a> {
             runtime,
             endpoint: cmd.health_url,
             from_warm_slot: false,
+            netns: netns_name,
         })
+    }
+
+    /// S88 ISO-02 seam: given a built+scrubbed `cmd`, establish the network
+    /// namespace for `class`'s egress posture and rewrite the command to spawn
+    /// INSIDE it. Returns the (possibly rewritten) command and the namespace name
+    /// to record for teardown.
+    ///
+    /// FAIL CLOSED: an [`IsolationDecision::Refused`] returns
+    /// [`LaunchError::IsolationRefused`] — the runtime is never spawned with full
+    /// host egress. `DisabledByConfig` / `UnisolatedOverride` return the command
+    /// unchanged with no namespace (the explicit opt-out / override paths).
+    fn isolate_command(
+        &self,
+        model_str: &str,
+        runtime: Runtime,
+        cmd: LaunchCommand,
+        class: RuntimeClass,
+        cfg: &Config,
+    ) -> Result<(LaunchCommand, Option<String>), LaunchError> {
+        let posture = posture_for(class, cfg);
+        let decision = decide_isolation(model_str, &posture);
+        match decision {
+            IsolationDecision::Isolated(handle) => {
+                // Resolve the `ip` binary and rewrite bin+args to `ip netns exec …`.
+                let ip = match crate::config::ip_bin() {
+                    Some(b) => b,
+                    None => {
+                        // Tooling vanished between prepare and wrap — fail closed,
+                        // tearing the just-created namespace down.
+                        let _ = handle.teardown();
+                        self.recorder
+                            .record_failure(model_str, runtime, "isolation-tool-unavailable");
+                        return Err(LaunchError::IsolationRefused(model_str.to_string()));
+                    }
+                };
+                let name = handle.name().to_string();
+                let (bin, args) = handle.wrap_command(&ip, &cmd.bin, &cmd.args);
+                Ok((
+                    LaunchCommand {
+                        bin,
+                        args,
+                        ..cmd
+                    },
+                    Some(name),
+                ))
+            }
+            IsolationDecision::DisabledByConfig | IsolationDecision::UnisolatedOverride(_) => {
+                // Explicit dev opt-out or loud operator override: spawn as-is, no ns.
+                Ok((cmd, None))
+            }
+            IsolationDecision::Refused(_) => {
+                self.recorder
+                    .record_failure(model_str, runtime, "isolation-refused");
+                Err(LaunchError::IsolationRefused(model_str.to_string()))
+            }
+        }
+    }
+}
+
+/// Tear down a network namespace by name (idempotent; no-op when `None`). Used to
+/// reap a namespace whose launch failed after the namespace was created, and as the
+/// hook the SRV-12 clean swap calls when a runtime is swapped out.
+pub fn teardown_netns(name: Option<&str>) {
+    if let Some(n) = name {
+        // Reconstruct a handle purely to call its idempotent teardown. A wrong
+        // posture here is irrelevant — teardown only needs the name.
+        let handle = crate::supervisor::netns::NetnsHandle::for_teardown(n);
+        if let Err(e) = handle.teardown() {
+            tracing::debug!(
+                target: "chord.serving.launcher",
+                reason = %e,
+                "network-namespace teardown reported an error (already idempotent-safe)"
+            );
+        }
     }
 }
 
@@ -655,6 +769,9 @@ impl<'a> ResidencyManager for PassThroughResidency<'a> {
             model_id: model_str,
             runtime,
             endpoint: cmd.health_url,
+            // The pass-through stub does not isolate (SRV-05's real residency
+            // manager owns warm-slot isolation); no namespace to record here.
+            netns: None,
         })
     }
 }
@@ -866,6 +983,7 @@ mod tests {
             LaunchError::KeepWarmMustUseResidency("m".into()),
             LaunchError::CpuModelExceedsHostRam("m".into()),
             LaunchError::ProfileStoreUnavailable,
+            LaunchError::IsolationRefused("m".into()),
         ];
         for e in errs {
             let s = e.to_string();
@@ -937,6 +1055,7 @@ mod tests {
                 model_id: model_id.as_str().to_string(),
                 runtime: Runtime::LlamaCpp,
                 endpoint: self.endpoint.clone(),
+                netns: None,
             })
         }
     }
@@ -1253,12 +1372,94 @@ mod tests {
         let rec = CountingRecorder { failures: Mutex::new(vec![]) };
         let resi = NeverResidency;
         let cfg = Config::test_default();
+        // ISO-02: on this unprivileged host the netns can't be created. Use the dev
+        // opt-out so the ISO-01 env scrub is still exercised end-to-end (the
+        // isolation fail-closed path is asserted by its own tests below).
+        std::env::set_var("CHORD_NETNS_ISOLATION", "0");
         let l = Launcher::with_scrub(&spawner, &health, &rec, &resi, &cfg);
         let e = entry("m", ServingBackend::LlamaGpu, Runtime::LlamaCpp, "{}", false, None);
         l.serve_model(&ModelId::from("m"), &e, "/w/m.gguf").await.unwrap();
+        std::env::remove_var("CHORD_NETNS_ISOLATION");
         let env = spawner.env.lock().unwrap();
         assert!(env.iter().any(|(k, v)| k == "DO_NOT_TRACK" && v == "1"));
         assert!(env.iter().any(|(k, v)| k == "TRANSFORMERS_OFFLINE" && v == "1"));
+    }
+
+    // ── S88 ISO-02: launcher isolation integration ─────────────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn with_scrub_fails_closed_when_isolation_unavailable_and_no_override() {
+        // NEGATIVE TEST (the load-bearing one): a `with_scrub` launcher on a host
+        // WITHOUT CAP_NET_ADMIN and with isolation ON and NO override must REFUSE to
+        // launch (IsolationRefused) — it must NEVER spawn the runtime with full host
+        // egress. We assert the spawner was never called.
+        set_runtime_endpoints();
+        std::env::remove_var("CHORD_NETNS_ISOLATION"); // default ON
+        std::env::remove_var("CHORD_ALLOW_UNISOLATED"); // no override
+        let spawner = ScriptedSpawner { fail_runtimes: vec![], calls: Mutex::new(vec![]) };
+        let health = ScriptedHealth { healthy: true };
+        let rec = CountingRecorder { failures: Mutex::new(vec![]) };
+        let resi = NeverResidency;
+        let cfg = Config::test_default();
+        let l = Launcher::with_scrub(&spawner, &health, &rec, &resi, &cfg);
+        // No fallback so both attempts hit the same refusal; the error after the
+        // chain is AllRuntimesFailed, but crucially NOTHING was spawned.
+        let e = entry("m", ServingBackend::LlamaGpu, Runtime::LlamaCpp, "{}", false, None);
+        let err = l.serve_model(&ModelId::from("m"), &e, "/w/m.gguf").await.unwrap_err();
+        assert!(matches!(err, LaunchError::AllRuntimesFailed(_)));
+        assert!(
+            spawner.calls.lock().unwrap().is_empty(),
+            "fail-closed: the runtime must NOT be spawned when isolation is unavailable"
+        );
+        // The isolation refusal was recorded.
+        assert!(rec
+            .failures
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, _, r)| r == "isolation-refused"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn with_scrub_override_permits_unisolated_spawn_loudly() {
+        // With the explicit operator override, the same unprivileged host DOES
+        // spawn (unisolated) — the sanctioned bypass. The serve handle carries no
+        // namespace (none was created).
+        set_runtime_endpoints();
+        std::env::remove_var("CHORD_NETNS_ISOLATION");
+        std::env::set_var("CHORD_ALLOW_UNISOLATED", "1");
+        let spawner = ScriptedSpawner { fail_runtimes: vec![], calls: Mutex::new(vec![]) };
+        let health = ScriptedHealth { healthy: true };
+        let rec = CountingRecorder { failures: Mutex::new(vec![]) };
+        let resi = NeverResidency;
+        let cfg = Config::test_default();
+        let l = Launcher::with_scrub(&spawner, &health, &rec, &resi, &cfg);
+        let e = entry("m", ServingBackend::LlamaGpu, Runtime::LlamaCpp, "{}", false, None);
+        let h = l.serve_model(&ModelId::from("m"), &e, "/w/m.gguf").await.unwrap();
+        std::env::remove_var("CHORD_ALLOW_UNISOLATED");
+        assert_eq!(*spawner.calls.lock().unwrap(), vec![Runtime::LlamaCpp]);
+        assert!(h.netns.is_none(), "override path spawns without a namespace");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn with_scrub_disabled_by_config_spawns_unisolated_legacy_path() {
+        // CHORD_NETNS_ISOLATION=0 is the dev/CI opt-out: spawn, no namespace.
+        set_runtime_endpoints();
+        std::env::set_var("CHORD_NETNS_ISOLATION", "0");
+        let spawner = ScriptedSpawner { fail_runtimes: vec![], calls: Mutex::new(vec![]) };
+        let health = ScriptedHealth { healthy: true };
+        let rec = CountingRecorder { failures: Mutex::new(vec![]) };
+        let resi = NeverResidency;
+        let cfg = Config::test_default();
+        let l = Launcher::with_scrub(&spawner, &health, &rec, &resi, &cfg);
+        let e = entry("m", ServingBackend::LlamaGpu, Runtime::LlamaCpp, "{}", false, None);
+        let h = l.serve_model(&ModelId::from("m"), &e, "/w/m.gguf").await.unwrap();
+        std::env::remove_var("CHORD_NETNS_ISOLATION");
+        assert_eq!(*spawner.calls.lock().unwrap(), vec![Runtime::LlamaCpp]);
+        assert!(h.netns.is_none());
     }
 
     #[tokio::test]

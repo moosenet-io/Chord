@@ -4,22 +4,36 @@
 //! child is spawned with ([`launch_env`]) and the network egress policy that
 //! launch should have ([`egress_policy`]).
 //!
-//! ## Honest scope — ISO-01 is ADVISORY
-//! ISO-01 ships the env-scrub and the egress-policy **config surface only**. The
-//! env-scrub sets documented telemetry-off / offline opt-outs and strips proxy
-//! vars; it relies on the runtimes HONOURING those opt-outs. The egress policy is
-//! *declared* (Serve = Denied, Pull = allow-list-or-Denied) but **not enforced at
-//! the kernel**. The actual guarantee — a network namespace that physically blocks
-//! egress so a misbehaving binary cannot reach the internet — is **ISO-02 and is
-//! NOT built yet**. Do not treat ISO-01 as a security boundary; it is
-//! defense-in-depth and the policy plumbing ISO-02 will enforce.
+//! ## Scope — ISO-01 (advisory) + ISO-02 (the kernel guarantee)
+//! ISO-01 ships the env-scrub ([`launch_env`]) and the egress-policy config
+//! surface ([`egress_policy`]); it is ADVISORY — it relies on the runtimes
+//! HONOURING the telemetry-off / offline opt-outs.
 //!
-//! The launcher ([`crate::serving::launcher`]) consumes [`launch_env`] when it
-//! assembles a runtime's launch env; ISO-02 will additionally consume
-//! [`egress_policy`] to build the netns.
+//! ISO-02 ([`netns`], [`egress_filter`], [`launch_isolation`]) is the KERNEL
+//! guarantee: a per-runtime network namespace that physically blocks the egress
+//! ISO-01 only declared. A `Serve`/`Denied` runtime gets a namespace with NO route
+//! (every external `connect()` fails at the kernel); a `Pull`/`AllowList` runtime
+//! gets a constrained, nftables-filtered egress path to the configured model
+//! sources only. It is **fail-closed**: without `CAP_NET_ADMIN` the launch is
+//! refused, not run with full host egress (an explicit `CHORD_ALLOW_UNISOLATED=1`
+//! override exists and is loud + off by default).
+//!
+//! Honest scope: ISO-02 isolates the runtimes Chord LAUNCHES. It does NOT firewall
+//! Chord's own process (ISO-03) and does NOT replace the host firewall for
+//! non-Chord processes. See `docs/egress.md`.
+//!
+//! The launcher ([`crate::serving::launcher`]) consumes [`launch_env`] for the
+//! scrubbed env AND [`launch_isolation`]/[`netns`] to spawn the runtime inside its
+//! namespace; the SRV-12 clean swap ([`crate::serving::swap`]) tears the outgoing
+//! runtime's namespace down.
 
+pub mod egress_filter;
 pub mod egress_policy;
 pub mod launch_env;
+pub mod launch_isolation;
+pub mod netns;
 
 pub use egress_policy::{posture_for, EgressPosture, RuntimeClass};
 pub use launch_env::build_runtime_env;
+pub use launch_isolation::{decide_isolation, IsolationDecision};
+pub use netns::{NetnsConfig, NetnsError, NetnsHandle};

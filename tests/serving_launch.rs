@@ -99,6 +99,7 @@ impl ResidencyManager for Residency {
             model_id: model_id.as_str().to_string(),
             runtime: Runtime::LlamaCpp,
             endpoint: "http://warm.invalid/health".into(),
+            netns: None,
         })
     }
 }
