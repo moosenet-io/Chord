@@ -1,6 +1,6 @@
 [package]
 name = "chord-proxy"
-version = "1.3.0"
+version = "1.3.1"
 edition = "2021"
 license = "MIT"
 description = "Chord unified proxy — LLM inference + MCP tool gateway"

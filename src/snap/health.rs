@@ -9,6 +9,7 @@ use crate::snap::state::{
     EndpointStatus, EngineEndpoint, InferenceState, LoadedModel,
 };
 
+use crate::snap::activity::ActivityTracker;
 use crate::snap::config::SnapConfig;
 
 /// Shared inference state updated by the background health poller.
@@ -22,13 +23,29 @@ pub fn new_shared_state() -> SharedInferenceState {
 /// Background task: polls all inference endpoints every `poll_interval_secs`
 /// and updates the shared InferenceState atomically.
 /// VLLM-03: If vllm_url is non-empty, also polls vLLM health and metrics.
-pub async fn run_health_monitor(cfg: Arc<SnapConfig>, state: SharedInferenceState) {
+///
+/// `pool` is `Some` only when SNAP persistence is enabled (`CHORD_SNAP_PERSIST`)
+/// AND a DB resolved — see [`crate::snap::spawn_health_monitor`]. When `None`,
+/// the loop behaves exactly as before (no DB writes). Persistence is best-effort:
+/// every write is a `warn!`-and-drop on failure so the monitor never stalls.
+pub async fn run_health_monitor(
+    cfg: Arc<SnapConfig>,
+    state: SharedInferenceState,
+    pool: Option<sqlx::PgPool>,
+) {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .expect("reqwest client");
 
     let interval = Duration::from_secs_f64(cfg.poll_interval_secs);
+
+    // VRAM row-bloat guard state (only used when persisting): last write time +
+    // last (used_mb, allocation-count) so we write at most once per
+    // `vram_sample_secs` AND skip writes when nothing changed.
+    let vram_gate = Duration::from_secs_f64(cfg.vram_sample_secs.max(1.0));
+    let mut last_vram_write: Option<Instant> = None;
+    let mut last_vram_fingerprint: Option<(u64, usize)> = None;
 
     loop {
         let endpoints = vec![
@@ -63,7 +80,67 @@ pub async fn run_health_monitor(cfg: Arc<SnapConfig>, state: SharedInferenceStat
         // Update VRAM state from sysfs + Ollama allocations
         crate::snap::vram::update_vram(&state).await;
 
+        // ── SNAP persistence (default-OFF; only when pool is Some) ──
+        // Best-effort: any DB error is logged and dropped, never blocks polling.
+        if let Some(ref pool) = pool {
+            persist_tick(
+                pool,
+                &state,
+                vram_gate,
+                &mut last_vram_write,
+                &mut last_vram_fingerprint,
+            )
+            .await;
+        }
+
         tokio::time::sleep(interval).await;
+    }
+}
+
+/// Persist one tick's observability snapshot (VRAM sample + activity poll).
+///
+/// VRAM is interval-gated AND write-on-change: a sample is written only when
+/// `vram_gate` has elapsed since the last write *and* the (used_mb, alloc-count)
+/// fingerprint changed — so a fast health poll can't flood `snap_vram_sample`.
+/// Activity persists only models with `active_requests > 0` (the insert filters
+/// idle rows). All errors are `warn!`-and-dropped (best-effort observability).
+async fn persist_tick(
+    pool: &sqlx::PgPool,
+    state: &SharedInferenceState,
+    vram_gate: Duration,
+    last_vram_write: &mut Option<Instant>,
+    last_vram_fingerprint: &mut Option<(u64, usize)>,
+) {
+    // Snapshot the VRAM state + activity under a single read lock.
+    let (vram, sampled_at) = {
+        let s = state.read().await;
+        (s.vram.clone(), s.timestamp)
+    };
+
+    // VRAM interval + write-on-change gate.
+    let fingerprint = (vram.used_mb, vram.allocations.len());
+    let interval_ok = last_vram_write
+        .map(|t| t.elapsed() >= vram_gate)
+        .unwrap_or(true);
+    let changed = last_vram_fingerprint.map(|f| f != fingerprint).unwrap_or(true);
+    if interval_ok && changed {
+        match crate::snap::storage::insert_vram_sample(pool, &vram, sampled_at, None).await {
+            Ok(_) => {
+                *last_vram_write = Some(Instant::now());
+                *last_vram_fingerprint = Some(fingerprint);
+            }
+            Err(e) => warn!(error = %e, "SNAP vram sample persist failed (dropped)"),
+        }
+    }
+
+    // Activity poll: read all activity, persist only active rows (insert filters).
+    let activity = ActivityTracker::new(state.clone()).all_activity().await;
+    if activity.iter().any(|a| a.active_requests > 0) {
+        if let Err(e) =
+            crate::snap::storage::insert_activity_poll(pool, &activity, None).await
+        {
+            warn!(error = %e, "SNAP activity poll persist failed (dropped)");
+        }
     }
 }
 

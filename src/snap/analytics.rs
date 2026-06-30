@@ -54,10 +54,19 @@ pub struct DailyCost {
 }
 
 /// RequestLogger: append-only JSONL log with rotation at 100k lines.
+///
+/// SNAP-05 persistence (default-OFF): when [`RequestLogger::with_pool`] sets a
+/// pool (only the persist-enabled path does this), [`append`](Self::append)
+/// DUAL-writes each record to `snap_request_log` in addition to the JSONL —
+/// the file behavior is unchanged. With no pool (the default) it is JSONL-only,
+/// exactly as 1.2.0/1.3.0.
 pub struct RequestLogger {
     pub log_path: PathBuf,
     /// Cloud pricing table: model_prefix → pricing
     pub cloud_pricing: HashMap<String, CloudPricing>,
+    /// Optional Postgres sink (Some only when CHORD_SNAP_PERSIST is on and a DB
+    /// resolved). DB writes are best-effort and off the caller's critical path.
+    pub pool: Option<sqlx::PgPool>,
 }
 
 impl RequestLogger {
@@ -90,10 +99,23 @@ impl RequestLogger {
             CloudPricing { input_per_1k: 0.002, output_per_1k: 0.002 },
         );
 
-        Self { log_path, cloud_pricing }
+        Self { log_path, cloud_pricing, pool: None }
+    }
+
+    /// Attach a Postgres sink so [`append`](Self::append) dual-writes to
+    /// `snap_request_log`. Builder form — only the persist-enabled path calls it;
+    /// the default [`new`](Self::new) keeps `pool = None` (JSONL-only).
+    pub fn with_pool(mut self, pool: Option<sqlx::PgPool>) -> Self {
+        self.pool = pool;
+        self
     }
 
     /// Append a request record to the log. Rotates if > MAX_LINES.
+    ///
+    /// JSONL append is unchanged. When a pool is attached (persist-on), the same
+    /// record is ALSO written to `snap_request_log` on a spawned task — off the
+    /// caller's critical path and best-effort (a DB error is `warn!`-and-dropped,
+    /// never failing the request).
     pub fn append(&self, record: &RequestRecord) {
         // Check line count and rotate if needed
         self.rotate_if_needed();
@@ -112,6 +134,18 @@ impl RequestLogger {
             if let Some(ref mut f) = file {
                 let _ = f.write_all(json.as_bytes());
             }
+        }
+
+        // SNAP-05 dual-write to Postgres (default-OFF; only when pool attached).
+        if let Some(pool) = self.pool.clone() {
+            let rec = record.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    crate::snap::storage::insert_request_log(&pool, &rec, None).await
+                {
+                    tracing::warn!(error = %e, "SNAP request-log persist failed (dropped)");
+                }
+            });
         }
     }
 

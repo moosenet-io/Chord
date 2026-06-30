@@ -40,6 +40,7 @@ pub mod config;
 pub mod health;
 pub mod inventory;
 pub mod state;
+pub mod storage;
 pub mod vllm;
 pub mod vram;
 
@@ -66,9 +67,65 @@ pub static SHARED_STATE: Lazy<state::SharedInferenceState> = Lazy::new(state::ne
 ///
 /// Best-effort: if no engines are configured the poller simply records an empty
 /// snapshot each tick. Returns immediately after spawning.
+///
+/// ## Persistence (default-OFF)
+/// When `cfg.persist` (`CHORD_SNAP_PERSIST`) is true, this also builds ONE shared
+/// intake-DB pool (via [`storage::get_pool`] — reuses the harness URL resolver,
+/// no new secret), runs [`storage::migrate`] once, and hands the pool to the
+/// health loop so it can persist VRAM samples (interval-gated) and activity polls.
+/// When false — or when no DB URL resolves — the pool is `None` and the monitor
+/// runs exactly as 1.2.0/1.3.0 (in-memory only, zero behavior change). A DB
+/// failure here never blocks the monitor.
 pub fn spawn_health_monitor(cfg: Arc<config::SnapConfig>) {
     let state = SHARED_STATE.clone();
     tokio::spawn(async move {
-        health::run_health_monitor(cfg, state).await;
+        let pool = if cfg.persist {
+            match storage::get_pool().await {
+                Ok(p) => match storage::migrate(&p).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            "SNAP persistence ENABLED (CHORD_SNAP_PERSIST): \
+                             reusing intake DB, vram sample gate {}s",
+                            cfg.vram_sample_secs
+                        );
+                        // SNAP-03: persist a one-shot inventory snapshot at boot
+                        // when storage locations are configured (per-scan grain;
+                        // inventory is cold — not on any hot path). Best-effort.
+                        if !cfg.storage_locations.is_empty() {
+                            let inv = inventory::ModelInventory::scan(&cfg.storage_locations);
+                            match storage::insert_inventory_scan(&p, &inv.records, None).await {
+                                Ok(scan_id) => tracing::info!(
+                                    %scan_id,
+                                    records = inv.records.len(),
+                                    "SNAP inventory snapshot persisted"
+                                ),
+                                Err(e) => tracing::warn!(
+                                    error = %e,
+                                    "SNAP inventory snapshot persist failed (dropped)"
+                                ),
+                            }
+                        }
+                        Some(p)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "SNAP persistence migrate failed — running in-memory only"
+                        );
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "SNAP persistence enabled but no DB resolved — running in-memory only"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        health::run_health_monitor(cfg, state, pool).await;
     });
 }

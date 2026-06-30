@@ -45,6 +45,17 @@ pub struct SnapConfig {
     /// Model storage locations to scan, parsed from `SNAP_STORAGE_LOCATIONS`
     /// (`name:tier:path` entries separated by `;`).
     pub storage_locations: Vec<StorageLocation>,
+    /// Persist SNAP observability streams to Postgres (`CHORD_SNAP_PERSIST`).
+    /// **Default OFF.** When false, SNAP runs in-memory / JSONL exactly as
+    /// 1.2.0/1.3.0 (zero behavior change) and no DB pool is opened. When true,
+    /// SNAP reuses the shared intake DB pool (NO new secret) and writes one row
+    /// per event behind the row-bloat interval gate below.
+    pub persist: bool,
+    /// Minimum seconds between persisted VRAM samples (`SNAP_VRAM_SAMPLE_SECS`,
+    /// default 30). Row-bloat guard: the health monitor writes a VRAM sample at
+    /// most once per this interval (and on used_mb/allocation change), so a fast
+    /// health poll (every few seconds) doesn't flood `snap_vram_sample`.
+    pub vram_sample_secs: f64,
 }
 
 impl SnapConfig {
@@ -67,6 +78,18 @@ impl SnapConfig {
 
         let storage_locations = parse_storage_locations(&env("SNAP_STORAGE_LOCATIONS"));
 
+        // Default OFF: only "1" / "true" / "yes" (case-insensitive) enable it.
+        let persist = matches!(
+            env("CHORD_SNAP_PERSIST").trim().to_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+
+        let vram_sample_secs = std::env::var("SNAP_VRAM_SAMPLE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v > 0.0)
+            .unwrap_or(30.0);
+
         Self {
             llama_server_url: env("LLAMA_SERVER_URL"),
             ollama_url: env("OLLAMA_URL"),
@@ -75,6 +98,8 @@ impl SnapConfig {
             poll_interval_secs,
             data_dir,
             storage_locations,
+            persist,
+            vram_sample_secs,
         }
     }
 }
@@ -130,6 +155,39 @@ mod tests {
         let locs = parse_storage_locations("x:bogus:/p");
         assert_eq!(locs.len(), 1);
         assert_eq!(locs[0].tier, StorageTier::Warm);
+    }
+
+    #[test]
+    fn persist_defaults_off_and_parses_truthy_values() {
+        // Default OFF when unset (no env mutation here — just the parse rule).
+        let parse = |s: &str| {
+            matches!(
+                s.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        };
+        assert!(!parse(""));
+        assert!(!parse("0"));
+        assert!(!parse("false"));
+        assert!(!parse("off"));
+        assert!(parse("1"));
+        assert!(parse("true"));
+        assert!(parse("YES"));
+        assert!(parse("On"));
+    }
+
+    #[test]
+    fn vram_sample_secs_default_is_thirty() {
+        // The row-bloat interval gate default (design §VRAM guard).
+        let parse = |raw: Option<&str>| {
+            raw.and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| *v > 0.0)
+                .unwrap_or(30.0)
+        };
+        assert_eq!(parse(None), 30.0);
+        assert_eq!(parse(Some("0")), 30.0); // non-positive rejected
+        assert_eq!(parse(Some("bad")), 30.0);
+        assert_eq!(parse(Some("60")), 60.0);
     }
 
     #[test]
