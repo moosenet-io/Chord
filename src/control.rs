@@ -410,6 +410,9 @@ pub fn build_control_router(state: Arc<AppState>) -> axum::Router {
         .route("/api/models/:name/pull", post(pull_model))
         .route("/api/models/:name/protect", post(protect_model))
         .route("/api/storage", get(storage_summary))
+        // SNAP observability routes (additive; distinct paths, same JWT auth):
+        // /api/vram, /api/activity, /api/inventory, /api/analytics/*.
+        .merge(crate::snap::api::snap_routes())
         .with_state(state)
 }
 
