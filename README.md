@@ -70,6 +70,39 @@ Two cross-cutting subsystems wrap the core:
   `CAP_NET_ADMIN` the launch is refused rather than run with full host egress
   (an explicit, loud `CHORD_ALLOW_UNISOLATED=1` override exists, off by default).
 
+### Model fleet manager (autonomous model curation)
+
+Chord doesn't just route requests to a fixed set of models — it manages the
+fleet's models as a living inventory across three **storage tiers**. The
+file-backed registry ([`src/models/registry.rs`](src/models/registry.rs),
+`ModelRegistry` / `ModelRecord` / `StorageTier`) tracks every known model as
+*hot* (resident in VRAM), *warm* (on local disk, not loaded), or *cold* (only in
+the archive, e.g. NFS). At startup `reconcile()` *finds* what actually exists by
+walking the local and archive Ollama manifest trees — including Hugging-Face
+style names (`hf.co/org/model:tag`) — and rewrites the records to match reality,
+so the registry never drifts from disk. SNAP's inventory scanner
+([`src/snap/inventory.rs`](src/snap/inventory.rs)) complements this with a
+quant-aware sweep of GGUF and Ollama files across every configured storage
+location.
+
+Movement between tiers is automatic and safe. On a request for a cold model,
+the `PullCoordinator` ([`src/models/transfer.rs`](src/models/transfer.rs))
+transparently promotes it cold → warm — copying the manifest and its referenced
+blobs from the archive to the local root, with a disk precheck, per-model
+concurrent-pull dedup, timeout, and mid-copy cleanup so a failed pull never
+leaves corrupt state. Under disk pressure the eviction sweep
+([`src/models/eviction.rs`](src/models/eviction.rs)) does the reverse, archiving
+the least-recently-requested warm models warm → cold, archive-first /
+delete-after, never touching hot or protected models. Acquisition from outside
+the host is treated as a privileged operation: a runtime that needs to *fetch* a
+model runs in the `Pull` network namespace
+([`src/supervisor/egress_filter.rs`](src/supervisor/egress_filter.rs)), which
+gets a default-drop, nftables-filtered egress path to **only** the configured
+model-source allow-list — never a baked-in host — while serving runtimes get no
+route at all. The result is a self-curating model fleet: it knows what it has,
+pulls what a request needs, reclaims disk when it's tight, and reaches the
+network for new weights only through a locked-down, allow-listed door.
+
 These route across a **three-tier backend stack**:
 
 1. **llama.cpp-rocm** — the GPU tier; broadest model support and most
