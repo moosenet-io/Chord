@@ -36,13 +36,13 @@ pub use release_verify::{
     verify_release, DeviceProbe, ReleaseConfig, ReleaseOutcome, SysfsDeviceProbe,
 };
 pub use swap::{
-    clean_swap, default_ctx_for_footprint, CleanLauncher, ContextDefaults, NoopSwapEventSink,
-    SwapError, SwapEvent, SwapEventSink, SwapOutcome, SwapRequest, Teardown,
+    clean_swap, default_ctx_for_footprint, CleanLauncher, ContextDefaults, NetnsReapingTeardown,
+    NoopSwapEventSink, SwapError, SwapEvent, SwapEventSink, SwapOutcome, SwapRequest, Teardown,
 };
 pub use launcher::{
-    build_launch_command, scrub_launch_env, FailureRecorder, HealthChecker, LaunchCommand,
-    LaunchError, Launcher, NoopFailureRecorder, PassThroughResidency, ResidencyError,
-    ResidencyManager, RuntimeSpawner, ServeHandle, Slot,
+    build_launch_command, scrub_launch_env, teardown_netns, FailureRecorder, HealthChecker,
+    LaunchCommand, LaunchError, Launcher, NoopFailureRecorder, PassThroughResidency,
+    ResidencyError, ResidencyManager, RuntimeSpawner, ServeHandle, Slot,
 };
 pub use residency::{
     EventSink, NoopEventSink, Resident, ResidencyEvent, SysfsFreeVram, VramResidencyManager,

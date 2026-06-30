@@ -21,6 +21,43 @@ pub trait Teardown: Send + Sync {
     async fn teardown(&self, model_id: &str) -> Result<(), String>;
 }
 
+/// S88 ISO-02: a [`Teardown`] decorator that, after the inner backend teardown
+/// succeeds, ALSO reaps the outgoing runtime's network namespace — tying netns
+/// cleanup into the SRV-12 verified clean swap. The namespace name is re-derived
+/// from the model id with [`crate::supervisor::netns::namespace_name`] (the same
+/// derivation the launcher used as the slot token), so no extra state is threaded
+/// through the swap. Teardown of the namespace is **idempotent**: a runtime that
+/// crashed (leaving no namespace, or a half-built one) is cleaned without error, so
+/// a verified clean swap never leaves a leaked netns behind.
+///
+/// Wrap the production `Teardown` with this so every clean swap-out reaps the netns:
+/// `NetnsReapingTeardown::new(&inner)`.
+pub struct NetnsReapingTeardown<'a> {
+    inner: &'a dyn Teardown,
+}
+
+impl<'a> NetnsReapingTeardown<'a> {
+    /// Wrap an inner backend teardown so the network namespace is reaped after it.
+    pub fn new(inner: &'a dyn Teardown) -> Self {
+        NetnsReapingTeardown { inner }
+    }
+}
+
+#[async_trait]
+impl<'a> Teardown for NetnsReapingTeardown<'a> {
+    async fn teardown(&self, model_id: &str) -> Result<(), String> {
+        // (1) Stop the backend first. If that fails, do NOT reap the namespace —
+        // the swap aborts and the namespace is left for a retry/operator (reaping a
+        // still-running runtime's namespace would be wrong).
+        self.inner.teardown(model_id).await?;
+        // (2) Backend is down: reap the namespace by its derived name (idempotent —
+        // an absent/half-built namespace is cleaned without error).
+        let ns = crate::supervisor::netns::namespace_name(model_id);
+        super::launcher::teardown_netns(Some(&ns));
+        Ok(())
+    }
+}
+
 /// Launches the incoming model with EXPLICIT flags (incl. `-c <n_ctx>`).
 #[async_trait]
 pub trait CleanLauncher: Send + Sync {
@@ -369,5 +406,58 @@ mod tests {
         assert_eq!(default_ctx_for_footprint(Some(10.0), &c), 32768);
         assert_eq!(default_ctx_for_footprint(Some(60.0), &c), 8192);
         assert_eq!(default_ctx_for_footprint(None, &c), 32768);
+    }
+
+    // ── S88 ISO-02: netns-reaping teardown ties into the clean swap ────────────
+
+    #[tokio::test]
+    async fn netns_reaping_teardown_reaps_after_inner_teardown_succeeds() {
+        // The decorator runs the inner backend teardown, then reaps the namespace.
+        // On this unprivileged host the namespace was never created, so the reap is
+        // an idempotent no-op — but the inner teardown MUST have run, and the whole
+        // thing returns Ok (a verified clean swap never leaks a netns).
+        let inner = MockTeardown { ok: true, torn: Mutex::new(vec![]) };
+        let reaping = NetnsReapingTeardown::new(&inner);
+        let r = reaping.teardown("outgoing-model").await;
+        assert!(r.is_ok(), "reaping teardown must succeed (idempotent netns reap)");
+        assert_eq!(
+            *inner.torn.lock().unwrap(),
+            vec!["outgoing-model".to_string()],
+            "the inner backend teardown must have run"
+        );
+        // Idempotent: a second teardown of the same (already-gone) namespace is Ok.
+        assert!(reaping.teardown("outgoing-model").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn netns_reaping_teardown_does_not_reap_when_inner_teardown_fails() {
+        // If the backend teardown fails, the namespace is NOT reaped (the runtime
+        // may still be alive); the error propagates so the swap barrier aborts.
+        let inner = MockTeardown { ok: false, torn: Mutex::new(vec![]) };
+        let reaping = NetnsReapingTeardown::new(&inner);
+        let r = reaping.teardown("outgoing-model").await;
+        assert!(r.is_err(), "a failed inner teardown must propagate (no reap, swap aborts)");
+    }
+
+    #[tokio::test]
+    async fn clean_swap_through_reaping_teardown_still_completes() {
+        // End-to-end: wiring the reaping teardown into clean_swap does not change
+        // the swap's success semantics (the netns reap is additive + idempotent).
+        let inner = MockTeardown { ok: true, torn: Mutex::new(vec![]) };
+        let reaping = NetnsReapingTeardown::new(&inner);
+        let lc = MockLauncher { ok: true, launched: Mutex::new(vec![]) };
+        let sink = RecSink::default();
+        let req = SwapRequest {
+            from: Some("old"),
+            to: "new",
+            to_n_ctx: Some(32768),
+            to_footprint_gb: Some(18.0),
+        };
+        let out = clean_swap(&req, &reaping, &CleanProbe, &lc, &rcfg(), &ctxd(), &sink)
+            .await
+            .unwrap();
+        assert_eq!(out.to, "new");
+        // The outgoing model was torn down through the reaping decorator.
+        assert_eq!(*inner.torn.lock().unwrap(), vec!["old".to_string()]);
     }
 }

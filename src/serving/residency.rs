@@ -586,6 +586,11 @@ impl VramResidencyManager {
             model_id: model_id.to_string(),
             runtime,
             endpoint,
+            // S88 ISO-02: the SRV-05 warm-slot launch path predates netns isolation
+            // and is not wired through the ISO-02 launcher seam; record no namespace
+            // here. (Warm-slot isolation is a SRV-05 follow-up; the cold-launch path
+            // in `launcher.rs` IS isolated by ISO-02.)
+            netns: None,
         }
     }
 
@@ -659,6 +664,7 @@ impl VramResidencyManager {
                 model_id: r.model_id,
                 runtime: r.runtime,
                 endpoint: r.endpoint,
+                netns: None, // ISO-02: SRV-05 warm-slot reuse, not netns-wired here.
             });
         }
 
@@ -784,6 +790,7 @@ impl VramResidencyManager {
                 model_id: r.model_id,
                 runtime: r.runtime,
                 endpoint: r.endpoint,
+                netns: None, // ISO-02: SRV-05 warm-slot path, not netns-wired here.
             });
         }
 

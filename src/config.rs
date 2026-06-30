@@ -347,6 +347,29 @@ pub fn runtime_telemetry_off() -> bool {
     }
 }
 
+/// S88 ISO-02: the `ip` (iproute2) binary used to create/configure/teardown the
+/// per-runtime network namespace. Reads `CHORD_IP_BIN`; when unset, falls back to a
+/// bare `ip` (resolved on `PATH`). Returns `None` only when explicitly set to blank
+/// (an operator disabling the iproute2 path). Never a hardcoded absolute path.
+pub fn ip_bin() -> Option<String> {
+    match std::env::var("CHORD_IP_BIN") {
+        Ok(v) if v.trim().is_empty() => None,
+        Ok(v) => Some(v.trim().to_string()),
+        Err(_) => Some("ip".to_string()),
+    }
+}
+
+/// S88 ISO-02: the `nft` (nftables) binary used to apply the `Pull` namespace's
+/// egress allow-list filter. Reads `CHORD_NFT_BIN`; when unset, falls back to a
+/// bare `nft` (resolved on `PATH`). `None` only when explicitly blanked.
+pub fn nft_bin() -> Option<String> {
+    match std::env::var("CHORD_NFT_BIN") {
+        Ok(v) if v.trim().is_empty() => None,
+        Ok(v) => Some(v.trim().to_string()),
+        Err(_) => Some("nft".to_string()),
+    }
+}
+
 // ── S85 SRV-05: residency / VRAM-admission config helpers ─────────────────────
 //
 // The residency manager must read the host's FREE VRAM counter and persist a
