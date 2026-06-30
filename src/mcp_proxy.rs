@@ -286,6 +286,9 @@ mod tests {
             model_disk_pressure_percent: 80,
             model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_source_allowlist: Vec::new(),
+            outbound_proxy: None,
+            runtime_telemetry_off: true,
         };
 
         let proxy = McpProxy::new(&config, make_registry_with_echo());
@@ -334,6 +337,9 @@ mod tests {
             model_disk_pressure_percent: 80,
             model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_source_allowlist: Vec::new(),
+            outbound_proxy: None,
+            runtime_telemetry_off: true,
         };
 
         let reg = Arc::new(FallbackRegistry::new()); // no tools registered
@@ -387,6 +393,9 @@ mod tests {
             model_disk_pressure_percent: 80,
             model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_source_allowlist: Vec::new(),
+            outbound_proxy: None,
+            runtime_telemetry_off: true,
         };
 
         let proxy = McpProxy::new(&config, make_registry_with_echo());
@@ -418,6 +427,9 @@ mod tests {
             model_disk_pressure_percent: 80,
             model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_source_allowlist: Vec::new(),
+            outbound_proxy: None,
+            runtime_telemetry_off: true,
         };
 
         let proxy = McpProxy::new(&config, make_registry_with_echo());
@@ -474,6 +486,9 @@ mod tests {
             model_disk_pressure_percent: 80,
             model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_source_allowlist: Vec::new(),
+            outbound_proxy: None,
+            runtime_telemetry_off: true,
         };
 
         let reg = Arc::new(FallbackRegistry::new());

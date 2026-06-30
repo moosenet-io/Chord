@@ -40,9 +40,9 @@ pub use swap::{
     SwapError, SwapEvent, SwapEventSink, SwapOutcome, SwapRequest, Teardown,
 };
 pub use launcher::{
-    build_launch_command, FailureRecorder, HealthChecker, LaunchCommand, LaunchError, Launcher,
-    NoopFailureRecorder, PassThroughResidency, ResidencyError, ResidencyManager, RuntimeSpawner,
-    ServeHandle, Slot,
+    build_launch_command, scrub_launch_env, FailureRecorder, HealthChecker, LaunchCommand,
+    LaunchError, Launcher, NoopFailureRecorder, PassThroughResidency, ResidencyError,
+    ResidencyManager, RuntimeSpawner, ServeHandle, Slot,
 };
 pub use residency::{
     EventSink, NoopEventSink, Resident, ResidencyEvent, SysfsFreeVram, VramResidencyManager,

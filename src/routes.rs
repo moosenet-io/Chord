@@ -771,6 +771,9 @@ mod tests {
             model_disk_pressure_percent: 80,
             model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_source_allowlist: Vec::new(),
+            outbound_proxy: None,
+            runtime_telemetry_off: true,
         };
         let proxy = McpProxy::new(&config, Arc::new(reg));
         let proxy_arc = Arc::new(McpProxy::new(
@@ -792,6 +795,9 @@ mod tests {
                 model_disk_pressure_percent: 80,
                 model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_source_allowlist: Vec::new(),
+            outbound_proxy: None,
+            runtime_telemetry_off: true,
             },
             Arc::new(FallbackRegistry::new()),
         ));
@@ -831,6 +837,9 @@ mod tests {
             model_disk_pressure_percent: 80,
             model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_source_allowlist: Vec::new(),
+            outbound_proxy: None,
+            runtime_telemetry_off: true,
         };
         let proxy = McpProxy::new(&config, Arc::new(FallbackRegistry::new()));
         let proxy_arc = Arc::new(McpProxy::new(&config, Arc::new(FallbackRegistry::new())));
@@ -872,6 +881,9 @@ mod tests {
             model_disk_pressure_percent: 80,
             model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_source_allowlist: Vec::new(),
+            outbound_proxy: None,
+            runtime_telemetry_off: true,
         };
         let proxy = McpProxy::new(&config, Arc::new(FallbackRegistry::new()));
         let proxy_arc = Arc::new(McpProxy::new(
@@ -893,6 +905,9 @@ mod tests {
                 model_disk_pressure_percent: 80,
                 model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_source_allowlist: Vec::new(),
+            outbound_proxy: None,
+            runtime_telemetry_off: true,
             },
             Arc::new(FallbackRegistry::new()),
         ));
@@ -934,6 +949,9 @@ mod tests {
             model_disk_pressure_percent: 80,
             model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_source_allowlist: Vec::new(),
+            outbound_proxy: None,
+            runtime_telemetry_off: true,
         };
         let proxy = McpProxy::new(&config, Arc::new(reg));
         let proxy_arc = Arc::new(McpProxy::new(
@@ -955,6 +973,9 @@ mod tests {
                 model_disk_pressure_percent: 80,
                 model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_source_allowlist: Vec::new(),
+            outbound_proxy: None,
+            runtime_telemetry_off: true,
             },
             Arc::new(FallbackRegistry::new()),
         ));
@@ -1498,6 +1519,9 @@ mod tests {
             model_disk_pressure_percent: 80,
             model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_source_allowlist: Vec::new(),
+            outbound_proxy: None,
+            runtime_telemetry_off: true,
         };
         let proxy = McpProxy::new(&config, Arc::new(FallbackRegistry::new()));
         let proxy_arc = Arc::new(McpProxy::new(&config, Arc::new(FallbackRegistry::new())));

@@ -16,4 +16,5 @@ pub mod routing;
 pub mod serving;
 pub mod session;
 pub mod snap;
+pub mod supervisor;
 pub mod version;

@@ -72,6 +72,9 @@ fn make_noop_executor() -> Arc<AgenticExecutor> {
         model_disk_pressure_percent: 80,
         model_sweep_interval_secs: 1800,
         model_warm_cooldown_hours: 168,
+        model_source_allowlist: Vec::new(),
+        outbound_proxy: None,
+        runtime_telemetry_off: true,
         control_port: 8090,
     };
     Arc::new(AgenticExecutor::new(Arc::new(McpProxy::new(
@@ -178,6 +181,9 @@ fn make_state(mcp_url: String) -> Arc<AppState> {
         model_disk_pressure_percent: 80,
         model_sweep_interval_secs: 1800,
         model_warm_cooldown_hours: 168,
+        model_source_allowlist: Vec::new(),
+        outbound_proxy: None,
+        runtime_telemetry_off: true,
         control_port: 8090,
     };
     let proxy = McpProxy::new(&config, Arc::new(reg));
@@ -219,6 +225,9 @@ fn make_state_with_auth(mcp_url: String, secret: String) -> Arc<AppState> {
         model_disk_pressure_percent: 80,
         model_sweep_interval_secs: 1800,
         model_warm_cooldown_hours: 168,
+        model_source_allowlist: Vec::new(),
+        outbound_proxy: None,
+        runtime_telemetry_off: true,
         control_port: 8090,
     };
     let proxy = McpProxy::new(&config, Arc::new(FallbackRegistry::new()));
@@ -268,6 +277,9 @@ fn make_state_tight_limits(mcp_url: String) -> Arc<AppState> {
         model_disk_pressure_percent: 80,
         model_sweep_interval_secs: 1800,
         model_warm_cooldown_hours: 168,
+        model_source_allowlist: Vec::new(),
+        outbound_proxy: None,
+        runtime_telemetry_off: true,
         control_port: 8090,
     };
     let proxy = McpProxy::new(&config, Arc::new(FallbackRegistry::new()));
@@ -312,6 +324,9 @@ fn make_state_with_audit(mcp_url: String, dir: &TempDir) -> Arc<AppState> {
         model_disk_pressure_percent: 80,
         model_sweep_interval_secs: 1800,
         model_warm_cooldown_hours: 168,
+        model_source_allowlist: Vec::new(),
+        outbound_proxy: None,
+        runtime_telemetry_off: true,
         control_port: 8090,
     };
     let proxy = McpProxy::new(&config, Arc::new(reg));
@@ -931,6 +946,9 @@ async fn test_tool_call_both_backends_fail_returns_404() {
         model_disk_pressure_percent: 80,
         model_sweep_interval_secs: 1800,
         model_warm_cooldown_hours: 168,
+        model_source_allowlist: Vec::new(),
+        outbound_proxy: None,
+        runtime_telemetry_off: true,
         control_port: 8090,
     };
     let proxy = McpProxy::new(&config, Arc::new(FallbackRegistry::new()));
