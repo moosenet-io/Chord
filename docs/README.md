@@ -1,0 +1,28 @@
+# Chord — Documentation
+
+Component explainers for Chord (`chord-proxy`), the inference manager for local
+LLM fleets. Every page is written from the actual source in [`../src/`](../src)
+and names the real modules and types behind each component.
+
+## Contents
+
+- **[architecture.md](architecture.md)** — full component deep-dive: the two
+  listeners, the request flow through `/v1/chat/completions`, and each component
+  (Routing, backend tiers, model registry & storage tiering, memory/residency
+  management, the control API, the agentic loop, and the search harness) mapped to
+  its real module/types. References the
+  [architecture diagram](../assets/architecture.svg).
+- **[serving.md](serving.md)** — the serving / coordinator subsystem: how the
+  diagram's **Memory Coordinator** (SRV-11), **Clean-Swap Launcher** (SRV-12), and
+  **Mode Controller** (SRV-13) boxes map onto the code that actually ships, with an
+  explicit present/partial/absent table.
+
+## Test Results
+
+<!-- CHART: per-model BLITZ vs MULTI-FILE pass rates — themed SVG, generated at coder-sweep completion -->
+
+Benchmark charts are generated from the **MINT v2 coder harness** run and will be
+committed here (themed SVG, per-model BLITZ vs MULTI-FILE pass rates) once the
+coder sweep completes. Generated charts live in [`charts/`](charts/).
+
+_Charts pending — placeholder above is replaced at coder-sweep completion._

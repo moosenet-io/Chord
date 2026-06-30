@@ -65,6 +65,28 @@ the CPU tier.
 Early — separation from the monorepo is in progress. Chord ships as the Rust
 crate `chord-proxy`. Version **1.0**.
 
+## Documentation
+
+Component explainers (written from the source in [`src/`](src)) live in
+[`docs/`](docs/):
+
+- **[docs/architecture.md](docs/architecture.md)** — component deep-dive: request
+  flow, Routing, backend tiers, model registry & storage tiering,
+  memory/residency management, the control API, the agentic loop, and the search
+  harness, each mapped to its real module/types.
+- **[docs/serving.md](docs/serving.md)** — the serving / coordinator subsystem
+  (Memory Coordinator, Clean-Swap Launcher, Mode Controller) mapped to the code
+  that actually ships, with a present/partial/absent table.
+- **[docs/README.md](docs/README.md)** — the docs index.
+
+## Test Results
+
+<!-- CHART: per-model BLITZ vs MULTI-FILE pass rates — themed SVG, generated at coder-sweep completion -->
+
+Benchmark charts are generated from the **MINT v2 coder harness** run and will be
+committed under [`docs/charts/`](docs/charts/) (themed SVG, per-model BLITZ vs
+MULTI-FILE pass rates) once the coder sweep completes. _Charts pending._
+
 ## License
 
 MIT
