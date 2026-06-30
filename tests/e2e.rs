@@ -3,7 +3,7 @@
 //! Validates: tool list (merged catalog), MCP routing, Rust fallback,
 //! tool discovery, auth enforcement, rate limiting, and audit logging.
 //!
-//! Every test uses httpmock for the MCP backend — no real infrastructure.
+//! Every test uses httpmock for the <host> backend — no real infrastructure.
 //! Tests are idempotent and can run in parallel.
 
 use axum::body::Body;
@@ -64,7 +64,7 @@ fn make_noop_executor() -> Arc<AgenticExecutor> {
         },
         llm_backend_url: None,
         model_aliases: std::collections::HashMap::new(),
-        model_archive_path: "/var/lib/model-archive".into(),
+        model_archive_path: "/mnt/<host>/qnap-ollama-archive".into(),
         model_local_path: "/opt/ollama-models".into(),
         model_protected: vec![],
         model_pull_timeout_secs: 600,
@@ -170,7 +170,7 @@ fn make_state(mcp_url: String) -> Arc<AppState> {
         rate_limits: default_rate_config(),
         llm_backend_url: None,
         model_aliases: std::collections::HashMap::new(),
-        model_archive_path: "/var/lib/model-archive".into(),
+        model_archive_path: "/mnt/<host>/qnap-ollama-archive".into(),
         model_local_path: "/opt/ollama-models".into(),
         model_protected: vec![],
         model_pull_timeout_secs: 600,
@@ -211,7 +211,7 @@ fn make_state_with_auth(mcp_url: String, secret: String) -> Arc<AppState> {
         rate_limits: default_rate_config(),
         llm_backend_url: None,
         model_aliases: std::collections::HashMap::new(),
-        model_archive_path: "/var/lib/model-archive".into(),
+        model_archive_path: "/mnt/<host>/qnap-ollama-archive".into(),
         model_local_path: "/opt/ollama-models".into(),
         model_protected: vec![],
         model_pull_timeout_secs: 600,
@@ -260,7 +260,7 @@ fn make_state_tight_limits(mcp_url: String) -> Arc<AppState> {
         rate_limits: tight.clone(),
         llm_backend_url: None,
         model_aliases: std::collections::HashMap::new(),
-        model_archive_path: "/var/lib/model-archive".into(),
+        model_archive_path: "/mnt/<host>/qnap-ollama-archive".into(),
         model_local_path: "/opt/ollama-models".into(),
         model_protected: vec![],
         model_pull_timeout_secs: 600,
@@ -304,7 +304,7 @@ fn make_state_with_audit(mcp_url: String, dir: &TempDir) -> Arc<AppState> {
         rate_limits: default_rate_config(),
         llm_backend_url: None,
         model_aliases: std::collections::HashMap::new(),
-        model_archive_path: "/var/lib/model-archive".into(),
+        model_archive_path: "/mnt/<host>/qnap-ollama-archive".into(),
         model_local_path: "/opt/ollama-models".into(),
         model_protected: vec![],
         model_pull_timeout_secs: 600,
@@ -514,7 +514,7 @@ async fn test_tool_call_routes_to_mcp() {
     );
     assert_eq!(
         json["source"], "mcp",
-        "source must be 'mcp' when the MCP backend handled the call"
+        "source must be 'mcp' when <host> handled the call"
     );
 }
 
@@ -923,7 +923,7 @@ async fn test_tool_call_both_backends_fail_returns_404() {
         rate_limits: default_rate_config(),
         llm_backend_url: None,
         model_aliases: std::collections::HashMap::new(),
-        model_archive_path: "/var/lib/model-archive".into(),
+        model_archive_path: "/mnt/<host>/qnap-ollama-archive".into(),
         model_local_path: "/opt/ollama-models".into(),
         model_protected: vec![],
         model_pull_timeout_secs: 600,

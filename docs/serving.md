@@ -2,187 +2,198 @@
 
 The [architecture diagram](../assets/architecture.svg) names three serving boxes —
 **Memory Coordinator**, **Clean-Swap Launcher**, and **Mode Controller** — under
-the headings SRV-11/12/13. This document maps each to the **actual code in this
-extracted crate** and is explicit about which pieces ship here and which do not.
+the headings SRV-11/12/13. As of chord-proxy **1.1.0** all three ship as real
+code in [`src/serving/`](../src/serving). This document maps each box to its
+modules, structs, and functions.
 
-> **Scope honesty.** A repo-wide search of [`../src/`](../src) finds **no**
-> `MemoryCoordinator`, `SeparateCeilings`, `UnifiedPool`, `admission`,
-> `substrate`, `CleanSwap`, `ModeController`, `orphan`, or `false-OOM` symbols.
-> The serving *behaviour* the diagram describes is realised by the residency,
-> storage-tier, and lifecycle modules below. Where a spec'd capability (a VRAM
-> admission ceiling, substrate switch, false-OOM guard, persisted operating mode)
-> is **not present** in this crate, that is stated plainly rather than invented.
+The serving module ([`serving::mod`](../src/serving/mod.rs)) is the *consume* side
+of the S85 serving dimension: the shared profile/runtime types live in
+`terminus_rs::intake::serving`, the harness writes the `serving_profile` rows, and
+Chord reads them into a [`profile::RoutingMap`](../src/serving/profile.rs) and
+launches the correct runtime per model. Layered above the profile reader are the
+three coordinator subsystems below.
 
-## The residency picture that does ship
+## Storage residency vs. VRAM residency
 
-Chord separates two notions that the diagram collapses into "memory":
+Chord still distinguishes two notions of "memory":
 
 1. **Storage residency** — is a model `Hot` (VRAM), `Warm` (local disk), or
    `Cold` (archive)? Owned by
    [`models::registry::ModelRegistry`](../src/models/registry.rs) via the
-   `StorageTier` enum.
-2. **VRAM residency** — which single model is actually loaded on the GPU right
-   now? Driven by [`harness::vram_lifecycle`](../src/harness/vram_lifecycle.rs)
-   through Chord's lifecycle control API.
-
-Promotion runs `cold → warm → hot`: the **pull** (cold→warm) is
-[`models::transfer`](../src/models/transfer.rs); the **swap/load** (warm→hot) is
-`vram_lifecycle`; the registry tracks where each model currently sits. Demotion
-(`warm → cold`) is [`models::eviction`](../src/models/eviction.rs).
+   `StorageTier` enum; promotion (`models::transfer`) and warm↔cold demotion
+   (`models::eviction`) are unchanged.
+2. **VRAM residency** — which models are loaded on the GPU *right now*, and which
+   one may be admitted next? This is what the new
+   [`serving::residency`](../src/serving/residency.rs) Memory Coordinator owns.
 
 ---
 
-## Box 1 — "Memory Coordinator" (SRV-11)
+## Box 1 — Memory Coordinator (SRV-11)
 
-**Diagram annotations:** substrate-aware · SeparateCeilings · UnifiedPool ·
-admission · tier-aware eviction.
+Modules: [`memory_model`](../src/serving/memory_model.rs),
+[`residency`](../src/serving/residency.rs), [`eviction`](../src/serving/eviction.rs).
 
-**What actually backs it:**
+### Substrate-aware accounting
+[`memory_model.rs`](../src/serving/memory_model.rs) is the substrate model. It
+classifies the host once at boot (`classify_substrate` → `Substrate::{FixedCarveout,
+DynamicGtt}`) from a `SubstrateInfo` (BIOS VRAM carveout, GTT total, system RAM),
+and picks the accounting policy with `select_memory_model`. The `MemoryModel` trait
+answers one question — *how much free memory may a candidate in a given `Pool`
+(`Vram`/`SystemRam`) draw from?* — via two implementations:
 
-### Admission (by disk space, not VRAM ceiling)
-[`models::transfer`](../src/models/transfer.rs). Before a cold model is pulled,
-`PullCoordinator::ensure_local` sums the model's on-disk size from its manifest
-blobs (`parse_manifest_blobs` / `ManifestBlobs`) and checks it against free space
-reported by a `DiskSpaceProbe` (`StatvfsProbe` in production). Insufficient space
-→ `PullError::InsufficientDiskSpace` and **nothing is written** (fail-fast). Two
-requests for the same cold model are de-duplicated by a per-model async lock, the
-copy is timeout-wrapped, and any partial files are cleaned up on failure or
-timeout.
+- **`SeparateCeilings`** — ACTIVE under a fixed BIOS carveout: a GPU candidate
+  checks GPU free, a CPU candidate checks CPU free, and the pools never cross.
+- **`UnifiedPool`** — for dynamic-GTT substrates: every resident (GPU *or* CPU)
+  draws from one physical pool, so the admissible free for any candidate is the
+  physical total minus the combined draw of all residents — the cross-pool effect
+  `SeparateCeilings` cannot see.
 
-This is the only "admission" gate that physically exists: a model is admitted to
-the **local disk** only if there is room. There is **no VRAM-headroom admission
-check** in this crate — making a model VRAM-resident is a swap (below), and the
-swap delegates the actual fit/OOM behaviour to the underlying backend.
+A `MemorySnapshot` carries live free counters; **any unreadable counter is `None`,
+which the model turns into a fail-safe "won't fit"** rather than guessing — it never
+risks an OOM launch on a counter it could not read.
+
+### Admission ceiling (the coordinator)
+[`residency::VramResidencyManager`](../src/serving/residency.rs) is the
+`MemoryCoordinator`. It holds the resident set, in-flight **reservations** (VRAM an
+admission has committed to but not yet launched, netted out of free VRAM so two
+concurrent admissions cannot double-spend the same GB), the pinned chat model, and
+the current `OperatingMode` — all behind one mutex, so admission is decide-and-claim
+with no read-decide-write race. Free VRAM and warm-launch are injected through the
+`WarmLauncher` trait (production wires the sysfs counter `config::read_free_vram_gb`
++ the SRV-04 launcher; tests drive it deterministically with no GPU).
+
+`register_resident` is the admission entry: it computes the admissible free GB for
+the candidate's pool via the active `MemoryModel` (`admissible_free_gpu`, reservations
+netted out), asks the eviction policy for a plan, **claims** the eviction targets
+under the lock (removing them from the resident map so a concurrent admission cannot
+re-plan the same victim — the double-eviction race), then reclaims their VRAM outside
+the lock. Sanitized `ResidencyEvent`s (`admit`/`reuse`/`queue`/`evict`/
+`admission-denied`) carry only a model id, tier, and decision word — never an endpoint,
+host, or path (S6/S77). State is persisted atomically to the residency state file
+(`config::residency_state_path`).
 
 ### Tier-aware eviction
-[`models::eviction`](../src/models/eviction.rs). This is the real, fully-tested
-"tier-aware eviction" — operating on the warm↔cold **disk** tier:
+[`eviction.rs`](../src/serving/eviction.rs) is the pure, deterministic eviction
+policy. `plan_admission(need_gb, free_gb, residents)` returns an `EvictionPlan`:
 
-- `evict_to_archive` — the safe single-model warm → cold path:
-  validate Warm + non-protected → copy manifest + blobs local→archive (skipping
-  blobs already in archive with a matching size) → **verify** every blob +
-  manifest exist in archive with matching sizes → only then remove the local copy
-  via a GC-aware `LocalEvictor` (a blob shared by another local manifest is kept)
-  → update the registry to `Cold` and `save()`. A failed/partial copy leaves the
-  model warm (archive-first, delete-after).
-- `run_eviction_sweep` — a **cooldown pass** (archive every warm, non-protected
-  model idle longer than `MODEL_WARM_COOLDOWN_HOURS`, independent of disk
-  pressure; `0` disables it) followed by a **disk-pressure pass** (LRU-evict warm
-  models while local usage exceeds `MODEL_DISK_PRESSURE_PERCENT`, re-checking after
-  each, skipping persistently-failing candidates). Spawned on an interval from
-  [`main.rs`](../src/main.rs) and also invokable via `POST /api/models/sweep`.
-- `evict_for_space` — targeted pre-pull eviction: free at least *N* bytes by
-  evicting LRU warm models until the probe reports enough space.
-- A shared `DiskOpLock` (`new_disk_op_lock`) serialises every destructive disk op
-  (sweeps, pulls, pre-pull eviction) so they never interleave.
+- **`Fits { transient_first }`** — the candidate fits now, possibly after evicting
+  the listed `Tier::Transient` residents (cheap build/validation models, evicted
+  first); an empty list means it already fit.
+- **`RequiresKeepWarmEviction { transient_first, keep_warm_lru }`** — transients
+  alone are not enough; admitting requires evicting `Tier::KeepWarm` residents. The
+  caller must QUEUE first (bounded wait) and only then evict these LRU-ordered
+  keep-warm targets.
+- **`CannotAdmit`** — even evicting every non-pinned resident cannot make room (or
+  the footprint is unknown). The caller denies and **never evicts the pinned chat
+  model**.
 
-Safety invariants enforced in code: never evict Hot / protected / non-Warm
-models; no archive mounted ⇒ skip the sweep entirely (don't evict with nowhere to
-put the data); GC-aware blob removal for content-addressed shared blobs.
-
-### "substrate-aware / SeparateCeilings / UnifiedPool" — NOT in this crate
-There is no substrate abstraction, no separate-ceilings-vs-unified-pool VRAM model,
-and no `MemoryCoordinator` type in the extracted `src/`. The hardware distinction
-that *does* exist is the coarse `Hardware::{Gpu, Cpu}` tag on each
-[`Backend`](../src/models/backends.rs), used for routing — not a memory-pool
-accounting model. If/when SRV-11's VRAM admission lands, the natural seams are the
-`DiskSpaceProbe`-style probe abstraction in `transfer.rs` and the backend
-`Hardware` tag.
+`Tier::Chat` is the load-bearing safety invariant: `Tier::is_evictable()` is `false`
+for the chat tier, so the live chat-role model is never evicted while serving. The
+policy is clock-free — the caller stamps each `ResidentView` with a monotonic last-use
+tick, lower = LRU target — so it stays pure and deterministic.
 
 ---
 
-## Box 2 — "Clean-Swap Launcher" (SRV-12)
+## Box 2 — Clean-Swap Launcher (SRV-12)
 
-**Diagram annotations:** teardown → · verify release → · orphan force-kill ·
-false-OOM guard · launch w/ explicit `-c`.
+Modules: [`swap`](../src/serving/swap.rs),
+[`release_verify`](../src/serving/release_verify.rs),
+[`launcher`](../src/serving/launcher.rs).
 
-**What actually backs it:**
+### The verified clean-swap barrier
+[`swap::clean_swap`](../src/serving/swap.rs) is the only path that brings a model
+resident, and it enforces **teardown → verify-release → launch** in order. A
+`SwapRequest` names the outgoing model (`from`, or `None`), the incoming model
+(`to`), and the incoming model's explicit context. The barrier:
 
-### The swap mechanism
-[`harness::vram_lifecycle`](../src/harness/vram_lifecycle.rs). `HarnessVramManager`
-performs a model swap by calling Chord's lifecycle control API:
-`SwapClient::swap(model, engine)` → `POST {control_url}/api/lifecycle/swap`, and
-`restore()` → `…/api/lifecycle/restore`. A swap to a new model **evicts whatever
-was previously loaded** — that is the "teardown → launch" cycle as expressed in
-this crate. Each call is timeout-bounded (`HARNESS_SWAP_TIMEOUT_SECS`, default
-10 s); a `tokio::sync::Mutex` serialises rotations so two swaps never race the
-GPU. `current_model` tracking means a back-to-back request for an already-resident
-model is an `AlreadyWarm` no-op (no redundant teardown). Every failure mode is a
-graceful `SwapOutcome` (`Fallback` / `Degraded`), never a crash.
+1. Tears the outgoing backend down via the `Teardown` trait (signal stop + wait for
+   process exit). A failure here is `SwapError::TeardownFailed` and it **never
+   proceeds to launch**.
+2. Verifies the device actually released (below) — including force-killing an orphan.
+3. Only on a verified-clean device launches the incoming model via the
+   `CleanLauncher` trait with an **explicit `-c <n_ctx>`** (the
+   `launched_with_explicit_ctx` flag on every `SwapEvent` is always true on a
+   completed swap). When the profile carries no context,
+   `default_ctx_for_footprint` computes a safe explicit one (reduced for large
+   models), so a swap never relies on a runtime's implicit default.
 
-### "launch w/ explicit -c"
-This annotation is real and lives in
-[`models::backends::seed_from_env`](../src/models/backends.rs): the generic
-on-demand `llama-gpu` backend's `LaunchSpec.args` are
-`-c 32768 -ngl 999 -fa 1 --no-mmap --host 0.0.0.0 --port …`. The explicit context
-size (`-c`) and `--no-mmap` (keep-warm for large models) are baked into the launch
-spec, and `models::routing::to_resolved` hands that `LaunchSpec` to the
-`terminus_rs` lifecycle helper that actually spawns the server.
+### Verify-release + orphan kill + false-OOM guard
+[`release_verify::verify_release`](../src/serving/release_verify.rs) is the guard.
+The `DeviceProbe` trait reports memory currently *in use* on the device; at/below
+`baseline + tolerance` (from `ReleaseConfig`, sourced from config — no literals) the
+device counts as released. If memory is still held, `is_orphan_present` detects an
+orphaned backend process (e.g. a crashed `llama-server` still holding the device) and
+`force_kill_orphan` is the escalation step. **An unreadable counter is treated as
+"not released" (fail-safe — never assume a clean device we cannot measure).** If the
+device will not return to baseline even after escalation, the barrier refuses to
+launch (`SwapError::DeviceNotReleased`) — this is the **false-OOM guard**: it would
+rather refuse than launch onto a polluted device and trigger a spurious OOM. All
+events (`device_released`, `escalation_required`, the explicit ctx) are sanitized.
 
-### On-demand teardown of idle backends
-[`models::routing::idle_stop_sweep`](../src/models/routing.rs) stops any
-on-demand backend whose `idle_stop_secs` has elapsed since its last use (last-use
-is tracked by `lifecycle::ensure_up` touching a shared file on every request).
-Always-on / Ollama / daemon backends are exempt. This is the "no perpetual holds"
-teardown for backends (as opposed to per-model swaps).
-
-### "verify release → / orphan force-kill / false-OOM guard" — NOT in this crate
-The *model-swap* verify-release, orphan-process force-kill, and false-OOM guard
-described on the diagram are **not implemented in this extracted `src/`** — the
-swap simply trusts the lifecycle control API's success/failure and maps it to a
-`SwapOutcome`. The crate's verified, archive-first **storage** eviction
-(`eviction::verify_archive_copy`, the verify-before-delete guard) is the only
-"verify release" that ships, and it concerns disk, not VRAM. The actual
-teardown/launch/verify of a backend process lives behind
-`terminus_rs::intake::lifecycle` (an external dependency), not in this repo; a
-false-OOM guard would belong there or in a future SRV-12 module.
-
----
-
-## Box 3 — "Mode Controller" (SRV-13)
-
-**Diagram annotations:** assistant-live (pin + swap around) · batch-coder
-(full GPU, 1-at-a-time) · persisted state.
-
-**What actually backs it:**
-
-There is **no `ModeController` type and no persisted operating-mode state file** in
-this extracted `src/`. The two operating regimes the diagram names are *expressed*
-by existing mechanisms rather than centralised in one controller:
-
-- **assistant-live ("pin + swap around")** — the chat-role pin
-  ([`routing::assistant_profile`](../src/routing/assistant_profile.rs)) decides the
-  resident assistant model, and `HarnessVramManager`'s
-  `personality → search → synthesis → personality` rotation
-  ([vram_lifecycle.rs](../src/harness/vram_lifecycle.rs)) swaps other models in and
-  out *around* that pinned personality model, restoring it at the end.
-- **batch-coder ("full GPU, one-at-a-time")** — the dedicated `lemonade-coder`
-  GPU backend in [`backends::seed_from_env`](../src/models/backends.rs) is a
-  single fixed-model `llama-server`; the on-demand `idle_stop_secs` lifecycle
-  ([routing.rs](../src/models/routing.rs)) gives the GPU to one backend at a time
-  and releases it when idle.
-
-What is **missing** versus the SRV-13 spec: an explicit mode enum, an API to switch
-modes, and any persisted mode state. The behaviours exist; the *controller* that
-names, switches, and persists the mode does not (in this crate). The registry's
-`save()` (atomic JSON persistence) is the obvious place such state would live.
+### The runtime launcher
+[`launcher.rs`](../src/serving/launcher.rs) builds the actual launch command.
+`build_launch_command` produces a pure-data `LaunchCommand` (binary, argv, env pairs,
+health endpoint) from a model's serving profile — the binary and endpoint come from
+config helpers, never literals, and the only env key it sets is the ROCm gfx override
+(`gfx_override_version`). `LaunchError` is genericized (S77): `UnknownModel` (no
+profile row — Chord will not guess a runtime), `RuntimeNotConfigured`,
+`AllRuntimesFailed` (best + fallback exhausted), `KeepWarmMustUseResidency` (a
+keep-warm model must be admitted through the coordinator, never inline cold-launched),
+and `CpuModelTooLarge`. A `ServeHandle` records which runtime ultimately served (so a
+fallback is observable) and whether the serve came from a warm residency slot.
 
 ---
 
-## Summary: spec vs. shipped (this crate)
+## Box 3 — Mode Controller (SRV-13)
 
-| Diagram box / annotation | Present here? | Backing code |
-|--------------------------|---------------|--------------|
+Module: [`mode`](../src/serving/mode.rs) (+ persistence in `residency`).
+
+[`mode::ModeController`](../src/serving/mode.rs) is the real, persisted mode
+controller. `OperatingMode` is an explicit enum with two regimes:
+
+- **`AssistantLive`** ("assistant-live") — the default. The chat model is pinned +
+  resident and coders swap into the leftover VRAM around it.
+- **`BatchCoder`** ("batch-coder") — no pinned assistant; the full GPU is given to
+  one-at-a-time coder swaps.
+
+The controller reasons over per-pool ceilings: `coder_headroom_gb` returns the GPU a
+coder model may use under the current mode (full ceiling in batch-coder; the
+assistant's leftover in assistant-live), `coder_fits` tests a footprint against it,
+and `oversize_reason` gives a clear rejection when a coder is too big for
+assistant-live but would fit batch-coder. `request_switch` returns a `ModeAction`
+(`NoChange`, `UnpinAssistant` when leaving assistant-live, `PinAssistant` when
+entering it); **switching OFF assistant-live without an explicit `confirm` is refused**
+(`ModeError::ConfirmRequired`) so live Lumina is never silently dropped.
+
+Mode is persisted: the `VramResidencyManager` holds the active `OperatingMode`,
+`switch_mode` / `restore_mode` mutate it and write the state file, and the free
+function `read_persisted_mode(path)` restores the mode across a restart so the chosen
+operating regime survives a reboot.
+
+---
+
+## Summary: spec vs. shipped (chord-proxy 1.1.0)
+
+| Diagram box / annotation | Present? | Backing code |
+|--------------------------|----------|--------------|
 | Routing: backend-per-model | ✅ | `models::routing::resolve_and_ensure` |
 | Routing: chat-role pin | ✅ | `routing::assistant_profile::decide_chat_role` |
-| Three backend tiers (llama.cpp / ollama / CPU) | ✅ (tags) | `models::backends` (`Hardware`/`BackendKind`) |
-| Tier-aware eviction | ✅ (disk warm↔cold) | `models::eviction` |
-| Admission | ⚠️ disk-space only | `models::transfer::PullCoordinator` |
-| VRAM swap / teardown→launch | ✅ (via control API) | `harness::vram_lifecycle::HarnessVramManager` |
-| launch w/ explicit `-c` / `--no-mmap` | ✅ | `models::backends::seed_from_env` `LaunchSpec` |
-| substrate-aware / SeparateCeilings / UnifiedPool | ❌ not in this crate | — |
-| verify release / orphan force-kill / false-OOM guard (VRAM) | ❌ not in this crate | (storage verify-before-delete exists in `eviction`) |
-| Mode Controller / persisted mode state | ❌ not as a type | behaviours via pin + lifecycle |
+| Serving-profile reader + per-model launch | ✅ | `serving::profile`, `serving::launcher` |
+| Substrate-aware accounting | ✅ | `serving::memory_model` (`SeparateCeilings` / `UnifiedPool`) |
+| Memory Coordinator / VRAM admission ceiling | ✅ | `serving::residency::VramResidencyManager` |
+| Tier-aware eviction (transient → keep-warm LRU, chat pinned) | ✅ | `serving::eviction::plan_admission` |
+| Clean swap: teardown → verify-release → launch | ✅ | `serving::swap::clean_swap` |
+| Verify release / orphan force-kill / false-OOM guard | ✅ | `serving::release_verify::verify_release` |
+| Launch w/ explicit `-c` | ✅ | `serving::swap` + `serving::launcher` |
+| Mode Controller (assistant-live / batch-coder) + persisted state | ✅ | `serving::mode::ModeController`, `residency::read_persisted_mode` |
+| Storage tiers + warm↔cold eviction | ✅ | `models::registry`, `models::eviction` |
 
-Legend: ✅ implemented · ⚠️ partial / different shape than spec · ❌ absent in the
-extracted `src/`.
+Legend: ✅ implemented in the extracted `src/`.
+
+## Test Results
+
+Serving behaviour is covered by the `tests/serving_*.rs` integration suites
+(`serving_memory_model`, `serving_residency`, `serving_launch`, `serving_swap`,
+`serving_mode`, `serving_chat_pin`). Result charts are published below.
+
+![Test results](charts/.gitkeep)

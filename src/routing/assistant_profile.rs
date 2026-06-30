@@ -136,6 +136,141 @@ pub async fn fetch_chat_role_decision(
     Ok(decide_from_report(&report, known_models))
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SRV-06: chat-role PIN + residency integration
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// `decide_chat_role` (above) is the pure *which model* decision. This half closes
+// the loop to the live host: it registers that model as the residency manager's
+// PINNED, never-evicted chat alias — but only after (a) a serving-profile latency
+// guard confirms it is responsive enough to be the *interactive* alias, and (b) it
+// is brought resident successfully. The transfer is atomic: the new model is loaded
+// and pinned BEFORE the old pin is released, so Lumina is never without a resident
+// chat model. A failed load keeps the existing pin (a working chat alias is never
+// surrendered for a broken one).
+
+use crate::serving::profile::RoutingMap;
+use crate::serving::residency::VramResidencyManager;
+use crate::serving::ResidencyManager;
+use terminus_rs::intake::serving::ModelId;
+
+/// The result of applying a chat-role decision to the residency manager's pin.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChatPinOutcome {
+    /// The chat alias is pinned to `model_id`. `cold_start_flagged` is true when a
+    /// `keep_warm` model was allowed despite a slow cold-load — warm residency
+    /// mitigates steady-state latency, but the first cold-start still applies, so
+    /// the tradeoff is recorded.
+    Pinned {
+        model_id: String,
+        cold_start_flagged: bool,
+    },
+    /// The existing pin was left unchanged. `reason` explains why (no measured
+    /// switch, latency guard blocked, model unprofiled, or load failed).
+    KeptCurrent { reason: String },
+}
+
+impl ChatPinOutcome {
+    /// The model that ended up pinned, if the pin changed/confirmed to a model.
+    pub fn pinned_model(&self) -> Option<&str> {
+        match self {
+            ChatPinOutcome::Pinned { model_id, .. } => Some(model_id),
+            ChatPinOutcome::KeptCurrent { .. } => None,
+        }
+    }
+}
+
+/// Apply a [`ChatRoleDecision`] to the residency manager's chat pin, gated by the
+/// serving-profile latency guard and the atomic-transfer rule.
+///
+/// `max_cold_load_s` is the interactive-latency budget (caller passes it from
+/// [`crate::config::chat_pin_max_cold_load_s`] — never hardcoded here). Steps:
+///   1. A `KeepDefault` decision changes nothing (no measured pick).
+///   2. A `Route` pick with no serving-profile row keeps the current pin (we won't
+///      pin a model we can't reason about / size).
+///   3. Latency guard: a model whose `cold_load_s` exceeds the budget is rejected
+///      as the interactive alias UNLESS it is `keep_warm` (then allowed + flagged).
+///   4. Atomic transfer: bring the new model resident (the pinned old model is
+///      never evicted to make room — if it doesn't fit, keep the old pin), then
+///      pin it; [`set_pinned_chat_model`] releases the old pin in the same locked
+///      update. A failed acquire keeps the old pin.
+pub async fn apply_chat_pin(
+    decision: &ChatRoleDecision,
+    routing: &RoutingMap,
+    residency: &VramResidencyManager,
+    max_cold_load_s: f64,
+) -> ChatPinOutcome {
+    // (1) No measured pick → leave the operator's current pin untouched.
+    let model_id = match decision.routed_model() {
+        Some(m) => m.to_string(),
+        None => {
+            let reason = match decision {
+                ChatRoleDecision::KeepDefault { reason } => reason.clone(),
+                ChatRoleDecision::Route { .. } => unreachable!("routed_model is Some"),
+            };
+            return ChatPinOutcome::KeptCurrent { reason };
+        }
+    };
+
+    let mid = ModelId::from(model_id.as_str());
+
+    // (2) Unprofiled pick → keep current pin (don't pin a model we can't size/guard).
+    let route = match routing.get(&mid) {
+        Some(r) => r,
+        None => {
+            return ChatPinOutcome::KeptCurrent {
+                reason: format!(
+                    "chat-role pick '{model_id}' has no serving profile — keeping current pin"
+                ),
+            }
+        }
+    };
+
+    // (3) Latency guard for the INTERACTIVE alias.
+    let cold = route.profile.cold_load_s.unwrap_or(0.0);
+    let mut cold_start_flagged = false;
+    if cold > max_cold_load_s {
+        if route.keep_warm() {
+            // Held resident → steady-state latency mitigated; flag the first-load
+            // tradeoff but allow it.
+            cold_start_flagged = true;
+        } else {
+            // Cold every use AND slow → unresponsive as the live chat alias.
+            return ChatPinOutcome::KeptCurrent {
+                reason: format!(
+                    "chat-role pick '{model_id}' cold-loads too slowly to be the interactive \
+                     alias and is not keep-warm — keeping current pin"
+                ),
+            };
+        }
+    }
+
+    // Idempotent: already the pinned model → confirm, no reload.
+    if residency.pinned_chat_model().await.as_deref() == Some(model_id.as_str()) {
+        return ChatPinOutcome::Pinned {
+            model_id,
+            cold_start_flagged,
+        };
+    }
+
+    // (4) Atomic transfer: load the new model FIRST (the still-pinned old model is
+    // never evicted to make room — SRV-05 keeps it sticky), then pin it.
+    match residency.acquire_warm_slot(&mid, route.vram_gb()).await {
+        Ok(_slot) => {
+            residency.set_pinned_chat_model(Some(&model_id)).await;
+            ChatPinOutcome::Pinned {
+                model_id,
+                cold_start_flagged,
+            }
+        }
+        Err(_e) => ChatPinOutcome::KeptCurrent {
+            reason: format!(
+                "could not bring chat-role pick '{model_id}' resident — keeping current pin"
+            ),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
