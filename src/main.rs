@@ -172,6 +172,14 @@ async fn main() {
     // TIER-05: the model-tier control API runs on a SECOND listener (control port,
     // default 8090), sharing the same AppState. Build it before `state` is moved
     // into the proxy router.
+    // ── SNAP observability subsystem (additive) ──
+    // Background health/VRAM poller populates the process-global shared
+    // inference state read by the SNAP control-API routes. Best-effort: with no
+    // engine URLs configured it simply records empty snapshots.
+    let snap_cfg = std::sync::Arc::new(chord_proxy::snap::config::SnapConfig::from_env());
+    chord_proxy::snap::spawn_health_monitor(snap_cfg);
+    info!("SNAP observability subsystem started (vram/activity/inventory/analytics)");
+
     let control_port = config.control_port;
     let control_router = chord_proxy::control::build_control_router(state.clone());
 

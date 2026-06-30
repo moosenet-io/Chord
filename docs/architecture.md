@@ -255,6 +255,45 @@ the sequence `personality → search-model → synthesis → personality`, then 
 citation-style `SynthesisPrompt` from the curated documents. Every VRAM-rotation
 failure degrades gracefully (`SwapOutcome::Fallback` / `Degraded`) — never a crash.
 
+## Observability (SNAP)
+
+Chord 1.2.0 folds in the "SNAP" observability features (previously a separate
+harmony-chord codebase) as an additive subsystem under
+[`src/snap/`](../src/snap/). It contributes a read-only telemetry surface on the
+existing control port, gated by the same JWT auth as `/api/models`, with no
+change to the request path:
+
+- **VRAM reader** ([`snap::vram`](../src/snap/vram.rs), SNAP-02) — the *actual*
+  GPU read from sysfs (`mem_info_vram_total`) with a `rocm-smi --json` fallback
+  and an Ollama-allocation roll-up. This complements `serving::memory_model`
+  (which is VRAM *accounting*); the reader is the missing device-truth source.
+- **Health monitor** ([`snap::health`](../src/snap/health.rs)) — a background
+  poller that fills a shared `InferenceState` (engines + per-model load) every
+  `SNAP_POLL_INTERVAL_SECS`; only env-configured endpoints are polled.
+- **Model inventory** ([`snap::inventory`](../src/snap/inventory.rs), SNAP-03) —
+  scans `SNAP_STORAGE_LOCATIONS` for GGUF files (with quant detection) and
+  Ollama manifests, reporting size, tier, and cleanup candidates.
+- **Activity tracker** ([`snap::activity`](../src/snap/activity.rs), SNAP-04) —
+  passive per-engine/per-model in-use observation derived from live state.
+- **Analytics** ([`snap::analytics`](../src/snap/analytics.rs), SNAP-05) —
+  `RequestLogger`: append-only JSONL request log with imputed cloud-cost and
+  savings summaries vs. representative cloud pricing.
+- **vLLM adapter** ([`snap::vllm`](../src/snap/vllm.rs), VLLM-01) — a vLLM
+  `EngineAdapter` backend option (gfx1151 container lifecycle), additive to the
+  existing `serving/` launch path.
+
+Endpoints (all `GET`, control port, JWT-gated): `/api/vram`, `/api/activity`,
+`/api/inventory`, `/api/analytics/requests`, `/api/analytics/cost`,
+`/api/analytics/savings`. Harmony-chord's mutating lifecycle/config endpoints and
+its streaming reverse proxy were intentionally **not** ported — chord already
+owns the proxy path (`routes.rs` / `mcp_proxy.rs` / `routing/`), so only the
+unique analytics/inventory/observation *value* was reconciled in.
+
+Env knobs: `SNAP_POLL_INTERVAL_SECS`, `SNAP_DATA_DIR` (falls back to
+`CHORD_DATA_DIR` then the system temp dir), `SNAP_STORAGE_LOCATIONS`
+(`name:tier:/path` entries separated by `;`), `LLAMA_SERVER_URL`, `OLLAMA_URL`,
+`OLLAMA_CPU_URL`, `CHORD_VLLM_URL`.
+
 ## Configuration surface
 
 All operational knobs come from env (parsed in [`config.rs`](../src/config.rs)) —
@@ -262,4 +301,5 @@ nothing infrastructure-specific is hardcoded. Key variables: `CHORD_PROXY_PORT`,
 `CHORD_CONTROL_PORT`, `CHORD_JWT_SECRET`, `CHORD_LLM_URL`, `CHORD_MODEL_ALIASES`,
 `MODEL_LOCAL_PATH` / `MODEL_ARCHIVE_PATH` / `MODEL_REGISTRY_PATH`,
 `MODEL_PROTECTED`, `MODEL_DISK_PRESSURE_PERCENT`, `MODEL_WARM_COOLDOWN_HOURS`,
-`CHORD_FAST_MODEL` / `CHORD_DEEP_MODEL`, and the `HARNESS_*` harness knobs.
+`CHORD_FAST_MODEL` / `CHORD_DEEP_MODEL`, the `HARNESS_*` harness knobs, and the
+`SNAP_*` observability knobs (see Observability above).
