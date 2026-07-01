@@ -1,4 +1,6 @@
-# chord-tui (S91 CTUI-01/02/03)
+# chord-tui (S91 CTUI-01..06)
+
+> Operator guide & full reference: [`docs/chord-tui.md`](../../docs/chord-tui.md).
 
 A read-mostly terminal control UI (ratatui + crossterm + tokio) for the **Chord**
 and **Terminus-fleet** control planes. It is a **client** — it connects to the
@@ -24,6 +26,29 @@ but are **separate views**, never blended. `Tab` switches modes.
   against the `ServingControl` trait with a clearly-named `MockServingControl`.
   Panels render + navigate now and show a **"pending S85 integration"** banner.
   Swapping in the real S85 client is a single localized change.
+
+### Terminus-fleet mode (CTUI-04 connect+status, CTUI-05 per-instance config)
+- **Instances** — add/remove/select instances. Each declares a transport
+  (stdio | HTTP), an endpoint (from config, never a literal), and a kind
+  (local | remote | chord-embedded). A chord-embedded Terminus is just another
+  instance. Same-name instances are disambiguated by name + endpoint.
+- **Detail** — per-instance connection status, tool count, and tool inventory
+  (name, enabled, domain). Connects over stdio OR HTTP via `mcp_client`.
+  Unexpected MCP version → shown *incompatible* (no crash, tools untrusted);
+  stdio process death → *disconnected + retriable*; remote auth fail → per-instance
+  `auth-failed` only. **One unreachable instance never breaks the others.**
+- **Tools** — enable/disable a tool + view/edit scopes, **only if the server
+  exposes the control**; otherwise read-only "not supported" (no faked mutation).
+  Confirm-gated; the UI reflects the server's true state (no optimistic lie) and
+  reverts + explains on rejection.
+- **Secrets** — per-instance **vault-backed** management: names + status only,
+  values **never** shown. Change = **typed** confirmation, written to the vault
+  only (never file/screen), atomic-or-nothing.
+- **Transport** — set stdio/HTTP endpoint from config; a blank endpoint is
+  rejected (never defaulted); no hardcoded infra.
+
+Every fleet mutation is **audit-logged sanitized** (action + instance + target
+NAME + outcome — never a secret value).
 
 ## Safety model
 

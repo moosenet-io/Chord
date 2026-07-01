@@ -170,28 +170,89 @@ fn draw_backends(f: &mut Frame, area: Rect, chord: Option<&ChordSnapshot>) {
 }
 
 fn draw_fleet_mode(f: &mut Frame, area: Rect, data: &Framedata) {
+    let panel = data.app.fleet_panel;
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("Terminus-Fleet · Instances");
+        .title(format!("Terminus-Fleet · {}", panel.title()));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let mut lines: Vec<Line> = vec![Line::from(
-        crate::modes::terminus_fleet::FLEET_SCAFFOLD_NOTE,
-    )];
+    use crate::modes::terminus::fleet::FleetPanel;
+    match panel {
+        FleetPanel::Instances => draw_fleet_instances(f, inner, data),
+        FleetPanel::Detail => draw_fleet_detail(f, inner, data),
+        // CTUI-05 config panels: capability-aware, mutation-gated. Rendered as
+        // guidance panes here; the controllers (tools/secrets/transport) enforce
+        // confirm + capability + audit. Secret VALUES are never shown.
+        FleetPanel::Tools => f.render_widget(
+            Paragraph::new(vec![
+                Line::from("Tools — enable/disable + scopes (server-capability gated)."),
+                Line::from("A toggle requires confirm; if the instance lacks the control it is read-only."),
+            ]),
+            inner,
+        ),
+        FleetPanel::Secrets => f.render_widget(
+            Paragraph::new(vec![
+                Line::from("Secrets — VAULT-backed; names + status only, values NEVER shown."),
+                Line::from("Change requires a TYPED confirmation and writes only to the vault."),
+            ]),
+            inner,
+        ),
+        FleetPanel::Transport => f.render_widget(
+            Paragraph::new(vec![
+                Line::from("Transport — stdio (command) or HTTP (endpoint), from config."),
+                Line::from("No hardcoded endpoints; a blank endpoint is rejected, never defaulted."),
+            ]),
+            inner,
+        ),
+    }
+}
+
+fn draw_fleet_instances(f: &mut Frame, area: Rect, data: &Framedata) {
+    if data.instances.is_empty() {
+        f.render_widget(
+            Paragraph::new(crate::modes::terminus::fleet::FLEET_SCAFFOLD_NOTE),
+            area,
+        );
+        return;
+    }
+    let mut lines: Vec<Line> = Vec::new();
     for s in data.instances {
-        let color = match s.health {
-            crate::connection::Health::Connected => Color::Green,
-            crate::connection::Health::Degraded => Color::Yellow,
-            crate::connection::Health::Unreachable => Color::Red,
-            crate::connection::Health::Unknown => Color::DarkGray,
-        };
         lines.push(Line::from(vec![
-            Span::styled(format!(" ● {} ", s.name), Style::default().fg(color)),
+            Span::styled(format!(" ● {} ", s.name), Style::default().fg(health_color(s.health))),
             Span::raw(format!("{} ({})", s.base_url, s.health.label())),
         ]));
     }
-    f.render_widget(Paragraph::new(lines), inner);
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_fleet_detail(f: &mut Frame, area: Rect, data: &Framedata) {
+    let Some(sel) = data.instances.first() else {
+        f.render_widget(Paragraph::new("no instance selected"), area);
+        return;
+    };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("instance: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(sel.name.clone(), Style::default().fg(health_color(sel.health))),
+        ]),
+        Line::from(format!("endpoint: {}", sel.base_url)),
+        Line::from(format!("status:   {}", sel.health.label())),
+        Line::from(match &sel.version {
+            Some(v) => format!("version:  {v}"),
+            None => "version:  -".to_string(),
+        }),
+    ];
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn health_color(h: crate::connection::Health) -> Color {
+    match h {
+        crate::connection::Health::Connected => Color::Green,
+        crate::connection::Health::Degraded => Color::Yellow,
+        crate::connection::Health::Unreachable => Color::Red,
+        crate::connection::Health::Unknown => Color::DarkGray,
+    }
 }
 
 fn draw_confirm_overlay(f: &mut Frame, area: Rect, app: &App) {
