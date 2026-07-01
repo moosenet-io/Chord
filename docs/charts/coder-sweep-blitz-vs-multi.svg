@@ -1,109 +1,116 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="710" height="728" viewBox="0 0 710 728" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
-<rect width="710" height="728" rx="10" fill="#0d1117"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="710" height="777" viewBox="0 0 710 777" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
+<rect width="710" height="777" rx="10" fill="#0d1117"/>
 <text x="24" y="36" fill="#c9d1d9" font-size="20" font-weight="700">Coder-fleet sweep — BLITZ vs MULTI-FILE pass rate</text>
-<text x="24" y="58" fill="#8b949e" font-size="12">S86 · gfx1151 · MINT v2 harness · qwen3:8b judge · sorted by overall pass rate</text>
+<text x="24" y="58" fill="#8b949e" font-size="12">S86 · gfx1151 · MINT v2 harness · qwen3:8b judge · full final set · sorted by overall pass rate</text>
 <rect x="210" y="68" width="14" height="14" rx="3" fill="#58a6ff"/><text x="230" y="80" fill="#8b949e" font-size="12">BLITZ (single-file)</text>
 <rect x="380" y="68" width="14" height="14" rx="3" fill="#3fb950"/><text x="400" y="80" fill="#8b949e" font-size="12">MULTI (multi-file)</text>
-<line x1="210.0" y1="90" x2="210.0" y2="662.0" stroke="#21262d" stroke-width="1"/>
-<text x="210.0" y="686.0" fill="#8b949e" font-size="11" text-anchor="middle">0%</text>
-<line x1="317.5" y1="90" x2="317.5" y2="662.0" stroke="#21262d" stroke-width="1"/>
-<text x="317.5" y="686.0" fill="#8b949e" font-size="11" text-anchor="middle">25%</text>
-<line x1="425.0" y1="90" x2="425.0" y2="662.0" stroke="#21262d" stroke-width="1"/>
-<text x="425.0" y="686.0" fill="#8b949e" font-size="11" text-anchor="middle">50%</text>
-<line x1="532.5" y1="90" x2="532.5" y2="662.0" stroke="#21262d" stroke-width="1"/>
-<text x="532.5" y="686.0" fill="#8b949e" font-size="11" text-anchor="middle">75%</text>
-<line x1="640.0" y1="90" x2="640.0" y2="662.0" stroke="#21262d" stroke-width="1"/>
-<text x="640.0" y="686.0" fill="#8b949e" font-size="11" text-anchor="middle">100%</text>
+<line x1="210.0" y1="90" x2="210.0" y2="711.0" stroke="#21262d" stroke-width="1"/>
+<text x="210.0" y="735.0" fill="#8b949e" font-size="11" text-anchor="middle">0%</text>
+<line x1="317.5" y1="90" x2="317.5" y2="711.0" stroke="#21262d" stroke-width="1"/>
+<text x="317.5" y="735.0" fill="#8b949e" font-size="11" text-anchor="middle">25%</text>
+<line x1="425.0" y1="90" x2="425.0" y2="711.0" stroke="#21262d" stroke-width="1"/>
+<text x="425.0" y="735.0" fill="#8b949e" font-size="11" text-anchor="middle">50%</text>
+<line x1="532.5" y1="90" x2="532.5" y2="711.0" stroke="#21262d" stroke-width="1"/>
+<text x="532.5" y="735.0" fill="#8b949e" font-size="11" text-anchor="middle">75%</text>
+<line x1="640.0" y1="90" x2="640.0" y2="711.0" stroke="#21262d" stroke-width="1"/>
+<text x="640.0" y="735.0" fill="#8b949e" font-size="11" text-anchor="middle">100%</text>
 <text x="198" y="114.0" fill="#c9d1d9" font-size="13" text-anchor="end">qwen3-coder:30b</text>
 <rect x="210" y="99.0" width="430" height="13" rx="3" fill="#161b22"/>
 <rect x="210" y="99.0" width="430.0" height="13" rx="3" fill="#58a6ff"/>
 <text x="648" y="110.0" fill="#8b949e" font-size="10.5">100% (14/14)</text>
 <rect x="210" y="114.0" width="430" height="13" rx="3" fill="#161b22"/>
-<rect x="210" y="114.0" width="279.5" height="13" rx="3" fill="#3fb950"/>
+<rect x="210" y="114.0" width="278.2" height="13" rx="3" fill="#3fb950"/>
 <text x="648" y="125.0" fill="#8b949e" font-size="10.5">65% (11/17)</text>
 <text x="198" y="158.0" fill="#c9d1d9" font-size="13" text-anchor="end">qwen3-coder-next:latest</text>
 <rect x="210" y="143.0" width="430" height="13" rx="3" fill="#161b22"/>
 <rect x="210" y="143.0" width="430.0" height="13" rx="3" fill="#58a6ff"/>
 <text x="648" y="154.0" fill="#8b949e" font-size="10.5">100% (14/14)</text>
 <rect x="210" y="158.0" width="430" height="13" rx="3" fill="#161b22"/>
-<rect x="210" y="158.0" width="279.5" height="13" rx="3" fill="#3fb950"/>
+<rect x="210" y="158.0" width="278.2" height="13" rx="3" fill="#3fb950"/>
 <text x="648" y="169.0" fill="#8b949e" font-size="10.5">65% (11/17)</text>
 <text x="198" y="202.0" fill="#c9d1d9" font-size="13" text-anchor="end">qwen2.5-coder:14b-instruct</text>
 <rect x="210" y="187.0" width="430" height="13" rx="3" fill="#161b22"/>
-<rect x="210" y="187.0" width="399.9" height="13" rx="3" fill="#58a6ff"/>
+<rect x="210" y="187.0" width="399.5" height="13" rx="3" fill="#58a6ff"/>
 <text x="648" y="198.0" fill="#8b949e" font-size="10.5">93% (13/14)</text>
 <rect x="210" y="202.0" width="430" height="13" rx="3" fill="#161b22"/>
-<rect x="210" y="202.0" width="279.5" height="13" rx="3" fill="#3fb950"/>
+<rect x="210" y="202.0" width="278.2" height="13" rx="3" fill="#3fb950"/>
 <text x="648" y="213.0" fill="#8b949e" font-size="10.5">65% (11/17)</text>
-<text x="198" y="246.0" fill="#c9d1d9" font-size="13" text-anchor="end">gemma3:12b</text>
+<text x="198" y="246.0" fill="#c9d1d9" font-size="13" text-anchor="end">Seed-Coder-8B</text>
 <rect x="210" y="231.0" width="430" height="13" rx="3" fill="#161b22"/>
-<rect x="210" y="231.0" width="275.2" height="13" rx="3" fill="#58a6ff"/>
+<rect x="210" y="231.0" width="276.5" height="13" rx="3" fill="#58a6ff"/>
 <text x="648" y="242.0" fill="#8b949e" font-size="10.5">64% (9/14)</text>
 <rect x="210" y="246.0" width="430" height="13" rx="3" fill="#161b22"/>
-<rect x="210" y="246.0" width="176.3" height="13" rx="3" fill="#3fb950"/>
-<text x="648" y="257.0" fill="#8b949e" font-size="10.5">41% (7/17)</text>
-<text x="198" y="290.0" fill="#c9d1d9" font-size="13" text-anchor="end">qwen2.5-coder:32b-instruct</text>
+<rect x="210" y="246.0" width="252.8" height="13" rx="3" fill="#3fb950"/>
+<text x="648" y="257.0" fill="#8b949e" font-size="10.5">59% (10/17)</text>
+<text x="198" y="290.0" fill="#c9d1d9" font-size="13" text-anchor="end">gemma3:12b</text>
 <rect x="210" y="275.0" width="430" height="13" rx="3" fill="#161b22"/>
-<rect x="210" y="275.0" width="90.3" height="13" rx="3" fill="#58a6ff"/>
-<text x="648" y="286.0" fill="#8b949e" font-size="10.5">21% (3/14)</text>
+<rect x="210" y="275.0" width="276.5" height="13" rx="3" fill="#58a6ff"/>
+<text x="648" y="286.0" fill="#8b949e" font-size="10.5">64% (9/14)</text>
 <rect x="210" y="290.0" width="430" height="13" rx="3" fill="#161b22"/>
-<rect x="210" y="290.0" width="227.9" height="13" rx="3" fill="#3fb950"/>
-<text x="648" y="301.0" fill="#8b949e" font-size="10.5">53% (9/17)</text>
-<text x="198" y="334.0" fill="#c9d1d9" font-size="13" text-anchor="end">codestral:latest</text>
+<rect x="210" y="290.0" width="177.2" height="13" rx="3" fill="#3fb950"/>
+<text x="648" y="301.0" fill="#8b949e" font-size="10.5">41% (7/17)</text>
+<text x="198" y="334.0" fill="#c9d1d9" font-size="13" text-anchor="end">qwen2.5-coder:32b-instruct</text>
 <rect x="210" y="319.0" width="430" height="13" rx="3" fill="#161b22"/>
-<rect x="210" y="319.0" width="215.0" height="13" rx="3" fill="#58a6ff"/>
-<text x="648" y="330.0" fill="#8b949e" font-size="10.5">50% (7/14)</text>
+<rect x="210" y="319.0" width="92.0" height="13" rx="3" fill="#58a6ff"/>
+<text x="648" y="330.0" fill="#8b949e" font-size="10.5">21% (3/14)</text>
 <rect x="210" y="334.0" width="430" height="13" rx="3" fill="#161b22"/>
-<rect x="210" y="334.0" width="103.2" height="13" rx="3" fill="#3fb950"/>
-<text x="648" y="345.0" fill="#8b949e" font-size="10.5">24% (4/17)</text>
-<text x="198" y="378.0" fill="#c9d1d9" font-size="13" text-anchor="end">devstral:24b</text>
+<rect x="210" y="334.0" width="227.5" height="13" rx="3" fill="#3fb950"/>
+<text x="648" y="345.0" fill="#8b949e" font-size="10.5">53% (9/17)</text>
+<text x="198" y="378.0" fill="#c9d1d9" font-size="13" text-anchor="end">codestral:latest</text>
 <rect x="210" y="363.0" width="430" height="13" rx="3" fill="#161b22"/>
-<rect x="210" y="363.0" width="154.8" height="13" rx="3" fill="#58a6ff"/>
-<text x="648" y="374.0" fill="#8b949e" font-size="10.5">36% (5/14)</text>
+<rect x="210" y="363.0" width="215.0" height="13" rx="3" fill="#58a6ff"/>
+<text x="648" y="374.0" fill="#8b949e" font-size="10.5">50% (7/14)</text>
 <rect x="210" y="378.0" width="430" height="13" rx="3" fill="#161b22"/>
-<rect x="210" y="378.0" width="124.7" height="13" rx="3" fill="#3fb950"/>
-<text x="648" y="389.0" fill="#8b949e" font-size="10.5">29% (5/17)</text>
-<text x="198" y="422.0" fill="#c9d1d9" font-size="13" text-anchor="end">deepcoder:14b</text>
+<rect x="210" y="378.0" width="101.0" height="13" rx="3" fill="#3fb950"/>
+<text x="648" y="389.0" fill="#8b949e" font-size="10.5">24% (4/17)</text>
+<text x="198" y="422.0" fill="#c9d1d9" font-size="13" text-anchor="end">devstral:24b</text>
 <rect x="210" y="407.0" width="430" height="13" rx="3" fill="#161b22"/>
-<rect x="210" y="407.0" width="60.2" height="13" rx="3" fill="#58a6ff"/>
-<text x="648" y="418.0" fill="#8b949e" font-size="10.5">14% (2/14)</text>
+<rect x="210" y="407.0" width="153.5" height="13" rx="3" fill="#58a6ff"/>
+<text x="648" y="418.0" fill="#8b949e" font-size="10.5">36% (5/14)</text>
 <rect x="210" y="422.0" width="430" height="13" rx="3" fill="#161b22"/>
-<rect x="210" y="422.0" width="124.7" height="13" rx="3" fill="#3fb950"/>
+<rect x="210" y="422.0" width="126.4" height="13" rx="3" fill="#3fb950"/>
 <text x="648" y="433.0" fill="#8b949e" font-size="10.5">29% (5/17)</text>
-<text x="198" y="466.0" fill="#c9d1d9" font-size="13" text-anchor="end">olmo2:13b</text>
+<text x="198" y="466.0" fill="#c9d1d9" font-size="13" text-anchor="end">codegemma:7b</text>
 <rect x="210" y="451.0" width="430" height="13" rx="3" fill="#161b22"/>
-<rect x="210" y="451.0" width="30.1" height="13" rx="3" fill="#58a6ff"/>
-<text x="648" y="462.0" fill="#8b949e" font-size="10.5">7% (1/14)</text>
+<rect x="210" y="451.0" width="184.5" height="13" rx="3" fill="#58a6ff"/>
+<text x="648" y="462.0" fill="#8b949e" font-size="10.5">43% (6/14)</text>
 <rect x="210" y="466.0" width="430" height="13" rx="3" fill="#161b22"/>
-<rect x="210" y="466.0" width="25.8" height="13" rx="3" fill="#3fb950"/>
-<text x="648" y="477.0" fill="#8b949e" font-size="10.5">6% (1/17)</text>
-<text x="198" y="510.0" fill="#c9d1d9" font-size="13" text-anchor="end">starcoder2:15b</text>
+<rect x="210" y="466.0" width="75.7" height="13" rx="3" fill="#3fb950"/>
+<text x="648" y="477.0" fill="#8b949e" font-size="10.5">18% (3/17)</text>
+<text x="198" y="510.0" fill="#c9d1d9" font-size="13" text-anchor="end">opencoder:8b</text>
 <rect x="210" y="495.0" width="430" height="13" rx="3" fill="#161b22"/>
-<rect x="210" y="495.0" width="30.1" height="13" rx="3" fill="#58a6ff"/>
-<text x="648" y="506.0" fill="#8b949e" font-size="10.5">7% (1/14)</text>
+<rect x="210" y="495.0" width="184.5" height="13" rx="3" fill="#58a6ff"/>
+<text x="648" y="506.0" fill="#8b949e" font-size="10.5">43% (6/14)</text>
 <rect x="210" y="510.0" width="430" height="13" rx="3" fill="#161b22"/>
-<rect x="210" y="510.0" width="0.0" height="13" rx="3" fill="#3fb950"/>
-<text x="648" y="521.0" fill="#8b949e" font-size="10.5">0% (0/17)</text>
-<text x="198" y="554.0" fill="#c9d1d9" font-size="13" text-anchor="end">qwen3.5:27b</text>
+<rect x="210" y="510.0" width="25.4" height="13" rx="3" fill="#3fb950"/>
+<text x="648" y="521.0" fill="#8b949e" font-size="10.5">6% (1/17)</text>
+<text x="198" y="554.0" fill="#c9d1d9" font-size="13" text-anchor="end">deepcoder:14b</text>
 <rect x="210" y="539.0" width="430" height="13" rx="3" fill="#161b22"/>
-<rect x="210" y="539.0" width="0.0" height="13" rx="3" fill="#58a6ff"/>
-<text x="648" y="550.0" fill="#8b949e" font-size="10.5">0% (0/14)</text>
+<rect x="210" y="539.0" width="61.5" height="13" rx="3" fill="#58a6ff"/>
+<text x="648" y="550.0" fill="#8b949e" font-size="10.5">14% (2/14)</text>
 <rect x="210" y="554.0" width="430" height="13" rx="3" fill="#161b22"/>
-<rect x="210" y="554.0" width="0.0" height="13" rx="3" fill="#3fb950"/>
-<text x="648" y="565.0" fill="#8b949e" font-size="10.5">0% (0/17)</text>
-<text x="198" y="598.0" fill="#c9d1d9" font-size="13" text-anchor="end">qwen3:32b</text>
+<rect x="210" y="554.0" width="126.4" height="13" rx="3" fill="#3fb950"/>
+<text x="648" y="565.0" fill="#8b949e" font-size="10.5">29% (5/17)</text>
+<text x="198" y="598.0" fill="#c9d1d9" font-size="13" text-anchor="end">olmo2:13b</text>
 <rect x="210" y="583.0" width="430" height="13" rx="3" fill="#161b22"/>
-<rect x="210" y="583.0" width="0.0" height="13" rx="3" fill="#58a6ff"/>
-<text x="648" y="594.0" fill="#8b949e" font-size="10.5">0% (0/14)</text>
+<rect x="210" y="583.0" width="30.5" height="13" rx="3" fill="#58a6ff"/>
+<text x="648" y="594.0" fill="#8b949e" font-size="10.5">7% (1/14)</text>
 <rect x="210" y="598.0" width="430" height="13" rx="3" fill="#161b22"/>
-<rect x="210" y="598.0" width="0.0" height="13" rx="3" fill="#3fb950"/>
-<text x="648" y="609.0" fill="#8b949e" font-size="10.5">0% (0/17)</text>
-<text x="198" y="642.0" fill="#c9d1d9" font-size="13" text-anchor="end">yi-coder:9b</text>
+<rect x="210" y="598.0" width="25.4" height="13" rx="3" fill="#3fb950"/>
+<text x="648" y="609.0" fill="#8b949e" font-size="10.5">6% (1/17)</text>
+<text x="198" y="642.0" fill="#c9d1d9" font-size="13" text-anchor="end">starcoder2:15b</text>
 <rect x="210" y="627.0" width="430" height="13" rx="3" fill="#161b22"/>
-<rect x="210" y="627.0" width="0.0" height="13" rx="3" fill="#58a6ff"/>
-<text x="648" y="638.0" fill="#8b949e" font-size="10.5">0% (0/14)</text>
+<rect x="210" y="627.0" width="30.5" height="13" rx="3" fill="#58a6ff"/>
+<text x="648" y="638.0" fill="#8b949e" font-size="10.5">7% (1/14)</text>
 <rect x="210" y="642.0" width="430" height="13" rx="3" fill="#161b22"/>
 <rect x="210" y="642.0" width="0.0" height="13" rx="3" fill="#3fb950"/>
 <text x="648" y="653.0" fill="#8b949e" font-size="10.5">0% (0/17)</text>
-<text x="24" y="714" fill="#8b949e" font-size="11">Pass = change_correct AND compiles AND no error · best-batch dedup per model · 14 BLITZ + 17 MULTI cases</text>
+<text x="198" y="686.0" fill="#c9d1d9" font-size="13" text-anchor="end">qwen3.5:27b · gpt-oss:20b · yi-coder · qwen3:32b</text>
+<rect x="210" y="671.0" width="430" height="13" rx="3" fill="#161b22"/>
+<rect x="210" y="671.0" width="0.0" height="13" rx="3" fill="#58a6ff"/>
+<text x="648" y="682.0" fill="#8b949e" font-size="10.5">0% (0/14)</text>
+<rect x="210" y="686.0" width="430" height="13" rx="3" fill="#161b22"/>
+<rect x="210" y="686.0" width="0.0" height="13" rx="3" fill="#3fb950"/>
+<text x="648" y="697.0" fill="#8b949e" font-size="10.5">0% (0/17)</text>
+<text x="24" y="765" fill="#8b949e" font-size="11">Pass = change_correct AND compiles AND no error · best-batch dedup · 14 BLITZ + 17 MULTI cases</text>
 </svg>
