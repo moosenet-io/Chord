@@ -388,6 +388,30 @@ impl ModelRegistry {
         self.backends.insert(b.name.clone(), b);
     }
 
+    /// Tag every **dense large** model (see [`backends::is_vulkan_candidate`]) to
+    /// the driver-stable [`backends::VULKAN_BACKEND`] serving backend, *only* when
+    /// that backend is defined and the model is not already explicitly tagged to a
+    /// different backend. Returns the names of the models newly tagged.
+    ///
+    /// This is additive and conservative: it never overrides an operator's
+    /// existing per-model backend tag, and it is a no-op if the `vulkan` backend
+    /// is not present in the catalogue. It lets Chord know Vulkan is an available
+    /// backend for dense large models (e.g. `llama3.3:70b`) without hardcoding a
+    /// model list, mirroring the runtime-driven tagging convention.
+    pub fn tag_vulkan_candidates(&mut self) -> Vec<String> {
+        if !self.backends.contains_key(backends::VULKAN_BACKEND) {
+            return Vec::new();
+        }
+        let mut tagged = Vec::new();
+        for (name, rec) in self.records.iter_mut() {
+            if rec.backend.is_none() && backends::is_vulkan_candidate(name) {
+                rec.backend = Some(backends::VULKAN_BACKEND.to_string());
+                tagged.push(name.clone());
+            }
+        }
+        tagged
+    }
+
     /// Reconcile the registry against the on-disk reality.
     ///
     /// Scans the local manifest tree and (if mounted) the archive manifest tree
@@ -1084,6 +1108,40 @@ mod tests {
         assert_eq!(
             reg.backend_for("qwen3-coder:30b").map(|b| b.name.as_str()),
             Some("llama-gpu")
+        );
+    }
+
+    #[test]
+    fn tag_vulkan_candidates_dense_large_only() {
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        // A dense-large model (candidate), a MoE coder (not), and a small model (not).
+        write_manifest(&base.join("local"), "registry.ollama.ai", "library", "llama3.3", "70b", 1, &[1]);
+        write_manifest(&base.join("local"), "registry.ollama.ai", "library", "qwen3-coder", "30b", 1, &[2]);
+        write_manifest(&base.join("local"), "registry.ollama.ai", "library", "qwen3", "8b", 1, &[3]);
+        let mut reg = reg_at(base, vec![]);
+        reg.reconcile();
+        // vulkan backend is seeded (always offered), so tagging applies.
+        assert!(reg.backend(backends::VULKAN_BACKEND).is_some());
+        let tagged = reg.tag_vulkan_candidates();
+        assert_eq!(tagged, vec!["llama3.3:70b".to_string()]);
+        assert_eq!(
+            reg.backend_for("llama3.3:70b").map(|b| b.name.as_str()),
+            Some(backends::VULKAN_BACKEND)
+        );
+        // Non-candidates keep the default backend.
+        assert_ne!(
+            reg.get("qwen3-coder:30b").and_then(|r| r.backend.as_deref()),
+            Some(backends::VULKAN_BACKEND)
+        );
+        // Idempotent + never overrides an explicit tag.
+        assert!(reg.set_model_backend("qwen3:8b", Some("llama-gpu".into())));
+        let again = reg.tag_vulkan_candidates();
+        assert!(again.is_empty(), "already-tagged candidate not re-tagged");
+        assert_eq!(
+            reg.get("qwen3:8b").and_then(|r| r.backend.as_deref()),
+            Some("llama-gpu"),
+            "explicit operator tag is never overridden"
         );
     }
 

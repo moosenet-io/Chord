@@ -200,6 +200,69 @@ egress posture is declared (`Serve` → Denied, `Pull` → allow-list-or-Denied 
 `supervisor::egress_policy::posture_for`). **ISO-01 is ADVISORY** (relies on tools
 honouring opt-outs); the kernel netns guarantee is ISO-02 and is not yet built.
 
+## Serving backends
+
+The backend catalogue is defined in
+[`models::backends`](../src/models/backends.rs) and seeded by `seed_from_env()`.
+Each `Backend` is hardware-tagged (`gpu`/`cpu`), speaks a `BackendKind`
+(`ollama` / `llama-server` / `daemon`), and is either `always_on` or **on-demand**
+(started when a model tagged to it is requested, idle-stopped otherwise). A model
+is mapped to a backend via `ModelRecord::backend` in the model registry
+(`/opt/chord/model-registry.json`); untagged models resolve to the default
+(`ollama`) backend.
+
+| Backend | Hardware | Kind | Managed | Notes |
+|---------|----------|------|---------|-------|
+| `ollama` | cpu | ollama | always-on (`ollama.service`) | primary/general; default backend |
+| `ollama-cpu` | cpu | ollama | always-on (`ollama-cpu.service`) | embeddings / micro jobs |
+| `lemonade-coder` | gpu | llama-server | on-demand (`lemonade-coder.service`) | dedicated GPU coder, one fixed model (ROCm b1258) |
+| `llama-gpu` | gpu | llama-server | on-demand (spawned) | generic: serves any model's Ollama blob on GPU (ROCm b1258) |
+| `vulkan` | gpu | llama-server | on-demand (spawned) | generic Vulkan/RADV (Mesa) build; driver-stable ROCm alternative |
+
+### The `vulkan` (RADV / Mesa) backend
+
+`vulkan` is a `llama.cpp` `llama-server` built with the Vulkan backend
+(`-DGGML_VULKAN=ON`) against **Mesa 25.0.7 RADV** on `gfx1151`. Binary on the
+Inference host: `/root/llama-vk/build/bin/llama-server` (override with
+`VULKAN_LLAMA_BIN`; port defaults to `8083`, override `VULKAN_LLAMA_PORT`). It is
+seeded with the validated launch flags:
+
+```
+-c 32768 --no-mmap --no-warmup -ngl 99 --host 127.0.0.1 --port <port>
+```
+
+It is a generic on-demand backend (same shape as `llama-gpu`): it loads ANY
+requested model's Ollama GGUF blob on the GPU and idle-stops after 600s.
+
+**When to use it.** Vulkan/RADV is a *driver-stable* alternative to the ROCm-only
+lemonade build (b1258) — reach for it when ROCm is unavailable or unstable. It is
+memory-bound like HIP/ROCm (both ~5 tok/s at 70B), so it is intended for **dense
+large models in batch/async mode**, not latency-sensitive interactive traffic.
+
+**Validation (llama3.3:70b, Q4_K_M, 42.5 GB, on `gfx1151`):**
+
+| Metric | Result |
+|--------|--------|
+| Cold-load | ~13 s (`--no-warmup`) |
+| Peak VRAM @ 32k ctx | 50.6 GB / 96 GB |
+| Generation | 5.3 tok/s |
+| Prompt | 22–24 tok/s |
+| `dmesg` | clean (no GPU faults) |
+
+Vulkan generation throughput ≈ HIP/ROCm at 70B (both memory-bound), confirming it
+as a viable driver-stable fallback for dense large models.
+
+### Tagging models to Vulkan
+
+Vulkan is offered for the **dense-large** class (70B/32B-dense; per the
+dense-retest shortlist). `backends::is_vulkan_candidate()` classifies a model name
+(MoE tags such as `a3b`/`a22b`/`moe` are excluded even at large sizes), and
+`ModelRegistry::tag_vulkan_candidates()` tags every present dense-large model to
+the `vulkan` backend **additively** — it never overrides an existing operator tag
+and is a no-op if the `vulkan` backend is absent. An operator can also tag any
+model explicitly with `set_model_backend(model, Some("vulkan"))` (or by editing the
+registry JSON's `backend` field).
+
 ## Test Results
 
 Serving behaviour is covered by the `tests/serving_*.rs` integration suites

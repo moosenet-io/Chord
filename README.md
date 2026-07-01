@@ -115,6 +115,17 @@ These route across a **three-tier backend stack**:
 Routing prefers `llama.cpp-rocm`, falls back to `ollama-rocm`, and finally to
 the CPU tier.
 
+Alongside the ROCm GPU tiers, Chord also registers a **`vulkan`** backend — a
+`llama.cpp` `llama-server` built with the Vulkan/RADV (Mesa) driver
+(`-DGGML_VULKAN=ON`, Mesa 25.0.7 on `gfx1151`). It is a *driver-stable*
+alternative to the ROCm-only lemonade build for **dense large models**, used when
+ROCm is unavailable or unstable. It is memory-bound like HIP/ROCm (~5 tok/s at
+70B), so it is intended for batch/async serving rather than interactive traffic.
+Dense-large models (70B/32B-dense class; `llama3.3:70b` validated) are tagged to
+it via the model registry. See
+[docs/serving.md](docs/serving.md#serving-backends) for details and the validated
+`llama3.3:70b` numbers.
+
 ## Status
 
 Chord ships as the standalone Rust crate `chord-proxy`, version **1.4**. It
