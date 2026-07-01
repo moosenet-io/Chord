@@ -153,16 +153,14 @@ fn handle_event(app: &mut App, ev: Event) {
             match k.code {
                 KeyCode::Char('q') => app.should_quit = true,
                 KeyCode::Tab => app.switch_mode(),
-                KeyCode::Right => {
-                    if app.mode == Mode::Chord {
-                        app.chord_panel = app.chord_panel.next();
-                    }
-                }
-                KeyCode::Left => {
-                    if app.mode == Mode::Chord {
-                        app.chord_panel = app.chord_panel.prev();
-                    }
-                }
+                KeyCode::Right => match app.mode {
+                    Mode::Chord => app.chord_panel = app.chord_panel.next(),
+                    Mode::TerminusFleet => app.fleet_panel = app.fleet_panel.next(),
+                },
+                KeyCode::Left => match app.mode {
+                    Mode::Chord => app.chord_panel = app.chord_panel.prev(),
+                    Mode::TerminusFleet => app.fleet_panel = app.fleet_panel.prev(),
+                },
                 // 'p' requests a (simple, keystroke-confirmed) model pull demo action.
                 KeyCode::Char('p') if app.mode == Mode::Chord && app.chord_panel == ChordPanel::Models => {
                     app.request_mutation(pull_mutation("<selected-model>"));
