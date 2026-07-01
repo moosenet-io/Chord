@@ -12,57 +12,57 @@
 <text x="532.5" y="542.0" fill="#8b949e" font-size="11" text-anchor="middle">75%</text>
 <line x1="640.0" y1="78" x2="640.0" y2="520.0" stroke="#21262d" stroke-width="1"/>
 <text x="640.0" y="542.0" fill="#8b949e" font-size="11" text-anchor="middle">100%</text>
-<text x="198" y="101.0" fill="#c9d1d9" font-size="13" text-anchor="end">qwen3-coder-next:latest</text>
+<text x="198" y="100.0" fill="#c9d1d9" font-size="13" text-anchor="end">qwen3-coder:30b</text>
 <rect x="210" y="84.0" width="430" height="20" rx="4" fill="#161b22"/>
-<rect x="210" y="84.0" width="346.8" height="20" rx="4" fill="#3fb950"/>
+<rect x="210" y="84.0" width="348.3" height="20" rx="4" fill="#3fb950"/>
 <text x="648" y="100.0" fill="#c9d1d9" font-size="12" font-weight="600">81%</text>
-<text x="198" y="135.0" fill="#c9d1d9" font-size="13" text-anchor="end">qwen3-coder:30b</text>
+<text x="198" y="134.0" fill="#c9d1d9" font-size="13" text-anchor="end">qwen3-coder-next:latest</text>
 <rect x="210" y="118.0" width="430" height="20" rx="4" fill="#161b22"/>
-<rect x="210" y="118.0" width="346.8" height="20" rx="4" fill="#3fb950"/>
+<rect x="210" y="118.0" width="348.3" height="20" rx="4" fill="#3fb950"/>
 <text x="648" y="134.0" fill="#c9d1d9" font-size="12" font-weight="600">81%</text>
-<text x="198" y="169.0" fill="#c9d1d9" font-size="13" text-anchor="end">qwen2.5-coder:32b-instruct</text>
+<text x="198" y="168.0" fill="#c9d1d9" font-size="13" text-anchor="end">qwen2.5-coder:14b-instruct</text>
 <rect x="210" y="152.0" width="430" height="20" rx="4" fill="#161b22"/>
-<rect x="210" y="152.0" width="166.5" height="20" rx="4" fill="#58a6ff"/>
-<text x="648" y="168.0" fill="#c9d1d9" font-size="12" font-weight="600">39%</text>
-<text x="198" y="203.0" fill="#c9d1d9" font-size="13" text-anchor="end">codestral:latest</text>
+<rect x="210" y="152.0" width="331.1" height="20" rx="4" fill="#3fb950"/>
+<text x="648" y="168.0" fill="#c9d1d9" font-size="12" font-weight="600">77%</text>
+<text x="198" y="202.0" fill="#c9d1d9" font-size="13" text-anchor="end">gemma3:12b</text>
 <rect x="210" y="186.0" width="430" height="20" rx="4" fill="#161b22"/>
-<rect x="210" y="186.0" width="152.6" height="20" rx="4" fill="#58a6ff"/>
-<text x="648" y="202.0" fill="#c9d1d9" font-size="12" font-weight="600">35%</text>
-<text x="198" y="237.0" fill="#c9d1d9" font-size="13" text-anchor="end">devstral:24b</text>
+<rect x="210" y="186.0" width="223.6" height="20" rx="4" fill="#58a6ff"/>
+<text x="648" y="202.0" fill="#c9d1d9" font-size="12" font-weight="600">52%</text>
+<text x="198" y="236.0" fill="#c9d1d9" font-size="13" text-anchor="end">qwen2.5-coder:32b-instruct</text>
 <rect x="210" y="220.0" width="430" height="20" rx="4" fill="#161b22"/>
-<rect x="210" y="220.0" width="138.7" height="20" rx="4" fill="#58a6ff"/>
-<text x="648" y="236.0" fill="#c9d1d9" font-size="12" font-weight="600">32%</text>
-<text x="198" y="271.0" fill="#c9d1d9" font-size="13" text-anchor="end">deepcoder:14b</text>
+<rect x="210" y="220.0" width="167.7" height="20" rx="4" fill="#58a6ff"/>
+<text x="648" y="236.0" fill="#c9d1d9" font-size="12" font-weight="600">39%</text>
+<text x="198" y="270.0" fill="#c9d1d9" font-size="13" text-anchor="end">codestral:latest</text>
 <rect x="210" y="254.0" width="430" height="20" rx="4" fill="#161b22"/>
-<rect x="210" y="254.0" width="97.1" height="20" rx="4" fill="#58a6ff"/>
-<text x="648" y="270.0" fill="#c9d1d9" font-size="12" font-weight="600">23%</text>
-<text x="198" y="305.0" fill="#c9d1d9" font-size="13" text-anchor="end">qwen2.5-coder:14b-instruct</text>
+<rect x="210" y="254.0" width="150.5" height="20" rx="4" fill="#58a6ff"/>
+<text x="648" y="270.0" fill="#c9d1d9" font-size="12" font-weight="600">35%</text>
+<text x="198" y="304.0" fill="#c9d1d9" font-size="13" text-anchor="end">devstral:24b</text>
 <rect x="210" y="288.0" width="430" height="20" rx="4" fill="#161b22"/>
-<rect x="210" y="288.0" width="55.5" height="20" rx="4" fill="#58a6ff"/>
-<text x="648" y="304.0" fill="#c9d1d9" font-size="12" font-weight="600">13%</text>
-<text x="198" y="339.0" fill="#c9d1d9" font-size="13" text-anchor="end">olmo2:13b</text>
+<rect x="210" y="288.0" width="137.6" height="20" rx="4" fill="#58a6ff"/>
+<text x="648" y="304.0" fill="#c9d1d9" font-size="12" font-weight="600">32%</text>
+<text x="198" y="338.0" fill="#c9d1d9" font-size="13" text-anchor="end">deepcoder:14b</text>
 <rect x="210" y="322.0" width="430" height="20" rx="4" fill="#161b22"/>
-<rect x="210" y="322.0" width="27.7" height="20" rx="4" fill="#58a6ff"/>
-<text x="648" y="338.0" fill="#c9d1d9" font-size="12" font-weight="600">6%</text>
-<text x="198" y="373.0" fill="#c9d1d9" font-size="13" text-anchor="end">gemma3:12b</text>
+<rect x="210" y="322.0" width="98.9" height="20" rx="4" fill="#58a6ff"/>
+<text x="648" y="338.0" fill="#c9d1d9" font-size="12" font-weight="600">23%</text>
+<text x="198" y="372.0" fill="#c9d1d9" font-size="13" text-anchor="end">olmo2:13b</text>
 <rect x="210" y="356.0" width="430" height="20" rx="4" fill="#161b22"/>
-<rect x="210" y="356.0" width="13.9" height="20" rx="4" fill="#58a6ff"/>
-<text x="648" y="372.0" fill="#c9d1d9" font-size="12" font-weight="600">3%</text>
-<text x="198" y="407.0" fill="#c9d1d9" font-size="13" text-anchor="end">qwen3.5:27b</text>
+<rect x="210" y="356.0" width="25.8" height="20" rx="4" fill="#58a6ff"/>
+<text x="648" y="372.0" fill="#c9d1d9" font-size="12" font-weight="600">6%</text>
+<text x="198" y="406.0" fill="#c9d1d9" font-size="13" text-anchor="end">starcoder2:15b</text>
 <rect x="210" y="390.0" width="430" height="20" rx="4" fill="#161b22"/>
-<rect x="210" y="390.0" width="1.0" height="20" rx="4" fill="#30363d"/>
-<text x="648" y="406.0" fill="#8b949e" font-size="12" font-weight="600">0%</text>
-<text x="198" y="441.0" fill="#c9d1d9" font-size="13" text-anchor="end">qwen3:32b</text>
+<rect x="210" y="390.0" width="12.9" height="20" rx="4" fill="#58a6ff"/>
+<text x="648" y="406.0" fill="#c9d1d9" font-size="12" font-weight="600">3%</text>
+<text x="198" y="440.0" fill="#c9d1d9" font-size="13" text-anchor="end">qwen3.5:27b</text>
 <rect x="210" y="424.0" width="430" height="20" rx="4" fill="#161b22"/>
 <rect x="210" y="424.0" width="1.0" height="20" rx="4" fill="#30363d"/>
 <text x="648" y="440.0" fill="#8b949e" font-size="12" font-weight="600">0%</text>
-<text x="198" y="475.0" fill="#c9d1d9" font-size="13" text-anchor="end">starcoder2:15b</text>
+<text x="198" y="474.0" fill="#c9d1d9" font-size="13" text-anchor="end">qwen3:32b</text>
 <rect x="210" y="458.0" width="430" height="20" rx="4" fill="#161b22"/>
 <rect x="210" y="458.0" width="1.0" height="20" rx="4" fill="#30363d"/>
 <text x="648" y="474.0" fill="#8b949e" font-size="12" font-weight="600">0%</text>
-<text x="198" y="509.0" fill="#c9d1d9" font-size="13" text-anchor="end">yi-coder:9b</text>
+<text x="198" y="508.0" fill="#c9d1d9" font-size="13" text-anchor="end">yi-coder:9b</text>
 <rect x="210" y="492.0" width="430" height="20" rx="4" fill="#161b22"/>
 <rect x="210" y="492.0" width="1.0" height="20" rx="4" fill="#30363d"/>
 <text x="648" y="508.0" fill="#8b949e" font-size="12" font-weight="600">0%</text>
-<text x="24" y="558" fill="#8b949e" font-size="11">Overall = all passing cases / 31 · latest sweep per model</text>
+<text x="24" y="558" fill="#8b949e" font-size="11">Overall = all passing cases / 31 · best-batch dedup per model</text>
 </svg>

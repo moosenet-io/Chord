@@ -155,7 +155,8 @@ Results from the **S86 coder-fleet sweep** on `gfx1151` (MINT v2 harness,
 [![BLITZ vs MULTI-FILE pass rate by model](docs/charts/coder-sweep-blitz-vs-multi.svg)](docs/test-results.md)
 
 `qwen3-coder:30b` tops the fleet at **81% overall** with a perfect BLITZ score and
-is now the served model on `gfx1151`; multi-file coordination is where the fleet
+is now the served model on `gfx1151`; `qwen2.5-coder:14b-instruct` is the best value
+at **77%**, tying the MoEs on multi-file. Multi-file coordination is where the fleet
 separates, and base/general models score near zero.
 
 ## License
