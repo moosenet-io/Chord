@@ -1,3 +1,10 @@
+[workspace]
+# The root `chord-proxy` package plus S91's control TUI client sub-crate.
+# `chord-tui` is a CLIENT of Chord's stable control endpoints — it never
+# links or restarts the proxy binary.
+members = [".", "crates/chord-tui"]
+resolver = "2"
+
 [package]
 name = "chord-proxy"
 version = "1.4.0"
