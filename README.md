@@ -141,15 +141,22 @@ Component explainers (written from the source in [`src/`](src)) live in
   the fail-closed posture, and the honest scope boundaries.
 - **[docs/snap-persistence.md](docs/snap-persistence.md)** — the optional,
   default-off SNAP → Postgres persistence layer (`CHORD_SNAP_PERSIST`).
+- **[docs/test-results.md](docs/test-results.md)** — the S86 coder-fleet sweep
+  results: themed BLITZ vs MULTI-FILE pass-rate charts, leaderboard, table, and
+  takeaways.
 - **[docs/README.md](docs/README.md)** — the docs index.
 
 ## Test Results
 
-<!-- CHART: per-model BLITZ vs MULTI-FILE pass rates — themed SVG, generated at coder-sweep completion -->
+Results from the **S86 coder-fleet sweep** on `gfx1151` (MINT v2 harness,
+`qwen3:8b` judge) — full charts, table, and takeaways in
+[`docs/test-results.md`](docs/test-results.md).
 
-Benchmark charts are generated from the **MINT v2 coder harness** run and will be
-committed under [`docs/charts/`](docs/charts/) (themed SVG, per-model BLITZ vs
-MULTI-FILE pass rates) once the coder sweep completes. _Charts pending._
+[![BLITZ vs MULTI-FILE pass rate by model](docs/charts/coder-sweep-blitz-vs-multi.svg)](docs/test-results.md)
+
+`qwen3-coder:30b` tops the fleet at **81% overall** with a perfect BLITZ score and
+is now the served model on `gfx1151`; multi-file coordination is where the fleet
+separates, and base/general models score near zero.
 
 ## License
 

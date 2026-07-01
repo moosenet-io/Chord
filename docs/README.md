@@ -25,10 +25,7 @@ and names the real modules and types behind each component.
 
 ## Test Results
 
-<!-- CHART: per-model BLITZ vs MULTI-FILE pass rates — themed SVG, generated at coder-sweep completion -->
-
-Benchmark charts are generated from the **MINT v2 coder harness** run and will be
-committed here (themed SVG, per-model BLITZ vs MULTI-FILE pass rates) once the
-coder sweep completes. Generated charts live in [`charts/`](charts/).
-
-_Charts pending — placeholder above is replaced at coder-sweep completion._
+- **[test-results.md](test-results.md)** — the **S86 coder-fleet sweep** on
+  `gfx1151` (MINT v2 harness, `qwen3:8b` judge): themed per-model BLITZ vs
+  MULTI-FILE pass-rate charts, an overall leaderboard, the full results table, and
+  takeaways. Generated charts live in [`charts/`](charts/).
