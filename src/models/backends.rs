@@ -10,6 +10,10 @@
 //!     pinned to one model on the **GPU**.
 //!   - `llama-gpu`              — a *generic* on-demand `llama-server` that loads
 //!     ANY requested model's Ollama blob on the GPU (`-m <blob> -ngl 999`).
+//!   - `vulkan`                 — a `llama-server` built with the Vulkan/RADV
+//!     (Mesa) backend (`-DGGML_VULKAN=ON`), a *driver-stable* alternative to the
+//!     ROCm-only lemonade build for dense large models when ROCm is unavailable
+//!     or unstable. Same generic on-demand shape as `llama-gpu`.
 //!
 //! Backends are **demand-driven by tags**: an on-demand backend is only started
 //! when a model tagged for it is requested, and stopped when idle (see
@@ -196,7 +200,85 @@ pub fn seed_from_env() -> HashMap<String, Backend> {
         },
     );
 
+    // Vulkan/RADV (Mesa) GPU backend: a llama.cpp `llama-server` built with
+    // `-DGGML_VULKAN=ON` (Mesa 25.0.7 RADV on gfx1151). A *driver-stable*
+    // alternative to the ROCm-only `lemonade-coder`/`llama-gpu` (b1258) build —
+    // useful when ROCm is unavailable or unstable. Memory-bound like HIP/ROCm
+    // (~5 tok/s at 70B), so it is intended for dense large models in batch/async
+    // mode, not latency-sensitive interactive traffic. Same generic on-demand
+    // shape as `llama-gpu`: serves ANY requested model's Ollama blob on the GPU.
+    //
+    // Validated on <host>: llama3.3:70b (Q4_K_M, 42.5GB) — cold-load ~13s, peak
+    // VRAM 50.6GB/96GB at 32k context, generation 5.3 tok/s (prompt 22–24
+    // tok/s), dmesg clean.
+    let vk_bin = std::env::var("VULKAN_LLAMA_BIN")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "/root/llama-vk/build/bin/llama-server".to_string());
+    let vk_port = std::env::var("VULKAN_LLAMA_PORT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "8083".to_string());
+    out.insert(
+        "vulkan".into(),
+        Backend {
+            name: "vulkan".into(),
+            url: format!("http://127.0.0.1:{vk_port}"),
+            hardware: Hardware::Gpu,
+            kind: BackendKind::LlamaServer,
+            unit: None,
+            always_on: false,
+            idle_stop_secs: 600,
+            launch: Some(LaunchSpec {
+                // Validated flags: RADV/Mesa gfx1151, fits 70B dense at 32k
+                // context in ~51GB VRAM. `--no-warmup` keeps cold-load ~13s.
+                bin: vk_bin,
+                args: vec![
+                    "-c".into(), "32768".into(),
+                    "-ngl".into(), "99".into(),
+                    "--no-mmap".into(),
+                    "--no-warmup".into(),
+                    "--host".into(), "127.0.0.1".into(),
+                    "--port".into(), vk_port,
+                ],
+                model_arg: "-m".into(),
+                model_from: default_model_from(),
+            }),
+        },
+    );
+
     out
+}
+
+/// Backend name of the Vulkan/RADV (Mesa) GPU serving backend.
+pub const VULKAN_BACKEND: &str = "vulkan";
+
+/// Whether a model is a **dense large** model (70B- or 32B-dense class) and thus
+/// a candidate for the driver-stable [`VULKAN_BACKEND`] serving backend.
+///
+/// This mirrors the dense-retest shortlist: Vulkan is memory-bound (~5 tok/s at
+/// 70B) but driver-stable, so it is offered for dense large models that run in
+/// batch/async mode. MoE / small models keep their default (ROCm/Ollama) routing.
+/// Name matching is on the `:<size>` tag suffix and is deliberately conservative
+/// — MoE tags (e.g. containing `a3b`, `moe`) are excluded even at large sizes.
+pub fn is_vulkan_candidate(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    // Exclude Mixture-of-Experts tags — Vulkan is for *dense* large models.
+    if lower.contains("moe") || lower.contains("a3b") || lower.contains("a22b") {
+        return false;
+    }
+    // llama3.3:70b is the confirmed dense-large validation model.
+    if lower.contains("llama3.3:70b") || lower.contains("llama3.3-70b") {
+        return true;
+    }
+    // 70B- and 32B-dense class by tag suffix.
+    let Some((_, tag)) = lower.rsplit_once(':') else {
+        return false;
+    };
+    matches!(
+        tag.trim_end_matches("-instruct").trim_end_matches("-q4_k_m"),
+        "70b" | "72b" | "32b" | "34b"
+    )
 }
 
 #[cfg(test)]
@@ -237,6 +319,37 @@ mod tests {
         assert_eq!(g.kind, BackendKind::LlamaServer);
         assert!(g.on_demand());
         assert!(g.launch.is_some());
+    }
+
+    #[test]
+    fn seed_from_env_includes_vulkan() {
+        // vulkan is always offered regardless of env (like llama-gpu).
+        std::env::remove_var("VULKAN_LLAMA_BIN");
+        std::env::remove_var("VULKAN_LLAMA_PORT");
+        let b = seed_from_env();
+        assert!(b.contains_key("vulkan"));
+        let v = &b["vulkan"];
+        assert_eq!(v.name, "vulkan");
+        assert_eq!(v.hardware, Hardware::Gpu);
+        assert_eq!(v.kind, BackendKind::LlamaServer);
+        assert!(v.on_demand());
+        let l = v.launch.as_ref().expect("vulkan has a launch spec");
+        assert_eq!(l.bin, "/root/llama-vk/build/bin/llama-server");
+        assert_eq!(l.model_arg, "-m");
+        assert!(l.args.contains(&"--no-mmap".to_string()));
+        assert!(l.args.contains(&"--no-warmup".to_string()));
+    }
+
+    #[test]
+    fn vulkan_candidate_dense_large_only() {
+        assert!(is_vulkan_candidate("llama3.3:70b"));
+        assert!(is_vulkan_candidate("qwen2.5:72b-instruct"));
+        assert!(is_vulkan_candidate("qwen2.5-coder:32b"));
+        // MoE and small models are NOT candidates.
+        assert!(!is_vulkan_candidate("qwen3-a3b:30b"));
+        assert!(!is_vulkan_candidate("qwen3-coder:30b"));
+        assert!(!is_vulkan_candidate("qwen3:8b"));
+        assert!(!is_vulkan_candidate("untagged-name"));
     }
 
     #[test]
