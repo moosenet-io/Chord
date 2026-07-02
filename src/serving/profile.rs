@@ -53,10 +53,15 @@ use terminus_rs::intake::serving::{ModelId, Runtime, ServingProfile};
 ///     `--flash-attn`.
 ///   - `cpu_library` / `cpu_lib` (string) — explicit cpu-runtime library for the
 ///     genuine-CPU tier (the empty-gfx-override path).
+///   - `rope_scaling` (object, YARN-01) — an optional context-extension block for
+///     the llama.cpp tier: `method` (`none`/`linear`/`yarn`, default `none`),
+///     `rope_scale`, `yarn_orig_ctx`, `target_ctx`, `ext_factor`, `attn_factor`,
+///     `beta_slow`, `beta_fast`, and `validated` (bool, default `false`). See
+///     [`RopeScaling`] for the emission rules the launcher applies.
 ///
 /// Unknown keys are ignored (forward-compatible: a newer runner can add hints an
 /// older Chord harmlessly skips).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct EnvSpec {
     /// Explicit `HSA_OVERRIDE_GFX_VERSION` value. `Some("")` is meaningful (the CPU
     /// tier's deliberate empty override); `None` ⇒ no explicit value (see
@@ -78,6 +83,180 @@ pub struct EnvSpec {
     /// (the SRV-12 context-slash sidestep). Parsed from `n_ctx` / `ctx`. `None` ⇒
     /// the swap barrier computes a safe default from the model's footprint.
     pub n_ctx: Option<u32>,
+    /// YARN-01: optional context-extension config for the llama.cpp tier. `None`
+    /// ⇒ no `rope_scaling` key present (unchanged behavior — no scaling flags).
+    /// `Some(rope)` with `rope.method == RopeScalingMethod::None` is equivalent to
+    /// absent. See [`RopeScaling`] for the launcher's emission rules.
+    pub rope_scaling: Option<RopeScaling>,
+}
+
+/// YARN-01: the llama.cpp RoPE context-extension method a [`RopeScaling`] block
+/// requests. Mirrors llama.cpp's `--rope-scaling` argument vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RopeScalingMethod {
+    /// No context extension (unchanged native-context behavior).
+    #[default]
+    None,
+    /// Linear RoPE scaling (`--rope-scaling linear`).
+    Linear,
+    /// YaRN RoPE scaling (`--rope-scaling yarn`), with the yarn-specific
+    /// fine-tune flags (orig-ctx / ext-factor / attn-factor / beta-slow /
+    /// beta-fast).
+    Yarn,
+}
+
+impl RopeScalingMethod {
+    /// The literal value the llama.cpp `--rope-scaling` flag expects.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RopeScalingMethod::None => "none",
+            RopeScalingMethod::Linear => "linear",
+            RopeScalingMethod::Yarn => "yarn",
+        }
+    }
+
+    /// Parse the `env_json` `method` string. Unknown values are rejected (`None`
+    /// return, not defaulted) so a typo'd method never silently becomes a no-op —
+    /// the caller treats a parse failure as an invalid config (warn, don't emit).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "none" => Some(RopeScalingMethod::None),
+            "linear" => Some(RopeScalingMethod::Linear),
+            "yarn" => Some(RopeScalingMethod::Yarn),
+            _ => None,
+        }
+    }
+}
+
+/// YARN-01: a per-model RoPE context-extension config (llama.cpp tier only). Read
+/// from the serving profile's `env_json.rope_scaling` object; the ollama and CPU
+/// launchers ignore it (context extension is unavailable on those tiers — see
+/// [`super::launcher`]).
+///
+/// All numeric values are sourced from the profile row — the launcher never
+/// invents or hardcodes a scaling constant. `validated` gates emission: a
+/// `method != none` block that has not been validated on gfx1151 serves at native
+/// context (no yarn flags) rather than risk an unvalidated launch.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct RopeScaling {
+    /// The requested scaling method. `None` (the enum variant) ⇒ no extension.
+    pub method: RopeScalingMethod,
+    /// `--rope-scale` value (linear and yarn).
+    pub rope_scale: f64,
+    /// `--yarn-orig-ctx` value (yarn only).
+    pub yarn_orig_ctx: u32,
+    /// The desired extended context; becomes `--ctx-size` when the block is
+    /// emitted.
+    pub target_ctx: u32,
+    /// `--yarn-ext-factor` value (yarn only).
+    pub ext_factor: f64,
+    /// `--yarn-attn-factor` value (yarn only).
+    pub attn_factor: f64,
+    /// `--yarn-beta-slow` value (yarn only).
+    pub beta_slow: f64,
+    /// `--yarn-beta-fast` value (yarn only).
+    pub beta_fast: f64,
+    /// Whether this config has been validated on gfx1151. `false` ⇒ the launcher
+    /// refuses to emit yarn flags even though the block is present (serves at
+    /// native context, with a warning).
+    pub validated: bool,
+}
+
+/// Parse the `rope_scaling` object out of an already-parsed `env_json` map.
+///
+/// Returns `None` (no block, i.e. unchanged native-context behavior) when the key
+/// is absent, malformed, names an unknown method, or is missing a field the
+/// chosen method requires — every one of those is an INVALID config, logged and
+/// treated as absent rather than emitted partially or guessed.
+fn parse_rope_scaling(obj: &serde_json::Map<String, serde_json::Value>) -> Option<RopeScaling> {
+    let rs = obj.get("rope_scaling")?.as_object()?;
+
+    let method = match rs.get("method").and_then(|v| v.as_str()) {
+        Some(s) => match RopeScalingMethod::parse(s) {
+            Some(m) => m,
+            None => {
+                tracing::warn!(
+                    target: "chord.serving.profile",
+                    method = s,
+                    "rope_scaling.method unrecognized — ignoring config"
+                );
+                return None;
+            }
+        },
+        None => RopeScalingMethod::None,
+    };
+    let validated = rs.get("validated").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    if method == RopeScalingMethod::None {
+        return Some(RopeScaling {
+            method,
+            validated,
+            ..Default::default()
+        });
+    }
+
+    let rope_scale = rs.get("rope_scale").and_then(|v| v.as_f64());
+    let target_ctx = rs
+        .get("target_ctx")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok());
+
+    // Linear needs only `rope_scale` + `target_ctx`; yarn additionally needs the
+    // original-context + fine-tune quartet.
+    let (rope_scale, target_ctx) = match (rope_scale, target_ctx) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            tracing::warn!(
+                target: "chord.serving.profile",
+                method = method.as_str(),
+                "rope_scaling missing required field (rope_scale/target_ctx) — ignoring config"
+            );
+            return None;
+        }
+    };
+
+    if method == RopeScalingMethod::Linear {
+        return Some(RopeScaling {
+            method,
+            rope_scale,
+            target_ctx,
+            validated,
+            ..Default::default()
+        });
+    }
+
+    // method == Yarn: the orig-ctx + fine-tune quartet is required.
+    let yarn_orig_ctx = rs
+        .get("yarn_orig_ctx")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok());
+    let ext_factor = rs.get("ext_factor").and_then(|v| v.as_f64());
+    let attn_factor = rs.get("attn_factor").and_then(|v| v.as_f64());
+    let beta_slow = rs.get("beta_slow").and_then(|v| v.as_f64());
+    let beta_fast = rs.get("beta_fast").and_then(|v| v.as_f64());
+
+    match (yarn_orig_ctx, ext_factor, attn_factor, beta_slow, beta_fast) {
+        (Some(yarn_orig_ctx), Some(ext_factor), Some(attn_factor), Some(beta_slow), Some(beta_fast)) => {
+            Some(RopeScaling {
+                method,
+                rope_scale,
+                yarn_orig_ctx,
+                target_ctx,
+                ext_factor,
+                attn_factor,
+                beta_slow,
+                beta_fast,
+                validated,
+            })
+        }
+        _ => {
+            tracing::warn!(
+                target: "chord.serving.profile",
+                "rope_scaling method=yarn missing a required field (yarn_orig_ctx/ext_factor/attn_factor/beta_slow/beta_fast) — ignoring config"
+            );
+            None
+        }
+    }
 }
 
 impl EnvSpec {
@@ -126,6 +305,8 @@ impl EnvSpec {
             .or_else(|| obj.get("ctx").and_then(|x| x.as_u64()))
             .and_then(|n| u32::try_from(n).ok());
 
+        let rope_scaling = parse_rope_scaling(obj);
+
         EnvSpec {
             gfx_override,
             gfx_apply_host_default,
@@ -133,6 +314,7 @@ impl EnvSpec {
             flash_attn: obj.get("flash_attn").and_then(|x| x.as_bool()),
             cpu_library,
             n_ctx,
+            rope_scaling,
         }
     }
 }
@@ -591,6 +773,69 @@ mod tests {
         let map = RoutingMap::load(&src).await.unwrap();
         assert_eq!(map.len(), 1);
         assert!(!map.is_empty());
+    }
+
+    #[test]
+    fn envspec_rope_scaling_absent_is_none() {
+        assert_eq!(EnvSpec::parse("{}").rope_scaling, None);
+    }
+
+    #[test]
+    fn envspec_parses_valid_yarn_rope_scaling() {
+        let spec = EnvSpec::parse(
+            r#"{"rope_scaling":{"method":"yarn","rope_scale":4.0,"yarn_orig_ctx":32768,
+                "target_ctx":131072,"ext_factor":1.0,"attn_factor":1.0,"beta_slow":1.0,
+                "beta_fast":32.0,"validated":true}}"#,
+        );
+        let rope = spec.rope_scaling.expect("yarn block parsed");
+        assert_eq!(rope.method, RopeScalingMethod::Yarn);
+        assert_eq!(rope.rope_scale, 4.0);
+        assert_eq!(rope.yarn_orig_ctx, 32768);
+        assert_eq!(rope.target_ctx, 131072);
+        assert_eq!(rope.ext_factor, 1.0);
+        assert_eq!(rope.attn_factor, 1.0);
+        assert_eq!(rope.beta_slow, 1.0);
+        assert_eq!(rope.beta_fast, 32.0);
+        assert!(rope.validated);
+    }
+
+    #[test]
+    fn envspec_parses_valid_linear_rope_scaling() {
+        let spec = EnvSpec::parse(
+            r#"{"rope_scaling":{"method":"linear","rope_scale":2.0,"target_ctx":16384,"validated":true}}"#,
+        );
+        let rope = spec.rope_scaling.expect("linear block parsed");
+        assert_eq!(rope.method, RopeScalingMethod::Linear);
+        assert_eq!(rope.rope_scale, 2.0);
+        assert_eq!(rope.target_ctx, 16384);
+        // yarn-only fields default to zero — the launcher never emits them for linear.
+        assert_eq!(rope.yarn_orig_ctx, 0);
+    }
+
+    #[test]
+    fn envspec_rope_scaling_missing_required_field_is_invalid() {
+        // yarn missing the fine-tune quartet.
+        let spec = EnvSpec::parse(
+            r#"{"rope_scaling":{"method":"yarn","rope_scale":4.0,"target_ctx":131072,"validated":true}}"#,
+        );
+        assert_eq!(spec.rope_scaling, None);
+        // linear missing target_ctx.
+        let spec2 =
+            EnvSpec::parse(r#"{"rope_scaling":{"method":"linear","rope_scale":2.0,"validated":true}}"#);
+        assert_eq!(spec2.rope_scaling, None);
+    }
+
+    #[test]
+    fn envspec_rope_scaling_unknown_method_is_invalid() {
+        let spec = EnvSpec::parse(r#"{"rope_scaling":{"method":"bogus"}}"#);
+        assert_eq!(spec.rope_scaling, None);
+    }
+
+    #[test]
+    fn envspec_rope_scaling_method_none_is_default_shape() {
+        let spec = EnvSpec::parse(r#"{"rope_scaling":{"method":"none"}}"#);
+        let rope = spec.rope_scaling.expect("present, but a no-op method");
+        assert_eq!(rope.method, RopeScalingMethod::None);
     }
 
     #[test]
