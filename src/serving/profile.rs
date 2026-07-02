@@ -162,6 +162,30 @@ pub struct RopeScaling {
     pub validated: bool,
 }
 
+impl RopeScaling {
+    /// YARN-01 plausibility gate: a `validated=true` block can still carry
+    /// garbage numbers (e.g. a bad manual edit, a unit mix-up) — this is the
+    /// last line of defense before the launcher emits them verbatim to
+    /// `llama-server`. Deliberately conservative sanity bounds, NOT a physics
+    /// model: `rope_scale` must be positive; for `yarn`, `ext_factor` /
+    /// `attn_factor` must fall in `[0.0, 1.0]` and both betas must be
+    /// non-negative. `method == None` is trivially plausible (nothing is
+    /// emitted for it anyway).
+    pub fn is_plausible(&self) -> bool {
+        match self.method {
+            RopeScalingMethod::None => true,
+            RopeScalingMethod::Linear => self.rope_scale > 0.0,
+            RopeScalingMethod::Yarn => {
+                self.rope_scale > 0.0
+                    && (0.0..=1.0).contains(&self.ext_factor)
+                    && (0.0..=1.0).contains(&self.attn_factor)
+                    && self.beta_slow >= 0.0
+                    && self.beta_fast >= 0.0
+            }
+        }
+    }
+}
+
 /// Parse the `rope_scaling` object out of an already-parsed `env_json` map.
 ///
 /// Returns `None` (no block, i.e. unchanged native-context behavior) when the key
@@ -836,6 +860,66 @@ mod tests {
         let spec = EnvSpec::parse(r#"{"rope_scaling":{"method":"none"}}"#);
         let rope = spec.rope_scaling.expect("present, but a no-op method");
         assert_eq!(rope.method, RopeScalingMethod::None);
+    }
+
+    #[test]
+    fn rope_scaling_is_plausible_accepts_sane_yarn_values() {
+        let rope = RopeScaling {
+            method: RopeScalingMethod::Yarn,
+            rope_scale: 4.0,
+            yarn_orig_ctx: 32768,
+            target_ctx: 131072,
+            ext_factor: 1.0,
+            attn_factor: 1.0,
+            beta_slow: 1.0,
+            beta_fast: 32.0,
+            validated: true,
+        };
+        assert!(rope.is_plausible());
+    }
+
+    #[test]
+    fn rope_scaling_is_plausible_rejects_nonpositive_rope_scale() {
+        let mut rope = RopeScaling {
+            method: RopeScalingMethod::Yarn,
+            rope_scale: 0.0,
+            yarn_orig_ctx: 32768,
+            target_ctx: 131072,
+            ext_factor: 1.0,
+            attn_factor: 1.0,
+            beta_slow: 1.0,
+            beta_fast: 32.0,
+            validated: true,
+        };
+        assert!(!rope.is_plausible());
+        rope.rope_scale = -2.0;
+        assert!(!rope.is_plausible());
+    }
+
+    #[test]
+    fn rope_scaling_is_plausible_rejects_out_of_bounds_yarn_factors() {
+        let base = RopeScaling {
+            method: RopeScalingMethod::Yarn,
+            rope_scale: 4.0,
+            yarn_orig_ctx: 32768,
+            target_ctx: 131072,
+            ext_factor: 1.0,
+            attn_factor: 1.0,
+            beta_slow: 1.0,
+            beta_fast: 32.0,
+            validated: true,
+        };
+        let mut bad_ext = base;
+        bad_ext.ext_factor = 5.0; // way outside [0,1]
+        assert!(!bad_ext.is_plausible());
+
+        let mut bad_attn = base;
+        bad_attn.attn_factor = -0.5;
+        assert!(!bad_attn.is_plausible());
+
+        let mut bad_beta = base;
+        bad_beta.beta_slow = -1.0;
+        assert!(!bad_beta.is_plausible());
     }
 
     #[test]

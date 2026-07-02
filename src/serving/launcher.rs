@@ -308,8 +308,13 @@ fn resolve_gfx_override(env: &EnvSpec) -> Option<String> {
 ///   - `method == None` ⇒ no flags (unchanged native-context behavior).
 ///   - `method != None` but `!validated` ⇒ no flags; the caller logs the
 ///     "configured but not validated" warning and serves at native context.
-///   - `target_ctx <= yarn_orig_ctx` ⇒ no extension needed; no-op even when
-///     validated (nothing to gain from scaling down/flat).
+///   - `validated` but [`RopeScaling::is_plausible`] fails (e.g. a bad manual
+///     edit) ⇒ no flags; refuses to emit garbage to `llama-server`, same
+///     native-context fallback as the unvalidated path.
+///   - `method == Yarn` and `target_ctx <= yarn_orig_ctx` ⇒ no extension
+///     needed; no-op even when validated (nothing to gain from scaling
+///     down/flat). Yarn-specific: `yarn_orig_ctx` defaults to 0 for linear,
+///     where there is no original-context concept.
 ///   - otherwise: `--rope-scaling <method>`, `--rope-scale <rope_scale>`, and
 ///     `--ctx-size <target_ctx>`; `method == Yarn` additionally gets the
 ///     yarn-specific fine-tune flags (`--yarn-orig-ctx`, `--yarn-ext-factor`,
@@ -327,7 +332,25 @@ fn rope_scaling_args(rope: &RopeScaling) -> Vec<String> {
         );
         return Vec::new();
     }
-    if rope.target_ctx <= rope.yarn_orig_ctx {
+    // Plausibility gate: `validated=true` is not a license to emit whatever
+    // numbers are in the row verbatim — a bad manual edit or unit mix-up must
+    // never reach `llama-server` as-is. Same fallback as the unvalidated path:
+    // native context, no flags.
+    if !rope.is_plausible() {
+        tracing::warn!(
+            target: "chord.serving.launcher",
+            method = rope.method.as_str(),
+            rope_scale = rope.rope_scale,
+            ext_factor = rope.ext_factor,
+            attn_factor = rope.attn_factor,
+            "yarn validated but parameters implausible — refusing to emit, serving at native context"
+        );
+        return Vec::new();
+    }
+    // "No extension needed" is a yarn-specific check: `yarn_orig_ctx` defaults
+    // to 0 for linear (no original-context concept there), so scoping this to
+    // `Yarn` avoids a spurious no-op read for the linear method.
+    if rope.method == RopeScalingMethod::Yarn && rope.target_ctx <= rope.yarn_orig_ctx {
         tracing::warn!(
             target: "chord.serving.launcher",
             target_ctx = rope.target_ctx,
@@ -1001,6 +1024,43 @@ mod tests {
         assert_eq!(cmd.args, vec!["--model".to_string(), "/w/m.gguf".to_string()]);
         assert!(!cmd.args.iter().any(|a| a.starts_with("--rope") || a.starts_with("--yarn")));
         assert!(!cmd.args.contains(&"--ctx-size".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn llama_command_implausible_validated_yarn_emits_no_flags() {
+        // NEGATIVE TEST: validated=true does NOT license emitting garbage numbers
+        // verbatim to llama-server. A nonsensical rope_scale (<=0) must refuse to
+        // emit, same as the unvalidated path (native context, no flags).
+        set_runtime_endpoints();
+        let e = entry(
+            "big:coder",
+            ServingBackend::LlamaGpu,
+            Runtime::LlamaCpp,
+            r#"{"rope_scaling":{"method":"yarn","rope_scale":-1.0,"yarn_orig_ctx":32768,
+                "target_ctx":131072,"ext_factor":1.0,"attn_factor":1.0,"beta_slow":1.0,
+                "beta_fast":32.0,"validated":true}}"#,
+            false,
+            None,
+        );
+        let cmd = build_launch_command(&e, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
+        assert_eq!(cmd.args, vec!["--model".to_string(), "/w/m.gguf".to_string()]);
+        assert!(!cmd.args.iter().any(|a| a.starts_with("--rope") || a.starts_with("--yarn")));
+        assert!(!cmd.args.contains(&"--ctx-size".to_string()));
+
+        // An ext_factor wildly outside [0,1] is equally implausible.
+        let e2 = entry(
+            "big:coder",
+            ServingBackend::LlamaGpu,
+            Runtime::LlamaCpp,
+            r#"{"rope_scaling":{"method":"yarn","rope_scale":4.0,"yarn_orig_ctx":32768,
+                "target_ctx":131072,"ext_factor":50.0,"attn_factor":1.0,"beta_slow":1.0,
+                "beta_fast":32.0,"validated":true}}"#,
+            false,
+            None,
+        );
+        let cmd2 = build_launch_command(&e2, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
+        assert_eq!(cmd2.args, vec!["--model".to_string(), "/w/m.gguf".to_string()]);
     }
 
     #[test]
