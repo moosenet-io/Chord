@@ -30,6 +30,7 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
 use terminus_rs::intake::serving::{ModelId, Runtime, ServingProfile};
 
 /// Typed view of a serving row's `env_json` launch hints.
@@ -92,7 +93,13 @@ pub struct EnvSpec {
 
 /// YARN-01: the llama.cpp RoPE context-extension method a [`RopeScaling`] block
 /// requests. Mirrors llama.cpp's `--rope-scaling` argument vocabulary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// YARN-02 adds `Serialize`/`Deserialize` so the ingestion pipeline can persist
+/// a pre-filled block on a [`crate::models::registry::ModelRecord`] (the local
+/// model registry's own JSON file) — a separate persistence path from the
+/// `env_json` string this module otherwise parses by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum RopeScalingMethod {
     /// No context extension (unchanged native-context behavior).
     #[default]
@@ -137,7 +144,7 @@ impl RopeScalingMethod {
 /// invents or hardcodes a scaling constant. `validated` gates emission: a
 /// `method != none` block that has not been validated on gfx1151 serves at native
 /// context (no yarn flags) rather than risk an unvalidated launch.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct RopeScaling {
     /// The requested scaling method. `None` (the enum variant) ⇒ no extension.
     pub method: RopeScalingMethod,
