@@ -32,12 +32,14 @@
 //! [`evaluate`] can only recommend `validated: true` when ALL of the
 //! following hold: the [`LaunchReport`] served stably, at least one
 //! extended-context probe was actually collected, the deepest probe reached
-//! the full `target_ctx`, the native baseline itself is above
-//! [`WEAK_BASELINE_THRESHOLD`] (an absolute floor — a near-zero baseline makes
-//! the *relative* collapse check below carry no signal, since its threshold
-//! shrinks to near-zero right along with it), and no probe's combined score
-//! collapsed relative to that baseline. There is no code path that flips
-//! `validated` without that full evidence trail attached to the returned
+//! the full `target_ctx`, the native baseline score is a FINITE number, the
+//! native baseline itself is above [`WEAK_BASELINE_THRESHOLD`] (an absolute
+//! floor — a near-zero baseline makes the *relative* collapse check below
+//! carry no signal, since its threshold shrinks to near-zero right along with
+//! it), and no probe's combined score collapsed (or was itself non-finite —
+//! an invalid score is treated as a collapse, never silently ignored)
+//! relative to that baseline. There is no code path that flips `validated`
+//! without that full evidence trail attached to the returned
 //! [`ValidationEvidence`].
 
 use serde::{Deserialize, Serialize};
@@ -113,6 +115,16 @@ impl ProbeResult {
     /// collapse — exactly the failure mode YARN-03 cares most about
     /// distinguishing from a serving failure.
     pub fn combined_score(&self) -> f64 {
+        // `f64::min` deliberately ignores NaN (it returns the OTHER operand
+        // when one side is NaN) — exactly wrong for this use: a NaN input
+        // here means the grading round-trip on that side produced garbage,
+        // and that must propagate as an invalid (non-finite) combined score
+        // rather than be silently masked by whichever side happened to be a
+        // real number. Every non-finite consumer downstream (the `evaluate`
+        // collapse/baseline guards) relies on this propagation.
+        if self.recall_score.is_nan() || self.coherence_score.is_nan() {
+            return f64::NAN;
+        }
         self.recall_score.min(self.coherence_score)
     }
 }
@@ -238,7 +250,15 @@ pub fn evaluate(
     target_ctx: u32,
 ) -> ValidationEvidence {
     let native_baseline_score = native_baseline.combined_score();
-    let native_baseline_weak = native_baseline_score < WEAK_BASELINE_THRESHOLD;
+    // `native_baseline_score < WEAK_BASELINE_THRESHOLD` is `false` for a NaN
+    // score (NaN compares false against everything), so `is_finite()` must be
+    // checked separately rather than folded into the weak-baseline predicate
+    // — otherwise a NaN baseline would silently skip BOTH the weak-baseline
+    // floor and the relative collapse check below. A negative finite score
+    // needs no special handling: it naturally compares `< WEAK_BASELINE_THRESHOLD`
+    // (a positive constant), so it already trips the weak-baseline floor.
+    let native_baseline_weak =
+        native_baseline_score.is_finite() && native_baseline_score < WEAK_BASELINE_THRESHOLD;
     let extended_scores: Vec<(u32, f64)> = extended_probes
         .iter()
         .map(|p| (p.depth_tokens, p.combined_score()))
@@ -315,6 +335,30 @@ pub fn evaluate(
         };
     }
 
+    // Served stably with full-depth coverage, but the native baseline score
+    // itself is not a finite number (NaN or +/-inf — e.g. the native probe's
+    // fact-planting/grading round-trip itself failed). This is checked BEFORE
+    // (and separately from) the weak-baseline floor: `NaN < WEAK_BASELINE_THRESHOLD`
+    // is `false`, so a NaN baseline would otherwise slip past that floor AND
+    // the relative collapse check (`x < NaN` is also always `false`), landing
+    // on validated=true against garbage evidence. Never trust an invalid score.
+    if !native_baseline_score.is_finite() {
+        return ValidationEvidence {
+            validated: false,
+            served_stably: true,
+            failure_depth_tokens: None,
+            failure_reason: Some(format!(
+                "native baseline score is not a finite value ({native_baseline_score:?}) — cannot validate against invalid evidence"
+            )),
+            vram_gb_at_extended_ctx: launch.vram_gb_at_extended_ctx,
+            backend_used: launch.backend_used.clone(),
+            max_ctx_that_fit: launch.max_ctx_that_fit,
+            native_baseline_score,
+            native_baseline_weak,
+            extended_scores,
+        };
+    }
+
     // Served stably with full-depth coverage, but the native baseline itself
     // is too weak to validate against: the relative collapse check below is a
     // RATIO of native_baseline_score, so a zero (or near-zero) baseline makes
@@ -346,21 +390,39 @@ pub fn evaluate(
     // collapse at any probed depth relative to the native baseline. The FIRST
     // collapsing depth is recorded (not the worst) so the evidence shows
     // where things started going wrong.
+    //
+    // A non-finite (NaN or +/-inf) probe score is treated as a collapse at
+    // its depth rather than compared numerically: `NaN < collapse_threshold`
+    // is always `false`, so relying on the plain comparison would silently
+    // count a degenerate probe as "holding". Fail-safe instead — invalid
+    // evidence counts AGAINST validation, never for it. A negative finite
+    // score needs no special case: it naturally compares `< collapse_threshold`
+    // (a non-negative value here, since the baseline already passed the
+    // weak/finite floors above), so it already trips the collapse path.
     let collapse_threshold = native_baseline_score * COLLAPSE_RATIO;
-    let collapse = extended_probes
-        .iter()
-        .find(|p| p.combined_score() < collapse_threshold);
+    let collapse = extended_probes.iter().find(|p| {
+        let score = p.combined_score();
+        !score.is_finite() || score < collapse_threshold
+    });
 
     let validated = collapse.is_none();
     let failure_depth_tokens = collapse.map(|p| p.depth_tokens);
     let failure_reason = collapse.map(|p| {
-        format!(
-            "recall/coherence collapsed at depth {} tokens: combined score {:.3} fell below {:.0}% of native baseline ({:.3})",
-            p.depth_tokens,
-            p.combined_score(),
-            COLLAPSE_RATIO * 100.0,
-            native_baseline_score
-        )
+        let score = p.combined_score();
+        if !score.is_finite() {
+            format!(
+                "recall/coherence probe at depth {} tokens produced a non-finite score ({:?}) — treated as a collapse (invalid evidence never counts as holding)",
+                p.depth_tokens, score
+            )
+        } else {
+            format!(
+                "recall/coherence collapsed at depth {} tokens: combined score {:.3} fell below {:.0}% of native baseline ({:.3})",
+                p.depth_tokens,
+                score,
+                COLLAPSE_RATIO * 100.0,
+                native_baseline_score
+            )
+        }
     });
 
     ValidationEvidence {
@@ -477,6 +539,26 @@ mod tests {
         };
         // A fluent-but-wrong completion must not average away a recall miss.
         assert_eq!(p.combined_score(), 0.2);
+    }
+
+    #[test]
+    fn combined_score_propagates_nan_instead_of_masking_it() {
+        // f64::min ignores NaN and returns the OTHER operand — combined_score
+        // must NOT inherit that behavior, or a garbage grading round-trip on
+        // one side would silently read as a real, healthy score.
+        let recall_nan = ProbeResult {
+            depth_tokens: 1000,
+            recall_score: f64::NAN,
+            coherence_score: 0.9,
+        };
+        assert!(recall_nan.combined_score().is_nan());
+
+        let coherence_nan = ProbeResult {
+            depth_tokens: 1000,
+            recall_score: 0.9,
+            coherence_score: f64::NAN,
+        };
+        assert!(coherence_nan.combined_score().is_nan());
     }
 
     // ---- evaluate: positive case ----------------------------------------
@@ -767,6 +849,87 @@ mod tests {
         assert!(reason.contains("native baseline too weak to validate against"));
         assert!(!reason.contains("no extended-context probes collected"));
         assert!(!reason.contains("did not reach the full target context"));
+    }
+
+    // ---- evaluate: NaN native baseline — cycle-3 reviewer-flagged bypass -
+    // `f64::min` (used by `combined_score`) ignores NaN, and `NaN < x` /
+    // `x < NaN` are always `false`. Without an explicit `is_finite()` check,
+    // a NaN baseline would skip BOTH the weak-baseline floor (`NaN <
+    // WEAK_BASELINE_THRESHOLD` is false) AND the relative collapse check
+    // (`x < NaN` is false for every probe) — a validated=true against a
+    // garbage baseline. This must be caught by its OWN distinct reason, not
+    // conflated with "weak" or "no probes".
+
+    #[test]
+    fn nan_native_baseline_never_validates_true_with_distinct_reason() {
+        let nan_native = ProbeResult {
+            depth_tokens: 8_000,
+            recall_score: f64::NAN,
+            coherence_score: f64::NAN,
+        };
+        let extended = vec![strong_probe(30_000), strong_probe(60_000), strong_probe(100_000)];
+        let launch = LaunchReport {
+            served_stably: true,
+            failure_reason: None,
+            vram_gb_at_extended_ctx: Some(30.0),
+            backend_used: "rocm".to_string(),
+            max_ctx_that_fit: None,
+        };
+
+        let evidence = evaluate(nan_native, &extended, &launch, 100_000);
+
+        assert!(
+            !evidence.validated,
+            "a NaN native baseline must never produce validated=true"
+        );
+        assert!(evidence.served_stably);
+        let reason = evidence.failure_reason.as_deref().unwrap();
+        assert!(reason.contains("not a finite value"));
+        // Distinct from the weak-baseline and empty/depth-coverage reasons.
+        assert!(!reason.contains("too weak to validate against"));
+        assert!(!reason.contains("no extended-context probes collected"));
+        assert!(!reason.contains("did not reach the full target context"));
+    }
+
+    // ---- evaluate: healthy baseline, one NaN extended probe --------------
+
+    #[test]
+    fn nan_extended_probe_is_recorded_as_the_collapse_point() {
+        let native = strong_probe(8_000); // healthy, finite baseline
+        let extended = vec![
+            strong_probe(30_000),
+            ProbeResult {
+                depth_tokens: 60_000,
+                recall_score: f64::NAN,
+                coherence_score: 0.9,
+            },
+            strong_probe(100_000),
+        ];
+        let launch = LaunchReport {
+            served_stably: true,
+            failure_reason: None,
+            vram_gb_at_extended_ctx: Some(30.0),
+            backend_used: "rocm".to_string(),
+            max_ctx_that_fit: None,
+        };
+
+        let evidence = evaluate(native, &extended, &launch, 100_000);
+
+        assert!(
+            !evidence.validated,
+            "a non-finite probe score must never be silently treated as holding"
+        );
+        assert!(evidence.served_stably);
+        assert_eq!(
+            evidence.failure_depth_tokens,
+            Some(60_000),
+            "the NaN probe's depth must be recorded as the failure/collapse point"
+        );
+        assert!(evidence
+            .failure_reason
+            .as_deref()
+            .unwrap()
+            .contains("non-finite score"));
     }
 
     // ---- run_validation: end-to-end with mocked launcher + prober -------
