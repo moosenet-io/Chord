@@ -183,14 +183,38 @@ fn read_f64(r: &mut impl Read) -> io::Result<f64> {
     Ok(f64::from_le_bytes(read_exact_buf(r)?))
 }
 
+/// Absolute per-string sane bound (key or value), independent of file size —
+/// no legitimate GGUF key or rope/architecture string is anywhere near this
+/// large. Defeats a crafted/corrupt length prefix (e.g. `0xFFFFFFFFFFFFFF`)
+/// that would otherwise reach `vec![0u8; len]` and abort the process with an
+/// unrecoverable allocation failure (SIGABRT) before any error handling can
+/// run — `usize::try_from(len)` alone does NOT catch this on a 64-bit target,
+/// since a multi-exabyte `u64` still fits in a 64-bit `usize`.
+const MAX_GGUF_STRING_LEN: u64 = 8 * 1024 * 1024; // 8 MiB
+
 /// GGUF string: `u64` length prefix + that many raw bytes (no NUL terminator).
 /// Invalid UTF-8 is lossily replaced rather than failing the whole parse — a
 /// garbled string in an unrelated key must not abort ingestion of the keys we
 /// actually want.
-fn read_gguf_string(r: &mut impl Read) -> io::Result<String> {
+///
+/// `file_len` bounds the length prefix a second way: a string cannot possibly
+/// be larger than the file it lives in, so any claimed length exceeding the
+/// file's own byte count is provably bogus and rejected before allocating —
+/// on top of the absolute [`MAX_GGUF_STRING_LEN`] cap.
+fn read_gguf_string(r: &mut impl Read, file_len: u64) -> io::Result<String> {
     let len = read_u64(r)?;
-    let len = usize::try_from(len)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "gguf string length overflow"))?;
+    let cap = MAX_GGUF_STRING_LEN.min(file_len);
+    if len > cap {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "gguf string length exceeds sane bound — refusing to allocate (crafted/corrupt file guard)",
+        ));
+    }
+    // Safe: len <= cap <= MAX_GGUF_STRING_LEN (8 MiB), which fits usize on any
+    // real target, so this can never wrap/truncate the way the raw
+    // `usize::try_from(u64)` no-op check on 64-bit platforms failed to guard
+    // against.
+    let len = len as usize;
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
@@ -212,12 +236,30 @@ const GGUF_TYPE_UINT64: u32 = 10;
 const GGUF_TYPE_INT64: u32 = 11;
 const GGUF_TYPE_FLOAT64: u32 = 12;
 
+/// Max nesting depth for `ARRAY`-of-`ARRAY` values. GGUF kv metadata never
+/// legitimately needs more than one level of array nesting (arrays of scalars
+/// or strings); this cap exists purely to defeat a crafted file that nests
+/// `ARRAY → ARRAY → ARRAY → …` to blow the call stack (each level costs only
+/// ~12 bytes — `elem_type: u32` + `len: u64` — so well under 1 MiB of crafted
+/// input could otherwise recurse deep enough to abort the process). Set well
+/// above any legitimate need while staying far short of a stack overflow.
+const MAX_GGUF_ARRAY_DEPTH: u32 = 8;
+
 /// Read (or, for array elements we don't materialize, just advance past) one
 /// value of the given GGUF type. Every branch consumes exactly the bytes that
 /// type occupies, so the reader position stays correct regardless of whether
 /// the caller cares about this particular key — required because GGUF kv
 /// pairs are stored back-to-back with no per-entry length prefix to skip by.
-fn skip_or_read_value(r: &mut impl Read, value_type: u32) -> io::Result<Option<GgufScalar>> {
+///
+/// `file_len` is threaded through to bound any nested string reads (see
+/// [`read_gguf_string`]); `depth` tracks array-nesting recursion and is
+/// rejected past [`MAX_GGUF_ARRAY_DEPTH`] instead of recursing further.
+fn skip_or_read_value(
+    r: &mut impl Read,
+    value_type: u32,
+    file_len: u64,
+    depth: u32,
+) -> io::Result<Option<GgufScalar>> {
     match value_type {
         GGUF_TYPE_UINT8 => Ok(Some(GgufScalar::UInt(read_u8(r)? as u64))),
         GGUF_TYPE_INT8 => Ok(Some(GgufScalar::Int(read_i8(r)? as i64))),
@@ -227,17 +269,35 @@ fn skip_or_read_value(r: &mut impl Read, value_type: u32) -> io::Result<Option<G
         GGUF_TYPE_INT32 => Ok(Some(GgufScalar::Int(read_i32(r)? as i64))),
         GGUF_TYPE_FLOAT32 => Ok(Some(GgufScalar::Float(read_f32(r)? as f64))),
         GGUF_TYPE_BOOL => Ok(Some(GgufScalar::UInt(read_u8(r)? as u64))),
-        GGUF_TYPE_STRING => Ok(Some(GgufScalar::Str(read_gguf_string(r)?))),
+        GGUF_TYPE_STRING => Ok(Some(GgufScalar::Str(read_gguf_string(r, file_len)?))),
         GGUF_TYPE_UINT64 => Ok(Some(GgufScalar::UInt(read_u64(r)?))),
         GGUF_TYPE_INT64 => Ok(Some(GgufScalar::Int(read_i64(r)?))),
         GGUF_TYPE_FLOAT64 => Ok(Some(GgufScalar::Float(read_f64(r)?))),
         GGUF_TYPE_ARRAY => {
+            if depth >= MAX_GGUF_ARRAY_DEPTH {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "gguf array nesting exceeds max depth — refusing to recurse further \
+                     (crafted/corrupt file guard)",
+                ));
+            }
             let elem_type = read_u32(r)?;
             let len = read_u64(r)?;
-            // Arrays (e.g. the tokenizer vocab) can be huge; ingestion never
+            // An array's element count is bounded by the same "can't exceed
+            // the file's own size" logic as strings — a corrupt/crafted
+            // length here (each element costs at least 1 byte) can't
+            // possibly be satisfied by a file smaller than that count, so
+            // reject up front rather than looping toward a read failure.
+            if len > file_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "gguf array length exceeds file size — refusing to iterate (crafted/corrupt file guard)",
+                ));
+            }
+            // Arrays (e.g. the tokenizer vocab) can be large; ingestion never
             // needs their contents, only to advance past them correctly.
             for _ in 0..len {
-                skip_or_read_value(r, elem_type)?;
+                skip_or_read_value(r, elem_type, file_len, depth + 1)?;
             }
             Ok(None)
         }
@@ -256,6 +316,11 @@ fn skip_or_read_value(r: &mut impl Read, value_type: u32) -> io::Result<Option<G
 /// turns into a manual-configuration note rather than a crash or a guess.
 pub fn read_gguf_rope_kv(path: &Path) -> Option<GgufRopeKv> {
     let file = File::open(path).ok()?;
+    // Stat up front so string/array length prefixes can be bounds-checked
+    // against the file's actual size before any allocation or iteration —
+    // the core of the crash-safety fix (see `read_gguf_string` /
+    // `skip_or_read_value`).
+    let file_len = file.metadata().ok()?.len();
     let mut r = BufReader::new(file);
 
     let mut magic = [0u8; 4];
@@ -274,9 +339,9 @@ pub fn read_gguf_rope_kv(path: &Path) -> Option<GgufRopeKv> {
 
     let mut out = GgufRopeKv::default();
     for _ in 0..kv_count {
-        let key = read_gguf_string(&mut r).ok()?;
+        let key = read_gguf_string(&mut r, file_len).ok()?;
         let value_type = read_u32(&mut r).ok()?;
-        let value = skip_or_read_value(&mut r, value_type).ok()?;
+        let value = skip_or_read_value(&mut r, value_type, file_len, 0).ok()?;
 
         if key == "general.architecture" {
             out.architecture = value.as_ref().and_then(GgufScalar::as_str).map(str::to_string);
@@ -497,6 +562,48 @@ mod tests {
                 self.buf.extend_from_slice(&(v.len() as u64).to_le_bytes());
                 self.buf.extend_from_slice(v.as_bytes());
             }
+            self.kv_count += 1;
+            self
+        }
+
+        /// A `STRING`-typed kv whose length prefix is an arbitrary caller-given
+        /// `claimed_len`, deliberately NOT followed by that many actual data
+        /// bytes — models a crafted or truncated/corrupt file where the
+        /// length prefix cannot be trusted. Used to prove the reader rejects
+        /// the length up front instead of allocating (or blocking on) it.
+        fn kv_string_bogus_length(&mut self, key: &str, claimed_len: u64) -> &mut Self {
+            self.push_key(key);
+            self.buf.extend_from_slice(&GGUF_TYPE_STRING.to_le_bytes());
+            self.buf.extend_from_slice(&claimed_len.to_le_bytes());
+            // No data bytes follow — that's the point.
+            self.kv_count += 1;
+            self
+        }
+
+        /// An `ARRAY`-of-`ARRAY`-of-… value nested `levels` deep, terminated
+        /// by a single real `UINT8` leaf. Models a crafted file trying to
+        /// blow the parser's call stack via deep array nesting.
+        fn kv_nested_array(&mut self, key: &str, levels: u32) -> &mut Self {
+            self.push_key(key);
+            self.buf.extend_from_slice(&GGUF_TYPE_ARRAY.to_le_bytes()); // this kv's value type
+            for _ in 0..levels {
+                self.buf.extend_from_slice(&GGUF_TYPE_ARRAY.to_le_bytes()); // elem_type
+                self.buf.extend_from_slice(&1u64.to_le_bytes()); // len 1
+            }
+            // Terminal leaf so a nesting depth under the cap would parse cleanly.
+            self.buf.extend_from_slice(&GGUF_TYPE_UINT8.to_le_bytes());
+            self.buf.extend_from_slice(&1u64.to_le_bytes());
+            self.buf.push(0u8);
+            self.kv_count += 1;
+            self
+        }
+
+        /// A kv whose declared value type needs more bytes than are actually
+        /// written — models a file truncated mid-value.
+        fn kv_truncated_u32(&mut self, key: &str) -> &mut Self {
+            self.push_key(key);
+            self.buf.extend_from_slice(&GGUF_TYPE_UINT32.to_le_bytes());
+            self.buf.extend_from_slice(&[0x01, 0x02]); // only 2 of the 4 required bytes
             self.kv_count += 1;
             self
         }
@@ -724,5 +831,90 @@ mod tests {
             RopeIngestOutcome::Prefilled(rope) => assert_eq!(rope.attn_factor, 0.5),
             other => panic!("expected Prefilled, got {other:?}"),
         }
+    }
+
+    // --- Crash-safety regression tests (crafted/corrupt binary input) ------
+
+    #[test]
+    fn huge_string_length_prefix_is_rejected_not_allocated() {
+        // A crafted length prefix of u64::MAX must be rejected before any
+        // allocation is attempted. Before the fix, `usize::try_from(len)`
+        // was a no-op on a 64-bit target and `vec![0u8; len]` would abort the
+        // whole process with an unrecoverable allocation failure — this must
+        // instead come back as a clean `None`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.gguf");
+        GgufBuilder::new()
+            .kv_string_bogus_length("qwen2.rope.scaling.type", u64::MAX)
+            .write_to(&path);
+        assert!(read_gguf_rope_kv(&path).is_none());
+    }
+
+    #[test]
+    fn string_length_exceeding_file_size_is_rejected() {
+        // A smaller but still-absurd length (bigger than the file itself,
+        // well under the absolute MAX_GGUF_STRING_LEN cap) must also be
+        // rejected via the file-size bound, not just the absolute cap.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.gguf");
+        GgufBuilder::new()
+            .kv_string_bogus_length("general.architecture", 1_000_000)
+            .write_to(&path);
+        assert!(read_gguf_rope_kv(&path).is_none());
+    }
+
+    #[test]
+    fn string_length_within_absolute_cap_but_beyond_file_is_still_rejected() {
+        // Length is well under MAX_GGUF_STRING_LEN (8 MiB) but still bigger
+        // than the (tiny) file that claims it — must be rejected by the
+        // file-size bound specifically, proving that guard isn't redundant
+        // with the absolute cap.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.gguf");
+        GgufBuilder::new()
+            .kv_string_bogus_length("general.architecture", 4096)
+            .write_to(&path);
+        assert!(read_gguf_rope_kv(&path).is_none());
+    }
+
+    #[test]
+    fn deeply_nested_array_is_rejected_not_stack_overflowed() {
+        // 32 levels of ARRAY-of-ARRAY nesting, at ~12 bytes/level, vastly
+        // exceeds MAX_GGUF_ARRAY_DEPTH (8) — must return a clean `None`
+        // rather than recursing until the stack overflows.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.gguf");
+        GgufBuilder::new()
+            .kv_nested_array("some.irrelevant.key", 32)
+            .write_to(&path);
+        assert!(read_gguf_rope_kv(&path).is_none());
+    }
+
+    #[test]
+    fn array_nesting_at_or_under_the_cap_still_parses() {
+        // A depth well under the cap (e.g. the single-level string array
+        // real GGUFs actually use for tokenizer vocab) must keep working —
+        // the cap should reject only pathological nesting, not ordinary
+        // GGUF arrays.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.gguf");
+        GgufBuilder::new()
+            .kv_string_array("tokenizer.ggml.tokens", &["<s>", "</s>"])
+            .kv_string("llama.rope.scaling.type", "none")
+            .write_to(&path);
+        let kv = read_gguf_rope_kv(&path).expect("ordinary nesting depth still parses");
+        assert_eq!(derive_rope_scaling(&kv), RopeIngestOutcome::NoLongContext);
+    }
+
+    #[test]
+    fn truncated_mid_value_is_rejected_cleanly() {
+        // A value tag claims 4 bytes (UINT32) but only 2 are actually
+        // present before EOF — must be a clean `None`, not a panic.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.gguf");
+        GgufBuilder::new()
+            .kv_truncated_u32("qwen2.context_length")
+            .write_to(&path);
+        assert!(read_gguf_rope_kv(&path).is_none());
     }
 }
