@@ -29,11 +29,16 @@
 //! values — deterministic, no I/O, fully exercised by unit tests.
 //!
 //! ## Never a false positive
-//! [`evaluate`] can only recommend `validated: true` when it is handed a
-//! [`LaunchReport`] that served stably AND a full set of extended-context
-//! probes that held relative to the native baseline. There is no code path
-//! that flips `validated` without that evidence trail attached to the
-//! returned [`ValidationEvidence`].
+//! [`evaluate`] can only recommend `validated: true` when ALL of the
+//! following hold: the [`LaunchReport`] served stably, at least one
+//! extended-context probe was actually collected, the deepest probe reached
+//! the full `target_ctx`, the native baseline itself is above
+//! [`WEAK_BASELINE_THRESHOLD`] (an absolute floor — a near-zero baseline makes
+//! the *relative* collapse check below carry no signal, since its threshold
+//! shrinks to near-zero right along with it), and no probe's combined score
+//! collapsed relative to that baseline. There is no code path that flips
+//! `validated` without that full evidence trail attached to the returned
+//! [`ValidationEvidence`].
 
 use serde::{Deserialize, Serialize};
 
@@ -53,11 +58,13 @@ pub const PROBE_DEPTH_FRACTIONS: [f64; 3] = [0.3, 0.6, 1.0];
 pub const COLLAPSE_RATIO: f64 = 0.85;
 
 /// Below this native-context baseline score, the model's OWN native behavior
-/// is already weak — a low extended-context score in that case is not
-/// evidence against YaRN, it is inherited from the baseline. [`evaluate`]
-/// still runs the normal collapse check (so a config can't hide behind a weak
-/// baseline), but flags [`ValidationEvidence::native_baseline_weak`] so a
-/// human reader doesn't misattribute the weakness to the RoPE config.
+/// is already weak — a low (or zero) extended-context score in that case is
+/// not evidence against YaRN, it is inherited from the baseline, AND the
+/// relative collapse check below carries no signal against a near-zero
+/// baseline (its threshold shrinks to near-zero right along with it, so every
+/// extended probe would trivially "hold"). So this is an ABSOLUTE FLOOR, not
+/// just an informational flag: [`evaluate`] refuses to validate at all when
+/// the native baseline is this weak — see [`ValidationEvidence::native_baseline_weak`].
 pub const WEAK_BASELINE_THRESHOLD: f64 = 0.5;
 
 /// Compute the probe depths (in tokens) for a given extended `target_ctx`,
@@ -199,7 +206,10 @@ pub struct ValidationEvidence {
     /// `true` when the native baseline itself was weak (below
     /// [`WEAK_BASELINE_THRESHOLD`]) — a low extended score in that case is
     /// inherited from the model's own native behavior, not caused by YaRN.
-    /// Informational only; does not change the collapse decision.
+    /// This IS a gate, not merely informational: [`evaluate`] forces
+    /// `validated = false` whenever this is `true` (see
+    /// [`WEAK_BASELINE_THRESHOLD`]'s doc for why the relative collapse check
+    /// alone can't be trusted against a near-zero baseline).
     pub native_baseline_weak: bool,
     /// Every extended-context probe's combined score, keyed by depth, in the
     /// order probed — the recall/coherence curve a human can read directly.
@@ -295,6 +305,33 @@ pub fn evaluate(
             failure_depth_tokens: None,
             failure_reason: Some(format!(
                 "extended-context probes did not reach the full target context (deepest probed {deepest_probed} tokens < target {target_ctx} tokens) — cannot validate without evidence at the extended range"
+            )),
+            vram_gb_at_extended_ctx: launch.vram_gb_at_extended_ctx,
+            backend_used: launch.backend_used.clone(),
+            max_ctx_that_fit: launch.max_ctx_that_fit,
+            native_baseline_score,
+            native_baseline_weak,
+            extended_scores,
+        };
+    }
+
+    // Served stably with full-depth coverage, but the native baseline itself
+    // is too weak to validate against: the relative collapse check below is a
+    // RATIO of native_baseline_score, so a zero (or near-zero) baseline makes
+    // collapse_threshold zero (or near-zero) too — every extended probe would
+    // trivially clear it regardless of whether the model recalls anything at
+    // extended context. That's not "held" evidence, it's "no meaningful
+    // reference to hold against". So the weak-baseline flag is an absolute
+    // FLOOR, not merely informational: refuse to validate rather than let a
+    // degenerate native baseline (failed probe round-trip, or a model that
+    // genuinely recalls nothing natively) rubber-stamp the extended scores.
+    if native_baseline_weak {
+        return ValidationEvidence {
+            validated: false,
+            served_stably: true,
+            failure_depth_tokens: None,
+            failure_reason: Some(format!(
+                "native baseline too weak to validate against (combined score {native_baseline_score:.3} < {WEAK_BASELINE_THRESHOLD:.3}) — cannot confirm YaRN holds when the native reference itself barely recalls anything"
             )),
             vram_gb_at_extended_ctx: launch.vram_gb_at_extended_ctx,
             backend_used: launch.backend_used.clone(),
@@ -655,7 +692,7 @@ mod tests {
     // ---- evaluate: weak native baseline is flagged, not blamed on YaRN ---
 
     #[test]
-    fn weak_native_baseline_is_flagged_separately_from_collapse() {
+    fn weak_native_baseline_is_flagged_and_gates_validation() {
         let weak_native = ProbeResult {
             depth_tokens: 8_000,
             recall_score: 0.3,
@@ -677,9 +714,59 @@ mod tests {
         let evidence = evaluate(weak_native, &extended, &launch, 100_000);
 
         assert!(evidence.native_baseline_weak);
-        // Holding steady relative to an already-weak baseline should still
-        // validate — the weakness is the model's own, not caused by YaRN.
-        assert!(evidence.validated);
+        // A weak native baseline is an ABSOLUTE FLOOR, not just an FYI flag:
+        // the relative collapse check alone can't be trusted here (its
+        // threshold shrinks right along with a weak baseline), so this must
+        // never validate regardless of how "steady" the extended scores look
+        // relative to that weak reference.
+        assert!(!evidence.validated);
+        assert!(evidence
+            .failure_reason
+            .as_deref()
+            .unwrap()
+            .contains("native baseline too weak to validate against"));
+    }
+
+    // ---- evaluate: zero baseline — the reviewer-flagged bypass -----------
+    // A native baseline of EXACTLY 0.0 makes collapse_threshold 0.0 too, and
+    // combined_score() is always >= 0.0, so the relative-only collapse check
+    // would never fire (`0.0 < 0.0` is false) even when every extended probe
+    // also scores 0.0 — a validation PASS on zero genuine evidence. The
+    // absolute weak-baseline floor above must catch this.
+
+    #[test]
+    fn zero_native_baseline_with_all_zero_extended_probes_never_validates_true() {
+        let zero_native = ProbeResult {
+            depth_tokens: 8_000,
+            recall_score: 0.0,
+            coherence_score: 0.0,
+        };
+        let all_zero_extended = vec![
+            ProbeResult { depth_tokens: 30_000, recall_score: 0.0, coherence_score: 0.0 },
+            ProbeResult { depth_tokens: 60_000, recall_score: 0.0, coherence_score: 0.0 },
+            ProbeResult { depth_tokens: 100_000, recall_score: 0.0, coherence_score: 0.0 },
+        ];
+        let launch = LaunchReport {
+            served_stably: true,
+            failure_reason: None,
+            vram_gb_at_extended_ctx: Some(20.0),
+            backend_used: "rocm".to_string(),
+            max_ctx_that_fit: None,
+        };
+
+        let evidence = evaluate(zero_native, &all_zero_extended, &launch, 100_000);
+
+        assert!(
+            !evidence.validated,
+            "a zero native baseline must never rubber-stamp all-zero extended probes as validated"
+        );
+        assert!(evidence.native_baseline_weak);
+        // Distinct failure reason from the empty-probes and depth-coverage
+        // guards, so the evidence trail shows WHICH gate fired.
+        let reason = evidence.failure_reason.as_deref().unwrap();
+        assert!(reason.contains("native baseline too weak to validate against"));
+        assert!(!reason.contains("no extended-context probes collected"));
+        assert!(!reason.contains("did not reach the full target context"));
     }
 
     // ---- run_validation: end-to-end with mocked launcher + prober -------
