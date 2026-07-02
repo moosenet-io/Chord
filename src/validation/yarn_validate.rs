@@ -115,14 +115,21 @@ impl ProbeResult {
     /// collapse — exactly the failure mode YARN-03 cares most about
     /// distinguishing from a serving failure.
     pub fn combined_score(&self) -> f64 {
-        // `f64::min` deliberately ignores NaN (it returns the OTHER operand
-        // when one side is NaN) — exactly wrong for this use: a NaN input
-        // here means the grading round-trip on that side produced garbage,
-        // and that must propagate as an invalid (non-finite) combined score
-        // rather than be silently masked by whichever side happened to be a
-        // real number. Every non-finite consumer downstream (the `evaluate`
-        // collapse/baseline guards) relies on this propagation.
-        if self.recall_score.is_nan() || self.coherence_score.is_nan() {
+        // `f64::min` deliberately ignores non-finite operands in TWO ways —
+        // exactly wrong for this use, since a non-finite input here means the
+        // grading round-trip on that side produced garbage that must
+        // propagate, not get silently masked by whichever side happened to be
+        // a normal number:
+        //   - NaN: `f64::min` returns the OTHER operand (`NaN.min(0.9) == 0.9`).
+        //   - +/-infinity: `f64::min` still returns a FINITE result whenever
+        //     the other operand is finite (`f64::INFINITY.min(0.9) == 0.9`,
+        //     and `f64::NEG_INFINITY.min(0.9) == -inf` is at least non-finite,
+        //     but the `+inf` case is finite and just as much a lie).
+        // `is_finite()` catches both NaN and +/-infinity in one check, so
+        // check that instead of `is_nan()` alone. Every non-finite consumer
+        // downstream (the `evaluate` collapse/baseline guards) relies on this
+        // propagation.
+        if !self.recall_score.is_finite() || !self.coherence_score.is_finite() {
             return f64::NAN;
         }
         self.recall_score.min(self.coherence_score)
@@ -561,6 +568,42 @@ mod tests {
         assert!(coherence_nan.combined_score().is_nan());
     }
 
+    #[test]
+    fn combined_score_propagates_infinity_instead_of_masking_it() {
+        // f64::min has the SAME masking problem for +infinity as it does for
+        // NaN: f64::min(f64::INFINITY, 0.9) == 0.9 — finite! — silently
+        // converting a garbage +inf grading result into a normal-looking
+        // score. is_finite() must reject +inf (and -inf) on either side, not
+        // just is_nan().
+        let recall_pos_inf = ProbeResult {
+            depth_tokens: 1000,
+            recall_score: f64::INFINITY,
+            coherence_score: 0.9,
+        };
+        assert!(!recall_pos_inf.combined_score().is_finite());
+
+        let coherence_pos_inf = ProbeResult {
+            depth_tokens: 1000,
+            recall_score: 0.9,
+            coherence_score: f64::INFINITY,
+        };
+        assert!(!coherence_pos_inf.combined_score().is_finite());
+
+        let recall_neg_inf = ProbeResult {
+            depth_tokens: 1000,
+            recall_score: f64::NEG_INFINITY,
+            coherence_score: 0.9,
+        };
+        assert!(!recall_neg_inf.combined_score().is_finite());
+
+        let coherence_neg_inf = ProbeResult {
+            depth_tokens: 1000,
+            recall_score: 0.9,
+            coherence_score: f64::NEG_INFINITY,
+        };
+        assert!(!coherence_neg_inf.combined_score().is_finite());
+    }
+
     // ---- evaluate: positive case ----------------------------------------
 
     #[test]
@@ -889,6 +932,39 @@ mod tests {
         assert!(!reason.contains("too weak to validate against"));
         assert!(!reason.contains("no extended-context probes collected"));
         assert!(!reason.contains("did not reach the full target context"));
+    }
+
+    #[test]
+    fn positive_infinity_native_baseline_never_validates_true() {
+        // Mirrors the NaN-baseline test, but for +infinity — a garbage
+        // grading round-trip that produces +inf on one side must not slip
+        // past combined_score() (fixed above) or the is_finite() guard here.
+        let inf_native = ProbeResult {
+            depth_tokens: 8_000,
+            recall_score: f64::INFINITY,
+            coherence_score: 0.9,
+        };
+        let extended = vec![strong_probe(30_000), strong_probe(60_000), strong_probe(100_000)];
+        let launch = LaunchReport {
+            served_stably: true,
+            failure_reason: None,
+            vram_gb_at_extended_ctx: Some(30.0),
+            backend_used: "rocm".to_string(),
+            max_ctx_that_fit: None,
+        };
+
+        let evidence = evaluate(inf_native, &extended, &launch, 100_000);
+
+        assert!(
+            !evidence.validated,
+            "a +infinity native baseline must never produce validated=true"
+        );
+        assert!(evidence.served_stably);
+        assert!(evidence
+            .failure_reason
+            .as_deref()
+            .unwrap()
+            .contains("not a finite value"));
     }
 
     // ---- evaluate: healthy baseline, one NaN extended probe --------------
