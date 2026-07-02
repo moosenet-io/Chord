@@ -59,6 +59,16 @@ use terminus_rs::intake::serving::{ModelId, Runtime, ServingProfile};
 ///     `rope_scale`, `yarn_orig_ctx`, `target_ctx`, `ext_factor`, `attn_factor`,
 ///     `beta_slow`, `beta_fast`, and `validated` (bool, default `false`). See
 ///     [`RopeScaling`] for the emission rules the launcher applies.
+///   - `thinking` (object, YARN-05) — an optional thinking-trace-preservation
+///     capability block for the llama.cpp tier: `supports_thinking` (bool,
+///     default `false` — whether the model itself can emit/preserve a
+///     reasoning trace), `preserve_thinking` (bool, default `false` — whether
+///     Chord should ask the runtime to preserve it across turns),
+///     `requires_prefix_caching` (bool, default `false` — whether preservation
+///     needs prefix caching to avoid re-processing the trace each turn), and
+///     `validated` (bool, default `false`, same gfx1151-validation gate as
+///     [`RopeScaling`]). See [`ThinkingConfig`] for the emission rules the
+///     launcher applies.
 ///
 /// Unknown keys are ignored (forward-compatible: a newer runner can add hints an
 /// older Chord harmlessly skips).
@@ -89,6 +99,11 @@ pub struct EnvSpec {
     /// `Some(rope)` with `rope.method == RopeScalingMethod::None` is equivalent to
     /// absent. See [`RopeScaling`] for the launcher's emission rules.
     pub rope_scaling: Option<RopeScaling>,
+    /// YARN-05: optional thinking-trace-preservation capability for the
+    /// llama.cpp tier. `None` ⇒ no `thinking` key present (unchanged behavior —
+    /// no preservation/prefix-caching flags). See [`ThinkingConfig`] for the
+    /// launcher's emission rules.
+    pub thinking: Option<ThinkingConfig>,
 }
 
 /// YARN-01: the llama.cpp RoPE context-extension method a [`RopeScaling`] block
@@ -290,6 +305,62 @@ fn parse_rope_scaling(obj: &serde_json::Map<String, serde_json::Value>) -> Optio
     }
 }
 
+/// YARN-05: a per-model thinking-trace-preservation capability (llama.cpp tier
+/// only). Read from the serving profile's `env_json.thinking` object; the
+/// ollama and CPU launchers ignore it (context/prompt-cache preservation is
+/// unavailable on those tiers — see [`super::launcher`]).
+///
+/// All flags are sourced from the profile row — the launcher never invents
+/// whether a model supports thinking (that is populated by ingestion, e.g. a
+/// small YARN-02-style addition to the model-config reader, not a new pipeline
+/// this item builds). `validated` gates emission exactly like [`RopeScaling`]:
+/// a `preserve_thinking` request that has not been validated on gfx1151 serves
+/// without preservation (no flags) rather than risk an unvalidated launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ThinkingConfig {
+    /// Whether the model itself is capable of emitting/preserving a thinking
+    /// (reasoning) trace. `false` ⇒ nothing to preserve — a `preserve_thinking`
+    /// request on such a model is an invalid config (see
+    /// [`super::launcher::thinking_args`]).
+    pub supports_thinking: bool,
+    /// Whether Chord should ask the runtime to preserve the thinking trace
+    /// across turns rather than discard it after each response. Requesting
+    /// this with `supports_thinking == false` never emits anything — the
+    /// launcher refuses and logs a note.
+    pub preserve_thinking: bool,
+    /// Whether preservation needs prefix caching to avoid re-processing the
+    /// (potentially large) trace on every turn. Without this, `preserve_thinking`
+    /// still may be requested, but forfeits the point on a tier that supports it
+    /// — the launcher notes the memory-growth cost when it enables caching.
+    pub requires_prefix_caching: bool,
+    /// Whether this config has been validated on gfx1151. `false` ⇒ the
+    /// launcher refuses to emit the preservation/prefix-caching flags even
+    /// though the block is present (serves without preservation, with a
+    /// warning) — mirrors [`RopeScaling::validated`] exactly.
+    pub validated: bool,
+}
+
+/// Parse the `thinking` object out of an already-parsed `env_json` map.
+///
+/// Returns `None` (no block, i.e. unchanged behavior — no preservation flags)
+/// when the key is absent or malformed. Unlike [`parse_rope_scaling`], every
+/// field here is an optional bool with a safe `false` default, so there is no
+/// "missing required field" rejection case — an object with unrecognized or
+/// partially-present keys still yields a (conservatively all-`false`) config
+/// rather than being discarded outright.
+fn parse_thinking(obj: &serde_json::Map<String, serde_json::Value>) -> Option<ThinkingConfig> {
+    let t = obj.get("thinking")?.as_object()?;
+    Some(ThinkingConfig {
+        supports_thinking: t.get("supports_thinking").and_then(|v| v.as_bool()).unwrap_or(false),
+        preserve_thinking: t.get("preserve_thinking").and_then(|v| v.as_bool()).unwrap_or(false),
+        requires_prefix_caching: t
+            .get("requires_prefix_caching")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        validated: t.get("validated").and_then(|v| v.as_bool()).unwrap_or(false),
+    })
+}
+
 impl EnvSpec {
     /// Parse a raw `env_json` string into a typed spec. A missing, blank, or
     /// malformed value yields the all-default spec (no flags) — never an error,
@@ -337,6 +408,7 @@ impl EnvSpec {
             .and_then(|n| u32::try_from(n).ok());
 
         let rope_scaling = parse_rope_scaling(obj);
+        let thinking = parse_thinking(obj);
 
         EnvSpec {
             gfx_override,
@@ -346,6 +418,7 @@ impl EnvSpec {
             cpu_library,
             n_ctx,
             rope_scaling,
+            thinking,
         }
     }
 }
@@ -927,6 +1000,45 @@ mod tests {
         let mut bad_beta = base;
         bad_beta.beta_slow = -1.0;
         assert!(!bad_beta.is_plausible());
+    }
+
+    // ── YARN-05: thinking-preservation parsing ─────────────────────────────
+
+    #[test]
+    fn envspec_thinking_absent_is_none() {
+        assert_eq!(EnvSpec::parse("{}").thinking, None);
+    }
+
+    #[test]
+    fn envspec_parses_full_thinking_block() {
+        let spec = EnvSpec::parse(
+            r#"{"thinking":{"supports_thinking":true,"preserve_thinking":true,
+                "requires_prefix_caching":true,"validated":true}}"#,
+        );
+        let t = spec.thinking.expect("thinking block parsed");
+        assert!(t.supports_thinking);
+        assert!(t.preserve_thinking);
+        assert!(t.requires_prefix_caching);
+        assert!(t.validated);
+    }
+
+    #[test]
+    fn envspec_thinking_missing_fields_default_false() {
+        // An object present but with only one field set — every other field is a
+        // safe `false` default, not a rejection (unlike rope_scaling's required
+        // fields, every thinking field is an optional bool).
+        let spec = EnvSpec::parse(r#"{"thinking":{"supports_thinking":true}}"#);
+        let t = spec.thinking.expect("thinking block parsed");
+        assert!(t.supports_thinking);
+        assert!(!t.preserve_thinking);
+        assert!(!t.requires_prefix_caching);
+        assert!(!t.validated);
+    }
+
+    #[test]
+    fn envspec_thinking_malformed_is_none() {
+        // `thinking` present but not an object.
+        assert_eq!(EnvSpec::parse(r#"{"thinking":"yes"}"#).thinking, None);
     }
 
     #[test]

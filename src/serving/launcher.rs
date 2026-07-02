@@ -15,8 +15,10 @@
 //!     `--flash-attn` when `flash_attn == Some(true)`; YARN-01: `--rope-scaling`
 //!     / `--rope-scale` / `--yarn-*` / `--ctx-size` when the row's
 //!     `rope_scaling` block is present, `validated`, and an extension is
-//!     actually needed (see [`rope_scaling_args`]). Health-checks
-//!     `llama_server_url()`.
+//!     actually needed (see [`rope_scaling_args`]); YARN-05: `--preserve-thinking`
+//!     / `--prompt-cache-all` when the row's `thinking` block requests
+//!     preservation on a model that `supports_thinking` and is `validated` (see
+//!     [`thinking_args`]). Health-checks `llama_server_url()`.
 //!   - **ollama-rocm** ([`Runtime::Ollama`]): `ollama_bin()` `serve`; the GPU
 //!     `gfx_override` env; health-checks `ollama_primary_url()`.
 //!   - **genuine CPU** ([`Runtime::Cpu`]): `ollama_bin()` `serve` against the
@@ -47,7 +49,9 @@ use crate::supervisor::egress_policy::posture_for;
 use crate::supervisor::launch_isolation::{decide_isolation, IsolationDecision};
 use crate::supervisor::{build_runtime_env, RuntimeClass};
 
-use super::profile::{EnvSpec, ProfileLoadError, RopeScaling, RopeScalingMethod, RouteEntry};
+use super::profile::{
+    EnvSpec, ProfileLoadError, RopeScaling, RopeScalingMethod, RouteEntry, ThinkingConfig,
+};
 
 /// A constructed runtime launch: the binary, its argv, the env pairs, and the
 /// endpoint to health-check. Pure data — building it touches no process, so it is
@@ -396,6 +400,67 @@ fn warn_rope_scaling_unsupported(rope: &RopeScaling) {
     }
 }
 
+/// YARN-05: build the `--preserve-thinking` / `--prompt-cache-all` arguments
+/// for the llama.cpp tier, or nothing at all. Mirrors [`rope_scaling_args`]'s
+/// gate discipline exactly.
+///
+/// Emission rules (all values sourced from `thinking` — never invented):
+///   - `preserve_thinking == false` ⇒ no flags (nothing requested — the
+///     unchanged, no-op baseline, same as a model with no `thinking` block).
+///   - `preserve_thinking == true` but `supports_thinking == false` ⇒ refuse:
+///     no flags, warn. A model that cannot produce a thinking trace has
+///     nothing to preserve — emitting the flag would be meaningless.
+///   - `preserve_thinking && supports_thinking` but `!validated` ⇒ no flags;
+///     the "configured but not validated" warning, served without it — same
+///     unvalidated-yarn fallback as YARN-01.
+///   - otherwise (validated): emit `--preserve-thinking`; additionally emit
+///     `--prompt-cache-all` when `requires_prefix_caching` is set, with a log
+///     note that the prompt cache grows with conversation length (a
+///     memory-cost surface, not something this item accounts for in bytes).
+fn thinking_args(thinking: &ThinkingConfig) -> Vec<String> {
+    if !thinking.preserve_thinking {
+        return Vec::new();
+    }
+    if !thinking.supports_thinking {
+        tracing::warn!(
+            target: "chord.serving.launcher",
+            "preserve_thinking requested but model does not support thinking — refusing, no flags emitted"
+        );
+        return Vec::new();
+    }
+    if !thinking.validated {
+        tracing::warn!(
+            target: "chord.serving.launcher",
+            "thinking preservation configured but not validated on gfx1151 — serving without it"
+        );
+        return Vec::new();
+    }
+    let mut args = vec!["--preserve-thinking".to_string()];
+    if thinking.requires_prefix_caching {
+        args.push("--prompt-cache-all".to_string());
+        tracing::warn!(
+            target: "chord.serving.launcher",
+            "prefix caching enabled for thinking preservation — prompt cache grows with \
+             conversation length, monitor VRAM/RAM headroom"
+        );
+    }
+    args
+}
+
+/// YARN-05: log that a `preserve_thinking` request was present on a tier that
+/// cannot apply it (ollama / CPU — no prefix-caching support). Never crashes,
+/// never applies the config — just a clear note that thinking preservation is
+/// unavailable on that tier.
+fn warn_thinking_unsupported(thinking: &ThinkingConfig) {
+    if thinking.preserve_thinking {
+        tracing::warn!(
+            target: "chord.serving.launcher",
+            "thinking preservation requested but not supported on this tier (no prefix \
+             caching) — serving without it"
+        );
+    }
+}
+
 /// Build the [`LaunchCommand`] for serving `entry` under a specific `runtime`.
 ///
 /// Reads every binary/endpoint from the SRV-01 config helpers (no literals) and
@@ -435,6 +500,11 @@ pub fn build_launch_command(
             if let Some(rope) = &env.rope_scaling {
                 args.extend(rope_scaling_args(rope));
             }
+            // YARN-05: emit --preserve-thinking/--prompt-cache-all when
+            // configured, supported, and validated (llama.cpp tier only).
+            if let Some(thinking) = &env.thinking {
+                args.extend(thinking_args(thinking));
+            }
             let mut envs = Vec::new();
             if let Some(gfx) = resolve_gfx_override(env) {
                 // Empty string is a meaningful (CPU) value, but on llama.cpp tier
@@ -460,6 +530,11 @@ pub fn build_launch_command(
             if let Some(rope) = &env.rope_scaling {
                 warn_rope_scaling_unsupported(rope);
             }
+            // YARN-05: this tier has no prefix-caching support — ignore, log,
+            // never crash.
+            if let Some(thinking) = &env.thinking {
+                warn_thinking_unsupported(thinking);
+            }
             let mut envs = Vec::new();
             if let Some(gfx) = resolve_gfx_override(env) {
                 if !gfx.is_empty() {
@@ -482,6 +557,11 @@ pub fn build_launch_command(
             // YARN-01: this tier cannot apply rope scaling — ignore, log, never crash.
             if let Some(rope) = &env.rope_scaling {
                 warn_rope_scaling_unsupported(rope);
+            }
+            // YARN-05: this tier has no prefix-caching support — ignore, log,
+            // never crash.
+            if let Some(thinking) = &env.thinking {
+                warn_thinking_unsupported(thinking);
             }
             let mut envs = Vec::new();
             // The CPU tier sets a DELIBERATE empty gfx override (the empty-override
@@ -1162,6 +1242,129 @@ mod tests {
             r#"{"rope_scaling":{"method":"yarn","rope_scale":4.0,"yarn_orig_ctx":32768,
                 "target_ctx":131072,"ext_factor":1.0,"attn_factor":1.0,"beta_slow":1.0,
                 "beta_fast":32.0,"validated":true}}"#,
+            false,
+            None,
+        );
+        let cmd = build_launch_command(&e, Runtime::Cpu, "ignored").unwrap();
+        assert_eq!(cmd.args, vec!["serve".to_string()]);
+    }
+
+    // ── YARN-05: thinking-preservation flag emission ───────────────────────────
+
+    #[test]
+    #[serial]
+    fn llama_command_emits_thinking_flags_when_validated() {
+        set_runtime_endpoints();
+        let e = entry(
+            "reasoner:30b",
+            ServingBackend::LlamaGpu,
+            Runtime::LlamaCpp,
+            r#"{"thinking":{"supports_thinking":true,"preserve_thinking":true,
+                "requires_prefix_caching":true,"validated":true}}"#,
+            false,
+            None,
+        );
+        let cmd = build_launch_command(&e, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
+        assert!(cmd.args.contains(&"--preserve-thinking".to_string()));
+        assert!(cmd.args.contains(&"--prompt-cache-all".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn llama_command_emits_thinking_flag_without_cache_flag_when_not_required() {
+        set_runtime_endpoints();
+        let e = entry(
+            "reasoner:30b",
+            ServingBackend::LlamaGpu,
+            Runtime::LlamaCpp,
+            r#"{"thinking":{"supports_thinking":true,"preserve_thinking":true,
+                "requires_prefix_caching":false,"validated":true}}"#,
+            false,
+            None,
+        );
+        let cmd = build_launch_command(&e, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
+        assert!(cmd.args.contains(&"--preserve-thinking".to_string()));
+        assert!(!cmd.args.contains(&"--prompt-cache-all".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn llama_command_unvalidated_thinking_emits_no_flags() {
+        set_runtime_endpoints();
+        let e = entry(
+            "reasoner:30b",
+            ServingBackend::LlamaGpu,
+            Runtime::LlamaCpp,
+            r#"{"thinking":{"supports_thinking":true,"preserve_thinking":true,
+                "requires_prefix_caching":true,"validated":false}}"#,
+            false,
+            None,
+        );
+        let cmd = build_launch_command(&e, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
+        // Unvalidated ⇒ served without preservation (warning logged, no flags).
+        assert!(!cmd.args.contains(&"--preserve-thinking".to_string()));
+        assert!(!cmd.args.contains(&"--prompt-cache-all".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn llama_command_no_supports_thinking_emits_no_flags_unchanged_baseline() {
+        set_runtime_endpoints();
+        // No `thinking` block at all — the unchanged, no-op baseline.
+        let e = entry("plain:7b", ServingBackend::LlamaGpu, Runtime::LlamaCpp, "{}", false, None);
+        let cmd = build_launch_command(&e, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
+        assert!(!cmd.args.contains(&"--preserve-thinking".to_string()));
+        assert!(!cmd.args.contains(&"--prompt-cache-all".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn llama_command_preserve_requested_on_non_supporting_model_refuses() {
+        set_runtime_endpoints();
+        // preserve_thinking=true but supports_thinking=false ⇒ refuse, no flags,
+        // never emit a meaningless preservation flag.
+        let e = entry(
+            "plain:7b",
+            ServingBackend::LlamaGpu,
+            Runtime::LlamaCpp,
+            r#"{"thinking":{"supports_thinking":false,"preserve_thinking":true,
+                "requires_prefix_caching":true,"validated":true}}"#,
+            false,
+            None,
+        );
+        let cmd = build_launch_command(&e, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
+        assert!(!cmd.args.contains(&"--preserve-thinking".to_string()));
+        assert!(!cmd.args.contains(&"--prompt-cache-all".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn ollama_command_ignores_thinking_never_crashes() {
+        set_runtime_endpoints();
+        let e = entry(
+            "reasoner:30b",
+            ServingBackend::OllamaGpu,
+            Runtime::Ollama,
+            r#"{"thinking":{"supports_thinking":true,"preserve_thinking":true,
+                "requires_prefix_caching":true,"validated":true}}"#,
+            false,
+            None,
+        );
+        let cmd = build_launch_command(&e, Runtime::Ollama, "ignored").unwrap();
+        // No crash, no invented support — plain serve command, same as baseline.
+        assert_eq!(cmd.args, vec!["serve".to_string()]);
+    }
+
+    #[test]
+    #[serial]
+    fn cpu_command_ignores_thinking_never_crashes() {
+        set_runtime_endpoints();
+        let e = entry(
+            "small:3b",
+            ServingBackend::Cpu,
+            Runtime::Cpu,
+            r#"{"thinking":{"supports_thinking":true,"preserve_thinking":true,
+                "requires_prefix_caching":true,"validated":true}}"#,
             false,
             None,
         );
