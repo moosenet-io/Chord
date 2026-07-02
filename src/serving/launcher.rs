@@ -588,6 +588,56 @@ pub fn build_launch_command(
     }
 }
 
+/// YARN-06: build the launch command for `entry`/`runtime`, honoring an
+/// optional per-request `thinking` hint (Harmony's THINK-01/02 send this on
+/// an inference request; Chord makes NO decision about *when* to think —
+/// that step-type/heuristic logic belongs entirely to Harmony. This is purely
+/// "can this be honored, and if so, honor it").
+///
+/// Returns the same [`LaunchCommand`] [`build_launch_command`] would produce,
+/// plus the [`ThinkingDecision`] describing what was actually honored:
+///   - no hint sent, or the model can't safely honor one (no `thinking`
+///     block, unsupported, or unvalidated — an unvalidated config degrades
+///     EXACTLY like a wholly non-supporting model, never serving an
+///     untrusted mode) ⇒ [`EffectiveThinking::ModelDefault`], command
+///     unchanged from what `build_launch_command` would emit, with a note
+///     when a hint was sent but ignored.
+///   - a supporting + validated model ⇒ the request is honored: the launch
+///     command reflects `--preserve-thinking`/`--prompt-cache-all`
+///     (`ForcedOn`) or their absence (`ForcedOff`) for THIS call only.
+///
+/// The override is applied to a throwaway clone of `entry`'s [`EnvSpec`] — it
+/// never mutates the profile row or the [`RoutingMap`], so a per-request hint
+/// can never leak into another request's launch.
+pub fn build_launch_command_for_request(
+    entry: &RouteEntry,
+    runtime: Runtime,
+    gguf_path: &str,
+    requested_thinking: Option<super::profile::ThinkingRequest>,
+) -> Result<(LaunchCommand, super::profile::ThinkingDecision), LaunchError> {
+    use super::profile::{resolve_thinking_request, EffectiveThinking};
+
+    let decision = resolve_thinking_request(requested_thinking, entry.env.thinking.as_ref());
+
+    let mut effective_entry = entry.clone();
+    match decision.effective {
+        EffectiveThinking::ForcedOn => {
+            if let Some(thinking) = effective_entry.env.thinking.as_mut() {
+                thinking.preserve_thinking = true;
+            }
+        }
+        EffectiveThinking::ForcedOff => {
+            if let Some(thinking) = effective_entry.env.thinking.as_mut() {
+                thinking.preserve_thinking = false;
+            }
+        }
+        EffectiveThinking::ModelDefault => {}
+    }
+
+    let command = build_launch_command(&effective_entry, runtime, gguf_path)?;
+    Ok((command, decision))
+}
+
 /// Compose a [`LaunchCommand`] that carries the **scrubbed** S88 ISO-01 launch
 /// environment for a runtime of `class`, with the command's own runtime-specific
 /// env (the gfx override etc.) layered ON TOP.
@@ -970,7 +1020,7 @@ impl<'a> ResidencyManager for PassThroughResidency<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::serving::profile::RouteEntry;
+    use crate::serving::profile::{EffectiveThinking, RouteEntry, ThinkingRequest};
     use serial_test::serial;
     use std::sync::Mutex;
     use terminus_rs::intake::serving::{
@@ -1994,5 +2044,137 @@ mod tests {
         assert_eq!(slot.runtime, Runtime::LlamaCpp);
         // The stub DID launch (it is a pass-through), behind the residency seam.
         assert_eq!(*spawner.calls.lock().unwrap(), vec![Runtime::LlamaCpp]);
+    }
+
+    // ── YARN-06: per-request thinking honored at launch ─────────────────────
+
+    #[test]
+    #[serial]
+    fn request_thinking_on_honored_for_supporting_validated_model() {
+        set_runtime_endpoints();
+        let e = entry(
+            "reasoner:30b",
+            ServingBackend::LlamaGpu,
+            Runtime::LlamaCpp,
+            r#"{"thinking":{"supports_thinking":true,"preserve_thinking":false,
+                "requires_prefix_caching":false,"validated":true}}"#,
+            false,
+            None,
+        );
+        let (cmd, decision) = build_launch_command_for_request(
+            &e,
+            Runtime::LlamaCpp,
+            "/w/m.gguf",
+            Some(ThinkingRequest::On),
+        )
+        .unwrap();
+        assert!(cmd.args.contains(&"--preserve-thinking".to_string()));
+        assert_eq!(decision.effective, EffectiveThinking::ForcedOn);
+        assert_eq!(decision.note, None);
+    }
+
+    #[test]
+    #[serial]
+    fn request_thinking_off_honored_for_supporting_validated_model() {
+        set_runtime_endpoints();
+        // Profile default is preserve_thinking=true; the per-request "off" hint
+        // suppresses it for THIS launch only.
+        let e = entry(
+            "reasoner:30b",
+            ServingBackend::LlamaGpu,
+            Runtime::LlamaCpp,
+            r#"{"thinking":{"supports_thinking":true,"preserve_thinking":true,
+                "requires_prefix_caching":true,"validated":true}}"#,
+            false,
+            None,
+        );
+        let (cmd, decision) = build_launch_command_for_request(
+            &e,
+            Runtime::LlamaCpp,
+            "/w/m.gguf",
+            Some(ThinkingRequest::Off),
+        )
+        .unwrap();
+        assert!(!cmd.args.contains(&"--preserve-thinking".to_string()));
+        assert!(!cmd.args.contains(&"--prompt-cache-all".to_string()));
+        assert_eq!(decision.effective, EffectiveThinking::ForcedOff);
+        assert_eq!(decision.note, None);
+
+        // The original entry's profile-level config is untouched by the override
+        // (the throwaway-clone contract) — a fresh default-mode call still sees
+        // the profile's own preserve_thinking=true.
+        let (default_cmd, default_decision) =
+            build_launch_command_for_request(&e, Runtime::LlamaCpp, "/w/m.gguf", None).unwrap();
+        assert!(default_cmd.args.contains(&"--preserve-thinking".to_string()));
+        assert_eq!(default_decision.effective, EffectiveThinking::ModelDefault);
+    }
+
+    #[test]
+    #[serial]
+    fn request_thinking_ignored_not_error_for_non_supporting_model() {
+        // NEGATIVE TEST: thinking:on against a model with no `thinking` block at
+        // all — ignored with a note, never an error, never a crash.
+        set_runtime_endpoints();
+        let e = entry("plain:7b", ServingBackend::LlamaGpu, Runtime::LlamaCpp, "{}", false, None);
+        let (cmd, decision) = build_launch_command_for_request(
+            &e,
+            Runtime::LlamaCpp,
+            "/w/m.gguf",
+            Some(ThinkingRequest::On),
+        )
+        .unwrap();
+        assert!(!cmd.args.contains(&"--preserve-thinking".to_string()));
+        assert_eq!(decision.effective, EffectiveThinking::ModelDefault);
+        assert!(decision.note.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn request_thinking_ignored_for_unvalidated_model_degrades_same_as_non_supporting() {
+        // Edge case: unvalidated config must degrade EXACTLY like a wholly
+        // non-supporting model — never serve an untrusted thinking mode.
+        set_runtime_endpoints();
+        let e = entry(
+            "reasoner:30b",
+            ServingBackend::LlamaGpu,
+            Runtime::LlamaCpp,
+            r#"{"thinking":{"supports_thinking":true,"preserve_thinking":false,
+                "requires_prefix_caching":false,"validated":false}}"#,
+            false,
+            None,
+        );
+        let (cmd, decision) = build_launch_command_for_request(
+            &e,
+            Runtime::LlamaCpp,
+            "/w/m.gguf",
+            Some(ThinkingRequest::On),
+        )
+        .unwrap();
+        assert!(!cmd.args.contains(&"--preserve-thinking".to_string()));
+        assert_eq!(decision.effective, EffectiveThinking::ModelDefault);
+        assert!(decision.note.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn request_no_thinking_param_serves_model_default_unchanged() {
+        // No hint sent at all ⇒ model's own default mode, unchanged behavior —
+        // identical output to plain `build_launch_command`.
+        set_runtime_endpoints();
+        let e = entry(
+            "reasoner:30b",
+            ServingBackend::LlamaGpu,
+            Runtime::LlamaCpp,
+            r#"{"thinking":{"supports_thinking":true,"preserve_thinking":true,
+                "requires_prefix_caching":true,"validated":true}}"#,
+            false,
+            None,
+        );
+        let baseline = build_launch_command(&e, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
+        let (cmd, decision) =
+            build_launch_command_for_request(&e, Runtime::LlamaCpp, "/w/m.gguf", None).unwrap();
+        assert_eq!(cmd.args, baseline.args);
+        assert_eq!(decision.effective, EffectiveThinking::ModelDefault);
+        assert_eq!(decision.note, None);
     }
 }
