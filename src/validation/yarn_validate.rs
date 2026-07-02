@@ -207,14 +207,25 @@ pub struct ValidationEvidence {
 }
 
 /// The pure decision core: given a native-context baseline, the extended-
-/// context probes actually collected (empty if the launch never served), and
-/// the launch report, decide whether this config validates. Deterministic —
-/// same inputs always produce the same [`ValidationEvidence`] — which is what
-/// makes this fully unit-testable without any real launch or probe.
+/// context probes actually collected (empty if the launch never served), the
+/// launch report, and the `target_ctx` the config was meant to be validated
+/// at, decide whether this config validates. Deterministic — same inputs
+/// always produce the same [`ValidationEvidence`] — which is what makes this
+/// fully unit-testable without any real launch or probe.
+///
+/// INVARIANT (enforced HERE, not merely assumed from how a caller happens to
+/// invoke this): `validated` can only be `true` when `extended_probes` is
+/// non-empty AND its deepest entry reaches `target_ctx` — i.e. there is an
+/// actual evidence trail covering the full extended range. A caller (present
+/// or future, e.g. the real YARN-04 wiring) that supplies zero probes, or
+/// only shallow ones that never exercise the extended range, gets
+/// `validated: false` with an explicit reason — never a silent pass on no
+/// evidence.
 pub fn evaluate(
     native_baseline: ProbeResult,
     extended_probes: &[ProbeResult],
     launch: &LaunchReport,
+    target_ctx: u32,
 ) -> ValidationEvidence {
     let native_baseline_score = native_baseline.combined_score();
     let native_baseline_weak = native_baseline_score < WEAK_BASELINE_THRESHOLD;
@@ -246,10 +257,58 @@ pub fn evaluate(
         };
     }
 
-    // Served stably: check for a recall/coherence collapse at any probed
-    // depth relative to the native baseline. The FIRST collapsing depth is
-    // recorded (not the worst) so the evidence shows where things started
-    // going wrong.
+    // Served stably, but with no evidence at all: never validate on an empty
+    // probe set. This is the "no evidence -> never true" guard — it must live
+    // HERE (inside the pure core), not be left to a caller's discipline.
+    if extended_probes.is_empty() {
+        return ValidationEvidence {
+            validated: false,
+            served_stably: true,
+            failure_depth_tokens: None,
+            failure_reason: Some(
+                "served but no extended-context probes collected — cannot validate without evidence"
+                    .to_string(),
+            ),
+            vram_gb_at_extended_ctx: launch.vram_gb_at_extended_ctx,
+            backend_used: launch.backend_used.clone(),
+            max_ctx_that_fit: launch.max_ctx_that_fit,
+            native_baseline_score,
+            native_baseline_weak,
+            extended_scores,
+        };
+    }
+
+    // Served stably with SOME probes, but they never reached the full
+    // extended range (target_ctx): the "runs at extended context" claim was
+    // never actually exercised at the depth that matters, so it cannot
+    // validate either — a shallow-only probe set is incomplete evidence, not
+    // sufficient evidence.
+    let deepest_probed = extended_probes
+        .iter()
+        .map(|p| p.depth_tokens)
+        .max()
+        .unwrap_or(0);
+    if deepest_probed < target_ctx {
+        return ValidationEvidence {
+            validated: false,
+            served_stably: true,
+            failure_depth_tokens: None,
+            failure_reason: Some(format!(
+                "extended-context probes did not reach the full target context (deepest probed {deepest_probed} tokens < target {target_ctx} tokens) — cannot validate without evidence at the extended range"
+            )),
+            vram_gb_at_extended_ctx: launch.vram_gb_at_extended_ctx,
+            backend_used: launch.backend_used.clone(),
+            max_ctx_that_fit: launch.max_ctx_that_fit,
+            native_baseline_score,
+            native_baseline_weak,
+            extended_scores,
+        };
+    }
+
+    // Served stably with full-depth coverage: check for a recall/coherence
+    // collapse at any probed depth relative to the native baseline. The FIRST
+    // collapsing depth is recorded (not the worst) so the evidence shows
+    // where things started going wrong.
     let collapse_threshold = native_baseline_score * COLLAPSE_RATIO;
     let collapse = extended_probes
         .iter()
@@ -300,13 +359,13 @@ pub fn run_validation(
 ) -> ValidationEvidence {
     let launch = launcher.launch(model_id, rope);
     if !launch.served_stably {
-        return evaluate(native_baseline, &[], &launch);
+        return evaluate(native_baseline, &[], &launch, rope.target_ctx);
     }
     let extended_probes: Vec<ProbeResult> = probe_depths_for(rope.target_ctx)
         .into_iter()
         .map(|depth| prober.probe(depth))
         .collect();
-    evaluate(native_baseline, &extended_probes, &launch)
+    evaluate(native_baseline, &extended_probes, &launch, rope.target_ctx)
 }
 
 #[cfg(test)]
@@ -397,7 +456,7 @@ mod tests {
             max_ctx_that_fit: None,
         };
 
-        let evidence = evaluate(native, &extended, &launch);
+        let evidence = evaluate(native, &extended, &launch, 100_000);
 
         assert!(evidence.validated);
         assert!(evidence.served_stably);
@@ -435,7 +494,7 @@ mod tests {
             max_ctx_that_fit: None,
         };
 
-        let evidence = evaluate(native, &extended, &launch);
+        let evidence = evaluate(native, &extended, &launch, 100_000);
 
         assert!(!evidence.validated);
         assert!(evidence.served_stably, "must be distinguished from a serving failure");
@@ -461,7 +520,7 @@ mod tests {
         };
 
         // No probes ran — the harness must handle this gracefully, not panic.
-        let evidence = evaluate(native, &[], &launch);
+        let evidence = evaluate(native, &[], &launch, 100_000);
 
         assert!(!evidence.validated);
         assert!(!evidence.served_stably);
@@ -471,6 +530,72 @@ mod tests {
             Some("wedge: no response within health-check window")
         );
         assert!(evidence.extended_scores.is_empty());
+    }
+
+    // ---- evaluate: served but zero evidence — THE most important guard ---
+    // Both independent reviewers flagged this: `served_stably=true` with an
+    // EMPTY probe set must never validate=true. `run_validation` happens to
+    // always supply probes, but `evaluate` is `pub` and re-exported — this is
+    // exactly the seam YARN-04's real production wiring will call directly,
+    // so the "no evidence -> never true" invariant has to be enforced HERE,
+    // not merely assumed from today's one caller.
+
+    #[test]
+    fn served_stably_with_zero_probes_never_validates_true() {
+        let native = strong_probe(8_000);
+        let launch = LaunchReport {
+            served_stably: true,
+            failure_reason: None,
+            vram_gb_at_extended_ctx: Some(42.0),
+            backend_used: "rocm".to_string(),
+            max_ctx_that_fit: None,
+        };
+
+        let evidence = evaluate(native, &[], &launch, 100_000);
+
+        assert!(
+            !evidence.validated,
+            "zero probe evidence must never produce validated=true"
+        );
+        assert!(evidence.served_stably);
+        assert!(evidence.extended_scores.is_empty());
+        assert!(evidence
+            .failure_reason
+            .as_deref()
+            .unwrap()
+            .contains("no extended-context probes collected"));
+    }
+
+    // ---- evaluate: shallow-only probes never reach the extended range ----
+    // Secondary reviewer note: probes that never actually exercise the full
+    // target_ctx must not validate either — "runs at extended context" has
+    // to mean the full extended range was probed, not just a shallow slice.
+
+    #[test]
+    fn probes_that_never_reach_target_ctx_never_validate_true() {
+        let native = strong_probe(8_000);
+        // Only shallow probes (30%/60%) — the 100% depth was never probed.
+        let shallow_only = vec![strong_probe(30_000), strong_probe(60_000)];
+        let launch = LaunchReport {
+            served_stably: true,
+            failure_reason: None,
+            vram_gb_at_extended_ctx: Some(42.0),
+            backend_used: "rocm".to_string(),
+            max_ctx_that_fit: None,
+        };
+
+        let evidence = evaluate(native, &shallow_only, &launch, 100_000);
+
+        assert!(
+            !evidence.validated,
+            "probes that stop short of target_ctx must never validate=true"
+        );
+        assert!(evidence.served_stably);
+        assert!(evidence
+            .failure_reason
+            .as_deref()
+            .unwrap()
+            .contains("did not reach the full target context"));
     }
 
     // ---- evaluate: backend-dependence -------------------------------------
@@ -495,8 +620,8 @@ mod tests {
             max_ctx_that_fit: None,
         };
 
-        let vulkan_evidence = evaluate(native, &[], &vulkan_launch);
-        let rocm_evidence = evaluate(native, &extended_ok, &rocm_launch);
+        let vulkan_evidence = evaluate(native, &[], &vulkan_launch, 100_000);
+        let rocm_evidence = evaluate(native, &extended_ok, &rocm_launch, 100_000);
 
         assert!(!vulkan_evidence.validated);
         assert_eq!(vulkan_evidence.backend_used, "vulkan");
@@ -517,7 +642,7 @@ mod tests {
             max_ctx_that_fit: Some(64_000),
         };
 
-        let evidence = evaluate(native, &[], &launch);
+        let evidence = evaluate(native, &[], &launch, 100_000);
 
         assert!(!evidence.validated, "the requested target_ctx did not validate");
         assert_eq!(
@@ -549,7 +674,7 @@ mod tests {
             max_ctx_that_fit: None,
         };
 
-        let evidence = evaluate(weak_native, &extended, &launch);
+        let evidence = evaluate(weak_native, &extended, &launch, 100_000);
 
         assert!(evidence.native_baseline_weak);
         // Holding steady relative to an already-weak baseline should still
