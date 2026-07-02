@@ -12,7 +12,10 @@
 //!   - **llama.cpp-rocm** ([`Runtime::LlamaCpp`]): `llama_server_bin()` with
 //!     `--model <gguf>`; `HSA_OVERRIDE_GFX_VERSION` env from `gfx_override`;
 //!     **`--no-mmap` when `mmap == Some(false)`** (the v2 NFS-page-fault lesson);
-//!     `--flash-attn` when `flash_attn == Some(true)`. Health-checks
+//!     `--flash-attn` when `flash_attn == Some(true)`; YARN-01: `--rope-scaling`
+//!     / `--rope-scale` / `--yarn-*` / `--ctx-size` when the row's
+//!     `rope_scaling` block is present, `validated`, and an extension is
+//!     actually needed (see [`rope_scaling_args`]). Health-checks
 //!     `llama_server_url()`.
 //!   - **ollama-rocm** ([`Runtime::Ollama`]): `ollama_bin()` `serve`; the GPU
 //!     `gfx_override` env; health-checks `ollama_primary_url()`.
@@ -44,7 +47,7 @@ use crate::supervisor::egress_policy::posture_for;
 use crate::supervisor::launch_isolation::{decide_isolation, IsolationDecision};
 use crate::supervisor::{build_runtime_env, RuntimeClass};
 
-use super::profile::{EnvSpec, ProfileLoadError, RouteEntry};
+use super::profile::{EnvSpec, ProfileLoadError, RopeScaling, RopeScalingMethod, RouteEntry};
 
 /// A constructed runtime launch: the binary, its argv, the env pairs, and the
 /// endpoint to health-check. Pure data — building it touches no process, so it is
@@ -298,6 +301,78 @@ fn resolve_gfx_override(env: &EnvSpec) -> Option<String> {
     None
 }
 
+/// YARN-01: build the `--rope-scaling` / `--yarn-*` / `--ctx-size` arguments for
+/// the llama.cpp tier, or nothing at all.
+///
+/// Emission rules (all values sourced from `rope` — never invented):
+///   - `method == None` ⇒ no flags (unchanged native-context behavior).
+///   - `method != None` but `!validated` ⇒ no flags; the caller logs the
+///     "configured but not validated" warning and serves at native context.
+///   - `target_ctx <= yarn_orig_ctx` ⇒ no extension needed; no-op even when
+///     validated (nothing to gain from scaling down/flat).
+///   - otherwise: `--rope-scaling <method>`, `--rope-scale <rope_scale>`, and
+///     `--ctx-size <target_ctx>`; `method == Yarn` additionally gets the
+///     yarn-specific fine-tune flags (`--yarn-orig-ctx`, `--yarn-ext-factor`,
+///     `--yarn-attn-factor`, `--yarn-beta-slow`, `--yarn-beta-fast`) — linear
+///     scaling never gets these.
+fn rope_scaling_args(rope: &RopeScaling) -> Vec<String> {
+    if rope.method == RopeScalingMethod::None {
+        return Vec::new();
+    }
+    if !rope.validated {
+        tracing::warn!(
+            target: "chord.serving.launcher",
+            method = rope.method.as_str(),
+            "yarn configured but not validated on gfx1151 — serving at native context"
+        );
+        return Vec::new();
+    }
+    if rope.target_ctx <= rope.yarn_orig_ctx {
+        tracing::warn!(
+            target: "chord.serving.launcher",
+            target_ctx = rope.target_ctx,
+            yarn_orig_ctx = rope.yarn_orig_ctx,
+            "rope-scaling target_ctx does not exceed yarn_orig_ctx — no context extension needed, skipping"
+        );
+        return Vec::new();
+    }
+
+    let mut args = vec![
+        "--rope-scaling".to_string(),
+        rope.method.as_str().to_string(),
+        "--rope-scale".to_string(),
+        rope.rope_scale.to_string(),
+    ];
+    if rope.method == RopeScalingMethod::Yarn {
+        args.push("--yarn-orig-ctx".to_string());
+        args.push(rope.yarn_orig_ctx.to_string());
+        args.push("--yarn-ext-factor".to_string());
+        args.push(rope.ext_factor.to_string());
+        args.push("--yarn-attn-factor".to_string());
+        args.push(rope.attn_factor.to_string());
+        args.push("--yarn-beta-slow".to_string());
+        args.push(rope.beta_slow.to_string());
+        args.push("--yarn-beta-fast".to_string());
+        args.push(rope.beta_fast.to_string());
+    }
+    args.push("--ctx-size".to_string());
+    args.push(rope.target_ctx.to_string());
+    args
+}
+
+/// YARN-01: log that a non-`none` `rope_scaling` block was present on a tier that
+/// cannot apply it (ollama / CPU). Never crashes, never applies the config — just
+/// a clear note that context extension is unavailable on that tier.
+fn warn_rope_scaling_unsupported(rope: &RopeScaling) {
+    if rope.method != RopeScalingMethod::None {
+        tracing::warn!(
+            target: "chord.serving.launcher",
+            method = rope.method.as_str(),
+            "rope-scaling not supported on this tier — context extension unavailable"
+        );
+    }
+}
+
 /// Build the [`LaunchCommand`] for serving `entry` under a specific `runtime`.
 ///
 /// Reads every binary/endpoint from the SRV-01 config helpers (no literals) and
@@ -332,6 +407,11 @@ pub fn build_launch_command(
                 args.push("-c".to_string());
                 args.push(n.to_string());
             }
+            // YARN-01: emit --rope-scaling/--yarn-*/--ctx-size when configured,
+            // validated, and an extension is actually needed (llama.cpp tier only).
+            if let Some(rope) = &env.rope_scaling {
+                args.extend(rope_scaling_args(rope));
+            }
             let mut envs = Vec::new();
             if let Some(gfx) = resolve_gfx_override(env) {
                 // Empty string is a meaningful (CPU) value, but on llama.cpp tier
@@ -353,6 +433,10 @@ pub fn build_launch_command(
             let health_url =
                 config::ollama_primary_url().ok_or(LaunchError::RuntimeNotConfigured)?;
             let args = vec!["serve".to_string()];
+            // YARN-01: this tier cannot apply rope scaling — ignore, log, never crash.
+            if let Some(rope) = &env.rope_scaling {
+                warn_rope_scaling_unsupported(rope);
+            }
             let mut envs = Vec::new();
             if let Some(gfx) = resolve_gfx_override(env) {
                 if !gfx.is_empty() {
@@ -372,6 +456,10 @@ pub fn build_launch_command(
             let health_url =
                 config::ollama_secondary_url().ok_or(LaunchError::RuntimeNotConfigured)?;
             let args = vec!["serve".to_string()];
+            // YARN-01: this tier cannot apply rope scaling — ignore, log, never crash.
+            if let Some(rope) = &env.rope_scaling {
+                warn_rope_scaling_unsupported(rope);
+            }
             let mut envs = Vec::new();
             // The CPU tier sets a DELIBERATE empty gfx override (the empty-override
             // CPU path). Some("") → set it empty; absent → fall through to empty
@@ -856,6 +944,169 @@ mod tests {
         // -c <n> present (the SRV-12 explicit-context sidestep).
         let pos = cmd.args.iter().position(|a| a == "-c").expect("-c emitted");
         assert_eq!(cmd.args.get(pos + 1).map(String::as_str), Some("98304"));
+    }
+
+    // ── YARN-01: rope-scaling flag emission ────────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn llama_command_emits_yarn_flags_when_validated() {
+        set_runtime_endpoints();
+        let e = entry(
+            "big:coder",
+            ServingBackend::LlamaGpu,
+            Runtime::LlamaCpp,
+            r#"{"rope_scaling":{"method":"yarn","rope_scale":4.0,"yarn_orig_ctx":32768,
+                "target_ctx":131072,"ext_factor":1.0,"attn_factor":1.0,"beta_slow":1.0,
+                "beta_fast":32.0,"validated":true}}"#,
+            false,
+            None,
+        );
+        let cmd = build_launch_command(&e, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
+        // Exact expected flag string (order matters — this is what's exec'd).
+        let expected: Vec<String> = [
+            "--model", "/w/m.gguf",
+            "--rope-scaling", "yarn",
+            "--rope-scale", "4",
+            "--yarn-orig-ctx", "32768",
+            "--yarn-ext-factor", "1",
+            "--yarn-attn-factor", "1",
+            "--yarn-beta-slow", "1",
+            "--yarn-beta-fast", "32",
+            "--ctx-size", "131072",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(cmd.args, expected);
+    }
+
+    #[test]
+    #[serial]
+    fn llama_command_unvalidated_yarn_emits_no_flags_native_context() {
+        // NEGATIVE TEST: method=yarn but validated=false → no yarn/ctx-size flags,
+        // native context (the "configured but not validated" path).
+        set_runtime_endpoints();
+        let e = entry(
+            "big:coder",
+            ServingBackend::LlamaGpu,
+            Runtime::LlamaCpp,
+            r#"{"rope_scaling":{"method":"yarn","rope_scale":4.0,"yarn_orig_ctx":32768,
+                "target_ctx":131072,"ext_factor":1.0,"attn_factor":1.0,"beta_slow":1.0,
+                "beta_fast":32.0,"validated":false}}"#,
+            false,
+            None,
+        );
+        let cmd = build_launch_command(&e, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
+        assert_eq!(cmd.args, vec!["--model".to_string(), "/w/m.gguf".to_string()]);
+        assert!(!cmd.args.iter().any(|a| a.starts_with("--rope") || a.starts_with("--yarn")));
+        assert!(!cmd.args.contains(&"--ctx-size".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn llama_command_method_none_emits_no_scaling_flags() {
+        // method=none (or the block absent entirely) → unchanged behavior.
+        set_runtime_endpoints();
+        let e = entry(
+            "m",
+            ServingBackend::LlamaGpu,
+            Runtime::LlamaCpp,
+            r#"{"rope_scaling":{"method":"none"}}"#,
+            false,
+            None,
+        );
+        let cmd = build_launch_command(&e, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
+        assert_eq!(cmd.args, vec!["--model".to_string(), "/w/m.gguf".to_string()]);
+
+        // No block at all — identical (unchanged) behavior.
+        let e2 = entry("m", ServingBackend::LlamaGpu, Runtime::LlamaCpp, "{}", false, None);
+        let cmd2 = build_launch_command(&e2, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
+        assert_eq!(cmd2.args, vec!["--model".to_string(), "/w/m.gguf".to_string()]);
+    }
+
+    #[test]
+    #[serial]
+    fn llama_command_emits_linear_flags_without_yarn_finetune() {
+        set_runtime_endpoints();
+        let e = entry(
+            "m",
+            ServingBackend::LlamaGpu,
+            Runtime::LlamaCpp,
+            r#"{"rope_scaling":{"method":"linear","rope_scale":2.0,"target_ctx":16384,"validated":true}}"#,
+            false,
+            None,
+        );
+        let cmd = build_launch_command(&e, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
+        let expected: Vec<String> = [
+            "--model", "/w/m.gguf",
+            "--rope-scaling", "linear",
+            "--rope-scale", "2",
+            "--ctx-size", "16384",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(cmd.args, expected);
+        // No yarn-specific fine-tune flags for linear.
+        assert!(!cmd.args.iter().any(|a| a.starts_with("--yarn")));
+    }
+
+    #[test]
+    #[serial]
+    fn llama_command_no_op_when_target_ctx_not_greater_than_orig() {
+        // target_ctx <= yarn_orig_ctx → no extension needed, no-op even validated.
+        set_runtime_endpoints();
+        let e = entry(
+            "m",
+            ServingBackend::LlamaGpu,
+            Runtime::LlamaCpp,
+            r#"{"rope_scaling":{"method":"yarn","rope_scale":4.0,"yarn_orig_ctx":32768,
+                "target_ctx":32768,"ext_factor":1.0,"attn_factor":1.0,"beta_slow":1.0,
+                "beta_fast":32.0,"validated":true}}"#,
+            false,
+            None,
+        );
+        let cmd = build_launch_command(&e, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
+        assert_eq!(cmd.args, vec!["--model".to_string(), "/w/m.gguf".to_string()]);
+    }
+
+    #[test]
+    #[serial]
+    fn ollama_command_ignores_yarn_rope_scaling_never_crashes() {
+        // NEGATIVE TEST: ollama tier cannot apply rope scaling — ignored, logged,
+        // and the command builds successfully (no panic, no flags).
+        set_runtime_endpoints();
+        let e = entry(
+            "gemma4:9b",
+            ServingBackend::OllamaGpu,
+            Runtime::Ollama,
+            r#"{"rope_scaling":{"method":"yarn","rope_scale":4.0,"yarn_orig_ctx":32768,
+                "target_ctx":131072,"ext_factor":1.0,"attn_factor":1.0,"beta_slow":1.0,
+                "beta_fast":32.0,"validated":true}}"#,
+            false,
+            None,
+        );
+        let cmd = build_launch_command(&e, Runtime::Ollama, "ignored").unwrap();
+        assert_eq!(cmd.args, vec!["serve".to_string()]);
+    }
+
+    #[test]
+    #[serial]
+    fn cpu_command_ignores_yarn_rope_scaling_never_crashes() {
+        set_runtime_endpoints();
+        let e = entry(
+            "small:3b",
+            ServingBackend::Cpu,
+            Runtime::Cpu,
+            r#"{"rope_scaling":{"method":"yarn","rope_scale":4.0,"yarn_orig_ctx":32768,
+                "target_ctx":131072,"ext_factor":1.0,"attn_factor":1.0,"beta_slow":1.0,
+                "beta_fast":32.0,"validated":true}}"#,
+            false,
+            None,
+        );
+        let cmd = build_launch_command(&e, Runtime::Cpu, "ignored").unwrap();
+        assert_eq!(cmd.args, vec!["serve".to_string()]);
     }
 
     #[test]
