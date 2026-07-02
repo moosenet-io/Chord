@@ -20,6 +20,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::models::backends::{self, Backend};
+use crate::models::rope_ingest::{self, RopeIngestOutcome};
+use crate::serving::profile::{RopeScaling, RopeScalingMethod};
 
 /// Storage tier a model currently lives at.
 ///
@@ -74,6 +76,24 @@ pub struct ModelRecord {
     /// `None` ⇒ the model is Ollama-managed and its blob is resolved normally.
     #[serde(default)]
     pub gguf_path: Option<String>,
+    /// YARN-02: RoPE/YaRN scaling metadata ingested from this model's OWN GGUF
+    /// kv header at registration time (never invented) — see
+    /// `rope_ingest::derive_rope_scaling`. `None` ⇒ not yet ingested, OR
+    /// ingestion could not safely produce a block (see
+    /// [`rope_scaling_note`](Self::rope_scaling_note)). `Some(RopeScaling {
+    /// method: RopeScalingMethod::None, .. })` ⇒ ingested and the model
+    /// declares no long-context scaling (the EnvSpec "no-op method" shape from
+    /// YARN-01). `validated` is always `false` on an ingested block — YARN-03
+    /// (not yet built) owns promoting it.
+    #[serde(default)]
+    pub rope_scaling: Option<RopeScaling>,
+    /// YARN-02: set when ingestion found scaling metadata it would not safely
+    /// pre-fill (e.g. yarn declared without `original_context_length`) — a
+    /// human-readable note for an operator to manually configure this model's
+    /// rope scaling. `None` when ingestion succeeded (including "no long
+    /// context") or has not run yet.
+    #[serde(default)]
+    pub rope_scaling_note: Option<String>,
 }
 
 /// Default for `ModelRecord::managed_by` so registries written before this field existed still
@@ -459,6 +479,7 @@ impl ModelRegistry {
                             protected,
                             managed_by: MANAGED_BY_OLLAMA.to_string(),
                             backend: None, gguf_path: None,
+                        rope_scaling: None, rope_scaling_note: None,
                         },
                     );
                 }
@@ -516,6 +537,7 @@ impl ModelRegistry {
                                 protected,
                                 managed_by: MANAGED_BY_OLLAMA.to_string(),
                                 backend: None, gguf_path: None,
+                        rope_scaling: None, rope_scaling_note: None,
                             },
                         );
                     }
@@ -577,6 +599,7 @@ impl ModelRegistry {
                         protected: false,
                         managed_by: managed_by.to_string(),
                         backend: None, gguf_path: None,
+                        rope_scaling: None, rope_scaling_note: None,
                     },
                 );
             }
@@ -623,6 +646,62 @@ impl ModelRegistry {
             tier = ?tier,
             "registered DiffusionGemma in model registry (non-Ollama, managed by llama-diffusion-daemon)"
         );
+    }
+
+    /// YARN-02: ingest RoPE/YaRN scaling metadata from a model's OWN GGUF kv
+    /// header, at registration time, into `rec.rope_scaling` /
+    /// `rec.rope_scaling_note`. Reads `gguf_path` off the already-registered
+    /// record — call this AFTER the model's `gguf_path` is set (e.g. after
+    /// `register_external`, or once an Ollama-managed record's `gguf_path` has
+    /// been resolved). No-op (`None`) when the model is unknown or has no
+    /// `gguf_path` — there is nothing to read yet.
+    ///
+    /// Never fabricates a scale factor: see [`rope_ingest::derive_rope_scaling`].
+    /// Persisting the updated record is the caller's responsibility (`save()`),
+    /// matching the rest of the registry's mutate-then-save pattern.
+    pub fn ingest_rope_scaling(&mut self, name: &str) -> Option<RopeIngestOutcome> {
+        let path = self.records.get(name)?.gguf_path.clone()?;
+        let outcome = match rope_ingest::read_gguf_rope_kv(Path::new(&path)) {
+            Some(kv) => rope_ingest::derive_rope_scaling(&kv),
+            None => RopeIngestOutcome::ManualConfigRequired(
+                "GGUF unreadable or not a valid GGUF file — manual configuration required"
+                    .to_string(),
+            ),
+        };
+
+        let rec = self.records.get_mut(name)?;
+        match &outcome {
+            RopeIngestOutcome::NoLongContext => {
+                rec.rope_scaling = Some(RopeScaling {
+                    method: RopeScalingMethod::None,
+                    ..Default::default()
+                });
+                rec.rope_scaling_note = None;
+                tracing::debug!(model = %name, "YARN-02: model declares no long-context rope scaling");
+            }
+            RopeIngestOutcome::Prefilled(rope) => {
+                tracing::info!(
+                    model = %name,
+                    method = rope.method.as_str(),
+                    rope_scale = rope.rope_scale,
+                    yarn_orig_ctx = rope.yarn_orig_ctx,
+                    target_ctx = rope.target_ctx,
+                    "YARN-02: pre-filled rope_scaling from model's own GGUF metadata (unvalidated)"
+                );
+                rec.rope_scaling = Some(*rope);
+                rec.rope_scaling_note = None;
+            }
+            RopeIngestOutcome::ManualConfigRequired(note) => {
+                tracing::warn!(
+                    model = %name,
+                    note = %note,
+                    "YARN-02: rope_scaling not pre-filled — manual configuration required"
+                );
+                rec.rope_scaling = None;
+                rec.rope_scaling_note = Some(note.clone());
+            }
+        }
+        Some(outcome)
     }
 
     /// Look up a record by model name.
@@ -1181,6 +1260,7 @@ mod tests {
                 protected: false,
                 managed_by: MANAGED_BY_OLLAMA.to_string(),
                 backend: None, gguf_path: None,
+                        rope_scaling: None, rope_scaling_note: None,
             },
         );
         reg.reconcile();
@@ -1391,5 +1471,201 @@ mod tests {
         std::env::remove_var("DGEM_MODEL_ARCHIVE_PATH");
         reg.register_diffusiongemma_from_env();
         assert!(reg.all_records().next().is_none(), "no registration without configured paths");
+    }
+
+    // --- YARN-02: rope-scaling ingestion at registration time -------------
+
+    const GGUF_T_U32: u32 = 4;
+    const GGUF_T_F32: u32 = 6;
+    const GGUF_T_STR: u32 = 8;
+
+    fn gguf_string_value(s: &str) -> Vec<u8> {
+        let mut v = (s.len() as u64).to_le_bytes().to_vec();
+        v.extend_from_slice(s.as_bytes());
+        v
+    }
+    fn gguf_u32_value(n: u32) -> Vec<u8> {
+        n.to_le_bytes().to_vec()
+    }
+    fn gguf_f32_value(n: f32) -> Vec<u8> {
+        n.to_le_bytes().to_vec()
+    }
+
+    /// Minimal valid GGUF byte buffer: magic + version 3 + tensor_count 0 +
+    /// the given kv pairs. Enough to exercise `ingest_rope_scaling` end-to-end
+    /// without a real model file (mirrors `models::rope_ingest`'s own test
+    /// builder, kept separate since that one is private to its module).
+    fn write_test_gguf(path: &Path, kvs: &[(&str, u32, Vec<u8>)]) {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        buf.extend_from_slice(&(kvs.len() as u64).to_le_bytes()); // kv_count
+        for (key, type_tag, value) in kvs {
+            buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            buf.extend_from_slice(key.as_bytes());
+            buf.extend_from_slice(&type_tag.to_le_bytes());
+            buf.extend_from_slice(value);
+        }
+        fs::write(path, buf).unwrap();
+    }
+
+    /// Register a model with no manifest of its own (so `reconcile()` won't
+    /// touch it) and a direct `gguf_path`, the shape `ingest_rope_scaling`
+    /// reads from.
+    fn register_with_gguf(reg: &mut ModelRegistry, name: &str, gguf_path: &Path) {
+        reg.register_external(name, "llama-gpu-gguf", None, None, 0);
+        reg.records.get_mut(name).unwrap().gguf_path =
+            Some(gguf_path.to_string_lossy().to_string());
+    }
+
+    #[test]
+    fn ingest_rope_scaling_prefills_yarn_from_gguf_metadata() {
+        let tmp = tempdir().unwrap();
+        let gguf_path = tmp.path().join("model.gguf");
+        write_test_gguf(
+            &gguf_path,
+            &[
+                ("qwen2.context_length", GGUF_T_U32, gguf_u32_value(131072)),
+                ("qwen2.rope.scaling.type", GGUF_T_STR, gguf_string_value("yarn")),
+                ("qwen2.rope.scaling.factor", GGUF_T_F32, gguf_f32_value(4.0)),
+                (
+                    "qwen2.rope.scaling.original_context_length",
+                    GGUF_T_U32,
+                    gguf_u32_value(32768),
+                ),
+            ],
+        );
+
+        let mut reg = reg_at(tmp.path(), vec![]);
+        register_with_gguf(&mut reg, "qwen2.5:32b", &gguf_path);
+
+        let outcome = reg.ingest_rope_scaling("qwen2.5:32b").expect("model known");
+        match outcome {
+            RopeIngestOutcome::Prefilled(rope) => {
+                assert_eq!(rope.method, RopeScalingMethod::Yarn);
+                assert_eq!(rope.rope_scale, 4.0);
+                assert_eq!(rope.yarn_orig_ctx, 32768);
+                assert_eq!(rope.target_ctx, 131072);
+                assert!(!rope.validated, "ingestion never marks validated — YARN-03's job");
+            }
+            other => panic!("expected Prefilled(yarn), got {other:?}"),
+        }
+
+        let rec = reg.get("qwen2.5:32b").unwrap();
+        let stored = rec.rope_scaling.expect("stored on the record");
+        assert_eq!(stored.method, RopeScalingMethod::Yarn);
+        assert!(rec.rope_scaling_note.is_none());
+    }
+
+    #[test]
+    fn ingest_rope_scaling_records_linear_method() {
+        let tmp = tempdir().unwrap();
+        let gguf_path = tmp.path().join("model.gguf");
+        write_test_gguf(
+            &gguf_path,
+            &[
+                ("llama.context_length", GGUF_T_U32, gguf_u32_value(16384)),
+                ("llama.rope.scaling.type", GGUF_T_STR, gguf_string_value("linear")),
+                ("llama.rope.scaling.factor", GGUF_T_F32, gguf_f32_value(2.0)),
+            ],
+        );
+
+        let mut reg = reg_at(tmp.path(), vec![]);
+        register_with_gguf(&mut reg, "llama3:8b", &gguf_path);
+
+        match reg.ingest_rope_scaling("llama3:8b").unwrap() {
+            RopeIngestOutcome::Prefilled(rope) => {
+                assert_eq!(rope.method, RopeScalingMethod::Linear);
+                assert_eq!(rope.rope_scale, 2.0);
+            }
+            other => panic!("expected Prefilled(linear), got {other:?}"),
+        }
+        assert_eq!(
+            reg.get("llama3:8b").unwrap().rope_scaling.unwrap().method,
+            RopeScalingMethod::Linear
+        );
+    }
+
+    #[test]
+    fn ingest_rope_scaling_no_long_context_is_method_none() {
+        let tmp = tempdir().unwrap();
+        let gguf_path = tmp.path().join("model.gguf");
+        write_test_gguf(
+            &gguf_path,
+            &[("llama.context_length", GGUF_T_U32, gguf_u32_value(4096))],
+        );
+
+        let mut reg = reg_at(tmp.path(), vec![]);
+        register_with_gguf(&mut reg, "tiny:1b", &gguf_path);
+
+        assert_eq!(
+            reg.ingest_rope_scaling("tiny:1b").unwrap(),
+            RopeIngestOutcome::NoLongContext
+        );
+        let rec = reg.get("tiny:1b").unwrap();
+        assert_eq!(rec.rope_scaling.as_ref().unwrap().method, RopeScalingMethod::None);
+        assert!(rec.rope_scaling_note.is_none());
+    }
+
+    #[test]
+    fn ingest_rope_scaling_missing_orig_ctx_never_fabricates_and_notes_manual_config() {
+        // Declares yarn + a factor + a context_length but NOT
+        // original_context_length: ingestion must refuse to guess it, and the
+        // record must end up with NO rope_scaling block, only a note.
+        let tmp = tempdir().unwrap();
+        let gguf_path = tmp.path().join("model.gguf");
+        write_test_gguf(
+            &gguf_path,
+            &[
+                ("qwen2.rope.scaling.type", GGUF_T_STR, gguf_string_value("yarn")),
+                ("qwen2.rope.scaling.factor", GGUF_T_F32, gguf_f32_value(4.0)),
+                ("qwen2.context_length", GGUF_T_U32, gguf_u32_value(131072)),
+            ],
+        );
+
+        let mut reg = reg_at(tmp.path(), vec![]);
+        register_with_gguf(&mut reg, "partial-yarn:7b", &gguf_path);
+
+        match reg.ingest_rope_scaling("partial-yarn:7b").unwrap() {
+            RopeIngestOutcome::ManualConfigRequired(note) => {
+                assert!(note.contains("original_context_length"));
+            }
+            other => panic!("expected ManualConfigRequired, got {other:?}"),
+        }
+        let rec = reg.get("partial-yarn:7b").unwrap();
+        assert!(rec.rope_scaling.is_none(), "never a fabricated block");
+        assert!(rec.rope_scaling_note.is_some());
+    }
+
+    #[test]
+    fn ingest_rope_scaling_unreadable_gguf_is_manual_config_not_a_crash() {
+        let tmp = tempdir().unwrap();
+        let bogus_path = tmp.path().join("not-really-a-model.gguf");
+        fs::write(&bogus_path, b"definitely not a gguf file").unwrap();
+
+        let mut reg = reg_at(tmp.path(), vec![]);
+        register_with_gguf(&mut reg, "bad-file:1b", &bogus_path);
+
+        match reg.ingest_rope_scaling("bad-file:1b").unwrap() {
+            RopeIngestOutcome::ManualConfigRequired(_) => {}
+            other => panic!("expected ManualConfigRequired, got {other:?}"),
+        }
+        assert!(reg.get("bad-file:1b").unwrap().rope_scaling.is_none());
+    }
+
+    #[test]
+    fn ingest_rope_scaling_unknown_model_is_none() {
+        let tmp = tempdir().unwrap();
+        let mut reg = reg_at(tmp.path(), vec![]);
+        assert!(reg.ingest_rope_scaling("nope:1b").is_none());
+    }
+
+    #[test]
+    fn ingest_rope_scaling_no_gguf_path_is_none() {
+        let tmp = tempdir().unwrap();
+        let mut reg = reg_at(tmp.path(), vec![]);
+        reg.register_external("ollama-managed:1b", "ollama", Some("/warm/x".to_string()), None, 1);
+        assert!(reg.ingest_rope_scaling("ollama-managed:1b").is_none());
     }
 }
