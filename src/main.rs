@@ -13,6 +13,7 @@ use chord_proxy::{
     models::transfer::{PullCoordinator, StatvfsProbe},
     rate_limiter::ProxyRateLimiter,
     routes::{build_router, AppState},
+    serving::profile::{DbProfileSource, RoutingMap},
 };
 
 #[tokio::main]
@@ -152,6 +153,44 @@ async fn main() {
         });
     }
 
+    // ── YARN-06: SRV-04 serving-profile routing map ──
+    // The source of a model's ThinkingConfig — capability advertisement
+    // (`GET /api/models`) and per-request thinking honoring
+    // (`/v1/chat/completions`) both read this. Best-effort, same fail-open
+    // discipline as the model registry/eviction sweep above: an unconfigured
+    // or unreachable intake DB yields an empty map (every lookup misses,
+    // `thinking_available` reports `false`) rather than blocking startup —
+    // Chord's core proxy/tooling function is independent of this feature.
+    let routing_map = Arc::new(Mutex::new(RoutingMap::empty()));
+    {
+        let routing_map = routing_map.clone();
+        tokio::spawn(async move {
+            let Some(db_url) = terminus_rs::config::intake_database_url() else {
+                info!(
+                    "serving profile DB not configured — thinking capability/routing disabled \
+                     (GET /api/models reports supports_thinking=false for all models)"
+                );
+                return;
+            };
+            let pool = match sqlx::PgPool::connect(&db_url).await {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("serving profile DB connect failed: {e}");
+                    return;
+                }
+            };
+            let source = DbProfileSource::new(pool);
+            match RoutingMap::load(&source).await {
+                Ok(map) => {
+                    let count = map.len();
+                    *routing_map.lock().await = map;
+                    info!("serving profile routing map loaded: {count} model(s)");
+                }
+                Err(e) => warn!("serving profile routing map load failed: {e}"),
+            }
+        });
+    }
+
     let state = Arc::new(AppState {
         proxy,
         jwt_secret,
@@ -168,6 +207,7 @@ async fn main() {
         disk_probe: std::sync::Arc::new(StatvfsProbe),
         disk_pressure_percent: config.model_disk_pressure_percent,
         model_warm_cooldown_hours: config.model_warm_cooldown_hours,
+        routing_map,
     });
     // TIER-05: the model-tier control API runs on a SECOND listener (control port,
     // default 8090), sharing the same AppState. Build it before `state` is moved

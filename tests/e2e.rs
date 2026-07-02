@@ -202,7 +202,7 @@ fn make_state(mcp_url: String) -> Arc<AppState> {
         http_client: reqwest::Client::new(),
         model_registry,
         pull_coordinator,
-        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168,
+        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: std::sync::Arc::new(Mutex::new(chord_proxy::serving::profile::RoutingMap::empty())),
     })
 }
 
@@ -246,7 +246,7 @@ fn make_state_with_auth(mcp_url: String, secret: String) -> Arc<AppState> {
         http_client: reqwest::Client::new(),
         model_registry,
         pull_coordinator,
-        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168,
+        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: std::sync::Arc::new(Mutex::new(chord_proxy::serving::profile::RoutingMap::empty())),
     })
 }
 
@@ -298,7 +298,7 @@ fn make_state_tight_limits(mcp_url: String) -> Arc<AppState> {
         http_client: reqwest::Client::new(),
         model_registry,
         pull_coordinator,
-        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168,
+        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: std::sync::Arc::new(Mutex::new(chord_proxy::serving::profile::RoutingMap::empty())),
     })
 }
 
@@ -345,7 +345,7 @@ fn make_state_with_audit(mcp_url: String, dir: &TempDir) -> Arc<AppState> {
         http_client: reqwest::Client::new(),
         model_registry,
         pull_coordinator,
-        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168,
+        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: std::sync::Arc::new(Mutex::new(chord_proxy::serving::profile::RoutingMap::empty())),
     })
 }
 
@@ -967,7 +967,7 @@ async fn test_tool_call_both_backends_fail_returns_404() {
         http_client: reqwest::Client::new(),
         model_registry,
         pull_coordinator,
-        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168,
+        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: std::sync::Arc::new(Mutex::new(chord_proxy::serving::profile::RoutingMap::empty())),
     });
     let app = build_router(state);
 

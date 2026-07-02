@@ -59,6 +59,18 @@ pub struct ModelView {
     pub protected: bool,
     /// Lifecycle manager: `"ollama"` (default) or e.g. `"llama-diffusion"` for DiffusionGemma.
     pub managed_by: String,
+    /// YARN-06: capability advertisement — whether this model currently
+    /// supports thinking (reasoning-trace) mode, derived from
+    /// [`crate::serving::profile::RoutingMap::thinking_available`]:
+    /// `true` only when the model's serving profile has a `thinking` block
+    /// AND `supports_thinking` AND `validated` are all true. An unvalidated
+    /// config is NEVER advertised as available (same "inert until validated"
+    /// discipline as the launcher's own emission gate) — Harmony's THINK-02
+    /// can rely on this field to decide whether sending a per-request
+    /// `thinking:on` hint on `/v1/chat/completions` is worth attempting at
+    /// all. Always computed from the CURRENT routing map at request time, so
+    /// a model swap/reprofile is reflected immediately (no separate cache).
+    pub supports_thinking: bool,
 }
 
 fn tier_str(tier: &StorageTier) -> &'static str {
@@ -70,6 +82,11 @@ fn tier_str(tier: &StorageTier) -> &'static str {
 }
 
 impl From<&ModelRecord> for ModelView {
+    /// Baseline conversion — `supports_thinking` defaults to `false` here
+    /// since a bare [`ModelRecord`] carries no serving-profile/routing
+    /// context. Callers with access to the [`crate::serving::profile::RoutingMap`]
+    /// (`list_models`/`get_model`) use [`model_view_with_capability`] instead
+    /// so the field reflects the model's actual thinking capability.
     fn from(r: &ModelRecord) -> Self {
         ModelView {
             name: r.name.clone(),
@@ -81,8 +98,25 @@ impl From<&ModelRecord> for ModelView {
             last_loaded: r.last_loaded,
             protected: r.protected,
             managed_by: r.managed_by.clone(),
+            supports_thinking: false,
         }
     }
+}
+
+/// YARN-06: build a [`ModelView`] with `supports_thinking` populated from the
+/// live [`crate::serving::profile::RoutingMap`] — the capability-advertisement
+/// surface Harmony's THINK-02 (built against a stub that always assumes
+/// non-supporting) would query over HTTP via `GET /api/models`/`GET
+/// /api/models/:name`.
+fn model_view_with_capability(
+    r: &ModelRecord,
+    routing: &crate::serving::profile::RoutingMap,
+) -> ModelView {
+    let mut view = ModelView::from(r);
+    view.supports_thinking = routing.thinking_available(
+        &terminus_rs::intake::serving::ModelId::from_registry_key(r.name.clone()),
+    );
+    view
 }
 
 /// Disk usage for one filesystem. `null` fields mean the probe couldn't read the
@@ -117,7 +151,11 @@ pub async fn list_models(
         return auth_error_response(e);
     }
     let reg = state.model_registry.lock().await;
-    let mut models: Vec<ModelView> = reg.all_records().map(ModelView::from).collect();
+    let routing = state.routing_map.lock().await;
+    let mut models: Vec<ModelView> = reg
+        .all_records()
+        .map(|r| model_view_with_capability(r, &routing))
+        .collect();
     models.sort_by(|a, b| a.name.cmp(&b.name));
     let count = models.len();
     Json(serde_json::json!({ "models": models, "count": count })).into_response()
@@ -135,8 +173,9 @@ pub async fn get_model(
         return auth_error_response(e);
     }
     let reg = state.model_registry.lock().await;
+    let routing = state.routing_map.lock().await;
     match reg.get(&name) {
-        Some(rec) => Json(ModelView::from(rec)).into_response(),
+        Some(rec) => Json(model_view_with_capability(rec, &routing)).into_response(),
         None => error_response(StatusCode::NOT_FOUND, format!("unknown model: {name}")),
     }
 }
@@ -443,6 +482,23 @@ mod tests {
         local_root: std::path::PathBuf,
         probe: Arc<dyn DiskSpaceProbe>,
     ) -> Arc<AppState> {
+        control_state_with_routing(
+            registry,
+            local_root,
+            probe,
+            Arc::new(Mutex::new(crate::serving::profile::RoutingMap::empty())),
+        )
+    }
+
+    /// Like `control_state` but with an explicit
+    /// [`crate::serving::profile::RoutingMap`] so YARN-06's `supports_thinking`
+    /// capability field can be exercised.
+    fn control_state_with_routing(
+        registry: Arc<Mutex<ModelRegistry>>,
+        local_root: std::path::PathBuf,
+        probe: Arc<dyn DiskSpaceProbe>,
+        routing_map: Arc<Mutex<crate::serving::profile::RoutingMap>>,
+    ) -> Arc<AppState> {
         use crate::agentic::AgenticExecutor;
         use crate::audit::AuditLogger;
         use crate::config::{Config, RateLimitConfig};
@@ -498,6 +554,7 @@ mod tests {
             disk_probe: probe,
             disk_pressure_percent: 80,
             model_warm_cooldown_hours: 168,
+            routing_map,
         })
     }
 
@@ -572,6 +629,115 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["alpha:1", "beta:1"]);
         assert_eq!(json["models"][0]["tier"], "warm");
+    }
+
+    /// YARN-06: build a one-row [`crate::serving::profile::RoutingMap`] for
+    /// `model_name` with the given `thinking` env_json fragment (or `"{}"` for
+    /// no thinking block at all).
+    fn routing_map_with(
+        model_name: &str,
+        thinking_env_json: &str,
+    ) -> Arc<Mutex<crate::serving::profile::RoutingMap>> {
+        use terminus_rs::intake::serving::{
+            ExclusionReason, ModelId, RecheckTrigger, Runtime, ServingBackend, ServingProfile,
+        };
+        let row = ServingProfile {
+            model_id: ModelId::from(model_name),
+            backend_tag: ServingBackend::LlamaGpu,
+            best_runtime: Runtime::LlamaCpp,
+            env_json: thinking_env_json.into(),
+            tok_s: Some(30.0),
+            vram_or_ram_peak_gb: Some(8.0),
+            cold_load_s: Some(10.0),
+            keep_warm: false,
+            fallback_runtime: None,
+            exclusion_reason: ExclusionReason::None,
+            recheck_trigger: RecheckTrigger::None,
+            provenance: None,
+        };
+        Arc::new(Mutex::new(crate::serving::profile::RoutingMap::load_from(
+            vec![row],
+        )))
+    }
+
+    #[tokio::test]
+    async fn list_models_reports_supports_thinking_only_for_validated_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        make_model(&base.join("local"), "alpha", "1", &[100]);
+        make_model(&base.join("local"), "beta", "1", &[200]);
+        let mut reg = reg_at(base, vec![]);
+        reg.reconcile();
+        let registry = Arc::new(Mutex::new(reg));
+        // Only "alpha:1" has a supporting + validated thinking config.
+        let routing = routing_map_with(
+            "alpha:1",
+            r#"{"thinking":{"supports_thinking":true,"validated":true}}"#,
+        );
+        let state = control_state_with_routing(
+            registry,
+            base.join("local"),
+            Arc::new(StatvfsProbe),
+            routing,
+        );
+        let app = build_control_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        let models = json["models"].as_array().unwrap();
+        let alpha = models.iter().find(|m| m["name"] == "alpha:1").unwrap();
+        let beta = models.iter().find(|m| m["name"] == "beta:1").unwrap();
+        assert_eq!(alpha["supports_thinking"], true);
+        // Negative: "beta:1" has no serving profile at all ⇒ not advertised.
+        assert_eq!(beta["supports_thinking"], false);
+    }
+
+    #[tokio::test]
+    async fn get_model_reports_false_for_unvalidated_thinking_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        make_model(&base.join("local"), "alpha", "1", &[100]);
+        let mut reg = reg_at(base, vec![]);
+        reg.reconcile();
+        let registry = Arc::new(Mutex::new(reg));
+        // Negative test: supports_thinking=true but validated=false ⇒ never advertised.
+        let routing = routing_map_with(
+            "alpha:1",
+            r#"{"thinking":{"supports_thinking":true,"validated":false}}"#,
+        );
+        let state = control_state_with_routing(
+            registry,
+            base.join("local"),
+            Arc::new(StatvfsProbe),
+            routing,
+        );
+        let app = build_control_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/models/alpha:1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["supports_thinking"], false);
     }
 
     #[tokio::test]
