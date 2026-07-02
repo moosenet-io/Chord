@@ -52,9 +52,59 @@ order, a request goes through:
 6. **Backend routing** — `models::routing::resolve_and_ensure` picks the model's
    tagged backend, starts it on demand if needed, and returns the upstream URL.
    On any failure it falls back to `CHORD_LLM_URL` ("availability over strictness").
-7. **Forward** — hop-by-hop headers are stripped, the (possibly model-rewritten)
-   body is forwarded, and the upstream response — JSON or `text/event-stream` — is
-   streamed straight back to the caller.
+7. **Thinking-mode honoring (YARN-06)** — an optional top-level `"thinking":
+   "on"` / `"thinking": "off"` field on the incoming request is Chord's own
+   per-request contract field for a caller (e.g. Harmony) that wants to force
+   reasoning-trace mode for this one call. Chord makes **no decision about
+   when to think** — that step-type heuristic is entirely the caller's; Chord
+   only resolves whether the hint **can** be honored
+   (`serving::profile::resolve_thinking_request`, driven by the target
+   model's `serving_profile.env_json.thinking` block — `supports_thinking &&
+   validated`, see [serving.md](serving.md)) and, if so, honors it. See
+   **"Per-request thinking mode"** below for the full contract (accepted
+   values, and what happens when the model doesn't support it, the value is
+   absent, or it's malformed).
+8. **Forward** — hop-by-hop headers are stripped, the (possibly model- and/or
+   thinking-rewritten) body is forwarded, and the upstream response — JSON or
+   `text/event-stream` — is streamed straight back to the caller.
+
+#### Per-request thinking mode (`POST /v1/chat/completions`)
+
+An external contract for callers (Harmony's THINK-01/02) that want to request
+thinking mode on a single inference call, without Chord making any judgment
+about *when* a step should think:
+
+| Request field | Type | Required | Meaning |
+|---|---|---|---|
+| `thinking` | string, `"on"` or `"off"` (case-insensitive) | No | Force reasoning-trace mode on/off for this one request. |
+
+Behavior:
+
+- **Absent** — the model's own default mode is used, unchanged. This is the
+  legacy behavior (no regression) and applies whenever the field is omitted.
+- **`"on"` / `"off"` on a model that supports thinking AND whose thinking
+  config is validated** — honored. Chord sets/merges
+  `chat_template_kwargs.enable_thinking` (`true`/`false`) into the body
+  forwarded to the backend. This is the actual runtime mechanism: llama.cpp's
+  `llama-server` (and vLLM/SGLang, for Qwen3-style chat templates) read
+  `chat_template_kwargs.enable_thinking` from **every** request body — an
+  already-warm/resident model honors it per-call, no relaunch required.
+- **`"on"` / `"off"` on a model that does NOT support thinking, or whose
+  thinking config is present but not yet validated** — ignored, **not** an
+  error. The model's default mode is served (HTTP 200 as normal); Chord logs
+  a debug-level note naming the reason. An unvalidated config is treated
+  identically to a wholly non-supporting model — Chord never serves an
+  unvalidated/untrusted thinking mode.
+- **Any other value** (anything besides `"on"`/`"off"`, case-insensitively) —
+  treated as malformed: degrades to the model's default mode with a logged
+  warning, never a 4xx/5xx and never a crash.
+- In every case, the `thinking` field itself is stripped before the request
+  is forwarded upstream — it is Chord's own contract field, not something an
+  OpenAI-compatible backend understands.
+
+Query whether a given model supports this ahead of time via `GET
+/api/models`'s `supports_thinking` field (below) — a caller can skip sending
+`thinking` at all for a model that doesn't support it.
 
 The other proxy routes are `/v1/tools/list`, `/v1/tools/call`,
 `/v1/tools/discover` (the MCP tool surface), `/v1/agent/execute` (the agentic
@@ -208,6 +258,14 @@ exposes the registry and tiering controls:
 | GET | `/api/storage` | local + archive disk usage |
 | POST | `/api/models/sweep` | trigger an eviction sweep (202 Accepted, runs async) |
 | GET | `/health` | version metadata (no auth) |
+
+`GET /api/models` / `GET /api/models/:name` response fields (per model,
+`ModelView` in [`control.rs`](../src/control.rs)) include a **YARN-06**
+capability-advertisement field:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `supports_thinking` | bool | Whether this model currently supports the `thinking` request parameter on `/v1/chat/completions` (see "Per-request thinking mode" above). `true` only when the model's serving profile has a `thinking` block AND `supports_thinking` AND `validated` are all true in it — an unvalidated config is never advertised as available. Computed fresh on every request from the in-process `serving::profile::RoutingMap` (never independently cached), so the value always matches what `/v1/chat/completions` would honor from that same map right now — **but** the map itself is loaded once at process startup from the intake DB and is not hot-reloaded, so a model reprofiled (or newly validated) after Chord starts is not reflected until the next process restart (see [serving.md](serving.md)). |
 
 ### Agentic loop
 

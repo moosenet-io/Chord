@@ -68,8 +68,12 @@ pub struct ModelView {
     /// discipline as the launcher's own emission gate) — Harmony's THINK-02
     /// can rely on this field to decide whether sending a per-request
     /// `thinking:on` hint on `/v1/chat/completions` is worth attempting at
-    /// all. Always computed from the CURRENT routing map at request time, so
-    /// a model swap/reprofile is reflected immediately (no separate cache).
+    /// all. Computed fresh from the process's in-memory `RoutingMap` on every
+    /// request (no separate result cache sitting on top of it) — but that map
+    /// itself is loaded ONCE at process startup (see `main.rs`) with no
+    /// background refresh, so a model reprofiled/newly-validated after Chord
+    /// starts is NOT reflected here until the next restart. See the "Load
+    /// cadence" note in `docs/serving.md`.
     pub supports_thinking: bool,
 }
 

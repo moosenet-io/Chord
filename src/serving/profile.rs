@@ -590,10 +590,13 @@ impl RouteEntry {
     /// capability-advertisement primitive. `true` only when the row's
     /// `thinking` block is present, `supports_thinking`, AND `validated`; an
     /// absent block or an unvalidated one both report `false` (never
-    /// advertise a mode Chord won't actually honor). Always computed live from
-    /// the entry's current [`EnvSpec`] — there is no separate capability
-    /// cache to go stale, so a reload/reprofile of the model is reflected the
-    /// moment a fresh [`RouteEntry`] replaces this one in the [`RoutingMap`].
+    /// advertise a mode Chord won't actually honor). Computed fresh from this
+    /// entry's [`EnvSpec`] on every call — there is no separate result cache
+    /// to go stale *on top of* the entry. This does NOT mean a model
+    /// reprofile is picked up live: `RouteEntry` is only replaced when a
+    /// [`RoutingMap`] reload runs, and (as of this item) production only
+    /// loads the map once at process startup with no background refresh —
+    /// see `main.rs` / the "Load cadence" note in `docs/serving.md`.
     pub fn thinking_available(&self) -> bool {
         self.env
             .thinking
@@ -734,14 +737,19 @@ impl RoutingMap {
     }
 
     /// YARN-06: capability advertisement — does `model_id` currently support
-    /// thinking mode? This is the query Harmony's THINK-02 (already built
-    /// against a stub that always returns "non-supporting") would call to
-    /// find out whether a per-request `thinking:on` hint is worth sending at
-    /// all. An unprofiled model (no [`RouteEntry`]) reports `false`, same as
-    /// a profiled model with no `thinking` block or an unvalidated one — this
-    /// always reads the CURRENT map, so a model swap/reload (which replaces
-    /// the whole map wholesale, see [`RoutingMap::load`]) is reflected
-    /// immediately with no independent cache to go stale.
+    /// thinking mode according to THIS map's contents? This is the query
+    /// Harmony's THINK-02 (already built against a stub that always returns
+    /// "non-supporting") would call to find out whether a per-request
+    /// `thinking:on` hint is worth sending at all. An unprofiled model (no
+    /// [`RouteEntry`]) reports `false`, same as a profiled model with no
+    /// `thinking` block or an unvalidated one. This reads the map fresh on
+    /// every call — no separate result cache — so if the map were reloaded
+    /// (see [`RoutingMap::load`], which replaces the whole map wholesale) the
+    /// new contents would apply immediately. It does NOT mean a `serving_
+    /// profile` row change is reflected live: as deployed (`main.rs`), the map
+    /// is loaded once at process startup with no background refresh, so a
+    /// reprofile after startup requires a restart to be picked up — see the
+    /// "Load cadence" note in `docs/serving.md`.
     pub fn thinking_available(&self, model_id: &ModelId) -> bool {
         self.get(model_id)
             .map(RouteEntry::thinking_available)
