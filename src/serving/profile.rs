@@ -340,6 +340,130 @@ pub struct ThinkingConfig {
     pub validated: bool,
 }
 
+impl ThinkingConfig {
+    /// YARN-06: whether this config is safe to *advertise* as thinking-capable
+    /// to a caller (Harmony) deciding whether to send a per-request `thinking`
+    /// hint at all. Mirrors the launcher's own emission gate exactly: a model
+    /// that supports thinking but whose config has not been validated on
+    /// gfx1151 is NOT advertised as available — an unvalidated config stays
+    /// inert everywhere, not just at launch (the same "inert until validated"
+    /// discipline YARN-05 established).
+    pub fn is_available(&self) -> bool {
+        self.supports_thinking && self.validated
+    }
+}
+
+/// YARN-06: a per-request `thinking` hint, as Harmony (THINK-02) would send it
+/// on an inference request. Chord makes NO decision about *when* to think —
+/// that step-type/heuristic logic belongs entirely to Harmony. This type only
+/// carries the caller's explicit on/off request; the decision of whether it
+/// can be honored is made by [`resolve_thinking_request`], driven solely by
+/// the model's own [`ThinkingConfig`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingRequest {
+    On,
+    Off,
+}
+
+/// Parse a raw `thinking` request parameter (as received on an inference
+/// request, e.g. the JSON string `"on"` / `"off"`). Case-insensitive.
+///
+/// Returns `(None, None)` when the param is absent — the caller (Harmony)
+/// simply didn't send a hint, so the model's own default mode applies
+/// unchanged. Returns `(None, Some(warning))` for a malformed/unrecognized
+/// value (anything other than on/off, case-insensitively) — never an error,
+/// never a crash: Chord degrades to the model default and surfaces a warning
+/// note the caller can log or ignore.
+pub fn parse_thinking_request(raw: Option<&str>) -> (Option<ThinkingRequest>, Option<String>) {
+    match raw {
+        None => (None, None),
+        Some(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "on" => (Some(ThinkingRequest::On), None),
+            "off" => (Some(ThinkingRequest::Off), None),
+            other => (
+                None,
+                Some(format!(
+                    "thinking parameter '{other}' is not a recognized value (expected on/off) — using model default mode"
+                )),
+            ),
+        },
+    }
+}
+
+/// YARN-06: the effective thinking mode Chord decided to honor for a request,
+/// plus an optional human-readable note for the caller (e.g. why a request
+/// was ignored). Never an error variant — every combination of input degrades
+/// to a servable mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThinkingDecision {
+    pub effective: EffectiveThinking,
+    /// `Some(...)` when the request could not be honored as asked (model
+    /// doesn't support thinking, config unvalidated, or a malformed value was
+    /// supplied) — the reason is informational, not an error.
+    pub note: Option<String>,
+}
+
+/// The thinking mode Chord will actually serve the request under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectiveThinking {
+    /// No request was made (or it could not be honored) — serve the model's
+    /// own default mode, unchanged.
+    ModelDefault,
+    /// The request asked for thinking mode, and the model is supporting +
+    /// validated, so it is honored.
+    ForcedOn,
+    /// The request asked to turn thinking off, and the model is supporting +
+    /// validated, so it is honored (a supporting model may default to
+    /// thinking-on; this explicitly suppresses it for this request).
+    ForcedOff,
+}
+
+/// YARN-06: decide how to honor a per-request `thinking` hint against a
+/// model's [`ThinkingConfig`].
+///
+/// Rules (Chord only ever advertises/honors — never decides *when* to
+/// think, that is Harmony's job):
+///   - no request (`requested == None`) ⇒ [`EffectiveThinking::ModelDefault`],
+///     no note — unchanged behavior, the model's own default mode applies.
+///   - a request against a model with no `thinking` block, or one that is not
+///     `is_available()` (unsupported OR unvalidated) ⇒ `ModelDefault` with a
+///     note — the hint is ignored, NOT an error. An unvalidated config is
+///     treated exactly like a wholly non-supporting model (never serve an
+///     untrusted mode).
+///   - a request against an available model ⇒ honored (`ForcedOn`/`ForcedOff`),
+///     no note.
+pub fn resolve_thinking_request(
+    requested: Option<ThinkingRequest>,
+    thinking: Option<&ThinkingConfig>,
+) -> ThinkingDecision {
+    let Some(req) = requested else {
+        return ThinkingDecision {
+            effective: EffectiveThinking::ModelDefault,
+            note: None,
+        };
+    };
+
+    let available = thinking.map(ThinkingConfig::is_available).unwrap_or(false);
+    if !available {
+        return ThinkingDecision {
+            effective: EffectiveThinking::ModelDefault,
+            note: Some(
+                "thinking parameter ignored: model does not support thinking mode, or its \
+                 thinking config is not validated"
+                    .to_string(),
+            ),
+        };
+    }
+
+    ThinkingDecision {
+        effective: match req {
+            ThinkingRequest::On => EffectiveThinking::ForcedOn,
+            ThinkingRequest::Off => EffectiveThinking::ForcedOff,
+        },
+        note: None,
+    }
+}
+
 /// Parse the `thinking` object out of an already-parsed `env_json` map.
 ///
 /// Returns `None` (no block, i.e. unchanged behavior — no preservation flags)
@@ -460,6 +584,25 @@ impl RouteEntry {
     /// by the residency manager's admission check for keep-warm models.
     pub fn vram_gb(&self) -> Option<f64> {
         self.profile.vram_or_ram_peak_gb
+    }
+
+    /// YARN-06: whether thinking mode is available for THIS entry — the
+    /// capability-advertisement primitive. `true` only when the row's
+    /// `thinking` block is present, `supports_thinking`, AND `validated`; an
+    /// absent block or an unvalidated one both report `false` (never
+    /// advertise a mode Chord won't actually honor). Computed fresh from this
+    /// entry's [`EnvSpec`] on every call — there is no separate result cache
+    /// to go stale *on top of* the entry. This does NOT mean a model
+    /// reprofile is picked up live: `RouteEntry` is only replaced when a
+    /// [`RoutingMap`] reload runs, and (as of this item) production only
+    /// loads the map once at process startup with no background refresh —
+    /// see `main.rs` / the "Load cadence" note in `docs/serving.md`.
+    pub fn thinking_available(&self) -> bool {
+        self.env
+            .thinking
+            .as_ref()
+            .map(ThinkingConfig::is_available)
+            .unwrap_or(false)
     }
 }
 
@@ -591,6 +734,26 @@ impl RoutingMap {
     /// Whether the map has no routable models.
     pub fn is_empty(&self) -> bool {
         self.by_model.is_empty()
+    }
+
+    /// YARN-06: capability advertisement — does `model_id` currently support
+    /// thinking mode according to THIS map's contents? This is the query
+    /// Harmony's THINK-02 (already built against a stub that always returns
+    /// "non-supporting") would call to find out whether a per-request
+    /// `thinking:on` hint is worth sending at all. An unprofiled model (no
+    /// [`RouteEntry`]) reports `false`, same as a profiled model with no
+    /// `thinking` block or an unvalidated one. This reads the map fresh on
+    /// every call — no separate result cache — so if the map were reloaded
+    /// (see [`RoutingMap::load`], which replaces the whole map wholesale) the
+    /// new contents would apply immediately. It does NOT mean a `serving_
+    /// profile` row change is reflected live: as deployed (`main.rs`), the map
+    /// is loaded once at process startup with no background refresh, so a
+    /// reprofile after startup requires a restart to be picked up — see the
+    /// "Load cadence" note in `docs/serving.md`.
+    pub fn thinking_available(&self, model_id: &ModelId) -> bool {
+        self.get(model_id)
+            .map(RouteEntry::thinking_available)
+            .unwrap_or(false)
     }
 }
 
@@ -1049,5 +1212,161 @@ mod tests {
             assert!(!msg.contains("://"));
             assert!(!msg.contains('@'));
         }
+    }
+
+    // ── YARN-06: thinking capability advertisement ──────────────────────────
+
+    #[test]
+    fn thinking_config_available_only_when_supported_and_validated() {
+        let available = ThinkingConfig {
+            supports_thinking: true,
+            preserve_thinking: false,
+            requires_prefix_caching: false,
+            validated: true,
+        };
+        assert!(available.is_available());
+
+        let unvalidated = ThinkingConfig {
+            validated: false,
+            ..available
+        };
+        assert!(!unvalidated.is_available(), "unvalidated config must not be advertised");
+
+        let unsupported = ThinkingConfig {
+            supports_thinking: false,
+            validated: true,
+            ..available
+        };
+        assert!(!unsupported.is_available());
+    }
+
+    #[test]
+    fn routing_map_thinking_available_true_only_for_validated_supporting_model() {
+        let supporting_validated = row(
+            "supporting-model",
+            ServingBackend::LlamaGpu,
+            Runtime::LlamaCpp,
+            r#"{"thinking":{"supports_thinking":true,"validated":true}}"#,
+            ExclusionReason::None,
+        );
+        let supporting_unvalidated = row(
+            "unvalidated-model",
+            ServingBackend::LlamaGpu,
+            Runtime::LlamaCpp,
+            r#"{"thinking":{"supports_thinking":true,"validated":false}}"#,
+            ExclusionReason::None,
+        );
+        let no_thinking_block = row(
+            "plain-model",
+            ServingBackend::LlamaGpu,
+            Runtime::LlamaCpp,
+            "{}",
+            ExclusionReason::None,
+        );
+
+        let map = RoutingMap::load_from(vec![
+            supporting_validated,
+            supporting_unvalidated,
+            no_thinking_block,
+        ]);
+
+        assert!(map.thinking_available(&ModelId::from("supporting-model")));
+        // Negative: unvalidated ⇒ not advertised, even though supports_thinking is true.
+        assert!(!map.thinking_available(&ModelId::from("unvalidated-model")));
+        // Negative: no thinking block at all.
+        assert!(!map.thinking_available(&ModelId::from("plain-model")));
+        // Negative: unprofiled model.
+        assert!(!map.thinking_available(&ModelId::from("nonexistent-model")));
+    }
+
+    // ── YARN-06: per-request thinking parameter parsing + resolution ────────
+
+    #[test]
+    fn parse_thinking_request_recognizes_on_off_case_insensitive() {
+        assert_eq!(parse_thinking_request(Some("on")).0, Some(ThinkingRequest::On));
+        assert_eq!(parse_thinking_request(Some("ON")).0, Some(ThinkingRequest::On));
+        assert_eq!(parse_thinking_request(Some("off")).0, Some(ThinkingRequest::Off));
+        assert_eq!(parse_thinking_request(Some("Off")).0, Some(ThinkingRequest::Off));
+    }
+
+    #[test]
+    fn parse_thinking_request_absent_is_none_no_warning() {
+        let (parsed, warning) = parse_thinking_request(None);
+        assert_eq!(parsed, None);
+        assert_eq!(warning, None);
+    }
+
+    #[test]
+    fn parse_thinking_request_malformed_defaults_and_warns_never_crashes() {
+        let (parsed, warning) = parse_thinking_request(Some("maybe"));
+        assert_eq!(parsed, None);
+        assert!(warning.is_some());
+
+        // Garbage/empty values also degrade cleanly.
+        let (parsed_empty, warning_empty) = parse_thinking_request(Some(""));
+        assert_eq!(parsed_empty, None);
+        assert!(warning_empty.is_some());
+    }
+
+    #[test]
+    fn resolve_thinking_request_no_param_is_model_default() {
+        let thinking = ThinkingConfig {
+            supports_thinking: true,
+            preserve_thinking: false,
+            requires_prefix_caching: false,
+            validated: true,
+        };
+        let decision = resolve_thinking_request(None, Some(&thinking));
+        assert_eq!(decision.effective, EffectiveThinking::ModelDefault);
+        assert_eq!(decision.note, None);
+    }
+
+    #[test]
+    fn resolve_thinking_request_on_honored_for_supporting_validated_model() {
+        let thinking = ThinkingConfig {
+            supports_thinking: true,
+            preserve_thinking: false,
+            requires_prefix_caching: false,
+            validated: true,
+        };
+        let decision = resolve_thinking_request(Some(ThinkingRequest::On), Some(&thinking));
+        assert_eq!(decision.effective, EffectiveThinking::ForcedOn);
+        assert_eq!(decision.note, None);
+    }
+
+    #[test]
+    fn resolve_thinking_request_off_honored_for_supporting_validated_model() {
+        let thinking = ThinkingConfig {
+            supports_thinking: true,
+            preserve_thinking: true,
+            requires_prefix_caching: false,
+            validated: true,
+        };
+        let decision = resolve_thinking_request(Some(ThinkingRequest::Off), Some(&thinking));
+        assert_eq!(decision.effective, EffectiveThinking::ForcedOff);
+        assert_eq!(decision.note, None);
+    }
+
+    #[test]
+    fn resolve_thinking_request_ignored_not_error_for_non_supporting_model() {
+        // Negative test: thinking:on against a model with NO thinking block at all.
+        let decision = resolve_thinking_request(Some(ThinkingRequest::On), None);
+        assert_eq!(decision.effective, EffectiveThinking::ModelDefault);
+        assert!(decision.note.is_some(), "must note why the hint was ignored");
+    }
+
+    #[test]
+    fn resolve_thinking_request_ignored_for_unvalidated_model_same_as_non_supporting() {
+        // Edge case: unvalidated must degrade exactly like non-supporting — never
+        // serve an untrusted thinking mode.
+        let unvalidated = ThinkingConfig {
+            supports_thinking: true,
+            preserve_thinking: false,
+            requires_prefix_caching: false,
+            validated: false,
+        };
+        let decision = resolve_thinking_request(Some(ThinkingRequest::On), Some(&unvalidated));
+        assert_eq!(decision.effective, EffectiveThinking::ModelDefault);
+        assert!(decision.note.is_some());
     }
 }

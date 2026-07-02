@@ -13,6 +13,19 @@ Chord reads them into a [`profile::RoutingMap`](../src/serving/profile.rs) and
 launches the correct runtime per model. Layered above the profile reader are the
 three coordinator subsystems below.
 
+**Load cadence (no hot-reload):** `main.rs` builds the `RoutingMap` exactly
+**once**, in a task spawned at process startup, from a one-shot `DbProfileSource`
+read of `serving_profile`. There is no background refresh — a row changed in the
+DB after that load (a reprofile, a newly-validated `thinking`/`rope_scaling`
+block, a new model) is not picked up until Chord restarts. Every *lookup*
+against the map (`RoutingMap::get`, `RoutingMap::thinking_available`,
+`RouteEntry::thinking_available`) is computed fresh from whatever the map
+currently holds — so there's no separate result cache on top of the map — but
+the map's *contents* are a startup-time snapshot, not a live view of the
+`serving_profile` table. If the intake DB is unconfigured or unreachable at
+startup, the map is `RoutingMap::empty()` (every lookup misses) rather than
+blocking the proxy; this doesn't change once the process is running either.
+
 ## Storage residency vs. VRAM residency
 
 Chord still distinguishes two notions of "memory":

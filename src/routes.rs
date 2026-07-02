@@ -62,6 +62,16 @@ pub struct AppState {
     pub disk_pressure_percent: u8,
     /// TIER-05: cooldown window for the manual sweep (hours before warm model is eligible).
     pub model_warm_cooldown_hours: u64,
+    /// YARN-06: SRV-04 serving-profile routing map — the source of a model's
+    /// [`crate::serving::profile::ThinkingConfig`] (capability advertisement +
+    /// per-request thinking honoring in `chat_completions`). Best-effort: when
+    /// the intake DB is unreachable/unconfigured this is
+    /// [`crate::serving::profile::RoutingMap::empty`] (every lookup misses,
+    /// `thinking_available` reports `false`) rather than blocking startup —
+    /// the same fail-open discipline as `model_registry`/the eviction sweep.
+    /// A background refresh (if added later) replaces the whole map, same as
+    /// [`crate::serving::profile::RoutingMap::load`] already guarantees.
+    pub routing_map: Arc<Mutex<crate::serving::profile::RoutingMap>>,
 }
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -514,14 +524,61 @@ pub async fn chat_completions(
     .await
     .unwrap_or(llm_url);
 
-    let (forward_body, model) = if resolved_model != requested_model {
-        match rewrite_model_in_body(&body, &resolved_model) {
-            Some(rewritten) => (axum::body::Bytes::from(rewritten), resolved_model),
+    // ── YARN-06: per-request thinking honoring ──────────────────────────────
+    // Harmony (THINK-01/02) may send an optional top-level `thinking: "on"|"off"`
+    // hint. Chord makes NO decision about WHEN to think — that step-type
+    // heuristic is entirely Harmony's; this only resolves whether the hint CAN
+    // be honored (the model is supporting + validated, per its
+    // `serving_profile.env_json.thinking` block) and, if so, honors it for
+    // THIS request via the llama.cpp/Qwen3-template per-request toggle
+    // (`chat_template_kwargs.enable_thinking`) — an already-warm/resident model
+    // reads this from the request body on every call, no relaunch required.
+    // A hint against a non-supporting or unvalidated model is ignored (model
+    // default mode) with a note, never an error; a malformed value degrades the
+    // same way. See `crate::serving::profile::resolve_thinking_request`.
+    let raw_thinking = parse_thinking_from_body(&body);
+    let (requested_thinking, malformed_thinking_note) =
+        crate::serving::profile::parse_thinking_request(raw_thinking.as_deref());
+    let thinking_capability = {
+        let routing = state.routing_map.lock().await;
+        routing
+            .get(&terminus_rs::intake::serving::ModelId::from(
+                resolved_model.as_str(),
+            ))
+            .and_then(|entry| entry.env.thinking)
+    };
+    let mut thinking_decision = crate::serving::profile::resolve_thinking_request(
+        requested_thinking,
+        thinking_capability.as_ref(),
+    );
+    if let Some(note) = malformed_thinking_note {
+        // A malformed value takes precedence over resolve_thinking_request's own
+        // (empty, since `requested == None` short-circuits) note — the caller
+        // sent SOMETHING, it just wasn't recognized.
+        thinking_decision.note = Some(note);
+    }
+    if let Some(note) = &thinking_decision.note {
+        tracing::debug!(model = %resolved_model, "chat/completions: thinking hint not honored as requested: {note}");
+    }
+
+    let need_model_rewrite = resolved_model != requested_model;
+    let need_any_rewrite = need_model_rewrite || raw_thinking.is_some();
+    let (forward_body, model) = if need_any_rewrite {
+        let new_model = need_model_rewrite.then(|| resolved_model.as_str());
+        match apply_request_rewrites(&body, new_model, &thinking_decision) {
+            Some(rewritten) => (
+                axum::body::Bytes::from(rewritten),
+                if need_model_rewrite {
+                    resolved_model.clone()
+                } else {
+                    requested_model.clone()
+                },
+            ),
             // Body wasn't valid JSON we could rewrite — forward verbatim, log original.
-            None => (body.clone(), requested_model),
+            None => (body.clone(), requested_model.clone()),
         }
     } else {
-        (body.clone(), requested_model)
+        (body.clone(), requested_model.clone())
     };
     let mut upstream_req = state.http_client.post(&llm_url).body(forward_body);
     let mut had_content_type = false;
@@ -613,12 +670,73 @@ fn parse_model_from_body(body: &[u8]) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Return a new JSON body with the `model` field replaced by `new_model`.
-/// Returns `None` if the body is not a JSON object (caller forwards verbatim).
-fn rewrite_model_in_body(body: &[u8], new_model: &str) -> Option<Vec<u8>> {
+/// YARN-06: extract the optional top-level `thinking` string hint from an
+/// incoming request body (Chord's own request-time contract field, e.g.
+/// `{"thinking": "on"}`) — NOT an OpenAI/upstream-standard field, and never
+/// forwarded upstream verbatim (see [`apply_request_rewrites`]). `None` when
+/// absent, the body isn't a JSON object, or the value isn't a string (an
+/// absent/non-string value is treated as "no hint sent", matching
+/// [`crate::serving::profile::parse_thinking_request`]'s `None` input case;
+/// a present-but-unrecognized STRING value like `"maybe"` is a different,
+/// malformed case that function itself handles).
+fn parse_thinking_from_body(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<Value>(body)
+        .ok()?
+        .get("thinking")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// YARN-06: apply the resolved per-request thinking decision to the outgoing
+/// body, and (when needed) the existing model-alias rewrite — both are small,
+/// targeted mutations of the same JSON object, so they share one
+/// parse/re-serialize pass. Returns `None` when the body isn't a JSON object
+/// (caller forwards verbatim; nothing to honor/rewrite).
+///
+/// The Chord-specific top-level `thinking` field is ALWAYS stripped before
+/// forwarding — it is Chord's own request-time hint, not something an
+/// upstream OpenAI-compatible backend understands. When the decision is
+/// `ForcedOn`/`ForcedOff` (only ever returned for a model that is supporting +
+/// validated — see [`crate::serving::profile::resolve_thinking_request`]),
+/// the corresponding llama.cpp/Qwen3-chat-template toggle
+/// (`chat_template_kwargs.enable_thinking`) is set/merged into the body: this
+/// is the actual per-request honoring mechanism for an already-warm/resident
+/// model — llama-server (and vLLM/SGLang) read `enable_thinking` from the
+/// chat-template kwargs on EVERY request, no relaunch required. `ModelDefault`
+/// leaves any caller-supplied `chat_template_kwargs` entirely untouched.
+fn apply_request_rewrites(
+    body: &[u8],
+    new_model: Option<&str>,
+    decision: &crate::serving::profile::ThinkingDecision,
+) -> Option<Vec<u8>> {
+    use crate::serving::profile::EffectiveThinking;
+
     let mut v: Value = serde_json::from_slice(body).ok()?;
     let obj = v.as_object_mut()?;
-    obj.insert("model".to_string(), Value::String(new_model.to_string()));
+
+    if let Some(model) = new_model {
+        obj.insert("model".to_string(), Value::String(model.to_string()));
+    }
+
+    // Chord's own hint never reaches the backend verbatim.
+    obj.remove("thinking");
+
+    match decision.effective {
+        EffectiveThinking::ModelDefault => {}
+        EffectiveThinking::ForcedOn | EffectiveThinking::ForcedOff => {
+            let enable = matches!(decision.effective, EffectiveThinking::ForcedOn);
+            let kwargs = obj
+                .entry("chat_template_kwargs".to_string())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if !kwargs.is_object() {
+                *kwargs = Value::Object(serde_json::Map::new());
+            }
+            if let Some(kwargs_obj) = kwargs.as_object_mut() {
+                kwargs_obj.insert("enable_thinking".to_string(), Value::Bool(enable));
+            }
+        }
+    }
+
     serde_json::to_vec(&v).ok()
 }
 
@@ -750,6 +868,14 @@ mod tests {
         (registry, coordinator)
     }
 
+    /// An empty [`crate::serving::profile::RoutingMap`] for state builders that
+    /// don't care about thinking-capability routing — every lookup misses,
+    /// `thinking_available()` is `false` (same fail-open default as production
+    /// when the intake DB is unconfigured).
+    fn empty_routing_map() -> Arc<Mutex<crate::serving::profile::RoutingMap>> {
+        Arc::new(Mutex::new(crate::serving::profile::RoutingMap::empty()))
+    }
+
     fn test_state(mcp_url: String) -> Arc<AppState> {
         let mut reg = FallbackRegistry::new();
         reg.register(Box::new(PingTool));
@@ -805,7 +931,7 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(default_rate_config())));
         let audit_logger = Arc::new(AuditLogger::new(std::path::PathBuf::from("/dev/null")));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168 })
+        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map() })
     }
 
     /// State with auth disabled and an explicit upstream LLM URL for chat/completions tests.
@@ -818,6 +944,17 @@ mod tests {
     fn test_state_with_llm_aliases(
         llm_url: Option<String>,
         model_aliases: std::collections::HashMap<String, String>,
+    ) -> Arc<AppState> {
+        test_state_with_llm_aliases_and_routing(llm_url, model_aliases, empty_routing_map())
+    }
+
+    /// Like `test_state_with_llm_aliases` but with an explicit
+    /// [`crate::serving::profile::RoutingMap`] so YARN-06 thinking-capability
+    /// routing (capability lookup + per-request honoring) can be exercised.
+    fn test_state_with_llm_aliases_and_routing(
+        llm_url: Option<String>,
+        model_aliases: std::collections::HashMap<String, String>,
+        routing_map: Arc<Mutex<crate::serving::profile::RoutingMap>>,
     ) -> Arc<AppState> {
         let config = Config {
             mcp_backend_url: "http://does-not-exist:9999".into(),
@@ -859,6 +996,7 @@ mod tests {
             model_registry,
             pull_coordinator,
             local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168,
+            routing_map,
         })
     }
 
@@ -915,7 +1053,7 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(default_rate_config())));
         let audit_logger = Arc::new(AuditLogger::new(std::path::PathBuf::from("/dev/null")));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: secret, audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168 })
+        Arc::new(AppState { proxy, jwt_secret: secret, audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map() })
     }
 
     /// Build a state with a very tight user tool limit for rate limit tests.
@@ -983,7 +1121,7 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(tight)));
         let audit_logger = Arc::new(AuditLogger::new(std::path::PathBuf::from("/dev/null")));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168 })
+        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map() })
     }
 
     #[tokio::test]
@@ -1244,6 +1382,315 @@ mod tests {
             "stream": stream,
         })
         .to_string()
+    }
+
+    /// Like `chat_request_body` but with an optional top-level `thinking` hint
+    /// (Chord's own request-time contract field — see `parse_thinking_from_body`).
+    fn chat_request_body_with_thinking(model: &str, thinking: &str) -> String {
+        serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": false,
+            "thinking": thinking,
+        })
+        .to_string()
+    }
+
+    /// YARN-06: a one-row [`crate::serving::profile::RoutingMap`] for `model`
+    /// with the given `thinking` env_json fragment (or `"{}"` for no thinking
+    /// block at all — a non-supporting model).
+    fn routing_map_with(
+        model: &str,
+        thinking_env_json: &str,
+    ) -> Arc<Mutex<crate::serving::profile::RoutingMap>> {
+        use terminus_rs::intake::serving::{
+            ExclusionReason, ModelId, RecheckTrigger, Runtime, ServingBackend, ServingProfile,
+        };
+        let row = ServingProfile {
+            model_id: ModelId::from(model),
+            backend_tag: ServingBackend::LlamaGpu,
+            best_runtime: Runtime::LlamaCpp,
+            env_json: thinking_env_json.into(),
+            tok_s: Some(30.0),
+            vram_or_ram_peak_gb: Some(8.0),
+            cold_load_s: Some(10.0),
+            keep_warm: false,
+            fallback_runtime: None,
+            exclusion_reason: ExclusionReason::None,
+            recheck_trigger: RecheckTrigger::None,
+            provenance: None,
+        };
+        Arc::new(Mutex::new(crate::serving::profile::RoutingMap::load_from(
+            vec![row],
+        )))
+    }
+
+    /// YARN-06: `thinking:"on"` against a supporting + validated model — the
+    /// forwarded body must carry `chat_template_kwargs.enable_thinking: true`
+    /// (the actual per-request honoring mechanism for an already-warm model;
+    /// llama-server/vLLM/SGLang read this chat-template kwarg on every
+    /// request, no relaunch required) and the Chord-only `thinking` field must
+    /// NOT be forwarded upstream.
+    #[tokio::test]
+    async fn test_chat_completions_thinking_on_sets_enable_thinking_true() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/chat/completions")
+                .json_body_partial(r#"{"chat_template_kwargs":{"enable_thinking":true}}"#)
+                .matches(|req| {
+                    let body = req.body.as_deref().unwrap_or(&[]);
+                    !String::from_utf8_lossy(body).contains("\"thinking\"")
+                });
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({"choices": []}));
+        });
+
+        let routing = routing_map_with(
+            "reasoner:30b",
+            r#"{"thinking":{"supports_thinking":true,"validated":true}}"#,
+        );
+        let llm_url = format!("{}/v1/chat/completions", server.base_url());
+        let state = test_state_with_llm_aliases_and_routing(
+            Some(llm_url),
+            std::collections::HashMap::new(),
+            routing,
+        );
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("Content-Type", "application/json")
+            .body(Body::from(chat_request_body_with_thinking(
+                "reasoner:30b",
+                "on",
+            )))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        mock.assert_async().await;
+    }
+
+    /// YARN-06: `thinking:"off"` against a supporting + validated model — the
+    /// forwarded body must carry `chat_template_kwargs.enable_thinking: false`.
+    #[tokio::test]
+    async fn test_chat_completions_thinking_off_sets_enable_thinking_false() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/chat/completions")
+                .json_body_partial(r#"{"chat_template_kwargs":{"enable_thinking":false}}"#);
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({"choices": []}));
+        });
+
+        let routing = routing_map_with(
+            "reasoner:30b",
+            r#"{"thinking":{"supports_thinking":true,"validated":true}}"#,
+        );
+        let llm_url = format!("{}/v1/chat/completions", server.base_url());
+        let state = test_state_with_llm_aliases_and_routing(
+            Some(llm_url),
+            std::collections::HashMap::new(),
+            routing,
+        );
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("Content-Type", "application/json")
+            .body(Body::from(chat_request_body_with_thinking(
+                "reasoner:30b",
+                "off",
+            )))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        mock.assert_async().await;
+    }
+
+    /// NEGATIVE TEST: `thinking:"on"` against a model with NO thinking block at
+    /// all — ignored, NOT an error (still 200), and no `chat_template_kwargs`
+    /// is injected into the forwarded body.
+    #[tokio::test]
+    async fn test_chat_completions_thinking_ignored_for_non_supporting_model() {
+        let server = httpmock::MockServer::start_async().await;
+        // Trap: fails the test (unmatched → 404) if chat_template_kwargs leaks in.
+        let trap = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/chat/completions")
+                .body_contains("chat_template_kwargs");
+            then.status(200).json_body(serde_json::json!({"choices": []}));
+        });
+        let real = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({"choices": []}));
+        });
+
+        // No thinking block at all in the profile ⇒ non-supporting.
+        let routing = routing_map_with("plain:7b", "{}");
+        let llm_url = format!("{}/v1/chat/completions", server.base_url());
+        let state = test_state_with_llm_aliases_and_routing(
+            Some(llm_url),
+            std::collections::HashMap::new(),
+            routing,
+        );
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("Content-Type", "application/json")
+            .body(Body::from(chat_request_body_with_thinking("plain:7b", "on")))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "ignored hint must never error");
+        trap.assert_hits_async(0).await;
+        real.assert_hits_async(1).await;
+    }
+
+    /// EDGE CASE: `thinking:"on"` against a model whose thinking config is
+    /// present but UNVALIDATED — must degrade EXACTLY like a non-supporting
+    /// model (never serve an untrusted mode): ignored, no `chat_template_kwargs`.
+    #[tokio::test]
+    async fn test_chat_completions_thinking_ignored_for_unvalidated_model() {
+        let server = httpmock::MockServer::start_async().await;
+        let trap = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/chat/completions")
+                .body_contains("chat_template_kwargs");
+            then.status(200).json_body(serde_json::json!({"choices": []}));
+        });
+        let real = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({"choices": []}));
+        });
+
+        let routing = routing_map_with(
+            "reasoner:30b",
+            r#"{"thinking":{"supports_thinking":true,"validated":false}}"#,
+        );
+        let llm_url = format!("{}/v1/chat/completions", server.base_url());
+        let state = test_state_with_llm_aliases_and_routing(
+            Some(llm_url),
+            std::collections::HashMap::new(),
+            routing,
+        );
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("Content-Type", "application/json")
+            .body(Body::from(chat_request_body_with_thinking(
+                "reasoner:30b",
+                "on",
+            )))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        trap.assert_hits_async(0).await;
+        real.assert_hits_async(1).await;
+    }
+
+    /// REGRESSION: no `thinking` param sent at all ⇒ unchanged behavior — the
+    /// body is forwarded exactly as `chat_request_body` produces it (byte-for-
+    /// byte pass-through, same as before this item), no `chat_template_kwargs`
+    /// ever appears.
+    #[tokio::test]
+    async fn test_chat_completions_no_thinking_param_leaves_body_unchanged() {
+        let server = httpmock::MockServer::start_async().await;
+        let trap = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/chat/completions")
+                .body_contains("chat_template_kwargs");
+            then.status(200).json_body(serde_json::json!({"choices": []}));
+        });
+        let real = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({"choices": []}));
+        });
+
+        // Model IS supporting + validated — proves absence of the param, not
+        // absence of capability, is what keeps behavior unchanged.
+        let routing = routing_map_with(
+            "reasoner:30b",
+            r#"{"thinking":{"supports_thinking":true,"validated":true}}"#,
+        );
+        let llm_url = format!("{}/v1/chat/completions", server.base_url());
+        let state = test_state_with_llm_aliases_and_routing(
+            Some(llm_url),
+            std::collections::HashMap::new(),
+            routing,
+        );
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("Content-Type", "application/json")
+            .body(Body::from(chat_request_body("reasoner:30b", false)))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        trap.assert_hits_async(0).await;
+        real.assert_hits_async(1).await;
+    }
+
+    /// NEGATIVE TEST: a malformed `thinking` value (anything but "on"/"off")
+    /// degrades to model default — never a crash, never a 4xx/5xx, and no
+    /// `chat_template_kwargs` is injected.
+    #[tokio::test]
+    async fn test_chat_completions_malformed_thinking_value_defaults_no_crash() {
+        let server = httpmock::MockServer::start_async().await;
+        let trap = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/chat/completions")
+                .body_contains("chat_template_kwargs");
+            then.status(200).json_body(serde_json::json!({"choices": []}));
+        });
+        let real = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({"choices": []}));
+        });
+
+        let routing = routing_map_with(
+            "reasoner:30b",
+            r#"{"thinking":{"supports_thinking":true,"validated":true}}"#,
+        );
+        let llm_url = format!("{}/v1/chat/completions", server.base_url());
+        let state = test_state_with_llm_aliases_and_routing(
+            Some(llm_url),
+            std::collections::HashMap::new(),
+            routing,
+        );
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("Content-Type", "application/json")
+            .body(Body::from(chat_request_body_with_thinking(
+                "reasoner:30b",
+                "maybe",
+            )))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "malformed value must never crash/error");
+        trap.assert_hits_async(0).await;
+        real.assert_hits_async(1).await;
     }
 
     #[tokio::test]
@@ -1540,6 +1987,7 @@ mod tests {
             model_registry: registry,
             pull_coordinator: coordinator,
             local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168,
+            routing_map: empty_routing_map(),
         })
     }
 
