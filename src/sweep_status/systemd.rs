@@ -2,18 +2,29 @@
 //! `tokio::process::Command` (async — this runs inside the sweep-monitor tick,
 //! never the blocking `std::process::Command`).
 
-/// The `ActiveState` values `systemctl is-active` prints when it *did*
-/// successfully query the unit and the answer is "not active". These are
-/// systemd's own well-known state words (see `systemctl(1)`); seeing one of
-/// them on stdout means the query was answered, just answered "no".
+/// The `ActiveState` values that `systemctl is-active` treats as SUCCESS
+/// (exit code 0) per systemd's own `verb_is_active` implementation
+/// (`src/systemctl/systemctl-is-active.c`): `active`, `reloading`, and
+/// `refreshing` are all "the unit is active" in different sub-phases, not
+/// "not active". Seeing any of these on stdout is a confirmed-active answer.
+const KNOWN_ACTIVE_STATES: &[&str] = &["active", "reloading", "refreshing"];
+
+/// The `ActiveState`/unit-state values `systemctl is-active` prints when it
+/// *did* successfully query the unit and the answer is "not active". These
+/// are systemd's own well-known state words (see `systemctl(1)` and
+/// `src/basic/unit-def.c`, which also defines the distinct `maintenance`
+/// state); seeing one of them on stdout means the query was answered, just
+/// answered "no".
 const KNOWN_NOT_ACTIVE_STATES: &[&str] =
-    &["inactive", "failed", "unknown", "activating", "deactivating", "reloading"];
+    &["inactive", "failed", "unknown", "activating", "deactivating", "maintenance"];
 
 /// Interpret the raw stdout of `systemctl is-active <unit>` (exit code is
 /// intentionally NOT consulted — see module docs) into a confirmed answer.
 ///
 /// Returns:
-/// - `Some(true)` — stdout was exactly `active`.
+/// - `Some(true)` — stdout was one of [`KNOWN_ACTIVE_STATES`]
+///   (`active`, `reloading`, `refreshing`): systemd's own `is-active`
+///   success states.
 /// - `Some(false)` — stdout was one of [`KNOWN_NOT_ACTIVE_STATES`]: the
 ///   query was genuinely answered, just answered "not active".
 /// - `None` — anything else, including empty stdout. This is the case a
@@ -24,7 +35,7 @@ const KNOWN_NOT_ACTIVE_STATES: &[&str] =
 ///   did before this fix).
 fn classify_is_active_output(stdout: &str) -> Option<bool> {
     let trimmed = stdout.trim();
-    if trimmed == "active" {
+    if KNOWN_ACTIVE_STATES.contains(&trimmed) {
         Some(true)
     } else if KNOWN_NOT_ACTIVE_STATES.contains(&trimmed) {
         Some(false)
@@ -36,10 +47,14 @@ fn classify_is_active_output(stdout: &str) -> Option<bool> {
 /// Check whether a systemd unit is active.
 ///
 /// Returns:
-/// - `Some(true)` — `systemctl is-active <unit>` printed `active`.
+/// - `Some(true)` — `systemctl is-active <unit>` printed one of systemd's
+///   own `is-active` success states: `active`, `reloading`, or
+///   `refreshing` (per `verb_is_active` in
+///   `src/systemctl/systemctl-is-active.c`). `reloading`/`refreshing` still
+///   exit 0 from `systemctl is-active` itself.
 /// - `Some(false)` — it printed one of a small set of well-known "queried,
 ///   not active" state words (`inactive`, `failed`, `unknown`,
-///   `activating`, `deactivating`, `reloading`). `systemctl is-active`
+///   `activating`, `deactivating`, `maintenance`). `systemctl is-active`
 ///   exits non-zero for all of these; we still read stdout rather than
 ///   trusting the exit code.
 /// - `None` — either `systemctl` itself could not be run (missing binary,
@@ -93,7 +108,12 @@ mod tests {
 
     #[test]
     fn classify_active_stdout_is_confirmed_true() {
+        // All three of systemd's own `is-active` success states
+        // (`verb_is_active` in `src/systemctl/systemctl-is-active.c`) must
+        // classify as confirmed-active.
         assert_eq!(classify_is_active_output("active\n"), Some(true));
+        assert_eq!(classify_is_active_output("reloading\n"), Some(true));
+        assert_eq!(classify_is_active_output("refreshing\n"), Some(true));
     }
 
     #[test]
