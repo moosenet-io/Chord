@@ -74,7 +74,11 @@ pub struct McpProxy {
 impl McpProxy {
     pub fn new(config: &Config, fallback: Arc<FallbackRegistry>) -> Self {
         Self {
-            session: McpSession::new(config.mcp_backend_url.clone(), config.tool_timeout_secs),
+            session: McpSession::with_token(
+                config.mcp_backend_url.clone(),
+                config.tool_timeout_secs,
+                config.mcp_backend_token.clone(),
+            ),
             catalog: Mutex::new(ToolCatalog::new(config.catalog_cache_secs)),
             fallback,
             timeout: Duration::from_secs(config.tool_timeout_secs),
@@ -289,6 +293,7 @@ mod tests {
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
+            mcp_backend_token: None,
         };
 
         let proxy = McpProxy::new(&config, make_registry_with_echo());
@@ -298,6 +303,63 @@ mod tests {
             .unwrap();
         assert_eq!(result, "fallback works");
         assert_eq!(source, "chord"); // served by Rust fallback
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_falls_back_on_401_from_mcp_backend() {
+        // Once the backend enforces bearer auth, a 401/403 must take the exact
+        // same fallback path as any other MCP error (e.g. HTTP 500 above) — no
+        // special-casing for auth failures.
+        let mock_server = httpmock::MockServer::start_async().await;
+
+        mock_server.mock(|when, then| {
+            when.body_contains(r#""method":"initialize""#);
+            then.status(200)
+                .header("Mcp-Session-Id", "test-401")
+                .json_body(serde_json::json!({"jsonrpc":"2.0","id":1,"result":{}}));
+        });
+        mock_server.mock(|when, then| {
+            when.body_contains("notifications/initialized");
+            then.status(200).body("");
+        });
+        mock_server.mock(|when, then| {
+            when.body_contains("tools/call");
+            then.status(401).body("Unauthorized: missing or invalid bearer token");
+        });
+
+        let config = Config {
+            mcp_backend_url: mock_server.base_url(),
+            jwt_secret: String::new(),
+            tool_timeout_secs: 5,
+            catalog_cache_secs: 300,
+            listen_port: 9099,
+            control_port: 8090,
+            rate_limits: RateLimitConfig::default(),
+            llm_backend_url: None,
+            model_aliases: std::collections::HashMap::new(),
+            model_archive_path: "/var/lib/model-archive".into(),
+            model_local_path: "/opt/ollama-models".into(),
+            model_protected: vec![],
+            model_pull_timeout_secs: 600,
+            model_registry_path: "<path>/model-registry.json".into(),
+            model_disk_pressure_percent: 80,
+            model_sweep_interval_secs: 1800,
+            model_warm_cooldown_hours: 168,
+            model_source_allowlist: Vec::new(),
+            outbound_proxy: None,
+            runtime_telemetry_off: true,
+            // Deliberately unset/wrong-on-the-remote-side: the mock 401s regardless,
+            // simulating a backend that has since turned on auth enforcement.
+            mcp_backend_token: None,
+        };
+
+        let proxy = McpProxy::new(&config, make_registry_with_echo());
+        let (result, source) = proxy
+            .tool_call("echo_test", serde_json::json!({"text": "fallback on 401"}))
+            .await
+            .unwrap();
+        assert_eq!(result, "fallback on 401");
+        assert_eq!(source, "chord"); // 401 routed through the same fallback as any other MCP error
     }
 
     #[tokio::test]
@@ -340,6 +402,7 @@ mod tests {
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
+            mcp_backend_token: None,
         };
 
         let reg = Arc::new(FallbackRegistry::new()); // no tools registered
@@ -396,6 +459,7 @@ mod tests {
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
+            mcp_backend_token: None,
         };
 
         let proxy = McpProxy::new(&config, make_registry_with_echo());
@@ -430,6 +494,7 @@ mod tests {
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
+            mcp_backend_token: None,
         };
 
         let proxy = McpProxy::new(&config, make_registry_with_echo());
@@ -489,6 +554,7 @@ mod tests {
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
+            mcp_backend_token: None,
         };
 
         let reg = Arc::new(FallbackRegistry::new());

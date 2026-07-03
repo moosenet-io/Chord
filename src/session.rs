@@ -63,10 +63,18 @@ pub struct McpSession {
     client: reqwest::Client,
     state: Arc<Mutex<SessionState>>,
     health_check_interval: Duration,
+    /// Shared bearer token for outbound MCP requests (`MCP_BACKEND_TOKEN`).
+    /// `None` means send no `Authorization` header at all (pre-hardening
+    /// behavior). Never format/log this field — only its `is_some()`.
+    token: Option<String>,
 }
 
 impl McpSession {
     pub fn new(backend_url: String, timeout_secs: u64) -> Self {
+        Self::with_token(backend_url, timeout_secs, None)
+    }
+
+    pub fn with_token(backend_url: String, timeout_secs: u64, token: Option<String>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .build()
@@ -77,6 +85,17 @@ impl McpSession {
             client,
             state: Arc::new(Mutex::new(SessionState::new())),
             health_check_interval: Duration::from_secs(60),
+            token,
+        }
+    }
+
+    /// Attach the `Authorization: Bearer <token>` header when a token is
+    /// configured; otherwise pass the builder through unchanged. Deliberately
+    /// takes `&self.token` only — never logs or formats the token value.
+    fn authorize(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.token {
+            Some(t) => builder.header("Authorization", format!("Bearer {t}")),
+            None => builder,
         }
     }
 
@@ -114,11 +133,13 @@ impl McpSession {
             })),
         };
 
-        let response = self
+        let request_builder = self
             .client
             .post(format!("{}/mcp", self.backend_url))
             .header("Content-Type", "application/json")
-            .header("Accept", "application/json, text/event-stream")
+            .header("Accept", "application/json, text/event-stream");
+        let response = self
+            .authorize(request_builder)
             .json(&init_request)
             .send()
             .await
@@ -144,14 +165,12 @@ impl McpSession {
             "method": "notifications/initialized",
             "params": {}
         });
-        let _ = self
+        let notif_builder = self
             .client
             .post(format!("{}/mcp", self.backend_url))
             .header("Content-Type", "application/json")
-            .header("Mcp-Session-Id", &session_id)
-            .json(&notif)
-            .send()
-            .await;
+            .header("Mcp-Session-Id", &session_id);
+        let _ = self.authorize(notif_builder).json(&notif).send().await;
 
         state.session_id = Some(session_id.clone());
         state.last_health_check = Some(Instant::now());
@@ -175,12 +194,14 @@ impl McpSession {
             params,
         };
 
-        let response = self
+        let request_builder = self
             .client
             .post(format!("{}/mcp", self.backend_url))
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
-            .header("Mcp-Session-Id", &session_id)
+            .header("Mcp-Session-Id", &session_id);
+        let response = self
+            .authorize(request_builder)
             .json(&request)
             .send()
             .await
@@ -437,5 +458,141 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ProxyError::McpBackend(_)));
         assert!(err.to_string().contains("Method not found"));
+    }
+
+    // ── MCP_BACKEND_TOKEN bearer-auth wiring ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_initialize_sends_authorization_header_when_token_configured() {
+        let mock_server = httpmock::MockServer::start_async().await;
+
+        let init_mock = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/mcp")
+                .header("Authorization", "Bearer test-token-abc")
+                .body_contains(r#""method":"initialize""#);
+            then.status(200)
+                .header("Mcp-Session-Id", "auth-test")
+                .json_body(serde_json::json!({"jsonrpc":"2.0","id":1,"result":{}}));
+        });
+        // Catch-all for notifications/initialized — must also carry the header.
+        let notif_mock = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/mcp")
+                .header("Authorization", "Bearer test-token-abc")
+                .body_contains("notifications/initialized");
+            then.status(200).body("");
+        });
+
+        let session = McpSession::with_token(
+            mock_server.base_url(),
+            10,
+            Some("test-token-abc".to_string()),
+        );
+        let session_id = session.ensure_session().await.unwrap();
+        assert_eq!(session_id, "auth-test");
+        init_mock.assert_hits(1);
+        notif_mock.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn test_send_request_sends_authorization_header_when_token_configured() {
+        let mock_server = httpmock::MockServer::start_async().await;
+
+        mock_server.mock(|when, then| {
+            when.body_contains(r#""method":"initialize""#);
+            then.status(200)
+                .header("Mcp-Session-Id", "auth-call-test")
+                .json_body(serde_json::json!({"jsonrpc":"2.0","id":1,"result":{}}));
+        });
+        mock_server.mock(|when, then| {
+            when.body_contains("notifications/initialized");
+            then.status(200).body("");
+        });
+        // tools/list must carry the bearer header alongside the session header.
+        let tools_mock = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/mcp")
+                .header("Authorization", "Bearer secret-xyz")
+                .header("Mcp-Session-Id", "auth-call-test")
+                .body_contains("tools/list");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": {"tools": []}
+                }));
+        });
+
+        let session =
+            McpSession::with_token(mock_server.base_url(), 10, Some("secret-xyz".to_string()));
+        let result = session.send_request("tools/list", None).await.unwrap();
+        assert!(result["tools"].is_array());
+        tools_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_no_authorization_header_when_token_unset() {
+        let mock_server = httpmock::MockServer::start_async().await;
+
+        // Explicitly require the ABSENCE of an Authorization header — this is the
+        // backward-compatible pre-hardening behavior and must not regress.
+        let init_mock = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/mcp")
+                .matches(|req| {
+                    !req.headers
+                        .as_ref()
+                        .map(|hs| hs.iter().any(|(k, _)| k.eq_ignore_ascii_case("authorization")))
+                        .unwrap_or(false)
+                })
+                .body_contains(r#""method":"initialize""#);
+            then.status(200)
+                .header("Mcp-Session-Id", "no-auth-test")
+                .json_body(serde_json::json!({"jsonrpc":"2.0","id":1,"result":{}}));
+        });
+        mock_server.mock(|when, then| {
+            when.body_contains("notifications/initialized");
+            then.status(200).body("");
+        });
+
+        // McpSession::new (the plain constructor) must still mean "no token".
+        let session = McpSession::new(mock_server.base_url(), 10);
+        let session_id = session.ensure_session().await.unwrap();
+        assert_eq!(session_id, "no-auth-test");
+        init_mock.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn test_401_from_backend_is_a_plain_mcp_backend_error() {
+        // A 401/403 from the backend (once it enforces auth) must surface as the
+        // same ProxyError::McpBackend variant as any other HTTP failure, so that
+        // McpProxy's generic fallback-on-error path (mcp_proxy.rs) handles it
+        // with no special-casing.
+        let mock_server = httpmock::MockServer::start_async().await;
+
+        mock_server.mock(|when, then| {
+            when.body_contains(r#""method":"initialize""#);
+            then.status(200)
+                .header("Mcp-Session-Id", "unauthed-test")
+                .json_body(serde_json::json!({"jsonrpc":"2.0","id":1,"result":{}}));
+        });
+        mock_server.mock(|when, then| {
+            when.body_contains("notifications/initialized");
+            then.status(200).body("");
+        });
+        mock_server.mock(|when, then| {
+            when.body_contains("tools/call");
+            then.status(401).body("Unauthorized");
+        });
+
+        // Deliberately configured with the WRONG/no token so the mock 401s.
+        let session = McpSession::new(mock_server.base_url(), 10);
+        let err = session
+            .send_request("tools/call", Some(serde_json::json!({})))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProxyError::McpBackend(_)));
+        assert!(err.to_string().contains("401"));
     }
 }
