@@ -2,6 +2,7 @@ pub mod agentic;
 pub mod audit;
 pub mod auth;
 pub mod catalog;
+pub mod coding_proxy;
 pub mod config;
 pub mod control;
 pub mod error;

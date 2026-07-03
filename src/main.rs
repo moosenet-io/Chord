@@ -194,6 +194,37 @@ async fn main() {
         });
     }
 
+    // ── CPROX-02/03: fleet-driven coding-model selection ──
+    // Same fail-open discipline as the serving-profile routing map above: an
+    // unconfigured/unreachable intake DB yields `None` (POST /v1/coding/select
+    // returns a clear 503, never blocks startup) rather than making Chord's
+    // core proxy function depend on this feature.
+    let coding_profile_source: chord_proxy::coding_proxy::SharedCodingProfileSource =
+        Arc::new(Mutex::new(None));
+    {
+        let coding_profile_source = coding_profile_source.clone();
+        tokio::spawn(async move {
+            let Some(db_url) = terminus_rs::config::intake_database_url() else {
+                info!(
+                    "coding-model intake DB not configured — POST /v1/coding/select disabled \
+                     (503 NotConfigured)"
+                );
+                return;
+            };
+            let pool = match sqlx::PgPool::connect(&db_url).await {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("coding-model intake DB connect failed: {e}");
+                    return;
+                }
+            };
+            let source: Arc<dyn chord_proxy::models::coding_selector::CodeProfileSource> =
+                Arc::new(chord_proxy::models::coding_selector::DbCodeProfileSource::new(pool));
+            *coding_profile_source.lock().await = Some(source);
+            info!("coding-model selection data source connected");
+        });
+    }
+
     let state = Arc::new(AppState {
         proxy,
         jwt_secret,
@@ -211,6 +242,7 @@ async fn main() {
         disk_pressure_percent: config.model_disk_pressure_percent,
         model_warm_cooldown_hours: config.model_warm_cooldown_hours,
         routing_map,
+        coding_profile_source,
     });
     // TIER-05: the model-tier control API runs on a SECOND listener (control port,
     // default 8090), sharing the same AppState. Build it before `state` is moved

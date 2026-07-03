@@ -202,7 +202,7 @@ fn make_state(mcp_url: String) -> Arc<AppState> {
         http_client: reqwest::Client::new(),
         model_registry,
         pull_coordinator,
-        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: std::sync::Arc::new(Mutex::new(chord_proxy::serving::profile::RoutingMap::empty())),
+        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: std::sync::Arc::new(Mutex::new(chord_proxy::serving::profile::RoutingMap::empty())), coding_profile_source: std::sync::Arc::new(Mutex::new(None)),
     })
 }
 
@@ -246,7 +246,7 @@ fn make_state_with_auth(mcp_url: String, secret: String) -> Arc<AppState> {
         http_client: reqwest::Client::new(),
         model_registry,
         pull_coordinator,
-        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: std::sync::Arc::new(Mutex::new(chord_proxy::serving::profile::RoutingMap::empty())),
+        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: std::sync::Arc::new(Mutex::new(chord_proxy::serving::profile::RoutingMap::empty())), coding_profile_source: std::sync::Arc::new(Mutex::new(None)),
     })
 }
 
@@ -298,7 +298,7 @@ fn make_state_tight_limits(mcp_url: String) -> Arc<AppState> {
         http_client: reqwest::Client::new(),
         model_registry,
         pull_coordinator,
-        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: std::sync::Arc::new(Mutex::new(chord_proxy::serving::profile::RoutingMap::empty())),
+        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: std::sync::Arc::new(Mutex::new(chord_proxy::serving::profile::RoutingMap::empty())), coding_profile_source: std::sync::Arc::new(Mutex::new(None)),
     })
 }
 
@@ -345,7 +345,7 @@ fn make_state_with_audit(mcp_url: String, dir: &TempDir) -> Arc<AppState> {
         http_client: reqwest::Client::new(),
         model_registry,
         pull_coordinator,
-        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: std::sync::Arc::new(Mutex::new(chord_proxy::serving::profile::RoutingMap::empty())),
+        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: std::sync::Arc::new(Mutex::new(chord_proxy::serving::profile::RoutingMap::empty())), coding_profile_source: std::sync::Arc::new(Mutex::new(None)),
     })
 }
 
@@ -967,7 +967,7 @@ async fn test_tool_call_both_backends_fail_returns_404() {
         http_client: reqwest::Client::new(),
         model_registry,
         pull_coordinator,
-        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: std::sync::Arc::new(Mutex::new(chord_proxy::serving::profile::RoutingMap::empty())),
+        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: std::sync::Arc::new(Mutex::new(chord_proxy::serving::profile::RoutingMap::empty())), coding_profile_source: std::sync::Arc::new(Mutex::new(None)),
     });
     let app = build_router(state);
 
@@ -981,6 +981,75 @@ async fn test_tool_call_both_backends_fail_returns_404() {
         StatusCode::NOT_FOUND,
         "when both backends fail, 404 must be returned"
     );
+}
+
+// ── CPROX-03/04: POST /v1/coding/select, exercised over the real HTTP router ──
+
+fn coding_select_request(body: serde_json::Value) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri("/v1/coding/select")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// No `coding_profile_source` wired (the default for `make_state`) ⇒ a clean
+/// 503, never a 500/hang, even for an otherwise well-formed request.
+#[tokio::test]
+async fn test_coding_select_not_configured_returns_503() {
+    let state = make_state("http://test-mcp-does-not-exist-for-e2e:9999".to_string());
+    let app = build_router(state);
+
+    let body = serde_json::json!({
+        "language": "rust",
+        "task_shape": "multi_file_build",
+        "reasoning_need": "enrich",
+        "context_depth_need": "short"
+    });
+    let resp = app.oneshot(coding_select_request(body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(json["error"].as_str().unwrap().contains("not configured"));
+}
+
+/// An unknown enum variant / malformed body must be a clean 4xx (Axum's `Json`
+/// extractor rejects it before the handler runs) — never a 500, never a hang.
+#[tokio::test]
+async fn test_coding_select_malformed_body_returns_4xx_not_500() {
+    let state = make_state("http://test-mcp-does-not-exist-for-e2e:9999".to_string());
+    let app = build_router(state);
+
+    let body = serde_json::json!({
+        "language": "cobol",
+        "task_shape": "multi_file_build",
+        "reasoning_need": "enrich",
+        "context_depth_need": "short"
+    });
+    let resp = app.oneshot(coding_select_request(body)).await.unwrap();
+    assert!(
+        resp.status().is_client_error(),
+        "expected a 4xx for a malformed work-type body, got {}",
+        resp.status()
+    );
+}
+
+/// Missing/empty JSON body must also be a clean 4xx, not a panic.
+#[tokio::test]
+async fn test_coding_select_empty_body_returns_4xx_not_500() {
+    let state = make_state("http://test-mcp-does-not-exist-for-e2e:9999".to_string());
+    let app = build_router(state);
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/coding/select")
+        .header("content-type", "application/json")
+        .body(Body::from(""))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert!(resp.status().is_client_error());
 }
 
 /// All backend URLs used in these tests are placeholder hostnames, not real IPs.
