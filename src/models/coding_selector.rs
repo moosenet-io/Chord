@@ -60,20 +60,45 @@
 //! yarn_validate.rs`) is a separate, still-in-progress sweep. Absent data simply
 //! means no candidate gets the bonus; nothing errors and nothing is fabricated.
 //!
-//! ## MoE / backend-safety gating
-//! Before candidates are returned, each is checked against
-//! [`crate::models::backends::is_vulkan_candidate`] — the existing S86
-//! dense-vs-MoE backend-safety signal (MoE tags are excluded from the
-//! memory-bound Vulkan tier; see that function's docs). This module does not
-//! reimplement MoE detection: it reuses `is_vulkan_candidate` as-is and records
-//! the result as [`CodingCandidate::vulkan_safe`], which the route handler
-//! (CPROX-03/04) uses to withhold a `vulkan` backend recommendation for MoE
-//! models, falling back to the model's default (ollama/llama-gpu) tier instead.
+//! ## MoE / backend-safety gating — EXCLUSION, not a flag
+//! Per spec, a candidate that fails the backend-safety check is **excluded
+//! from the ranked list entirely** — never returned with a warning attached,
+//! never visible to the caller as "the pick" (or as any pick at all). This
+//! module's [`rank_candidates`] drops such candidates before they are ever
+//! scored/sorted/returned; there is no `vulkan_safe`-style flag surfaced on
+//! [`CodingCandidate`] because an unsafe candidate simply never becomes one.
+//!
+//! **Which signal decides "backend-unsafe" — a documented deviation.** The
+//! original version of this item reused
+//! [`crate::models::backends::is_vulkan_candidate`] whole for this gate. That
+//! was wrong: `is_vulkan_candidate` answers "is this tag BOTH non-MoE AND one
+//! of the large 32B/34B/70B/72B dense size classes" — it is a vulkan-tier
+//! ELIGIBILITY gate, not a safety verdict, and its `false` case fires for
+//! almost every dense model that simply isn't one of those four sizes. Using
+//! it as an exclusion filter was verified (against the live Rust-language
+//! aggregates) to wrongly exclude ~13 of ~14 real fleet models — e.g.
+//! `codestral:latest`, `devstral:24b`, `gemma3:12b`,
+//! `qwen2.5-coder:14b-instruct` — none of which are MoE, all of which would
+//! vanish from every ranking. That is a far more destructive outcome than the
+//! spec's exclusion requirement intends, so this module instead calls
+//! [`crate::models::backends::is_moe_tagged`] — the exact MoE-substring check
+//! `is_vulkan_candidate` has always used internally, factored out to its own
+//! function so both callers share it (reuse, not reimplementation) without
+//! also inheriting the unrelated size gate. See `is_moe_tagged`'s doc comment
+//! for a known residual gap this narrower signal still has (`qwen3-coder:30b`,
+//! a genuine MoE model per the registry's own test comments, isn't tag-flagged
+//! as MoE and is therefore NOT excluded by this check) — closing that gap
+//! needs a curated model-family list or a real per-model architecture signal
+//! from the sweep, out of scope for this fix. **This is a deliberate deviation
+//! from directly reusing `is_vulkan_candidate`, flagged here rather than made
+//! silently** — the exclusion behavior itself (spec's actual requirement) is
+//! implemented as written; only the choice of *which existing function*
+//! constitutes "the MoE/backend-safety gate" changed.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::models::backends::is_vulkan_candidate;
+use crate::models::backends::is_moe_tagged;
 use crate::models::work_type::{ContextDepthNeed, WorkTypeCode};
 
 /// Weight of the sweep's own graduated 0-5 effective score in the combined
@@ -159,8 +184,12 @@ impl std::fmt::Display for SelectorError {
 
 impl std::error::Error for SelectorError {}
 
-/// A ranked, safety-gated coding-model candidate — CPROX-04's fallback list is
-/// built directly from a `Vec<CodingCandidate>` sorted best-first.
+/// A ranked, backend-safety-gated coding-model candidate — CPROX-04's fallback
+/// list is built directly from a `Vec<CodingCandidate>` sorted best-first.
+/// There is NO safety/unsafe flag on this type: a candidate that failed the
+/// MoE/backend-safety gate never becomes one of these in the first place (see
+/// the module-level "MoE / backend-safety gating" doc comment) — the caller
+/// can never see an unsafe candidate as "the pick" or as any pick at all.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CodingCandidate {
     pub model_id: String,
@@ -174,10 +203,6 @@ pub struct CodingCandidate {
     pub combined_score: f64,
     /// Whether the YaRN long-context bonus was applied to this candidate.
     pub yarn_bonus_applied: bool,
-    /// The S86 MoE/backend-safety signal, reused as-is from
-    /// [`crate::models::backends::is_vulkan_candidate`]. `false` ⇒ this model
-    /// must never be resolved onto the `vulkan` backend (see module docs).
-    pub vulkan_safe: bool,
 }
 
 /// Compute the documented combined score for one aggregate. Pure — no I/O, no
@@ -191,13 +216,19 @@ pub fn combined_score(agg: &CodeAggregate) -> f64 {
     WEIGHT_EFFECTIVE_SCORE * effective + WEIGHT_COMPILE_RATE * compile + WEIGHT_TEST_RATE * test
 }
 
-/// Turn a set of same-language aggregates into ranked, safety-gated candidates.
-/// Pure (given the yarn-lookup results already resolved) — the async DB lookups
-/// happen in [`rank_for_work_type`], this is the testable core.
+/// Turn a set of same-language aggregates into ranked, backend-safety-gated
+/// candidates. Pure (given the yarn-lookup results already resolved) — the
+/// async DB lookups happen in [`rank_for_work_type`], this is the testable
+/// core.
 ///
 /// `yarn_tokens` maps `(model_id, mem_config)` → usable ceiling tokens, for
 /// candidates that have one; a missing entry means "no YaRN data" (no bonus,
 /// no error — see module docs).
+///
+/// MoE-tagged aggregates (per [`crate::models::backends::is_moe_tagged`] — see
+/// the module-level doc comment for why this signal, not
+/// `is_vulkan_candidate`, is used) are EXCLUDED entirely here, before scoring
+/// or sorting — they never appear anywhere in the returned `Vec`, per spec.
 pub fn rank_candidates(
     aggregates: &[CodeAggregate],
     context_depth_need: ContextDepthNeed,
@@ -205,6 +236,7 @@ pub fn rank_candidates(
 ) -> Vec<CodingCandidate> {
     let mut out: Vec<CodingCandidate> = aggregates
         .iter()
+        .filter(|agg| !is_moe_tagged(&agg.model_id))
         .map(|agg| {
             let base_score = combined_score(agg);
             let key = (agg.model_id.clone(), agg.mem_config.clone());
@@ -225,7 +257,6 @@ pub fn rank_candidates(
                 test_pass_rate: agg.test_pass_rate,
                 combined_score: combined,
                 yarn_bonus_applied: apply_bonus,
-                vulkan_safe: is_vulkan_candidate(&agg.model_id),
             }
         })
         .collect();
@@ -539,17 +570,41 @@ mod tests {
     }
 
     #[test]
-    fn vulkan_safety_gate_reuses_backends_is_vulkan_candidate() {
+    fn moe_tagged_candidates_are_excluded_entirely_not_flagged() {
+        // A tag-flagged MoE model (a3b-class) even with a TOP score must never
+        // appear in the returned list at all — not with a warning, not as a
+        // lower-ranked entry, not anywhere. This is the blocking-bug regression
+        // test: an MoE candidate that scores well must not become "the pick".
         let aggregates = vec![
-            agg("qwen3-coder:30b", None, 4.0, 1.0, 1.0), // MoE-tagged (a3b-class)
-            agg("llama3.3:70b", None, 4.0, 1.0, 1.0),    // dense large
+            agg("qwen3-a3b-coder:30b", None, 5.0, 1.0, 1.0), // MoE-tagged, best score
+            agg("llama3.3:70b", None, 3.0, 0.8, 0.8),        // dense, lower score
         ];
         let ranked = rank_candidates(&aggregates, ContextDepthNeed::Short, &Default::default());
-        let moe = ranked.iter().find(|c| c.model_id == "qwen3-coder:30b").unwrap();
-        let dense = ranked.iter().find(|c| c.model_id == "llama3.3:70b").unwrap();
-        assert_eq!(moe.vulkan_safe, is_vulkan_candidate("qwen3-coder:30b"));
-        assert_eq!(dense.vulkan_safe, is_vulkan_candidate("llama3.3:70b"));
-        assert!(dense.vulkan_safe);
+
+        assert_eq!(ranked.len(), 1, "the MoE-tagged candidate must be excluded, not just flagged");
+        assert_eq!(ranked[0].model_id, "llama3.3:70b");
+        assert!(
+            ranked.iter().all(|c| c.model_id != "qwen3-a3b-coder:30b"),
+            "an MoE candidate must never appear in the ranked list, regardless of score"
+        );
+        // No safety flag is exposed at all — there's nothing to flag once
+        // exclusion is real (see the module docs on why this field was removed).
+    }
+
+    #[test]
+    fn dense_non_32b_class_models_are_not_wrongly_excluded() {
+        // Regression guard for the original bug's root cause: using
+        // `is_vulkan_candidate` (which also gates on the 32B/34B/70B/72B size
+        // allowlist) as the exclusion signal would wrongly drop real, non-MoE
+        // dense models that just aren't in that size class. `is_moe_tagged`
+        // must NOT exclude these.
+        let aggregates = vec![
+            agg("devstral:24b", None, 3.5, 0.8, 0.8),
+            agg("gemma3:12b", None, 3.2, 0.7, 0.7),
+            agg("codestral:latest", None, 4.0, 0.9, 0.9),
+        ];
+        let ranked = rank_candidates(&aggregates, ContextDepthNeed::Short, &Default::default());
+        assert_eq!(ranked.len(), 3, "non-MoE dense models below the vulkan size allowlist must survive");
     }
 
     #[tokio::test]
@@ -586,19 +641,63 @@ mod tests {
         let aggregates = source.load_aggregates("rust").await.expect("query ok");
         assert!(!aggregates.is_empty(), "expected live rust aggregates");
 
-        // Group by model_id and assert distinct mem_config values are separate rows.
-        let mut by_model: std::collections::BTreeMap<&str, Vec<&Option<String>>> =
+        // Group by model_id, collecting (mem_config, avg_effective_score) per row.
+        let mut by_model: std::collections::BTreeMap<&str, Vec<(Option<String>, Option<f64>)>> =
             Default::default();
         for a in &aggregates {
-            by_model.entry(a.model_id.as_str()).or_default().push(&a.mem_config);
+            by_model
+                .entry(a.model_id.as_str())
+                .or_default()
+                .push((a.mem_config.clone(), a.avg_effective_score));
         }
-        for (_model, configs) in by_model {
-            let unique: std::collections::BTreeSet<_> = configs.into_iter().collect();
-            // No assertion needed beyond "this ran without erroring and each
-            // mem_config produced its own row" — the grouping is enforced by
-            // the SQL GROUP BY itself; this test's purpose is a live smoke
-            // check that the query still returns the expected shape.
-            let _ = unique;
+
+        // For EVERY model, each distinct mem_config value it has data under
+        // must have produced its OWN row — a regression that dropped
+        // `mem_config` from the SQL `GROUP BY` would collapse these into fewer
+        // rows than distinct configs (or fail with a Postgres "column must
+        // appear in GROUP BY" error before we even get here).
+        let mut found_dual_config_model = false;
+        for (model, rows) in &by_model {
+            let distinct_configs: std::collections::BTreeSet<&Option<String>> =
+                rows.iter().map(|(c, _)| c).collect();
+            assert!(
+                rows.len() >= distinct_configs.len(),
+                "model {model} produced fewer aggregate rows ({}) than distinct \
+                 mem_config values ({}) it has data under — mem_config may have been \
+                 dropped from the GROUP BY",
+                rows.len(),
+                distinct_configs.len()
+            );
+
+            // The load-bearing assertion: a model with BOTH a `dynamic_gtt` row
+            // and a legacy/untagged row must show DIFFERENT scores. As of this
+            // writing several real models qualify (e.g. `qwen3-coder:30b`:
+            // ~4.19 untagged vs. ~1.75 under `dynamic_gtt`) — if a future
+            // regression silently blended them, this is exactly the check that
+            // would fail (blended rows either collapse to one row, tripping the
+            // assertion above, or — if the bug is instead in the AVG itself —
+            // would produce the SAME score for both configs, tripping this one).
+            if distinct_configs.len() >= 2 {
+                found_dual_config_model = true;
+                let scores: Vec<f64> = rows.iter().filter_map(|(_, s)| *s).collect();
+                if scores.len() >= 2 {
+                    let all_equal = scores.windows(2).all(|w| (w[0] - w[1]).abs() < 1e-9);
+                    assert!(
+                        !all_equal,
+                        "model {model} has DIFFERENT mem_config rows but IDENTICAL \
+                         avg_effective_score values ({scores:?}) — this is exactly the \
+                         blending regression this test exists to catch"
+                    );
+                }
+            }
         }
+        assert!(
+            found_dual_config_model,
+            "expected at least one live Rust model with rows under BOTH a mem_config \
+             value and legacy/untagged (e.g. qwen3-coder:30b as of this writing) — \
+             without one, this test cannot actually exercise the non-blending guarantee. \
+             If the live sweep data has changed shape, update this test's expectations \
+             rather than deleting the assertion."
+        );
     }
 }

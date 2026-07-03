@@ -319,6 +319,27 @@ pub fn seed_from_env() -> HashMap<String, Backend> {
 /// Backend name of the Vulkan/RADV (Mesa) GPU serving backend.
 pub const VULKAN_BACKEND: &str = "vulkan";
 
+/// Whether `model`'s tag names it as a Mixture-of-Experts architecture, by the
+/// same name-substring convention [`is_vulkan_candidate`] has always used
+/// (`moe`, `a3b`, `a22b`). Factored out to its own function (CPROX-02 fix) so
+/// callers that need a PURE MoE signal — not entangled with `is_vulkan_candidate`'s
+/// separate "is this tag one of the large DENSE size classes" size gate — can
+/// reuse the exact same detection logic without reimplementing it.
+///
+/// **Known limitation, not introduced by this function**: this is a naming
+/// convention, not a true architecture read from the model's config/weights.
+/// Ollama's stored tag for at least one real MoE coder in the fleet
+/// (`qwen3-coder:30b`, a genuine 30B-total/3B-active MoE model — see the
+/// `tag_vulkan_candidates_dense_large_only` registry test, which already
+/// labels it "a MoE coder" in its comment) does NOT contain `moe`/`a3b`/`a22b`
+/// literally, so this substring check does not catch it. Closing that gap
+/// needs either a curated model-family list or a real per-model architecture
+/// signal ingested by the sweep — out of scope for this factoring-out.
+pub fn is_moe_tagged(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower.contains("moe") || lower.contains("a3b") || lower.contains("a22b")
+}
+
 /// Whether a model is a **dense large** model (70B- or 32B-dense class) and thus
 /// a candidate for the driver-stable [`VULKAN_BACKEND`] serving backend.
 ///
@@ -327,10 +348,19 @@ pub const VULKAN_BACKEND: &str = "vulkan";
 /// batch/async mode. MoE / small models keep their default (ROCm/Ollama) routing.
 /// Name matching is on the `:<size>` tag suffix and is deliberately conservative
 /// — MoE tags (e.g. containing `a3b`, `moe`) are excluded even at large sizes.
+///
+/// NOTE: this answers "is this tag BOTH non-MoE AND one of the large dense size
+/// classes" — it is a vulkan-tier ELIGIBILITY gate, not a general model-safety
+/// verdict. A model this returns `false` for is not necessarily MoE or unsafe —
+/// most `false` results here are simply "not 32B/34B/70B/72B", which says
+/// nothing about safety. Callers that need a pure MoE-only safety signal
+/// (e.g. `models::coding_selector`, which must not exclude every non-32B+
+/// dense model from ranking) should call [`is_moe_tagged`] directly instead of
+/// inferring MoE-ness from a `false` return here.
 pub fn is_vulkan_candidate(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
     // Exclude Mixture-of-Experts tags — Vulkan is for *dense* large models.
-    if lower.contains("moe") || lower.contains("a3b") || lower.contains("a22b") {
+    if is_moe_tagged(model) {
         return false;
     }
     // llama3.3:70b is the confirmed dense-large validation model.
@@ -448,6 +478,21 @@ mod tests {
         assert!(!is_vulkan_candidate("qwen3-coder:30b"));
         assert!(!is_vulkan_candidate("qwen3:8b"));
         assert!(!is_vulkan_candidate("untagged-name"));
+    }
+
+    #[test]
+    fn is_moe_tagged_matches_known_substrings_only() {
+        assert!(is_moe_tagged("qwen3-a3b:30b"));
+        assert!(is_moe_tagged("some-model-moe:latest"));
+        assert!(is_moe_tagged("model-a22b:1"));
+        // Dense models, including ones that are NOT vulkan-eligible by size,
+        // must NOT be flagged as MoE by this narrower check.
+        assert!(!is_moe_tagged("devstral:24b"));
+        assert!(!is_moe_tagged("gemma3:12b"));
+        assert!(!is_moe_tagged("codestral:latest"));
+        // Known limitation (documented on the function): qwen3-coder:30b is a
+        // genuine MoE model but its stored tag doesn't literally say so.
+        assert!(!is_moe_tagged("qwen3-coder:30b"));
     }
 
     #[test]

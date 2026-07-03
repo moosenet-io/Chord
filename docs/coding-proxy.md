@@ -87,13 +87,40 @@ gets a fixed `+0.10` ranking bonus. As of this item the sweep has recorded
 still-in-progress sweep), not a bug: no candidate gets the bonus, nothing
 errors, nothing is fabricated.
 
-### MoE / backend-safety gating
-Every candidate is checked against
-[`models::backends::is_vulkan_candidate`](../src/models/backends.rs) — the
-existing S86 dense-vs-MoE backend-safety signal — and tagged
-`CodingCandidate::vulkan_safe`. This is reused as-is, not reimplemented; the
-route handler uses it to withhold a `vulkan` backend recommendation for
-MoE-tagged models.
+### MoE / backend-safety gating — exclusion, not a flag
+Per spec, a candidate that fails the backend-safety check is **excluded from
+the ranked list entirely** — never returned with a warning attached, never
+visible to the caller as "the pick" (or as any pick at all). `rank_candidates`
+drops such candidates before scoring/sorting; there is no safety flag on
+`CodingCandidate` because an unsafe candidate simply never becomes one.
+
+**Which signal — a documented deviation.** The first version of this item
+reused [`models::backends::is_vulkan_candidate`](../src/models/backends.rs)
+whole for this gate, and only flagged (didn't exclude) failing candidates — a
+review caught both problems. Fixing the "flag, don't exclude" bug is
+straightforward; the harder finding was that `is_vulkan_candidate` is the
+WRONG signal to filter on at all: it answers "is this tag BOTH non-MoE AND one
+of the large 32B/34B/70B/72B dense size classes" (a vulkan-tier ELIGIBILITY
+gate), not a safety verdict. Filtering the ranked list by it was verified
+against the live Rust-language aggregates to wrongly exclude ~13 of ~14 real
+fleet models — `codestral:latest`, `devstral:24b`, `gemma3:12b`,
+`qwen2.5-coder:14b-instruct`, etc. — none of which are MoE, all of which
+would vanish from every ranking. That is far more destructive than the spec's
+exclusion requirement intends, so this module instead calls
+[`models::backends::is_moe_tagged`](../src/models/backends.rs) — the exact
+MoE-substring check (`moe`/`a3b`/`a22b`) `is_vulkan_candidate` has always used
+internally, factored out to its own function so both callers share it (reuse,
+not reimplementation) without inheriting the unrelated size gate.
+
+**Known residual gap**, not introduced by this fix: `qwen3-coder:30b` is a
+genuine MoE model (30B total / 3B active) — the registry module's own tests
+already call it "a MoE coder" — but its stored tag in the DB doesn't literally
+contain `moe`/`a3b`/`a22b`, so `is_moe_tagged` does not catch it and it is
+NOT excluded today. Closing that needs either a curated model-family list or a
+real per-model architecture signal ingested by the sweep (`model_profiles` has
+no such column yet) — flagged as a follow-up, not fixed here, since inventing
+a bespoke per-model exception list inside `coding_selector.rs` would be exactly
+the kind of un-sourced "magic" this module's scoring rules otherwise avoid.
 
 ### Data source abstraction
 `CodeProfileSource` (async trait) mirrors the established
@@ -138,8 +165,12 @@ Failure (`503`, always JSON `{"error": "..."}`, never a 500 or a hang):
   to return an unverified selection` — CPROX-04's terminal case.
 
 Malformed/unknown-variant/empty body → `4xx` from Axum's `Json` extractor
-before the handler runs (see `test_coding_select_malformed_body_returns_4xx_not_500`
-/ `test_coding_select_empty_body_returns_4xx_not_500` in `tests/e2e.rs`).
+before the handler runs — never a 500, never a hang. Concretely: invalid JSON
+*syntax* (e.g. an empty body) is `400 Bad Request`; valid JSON that doesn't
+match the schema (e.g. an unknown enum variant) is `422 Unprocessable Entity`.
+See `test_coding_select_malformed_body_returns_4xx_not_500` (asserts 422) /
+`test_coding_select_empty_body_returns_4xx_not_500` (asserts 400) in
+`tests/e2e.rs`.
 
 ### Design decision: a resolution, not a transparent proxy
 This endpoint returns `model_id` / `backend` / `confidence` for the caller to
@@ -161,10 +192,11 @@ model name.
 absent/legacy — not fine-grained enough to name a specific serving backend
 (`llama-gpu` vs `lemonade-coder` vs `vulkan`). This module maps `Some("gpu")` →
 the generic on-demand `llama-gpu` backend (serves ANY requested model's blob
-on GPU) and anything else → the always-on `ollama` backend. A candidate whose
-`vulkan_safe` is `false` is never resolved onto `vulkan`, but this item does
-not otherwise attempt to route dense-large candidates onto the `vulkan` tier —
-left as a follow-up if that finer-grained routing is wanted later.
+on GPU) and anything else → the always-on `ollama` backend. Neither mapping
+ever names `vulkan`, so nothing reaching this module can be resolved onto it.
+MoE-tagged candidates never even reach this module — CPROX-02 excludes them
+from the ranked list entirely (see above) — so there is no per-candidate
+safety flag to check here at all.
 
 ## Ranked-list fallback (CPROX-04)
 
@@ -190,7 +222,12 @@ route handler (`select_with_fallback`) walks it best-first:
 - `task_shape` / `reasoning_need` don't yet affect ranking (see the scope note
   above) — the sweep data doesn't support that breakdown yet.
 - Backend resolution is coarse (`gpu` → `llama-gpu`, else → `ollama`); no
-  attempt to route dense-large MoE-safe candidates onto `vulkan` specifically.
+  attempt to route dense-large candidates onto `vulkan` specifically.
 - No caching of `rank_for_work_type`'s DB query — every `/v1/coding/select`
   call re-queries `code_profile_runs`. Fine at today's sweep-query volume; a
   future item could add a short TTL cache if this becomes hot-path traffic.
+- **`is_moe_tagged`'s residual gap** (see "MoE / backend-safety gating"
+  above): `qwen3-coder:30b` is a genuine MoE model not caught by the
+  name-substring check, so it is NOT excluded today. A real per-model
+  architecture signal (ideally ingested by the sweep itself, not name-sniffed)
+  would close this properly.

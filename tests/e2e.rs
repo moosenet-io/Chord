@@ -1029,14 +1029,21 @@ async fn test_coding_select_malformed_body_returns_4xx_not_500() {
         "context_depth_need": "short"
     });
     let resp = app.oneshot(coding_select_request(body)).await.unwrap();
-    assert!(
-        resp.status().is_client_error(),
-        "expected a 4xx for a malformed work-type body, got {}",
+    // Axum's `Json` extractor rejects an unknown enum variant (a schema
+    // mismatch, not invalid JSON syntax) with 422 Unprocessable Entity — still
+    // a clean 4xx (never a 500/hang), pinned exactly rather than a vague
+    // "some 4xx" so this test documents the real status.
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "expected 422 for a malformed work-type body, got {}",
         resp.status()
     );
 }
 
-/// Missing/empty JSON body must also be a clean 4xx, not a panic.
+/// Missing/empty JSON body must also be a clean 4xx, not a panic. An empty
+/// body is invalid JSON *syntax* (not a schema mismatch), which Axum's `Json`
+/// extractor rejects with 400 Bad Request — distinct from the 422 above.
 #[tokio::test]
 async fn test_coding_select_empty_body_returns_4xx_not_500() {
     let state = make_state("http://test-mcp-does-not-exist-for-e2e:9999".to_string());
@@ -1049,7 +1056,7 @@ async fn test_coding_select_empty_body_returns_4xx_not_500() {
         .body(Body::from(""))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert!(resp.status().is_client_error());
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 /// All backend URLs used in these tests are placeholder hostnames, not real IPs.

@@ -35,11 +35,14 @@
 //! backend (`llama-gpu` vs `lemonade-coder` vs `vulkan`). This module maps
 //! `Some("gpu")` → the generic on-demand `llama-gpu` backend (serves ANY
 //! requested model's blob on GPU — see `models::backends::seed_from_env`) and
-//! anything else → the always-on `ollama` backend. A candidate whose
-//! `vulkan_safe` is `false` (MoE-tagged, per CPROX-02's gating) is NEVER
-//! resolved onto the `vulkan` backend, but this module doesn't otherwise
-//! attempt to route dense-large candidates onto `vulkan` — that finer-grained
-//! backend selection is out of this item's scope and left as a follow-up.
+//! anything else → the always-on `ollama` backend. Neither of these mappings
+//! ever names `vulkan`, so no candidate reaching this module can be resolved
+//! onto it — that finer-grained routing is out of this item's scope. Note
+//! MoE-tagged candidates never even reach this module: CPROX-02's
+//! [`crate::models::coding_selector::rank_candidates`] excludes them from the
+//! ranked list entirely (see that module's docs) — there is no per-candidate
+//! safety flag here to check, because an unsafe candidate is never one of the
+//! inputs in the first place.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -120,8 +123,12 @@ pub fn resolve_backend_for_candidate(
 
 /// The request body: Harmony's work-type-tagged coding request. A malformed or
 /// unknown-variant body fails Axum's `Json` extraction before this handler
-/// ever runs, yielding a 400 automatically (see [`WorkTypeCode`]'s strict
-/// serde derive) — never a 500, never a hang.
+/// ever runs (see [`WorkTypeCode`]'s strict serde derive) — a 4xx automatically,
+/// never a 500, never a hang. Concretely: invalid JSON syntax (e.g. an empty
+/// body) is 400 Bad Request; valid JSON that doesn't match the schema (e.g. an
+/// unknown enum variant) is 422 Unprocessable Entity — see
+/// `test_coding_select_malformed_body_returns_4xx_not_500` /
+/// `test_coding_select_empty_body_returns_4xx_not_500` in `tests/e2e.rs`.
 pub type CodingSelectRequest = WorkTypeCode;
 
 /// What Chord actually picked, plus enough detail for Harmony (and logs/audits)
@@ -317,7 +324,6 @@ mod tests {
             test_pass_rate: Some(1.0),
             combined_score: score,
             yarn_bonus_applied: false,
-            vulkan_safe: true,
         }
     }
 
