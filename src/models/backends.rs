@@ -276,20 +276,20 @@ pub fn seed_from_env() -> HashMap<String, Backend> {
     // appends `/v1/chat/completions` to every backend's `url` uniformly, and
     // OpenRouter's real endpoint is `https://openrouter.ai/api/v1/chat/completions`.
     //
-    // Registered here for "Owl Alpha" (`OWL_ALPHA_MODEL_ID`,
+    // Registered here for the "Owl Alpha" slot (`OWL_ALPHA_MODEL_ID`,
     // `registry::register_openrouter_owl_alpha_from_env`) per operator request.
-    // IMPORTANT, verified 2026-07-03 directly against OpenRouter's own API
-    // (`GET https://openrouter.ai/api/v1/models/openrouter/owl-alpha/endpoints`):
-    // the model IS real (created 2026-04-28, 1,048,576-token context window,
-    // matches the operator's "1M context" claim) but currently returns
-    // `"endpoints":[]` — ZERO active serving endpoints. It is not in the public
-    // `/api/v1/models` list for the same reason. Concretely: **no pricing can be
-    // confirmed as $0 right now** (pricing is a property of an active endpoint,
-    // and there are none), and a live chat-completions call against it will fail
-    // upstream (likely 404/"no endpoints found") regardless of API key validity,
-    // until OpenRouter (re)activates a provider for it. The backend and model
-    // registration are wired up now so enabling it later is a config flip
-    // (`OPENROUTER_OWL_ALPHA_ENABLED=1`), not a code change.
+    // The original target, `openrouter/owl-alpha`, was verified 2026-07-03
+    // directly against OpenRouter's own API to genuinely exist (created
+    // 2026-04-28, 1,048,576-token context, matching the operator's "1M
+    // context" claim) but to have ZERO active serving endpoints
+    // (`"endpoints":[]`) — confirmed dead, not just unpriced, by an
+    // independent live 404 from a sibling project's authenticated call.
+    // Retargeted (2026-07-03, operator-directed) to
+    // `nvidia/nemotron-3-ultra-550b-a55b:free` — same $0 pricing tier, same
+    // ~1M context, confirmed LIVE (a real chat-completion round trip
+    // succeeded). See `OWL_ALPHA_MODEL_ID`'s docs for the full history and
+    // the `OPENROUTER_OWL_ALPHA_MODEL` override if this ever needs to move
+    // again — that's a config flip, not a code change.
     out.insert(
         "openrouter".into(),
         Backend {

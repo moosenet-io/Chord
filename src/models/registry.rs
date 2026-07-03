@@ -109,17 +109,28 @@ pub const MANAGED_BY_OLLAMA: &str = "ollama";
 /// endpoint (no local file, no archive, nothing `reconcile()` should touch).
 pub const MANAGED_BY_OPENROUTER: &str = "openrouter-api";
 
-/// OpenRouter's real model ID for "Owl Alpha", verified 2026-07-03 directly
-/// against OpenRouter's own site/API (`openrouter.ai/openrouter/owl-alpha`,
-/// `GET /api/v1/models/openrouter/owl-alpha/endpoints`). Confirmed real:
-/// `context_length: 1048576` (~1M tokens, matching the operator's claim),
-/// created 2026-04-28, description "designed for agentic workloads". NOT
-/// confirmed: pricing. The endpoints API returns `"endpoints":[]` — zero
-/// active serving endpoints as of verification, so no per-token price is
-/// currently published (there is no active endpoint to price), and the model
-/// does not appear in the public `GET /api/v1/models` catalog for the same
-/// reason. Treat "currently free" as unconfirmed/likely-stale, not verified.
-pub const OWL_ALPHA_MODEL_ID: &str = "openrouter/owl-alpha";
+/// The "Owl Alpha" slot's actual OpenRouter model ID.
+///
+/// "Owl Alpha" (`openrouter/owl-alpha`) was the operator's original free
+/// 1M-context target, verified 2026-07-03 directly against OpenRouter's own
+/// site/API (`openrouter.ai/openrouter/owl-alpha`,
+/// `GET /api/v1/models/openrouter/owl-alpha/endpoints`) to genuinely have
+/// `context_length: 1048576` and a 2026-04-28 creation date — but that same
+/// verification found `"endpoints":[]`: zero active serving endpoints, so
+/// nothing is actually reachable there (no per-token price is published for
+/// the same reason — there's no active endpoint to price). It's also absent
+/// from the public `GET /api/v1/models` catalog. Confirmed dead, not merely
+/// repriced, by an independent live authenticated call from a sibling
+/// project (Harmony) returning a clean 404 rather than an auth/pricing error.
+///
+/// Retargeted (2026-07-03, operator-directed) to `nvidia/nemotron-3-ultra-550b-a55b:free`
+/// — same free ($0) pricing tier, same ~1M (1,048,576) token context window,
+/// and confirmed live (a real chat-completion round trip succeeded) by the
+/// same sibling project. Override via `OPENROUTER_OWL_ALPHA_MODEL` if
+/// OpenRouter ever reinstates `openrouter/owl-alpha` or this substitute also
+/// rotates off free pricing — no code change needed, see
+/// [`ModelRegistry::register_openrouter_owl_alpha_from_env`].
+pub const OWL_ALPHA_MODEL_ID: &str = "nvidia/nemotron-3-ultra-550b-a55b:free";
 
 /// File-backed registry of all known models.
 #[derive(Debug, Clone)]
@@ -729,15 +740,16 @@ impl ModelRegistry {
         true
     }
 
-    /// Register "Owl Alpha" (OpenRouter) from env, tagged to the `openrouter`
-    /// backend (see `backends::seed_from_env`). **Opt-in**, via
-    /// `OPENROUTER_OWL_ALPHA_ENABLED=1` — no-op otherwise. This is deliberately
-    /// NOT on-by-default like `register_diffusiongemma_from_env`: as of
-    /// verification (2026-07-03; see [`OWL_ALPHA_MODEL_ID`] docs) OpenRouter's
-    /// own API reports zero active serving endpoints for this model, so
-    /// enabling it currently gets you a wired-up-but-non-functional route.
-    /// It's opt-in so a deploy can flip it on later purely via config, once
-    /// OpenRouter (re)activates a provider, without a code change.
+    /// Register the "Owl Alpha" slot (OpenRouter) from env, tagged to the
+    /// `openrouter` backend (see `backends::seed_from_env`). **Opt-in**, via
+    /// `OPENROUTER_OWL_ALPHA_ENABLED=1` — no-op otherwise. Defaults to
+    /// [`OWL_ALPHA_MODEL_ID`] (currently `nvidia/nemotron-3-ultra-550b-a55b:free`,
+    /// a live, free, ~1M-context substitute for the original "Owl Alpha" model,
+    /// which OpenRouter's own API confirms has zero active serving endpoints
+    /// — see that constant's docs for the full history). Override the actual
+    /// model routed here via `OPENROUTER_OWL_ALPHA_MODEL` — e.g. if OpenRouter
+    /// ever reinstates `openrouter/owl-alpha`, or this substitute rotates off
+    /// free pricing — purely via config, no code change needed.
     ///
     /// Returns `false` if disabled OR if the `openrouter` backend is not in
     /// the catalogue (e.g. `seed_from_env` didn't run, or was overridden by a
@@ -1645,29 +1657,62 @@ mod tests {
         std::env::remove_var("OPENROUTER_OWL_ALPHA_ENABLED");
         std::env::remove_var("OPENROUTER_OWL_ALPHA_MODEL");
         assert!(!reg.register_openrouter_owl_alpha_from_env());
-        assert!(reg.backend_for("openrouter/owl-alpha:latest").is_none()
-            || reg.backend_for("openrouter/owl-alpha:latest").unwrap().name != "openrouter");
+        let key = format!("{OWL_ALPHA_MODEL_ID}:latest");
+        assert!(reg.backend_for(&key).is_none()
+            || reg.backend_for(&key).unwrap().name != "openrouter");
     }
 
     #[test]
-    fn register_openrouter_owl_alpha_from_env_uses_the_same_registry_key_routes_rs_will_look_up() {
-        // Regression test for a real bug caught via a live request through a
-        // running chord-proxy: `routes.rs::chat_completions` normalizes an
-        // untagged model name to "{model}:latest" (registry_key, ~L469)
-        // BEFORE calling `backend_for`. Registering the bare
-        // "openrouter/owl-alpha" (no ':') created a record no real request
-        // could ever match. This asserts the registry is keyed exactly as
-        // `chat_completions` will query it: "openrouter/owl-alpha:latest".
+    fn register_openrouter_owl_alpha_from_env_uses_the_default_model_verbatim() {
+        // OWL_ALPHA_MODEL_ID (currently the Nemotron substitute) already
+        // contains ':' (its own "-free" tag), so the untagged->":latest"
+        // normalization branch does NOT apply to it — it must register
+        // (and be looked up) verbatim, unmodified.
         let tmp = tempdir().unwrap();
         let mut reg = reg_at(tmp.path(), vec![]);
         std::env::set_var("OPENROUTER_OWL_ALPHA_ENABLED", "1");
         std::env::remove_var("OPENROUTER_OWL_ALPHA_MODEL");
         assert!(reg.register_openrouter_owl_alpha_from_env());
 
-        // The exact key chat_completions computes for an untagged request.
-        let registry_key = format!("{OWL_ALPHA_MODEL_ID}:latest");
         let resolved = reg
-            .backend_for(&registry_key)
+            .backend_for(OWL_ALPHA_MODEL_ID)
+            .expect("registered verbatim under its own already-tagged id");
+        assert_eq!(resolved.name, "openrouter");
+        assert_eq!(resolved.kind, backends::BackendKind::OpenRouter);
+
+        // It must NOT also be double-suffixed to "...:free:latest" — backend_for
+        // always falls back to default_backend() rather than returning None, so
+        // the real assertion is "not registered as OpenRouter", not "is_none()".
+        let double_suffixed = format!("{OWL_ALPHA_MODEL_ID}:latest");
+        assert_ne!(
+            reg.backend_for(&double_suffixed).map(|b| b.kind),
+            Some(backends::BackendKind::OpenRouter),
+            "an already-tagged model id must not additionally get :latest appended"
+        );
+
+        std::env::remove_var("OPENROUTER_OWL_ALPHA_ENABLED");
+    }
+
+    #[test]
+    fn register_openrouter_owl_alpha_from_env_normalizes_an_untagged_override_to_match_routes_rs() {
+        // Regression test for a real bug caught via a live request through a
+        // running chord-proxy: `routes.rs::chat_completions` normalizes an
+        // untagged model name to "{model}:latest" (registry_key, ~L469)
+        // BEFORE calling `backend_for`. Registering a bare, colon-less model
+        // id verbatim creates a record no real (normalized) request could
+        // ever match. Exercised here via OPENROUTER_OWL_ALPHA_MODEL, since
+        // the current default id already contains ':' and no longer takes
+        // this branch itself (see the sibling verbatim test above).
+        let tmp = tempdir().unwrap();
+        let mut reg = reg_at(tmp.path(), vec![]);
+        std::env::set_var("OPENROUTER_OWL_ALPHA_ENABLED", "1");
+        std::env::set_var("OPENROUTER_OWL_ALPHA_MODEL", "openrouter/some-untagged-model");
+        assert!(reg.register_openrouter_owl_alpha_from_env());
+
+        // The exact key chat_completions computes for an untagged request.
+        let registry_key = "openrouter/some-untagged-model:latest";
+        let resolved = reg
+            .backend_for(registry_key)
             .expect("registered under the :latest-normalized key");
         assert_eq!(resolved.name, "openrouter");
         assert_eq!(resolved.kind, backends::BackendKind::OpenRouter);
@@ -1675,7 +1720,7 @@ mod tests {
         // The un-normalized bare ID must NOT be the registry key (that was
         // the bug) — it resolves only via default_backend() fallback, which
         // (per the other regression test) is guaranteed never OpenRouter.
-        let bare_lookup = reg.backend_for(OWL_ALPHA_MODEL_ID);
+        let bare_lookup = reg.backend_for("openrouter/some-untagged-model");
         assert_ne!(
             bare_lookup.map(|b| b.kind),
             Some(backends::BackendKind::OpenRouter),
@@ -1683,6 +1728,7 @@ mod tests {
         );
 
         std::env::remove_var("OPENROUTER_OWL_ALPHA_ENABLED");
+        std::env::remove_var("OPENROUTER_OWL_ALPHA_MODEL");
     }
 
     // --- YARN-02: rope-scaling ingestion at registration time -------------
