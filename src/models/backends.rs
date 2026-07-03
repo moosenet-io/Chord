@@ -45,6 +45,12 @@ pub enum BackendKind {
     LlamaServer,
     /// Externally-managed daemon (e.g. DiffusionGemma); not load/unload-managed.
     Daemon,
+    /// A remote, bearer-token-authenticated cloud HTTP API (OpenAI-compatible
+    /// `/v1/chat/completions`), e.g. OpenRouter. Like `Daemon`, has no local
+    /// process lifecycle — always assumed reachable over the network. Unlike
+    /// every other kind, requests to it need an `Authorization: Bearer <key>`
+    /// header; see `Backend::api_key_env`.
+    OpenRouter,
 }
 
 /// How to spawn a unit-less on-demand backend (the generic `llama-gpu`): a base
@@ -92,6 +98,16 @@ pub struct Backend {
     /// Spawn spec for unit-less on-demand backends (the generic `llama-gpu`).
     #[serde(default)]
     pub launch: Option<LaunchSpec>,
+    /// For `BackendKind::OpenRouter` (and any future bearer-authenticated
+    /// remote kind): the NAME of the environment variable holding the API key
+    /// — never the key value itself. The registry file is plain JSON on local
+    /// disk (see module docs on `ModelRegistry`); storing a secret *value* in
+    /// it would defeat "no hardcoded secrets, everything from env/<secret-manager> at
+    /// runtime". The value is read fresh from this env var at dispatch time
+    /// (`models::routing::resolve_and_ensure`). `None` for every local/
+    /// unauthenticated backend (Ollama, llama-server, daemon).
+    #[serde(default)]
+    pub api_key_env: Option<String>,
 }
 
 impl Backend {
@@ -130,6 +146,7 @@ pub fn seed_from_env() -> HashMap<String, Backend> {
                 always_on: true,
                 idle_stop_secs: 0,
                 launch: None,
+                api_key_env: None,
             },
         );
     }
@@ -146,6 +163,7 @@ pub fn seed_from_env() -> HashMap<String, Backend> {
                 always_on: true,
                 idle_stop_secs: 0,
                 launch: None,
+                api_key_env: None,
             },
         );
     }
@@ -162,6 +180,7 @@ pub fn seed_from_env() -> HashMap<String, Backend> {
                 always_on: false,
                 idle_stop_secs: 900,
                 launch: None,
+                api_key_env: None,
             },
         );
     }
@@ -197,6 +216,7 @@ pub fn seed_from_env() -> HashMap<String, Backend> {
                 model_arg: "-m".into(),
                 model_from: default_model_from(),
             }),
+            api_key_env: None,
         },
     );
 
@@ -244,6 +264,52 @@ pub fn seed_from_env() -> HashMap<String, Backend> {
                 model_arg: "-m".into(),
                 model_from: default_model_from(),
             }),
+            api_key_env: None,
+        },
+    );
+
+    // OpenRouter: a remote, bearer-authenticated cloud API — fundamentally
+    // different from every other backend here (no local process, no VRAM, no
+    // lifecycle to start/stop). Always offered, like `llama-gpu`/`vulkan`, since
+    // there is nothing to seed conditionally on: it's a fixed public HTTPS
+    // endpoint. NOTE the URL intentionally omits the trailing `/v1` — routing.rs
+    // appends `/v1/chat/completions` to every backend's `url` uniformly, and
+    // OpenRouter's real endpoint is `https://openrouter.ai/api/v1/chat/completions`.
+    //
+    // Registered here for "Owl Alpha" (`OWL_ALPHA_MODEL_ID`,
+    // `registry::register_openrouter_owl_alpha_from_env`) per operator request.
+    // IMPORTANT, verified 2026-07-03 directly against OpenRouter's own API
+    // (`GET https://openrouter.ai/api/v1/models/openrouter/owl-alpha/endpoints`):
+    // the model IS real (created 2026-04-28, 1,048,576-token context window,
+    // matches the operator's "1M context" claim) but currently returns
+    // `"endpoints":[]` — ZERO active serving endpoints. It is not in the public
+    // `/api/v1/models` list for the same reason. Concretely: **no pricing can be
+    // confirmed as $0 right now** (pricing is a property of an active endpoint,
+    // and there are none), and a live chat-completions call against it will fail
+    // upstream (likely 404/"no endpoints found") regardless of API key validity,
+    // until OpenRouter (re)activates a provider for it. The backend and model
+    // registration are wired up now so enabling it later is a config flip
+    // (`OPENROUTER_OWL_ALPHA_ENABLED=1`), not a code change.
+    out.insert(
+        "openrouter".into(),
+        Backend {
+            name: "openrouter".into(),
+            url: std::env::var("OPENROUTER_URL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "https://openrouter.ai/api".to_string()),
+            hardware: Hardware::Cpu, // remote call — no local GPU/CPU cost
+            kind: BackendKind::OpenRouter,
+            unit: None,
+            always_on: true, // no process lifecycle: it's a remote HTTP API
+            idle_stop_secs: 0,
+            launch: None,
+            api_key_env: Some(
+                std::env::var("OPENROUTER_API_KEY_ENV_NAME")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "OPENROUTER_API_KEY_CHORDHARMONY".to_string()),
+            ),
         },
     );
 
@@ -296,6 +362,7 @@ mod tests {
             always_on: false,
             idle_stop_secs: 600,
             launch: None,
+            api_key_env: None,
         };
         assert!(gpu.on_demand());
 
@@ -341,6 +408,37 @@ mod tests {
     }
 
     #[test]
+    fn seed_from_env_includes_openrouter() {
+        // openrouter is always offered regardless of env (like llama-gpu/vulkan).
+        std::env::remove_var("OPENROUTER_URL");
+        std::env::remove_var("OPENROUTER_API_KEY_ENV_NAME");
+        let b = seed_from_env();
+        assert!(b.contains_key("openrouter"));
+        let o = &b["openrouter"];
+        assert_eq!(o.name, "openrouter");
+        assert_eq!(o.kind, BackendKind::OpenRouter);
+        assert_eq!(o.hardware, Hardware::Cpu);
+        assert!(o.always_on, "no process lifecycle to manage");
+        assert!(!o.on_demand());
+        assert!(o.launch.is_none());
+        assert_eq!(o.url, "https://openrouter.ai/api");
+        // Default env var name, never an actual key value.
+        assert_eq!(o.api_key_env.as_deref(), Some("OPENROUTER_API_KEY_CHORDHARMONY"));
+    }
+
+    #[test]
+    fn seed_from_env_openrouter_respects_env_overrides() {
+        std::env::set_var("OPENROUTER_URL", "https://openrouter.example/api");
+        std::env::set_var("OPENROUTER_API_KEY_ENV_NAME", "MY_CUSTOM_KEY_VAR");
+        let b = seed_from_env();
+        let o = &b["openrouter"];
+        assert_eq!(o.url, "https://openrouter.example/api");
+        assert_eq!(o.api_key_env.as_deref(), Some("MY_CUSTOM_KEY_VAR"));
+        std::env::remove_var("OPENROUTER_URL");
+        std::env::remove_var("OPENROUTER_API_KEY_ENV_NAME");
+    }
+
+    #[test]
     fn vulkan_candidate_dense_large_only() {
         assert!(is_vulkan_candidate("llama3.3:70b"));
         assert!(is_vulkan_candidate("qwen2.5:72b-instruct"));
@@ -358,6 +456,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&BackendKind::LlamaServer).unwrap(),
             "\"llama-server\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BackendKind::OpenRouter).unwrap(),
+            "\"open-router\""
         );
     }
 }

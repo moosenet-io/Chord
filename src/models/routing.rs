@@ -32,6 +32,13 @@ fn to_resolved(
             BackendKind::Ollama => "ollama",
             BackendKind::LlamaServer => "llama-server",
             BackendKind::Daemon => "daemon",
+            // terminus-rs's lifecycle helpers only actively manage the
+            // "llama-server" kind (start/stop a local process); every other
+            // kind is treated as already up. OpenRouter has no local process
+            // either — map it to "daemon" so `lifecycle::ensure_up` no-ops for
+            // it exactly like DiffusionGemma, without needing a terminus-rs
+            // change for a kind that crate doesn't need to know about.
+            BackendKind::OpenRouter => "daemon",
         }
         .to_string(),
         hardware: match b.hardware {
@@ -52,22 +59,38 @@ fn to_resolved(
 }
 
 /// Resolve `model`'s backend, start it on demand if needed, and return the
-/// OpenAI chat-completions URL to forward to. Returns `None` (caller falls back
-/// to `CHORD_LLM_URL`) when no backend is defined or the tagged backend could
-/// not be started — availability over strictness for live chat.
+/// OpenAI chat-completions URL to forward to, plus the bearer API key to send
+/// with it (`Some(key)` only for backends with `api_key_env` set, e.g.
+/// OpenRouter — `None` for every local/unauthenticated backend). Returns
+/// `None` (caller falls back to `CHORD_LLM_URL`) when no backend is defined or
+/// the tagged backend could not be started — availability over strictness for
+/// live chat.
+///
+/// The key is read fresh from the backend's `api_key_env`-named environment
+/// variable on every call (never cached, never persisted) — see
+/// `Backend::api_key_env` docs for why. A backend that names an env var whose
+/// value is unset/empty at call time resolves to `None` (request goes out
+/// unauthenticated and will fail upstream with the provider's own auth error,
+/// same "availability over strictness, fail at the edge" posture as the rest
+/// of this function).
 pub async fn resolve_and_ensure(
     registry: &Arc<Mutex<ModelRegistry>>,
     registry_key: &str,
     model: &str,
-) -> Option<String> {
+) -> Option<(String, Option<String>)> {
     // Brief lock: snapshot the backend + the model's local path, then release so
     // a (possibly long) on-demand start does not block other requests.
-    let resolved = {
+    let (resolved, bearer_key) = {
         let reg = registry.lock().await;
         let b = reg.backend_for(registry_key)?.clone();
         let local = reg.get(registry_key).and_then(|r| r.local_path.clone());
         let gguf = reg.get(registry_key).and_then(|r| r.gguf_path.clone());
-        to_resolved(&b, local, gguf)
+        let bearer_key = b
+            .api_key_env
+            .as_ref()
+            .and_then(|env_name| std::env::var(env_name).ok())
+            .filter(|v| !v.trim().is_empty());
+        (to_resolved(&b, local, gguf), bearer_key)
     };
 
     if let Err(e) = lifecycle::ensure_up(&resolved, model).await {
@@ -78,7 +101,7 @@ pub async fn resolve_and_ensure(
         return None;
     }
     // ensure_up already touched the shared last-used file (read by the sweep).
-    Some(format!("{}/v1/chat/completions", resolved.url))
+    Some((format!("{}/v1/chat/completions", resolved.url), bearer_key))
 }
 
 /// Background task: every `interval`, stop each on-demand backend whose
@@ -140,6 +163,7 @@ mod tests {
                 model_arg: "-m".into(),
                 model_from: "ollama-blob".into(),
             }),
+            api_key_env: None,
         };
         let r = to_resolved(&b, Some("/opt/ollama-models".into()), None);
         assert_eq!(r.kind, "llama-server");
@@ -150,5 +174,61 @@ mod tests {
         let l = r.launch.unwrap();
         assert_eq!(l.bin, "/x/llama-server");
         assert_eq!(l.model_arg, "-m");
+    }
+
+    #[test]
+    fn to_resolved_maps_openrouter_kind_to_daemon() {
+        // OpenRouter has no local process for terminus-rs's lifecycle helpers
+        // to manage — it maps to "daemon" (assumed always up), same as any
+        // other externally-managed backend.
+        let b = Backend {
+            name: "openrouter".into(),
+            url: "https://openrouter.ai/api".into(),
+            hardware: Hardware::Cpu,
+            kind: BackendKind::OpenRouter,
+            unit: None,
+            always_on: true,
+            idle_stop_secs: 0,
+            launch: None,
+            api_key_env: Some("OPENROUTER_API_KEY_CHORDHARMONY".into()),
+        };
+        let r = to_resolved(&b, None, None);
+        assert_eq!(r.kind, "daemon");
+        assert!(r.always_on);
+        assert!(r.launch.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_and_ensure_returns_bearer_key_for_openrouter_backend() {
+        // Env var is read fresh inside resolve_and_ensure, keyed off the
+        // backend's api_key_env — never stored in the Backend/ModelRecord.
+        std::env::set_var("TEST_OWL_ALPHA_KEY_VAR", "<REDACTED-SECRET>");
+
+        let mut reg = ModelRegistry::new(
+            std::path::PathBuf::from("/nonexistent/chord-test-registry.json"),
+            std::path::PathBuf::from("/nonexistent/local"),
+            std::path::PathBuf::from("/nonexistent/archive"),
+            vec![],
+        );
+        reg.upsert_backend(Backend {
+            name: "openrouter".into(),
+            url: "http://127.0.0.1:0".into(), // unreachable on purpose; ensure_up no-ops for "daemon"
+            hardware: Hardware::Cpu,
+            kind: BackendKind::OpenRouter,
+            unit: None,
+            always_on: true,
+            idle_stop_secs: 0,
+            launch: None,
+            api_key_env: Some("TEST_OWL_ALPHA_KEY_VAR".into()),
+        });
+        assert!(reg.register_remote_api_model("openrouter/owl-alpha", "openrouter-api", "openrouter"));
+        let registry = Arc::new(Mutex::new(reg));
+
+        let result = resolve_and_ensure(&registry, "openrouter/owl-alpha", "openrouter/owl-alpha").await;
+        let (url, bearer) = result.expect("openrouter backend should resolve");
+        assert_eq!(url, "http://127.0.0.1:0/v1/chat/completions");
+        assert_eq!(bearer.as_deref(), Some("<REDACTED-SECRET>"));
+
+        std::env::remove_var("TEST_OWL_ALPHA_KEY_VAR");
     }
 }

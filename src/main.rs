@@ -86,6 +86,9 @@ async fn main() {
     // S80 DGEM-03: register DiffusionGemma (non-Ollama, llama-diffusion-daemon) after the Ollama-driven
     // reconcile, so it survives re-tiering and shows up in the control API / counts.
     model_registry.register_diffusiongemma_from_env();
+    // Owl Alpha (OpenRouter) — opt-in, see `register_openrouter_owl_alpha_from_env` docs for why
+    // this is gated behind OPENROUTER_OWL_ALPHA_ENABLED=1 rather than on-by-default.
+    model_registry.register_openrouter_owl_alpha_from_env();
     let (hot, warm, cold) = model_registry.tier_counts();
     info!("model registry: {warm} warm, {cold} cold, {hot} hot");
     if let Err(e) = model_registry.save() {

@@ -105,6 +105,22 @@ fn default_managed_by() -> String {
 /// `managed_by` value for an Ollama-managed model (the reconcile default).
 pub const MANAGED_BY_OLLAMA: &str = "ollama";
 
+/// `managed_by` value for a model served entirely through a remote OpenRouter
+/// endpoint (no local file, no archive, nothing `reconcile()` should touch).
+pub const MANAGED_BY_OPENROUTER: &str = "openrouter-api";
+
+/// OpenRouter's real model ID for "Owl Alpha", verified 2026-07-03 directly
+/// against OpenRouter's own site/API (`openrouter.ai/openrouter/owl-alpha`,
+/// `GET /api/v1/models/openrouter/owl-alpha/endpoints`). Confirmed real:
+/// `context_length: 1048576` (~1M tokens, matching the operator's claim),
+/// created 2026-04-28, description "designed for agentic workloads". NOT
+/// confirmed: pricing. The endpoints API returns `"endpoints":[]` — zero
+/// active serving endpoints as of verification, so no per-token price is
+/// currently published (there is no active endpoint to price), and the model
+/// does not appear in the public `GET /api/v1/models` catalog for the same
+/// reason. Treat "currently free" as unconfirmed/likely-stale, not verified.
+pub const OWL_ALPHA_MODEL_ID: &str = "openrouter/owl-alpha";
+
 /// File-backed registry of all known models.
 #[derive(Debug, Clone)]
 pub struct ModelRegistry {
@@ -367,12 +383,32 @@ impl ModelRegistry {
     }
 
     /// The default backend for untagged models: the primary `ollama`, else any
-    /// `always_on` backend, else any backend.
+    /// local `always_on` backend, else any local backend.
+    ///
+    /// Excludes [`BackendKind::OpenRouter`] (and any future remote,
+    /// bearer-authenticated kind) from every fallback tier, not just the
+    /// `ollama` lookup. This was found by a live test regression while wiring
+    /// up the OpenRouter backend: `openrouter` is `always_on: true` (it has no
+    /// process to start/stop), so once it's seeded it satisfies
+    /// `.find(|b| b.always_on)` in any environment without `OLLAMA_URL`
+    /// configured — silently becoming the *implicit* default for every
+    /// untagged model, sending ordinary local-model traffic out to a real
+    /// internet API with no key. A remote backend must only ever be reached by
+    /// a model **explicitly** tagged to it (`backend_for`/`set_model_backend`/
+    /// `register_remote_api_model`), never picked as a fallback.
     pub fn default_backend(&self) -> Option<&Backend> {
         self.backends
             .get("ollama")
-            .or_else(|| self.backends.values().find(|b| b.always_on))
-            .or_else(|| self.backends.values().next())
+            .or_else(|| {
+                self.backends
+                    .values()
+                    .find(|b| b.always_on && b.kind != backends::BackendKind::OpenRouter)
+            })
+            .or_else(|| {
+                self.backends
+                    .values()
+                    .find(|b| b.kind != backends::BackendKind::OpenRouter)
+            })
     }
 
     /// Resolve the backend a model should run on: its tagged `backend` if set and
@@ -646,6 +682,107 @@ impl ModelRegistry {
             tier = ?tier,
             "registered DiffusionGemma in model registry (non-Ollama, managed by llama-diffusion-daemon)"
         );
+    }
+
+    /// Register a model served entirely by a remote HTTP API backend (e.g.
+    /// OpenRouter) — no local file, no archive, nothing to pull. Tier is
+    /// deliberately `Warm`, never `Cold`: TIER-02's pull-on-miss path
+    /// (`chat_completions` in `routes.rs`) fetches from the *archive* when a
+    /// model is `Cold`, but a remote-API model has no archive to pull from —
+    /// tagging it `Cold` would make every request 503 with "archive pull
+    /// failed". `Warm` correctly signals "no pull needed, just dispatch".
+    ///
+    /// Returns `false` (no-op) if `backend` is not a defined backend in the
+    /// catalogue, mirroring [`Self::set_model_backend`]'s validation. Callers
+    /// should `save()` afterwards to persist.
+    pub fn register_remote_api_model(&mut self, name: &str, managed_by: &str, backend: &str) -> bool {
+        if !self.backends.contains_key(backend) {
+            return false;
+        }
+        match self.records.get_mut(name) {
+            Some(rec) => {
+                rec.tier = StorageTier::Warm;
+                rec.managed_by = managed_by.to_string();
+                rec.backend = Some(backend.to_string());
+            }
+            None => {
+                self.records.insert(
+                    name.to_string(),
+                    ModelRecord {
+                        name: name.to_string(),
+                        tier: StorageTier::Warm,
+                        local_path: None,
+                        archive_path: None,
+                        size_bytes: 0,
+                        last_loaded: None,
+                        last_requested: None,
+                        protected: false,
+                        managed_by: managed_by.to_string(),
+                        backend: Some(backend.to_string()),
+                        gguf_path: None,
+                        rope_scaling: None,
+                        rope_scaling_note: None,
+                    },
+                );
+            }
+        }
+        true
+    }
+
+    /// Register "Owl Alpha" (OpenRouter) from env, tagged to the `openrouter`
+    /// backend (see `backends::seed_from_env`). **Opt-in**, via
+    /// `OPENROUTER_OWL_ALPHA_ENABLED=1` — no-op otherwise. This is deliberately
+    /// NOT on-by-default like `register_diffusiongemma_from_env`: as of
+    /// verification (2026-07-03; see [`OWL_ALPHA_MODEL_ID`] docs) OpenRouter's
+    /// own API reports zero active serving endpoints for this model, so
+    /// enabling it currently gets you a wired-up-but-non-functional route.
+    /// It's opt-in so a deploy can flip it on later purely via config, once
+    /// OpenRouter (re)activates a provider, without a code change.
+    ///
+    /// Returns `false` if disabled OR if the `openrouter` backend is not in
+    /// the catalogue (e.g. `seed_from_env` didn't run, or was overridden by a
+    /// hand-edited registry file without it).
+    pub fn register_openrouter_owl_alpha_from_env(&mut self) -> bool {
+        let enabled = std::env::var("OPENROUTER_OWL_ALPHA_ENABLED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if !enabled {
+            return false;
+        }
+        let model_id = std::env::var("OPENROUTER_OWL_ALPHA_MODEL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| OWL_ALPHA_MODEL_ID.to_string());
+        // `routes.rs::chat_completions` normalizes an untagged (no `:`) model
+        // name to `"{model}:latest"` before it EVER looks the model up in this
+        // registry (`registry_key`, routes.rs ~L469) — Ollama's own untagged
+        // convention. "openrouter/owl-alpha" has no `:`, so registering it
+        // verbatim creates a record `backend_for` can never actually match:
+        // every real request misses and silently falls through to the default
+        // backend instead of OpenRouter. This was caught by an actual live
+        // request through a running chord-proxy, not by a unit test — the
+        // registry key MUST mirror that same normalization or the "tagged"
+        // model is a dead entry.
+        let registry_key = if model_id.contains(':') {
+            model_id.clone()
+        } else {
+            format!("{model_id}:latest")
+        };
+        let ok = self.register_remote_api_model(&registry_key, MANAGED_BY_OPENROUTER, "openrouter");
+        if ok {
+            tracing::info!(
+                model = %model_id,
+                registry_key = %registry_key,
+                "registered Owl Alpha (OpenRouter, non-Ollama, remote API)"
+            );
+        } else {
+            tracing::warn!(
+                model = %model_id,
+                "Owl Alpha registration requested (OPENROUTER_OWL_ALPHA_ENABLED=1) but the \
+                 'openrouter' backend is not in the catalogue"
+            );
+        }
+        ok
     }
 
     /// YARN-02: ingest RoPE/YaRN scaling metadata from a model's OWN GGUF kv
@@ -1191,6 +1328,34 @@ mod tests {
     }
 
     #[test]
+    fn default_backend_never_implicitly_picks_openrouter() {
+        // Regression test for a real bug caught by the test suite while wiring
+        // up OpenRouter: `openrouter` is `always_on: true` (no process
+        // lifecycle), so in any environment without OLLAMA_URL configured it
+        // used to satisfy `.find(|b| b.always_on)` and become the *implicit*
+        // default backend for every UNTAGGED model — silently sending ordinary
+        // local-model chat traffic to a real internet API with no key. An
+        // untagged/unknown model must always resolve to a local backend (or
+        // no backend at all), never the remote OpenRouter one.
+        std::env::remove_var("OLLAMA_URL");
+        std::env::remove_var("OLLAMA_BASE_URL");
+        std::env::remove_var("OLLAMA_CPU_URL");
+        std::env::remove_var("LLAMA_SERVER_URL");
+        let tmp = tempdir().unwrap();
+        let reg = reg_at(tmp.path(), vec![]);
+        // openrouter is always seeded (like llama-gpu/vulkan)...
+        assert!(reg.backend("openrouter").is_some());
+        // ...but must never be what an untagged model resolves to.
+        let default = reg.default_backend().expect("some local backend is always seeded");
+        assert_ne!(default.name, "openrouter");
+        assert_ne!(default.kind, backends::BackendKind::OpenRouter);
+        let resolved = reg
+            .backend_for("some-untagged-model:latest")
+            .expect("falls back to a local default");
+        assert_ne!(resolved.kind, backends::BackendKind::OpenRouter);
+    }
+
+    #[test]
     fn tag_vulkan_candidates_dense_large_only() {
         let tmp = tempdir().unwrap();
         let base = tmp.path();
@@ -1471,6 +1636,53 @@ mod tests {
         std::env::remove_var("DGEM_MODEL_ARCHIVE_PATH");
         reg.register_diffusiongemma_from_env();
         assert!(reg.all_records().next().is_none(), "no registration without configured paths");
+    }
+
+    #[test]
+    fn register_openrouter_owl_alpha_from_env_noop_when_disabled() {
+        let tmp = tempdir().unwrap();
+        let mut reg = reg_at(tmp.path(), vec![]);
+        std::env::remove_var("OPENROUTER_OWL_ALPHA_ENABLED");
+        std::env::remove_var("OPENROUTER_OWL_ALPHA_MODEL");
+        assert!(!reg.register_openrouter_owl_alpha_from_env());
+        assert!(reg.backend_for("openrouter/owl-alpha:latest").is_none()
+            || reg.backend_for("openrouter/owl-alpha:latest").unwrap().name != "openrouter");
+    }
+
+    #[test]
+    fn register_openrouter_owl_alpha_from_env_uses_the_same_registry_key_routes_rs_will_look_up() {
+        // Regression test for a real bug caught via a live request through a
+        // running chord-proxy: `routes.rs::chat_completions` normalizes an
+        // untagged model name to "{model}:latest" (registry_key, ~L469)
+        // BEFORE calling `backend_for`. Registering the bare
+        // "openrouter/owl-alpha" (no ':') created a record no real request
+        // could ever match. This asserts the registry is keyed exactly as
+        // `chat_completions` will query it: "openrouter/owl-alpha:latest".
+        let tmp = tempdir().unwrap();
+        let mut reg = reg_at(tmp.path(), vec![]);
+        std::env::set_var("OPENROUTER_OWL_ALPHA_ENABLED", "1");
+        std::env::remove_var("OPENROUTER_OWL_ALPHA_MODEL");
+        assert!(reg.register_openrouter_owl_alpha_from_env());
+
+        // The exact key chat_completions computes for an untagged request.
+        let registry_key = format!("{OWL_ALPHA_MODEL_ID}:latest");
+        let resolved = reg
+            .backend_for(&registry_key)
+            .expect("registered under the :latest-normalized key");
+        assert_eq!(resolved.name, "openrouter");
+        assert_eq!(resolved.kind, backends::BackendKind::OpenRouter);
+
+        // The un-normalized bare ID must NOT be the registry key (that was
+        // the bug) — it resolves only via default_backend() fallback, which
+        // (per the other regression test) is guaranteed never OpenRouter.
+        let bare_lookup = reg.backend_for(OWL_ALPHA_MODEL_ID);
+        assert_ne!(
+            bare_lookup.map(|b| b.kind),
+            Some(backends::BackendKind::OpenRouter),
+            "bare model ID (no :latest) must not accidentally resolve to OpenRouter"
+        );
+
+        std::env::remove_var("OPENROUTER_OWL_ALPHA_ENABLED");
     }
 
     // --- YARN-02: rope-scaling ingestion at registration time -------------

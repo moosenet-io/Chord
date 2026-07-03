@@ -516,13 +516,16 @@ pub async fn chat_completions(
     // backend if needed. Untagged models resolve to the default backend (whose
     // URL matches CHORD_LLM_URL), so behavior is unchanged until models are
     // tagged. On any failure we fall back to CHORD_LLM_URL.
-    let llm_url = crate::models::routing::resolve_and_ensure(
+    // `bearer_key` is `Some` only for backends with `api_key_env` set (e.g.
+    // OpenRouter) — re-injected as an outbound Authorization header below,
+    // after the inbound-header copy loop strips the caller's own JWT.
+    let (llm_url, bearer_key) = crate::models::routing::resolve_and_ensure(
         &state.model_registry,
         &registry_key,
         &resolved_model,
     )
     .await
-    .unwrap_or(llm_url);
+    .unwrap_or((llm_url, None));
 
     // ── YARN-06: per-request thinking honoring ──────────────────────────────
     // Harmony (THINK-01/02) may send an optional top-level `thinking: "on"|"off"`
@@ -593,6 +596,14 @@ pub async fn chat_completions(
     }
     if !had_content_type {
         upstream_req = upstream_req.header("content-type", "application/json");
+    }
+    // Re-add an Authorization header ONLY for backends that need one (e.g.
+    // OpenRouter) — the loop above stripped the caller's own JWT via
+    // `is_unforwardable_request_header`, so this can never leak the caller's
+    // token to the upstream provider; it's a fresh value from `bearer_key`,
+    // resolved by `resolve_and_ensure` from the backend's own `api_key_env`.
+    if let Some(key) = &bearer_key {
+        upstream_req = upstream_req.header("authorization", format!("Bearer {key}"));
     }
 
     let upstream = match upstream_req.send().await {
