@@ -115,6 +115,7 @@ async fn tick(
 
     let coder_verdict = compute_verdict_optional(
         coder_active,
+        coder_db.available,
         coder_db.latest_row_age_secs,
         gpu_busy_percent,
         cfg.stuck_age_secs,
@@ -122,6 +123,7 @@ async fn tick(
     );
     let assistant_verdict = compute_verdict_optional(
         assistant_active,
+        assistant_db.available,
         assistant_db.latest_row_age_secs,
         gpu_busy_percent,
         cfg.stuck_age_secs,
@@ -188,9 +190,11 @@ mod tests {
         assert!(snapshot.coder.db.error_message.as_deref().unwrap().contains("INTAKE_DATABASE_URL"));
         assert!(!snapshot.assistant.as_ref().unwrap().db.available);
         assert!(snapshot.gpu_busy_percent.is_none());
-        // No systemd unit named this exists (or systemctl is unavailable in the
-        // sandbox) -> not confirmed active -> Idle, never Stuck, even though
-        // the DB is "unavailable" (which maps to i64::MAX age).
+        // No systemd unit named this exists, so `systemctl is-active` reports
+        // "inactive" (Some(false)) -> Idle, never Stuck/Unknown, regardless of
+        // the DB being unconfigured. (If systemctl itself were unrunnable,
+        // `is_unit_active` would return `None` and the verdict would be
+        // `Unknown` instead — see the `verdict` module's own unit tests.)
         assert_eq!(snapshot.coder.verdict, super::super::verdict::Verdict::Idle);
         assert_eq!(snapshot.overall_verdict, super::super::verdict::Verdict::Idle);
 

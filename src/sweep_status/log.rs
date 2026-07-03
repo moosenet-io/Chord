@@ -93,7 +93,14 @@ impl SweepStatusLog {
             Ok(e) => e,
             Err(_) => return Ok(0),
         };
-        let cutoff = now.date_naive() - chrono::Duration::days(self.retention_days as i64);
+        // `retention_days` calendar days are kept, counting today as one of
+        // them: today, today-1, ..., today-(retention_days-1). A file dated
+        // exactly `today - retention_days` is the first day *outside* that
+        // window, so it (and anything older) must be deleted. Using
+        // `today - retention_days` as the cutoff below with `date < cutoff`
+        // gets exactly that: with retention_days=10 the oldest surviving date
+        // is `today - 9`, i.e. 10 files total, not 11.
+        let cutoff = now.date_naive() - chrono::Duration::days(self.retention_days as i64 - 1);
         let stem = self.stem();
         let ext = self.ext();
         let mut removed = 0usize;
@@ -317,6 +324,44 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(!tokio::fs::try_exists(&old_path).await.unwrap());
         assert!(tokio::fs::try_exists(&recent_path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn enforce_retention_keeps_exactly_retention_days_files() {
+        // Off-by-one regression test: with retention_days=10, exactly 10
+        // daily files must survive (today through today-9 inclusive), and
+        // the 11th-oldest (today-10) must be deleted.
+        let tmp = tempfile::tempdir().unwrap();
+        let retention_days = 10u32;
+        let log = SweepStatusLog::new(tmpl(tmp.path()), retention_days);
+        let now = Utc.with_ymd_and_hms(2026, 7, 2, 12, 0, 0).unwrap();
+        tokio::fs::create_dir_all(tmp.path()).await.unwrap();
+
+        // Create one file per day from today back 12 days (13 files total),
+        // so the test also exercises files well past the retention window.
+        let mut paths = Vec::new();
+        for days_ago in 0..=12i64 {
+            let date = (now - chrono::Duration::days(days_ago)).date_naive();
+            let path = log.file_for_date(date);
+            tokio::fs::write(&path, "{}\n").await.unwrap();
+            paths.push((days_ago, path));
+        }
+
+        log.enforce_retention(now).await.unwrap();
+
+        let mut survivors = 0usize;
+        for (days_ago, path) in &paths {
+            let exists = tokio::fs::try_exists(path).await.unwrap();
+            if *days_ago < retention_days as i64 {
+                assert!(exists, "day -{days_ago} should survive (within {retention_days}-day window)");
+            } else {
+                assert!(!exists, "day -{days_ago} should be deleted (outside {retention_days}-day window)");
+            }
+            if exists {
+                survivors += 1;
+            }
+        }
+        assert_eq!(survivors, retention_days as usize, "exactly retention_days files must survive");
     }
 
     #[tokio::test]

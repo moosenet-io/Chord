@@ -34,6 +34,11 @@ pub enum Verdict {
     /// The sweep's systemd unit is not active — nothing running, nothing to
     /// judge as stuck.
     Idle,
+    /// A signal required to judge health is unavailable (systemctl couldn't
+    /// run, or the DB itself is unreachable) — we cannot confidently say
+    /// `Working`, `Stuck`, or `Idle`, so we say so rather than guessing in
+    /// either direction.
+    Unknown,
 }
 
 impl Verdict {
@@ -42,6 +47,7 @@ impl Verdict {
             Verdict::Working => "working",
             Verdict::Stuck => "stuck",
             Verdict::Idle => "idle",
+            Verdict::Unknown => "unknown",
         }
     }
 }
@@ -74,43 +80,83 @@ pub fn compute_verdict(
 }
 
 /// `compute_verdict` variant for the real-world case where a signal may be
-/// unavailable (DB unreachable → no row-age; sysfs read failed → no GPU busy%).
+/// unavailable (DB unreachable → no row-age; sysfs read failed → no GPU
+/// busy%; systemctl unrunnable → no service-active reading). Availability is
+/// threaded through explicitly (`db_available`, plus the `Option`-ness of
+/// `service_active`/`gpu_busy_percent`) rather than collapsed into a
+/// concrete-but-misleading number before this call, so a missing signal can
+/// never silently masquerade as a confident `Working` or `Stuck`.
 ///
-/// Missing `latest_row_age_secs` is mapped to `i64::MAX` (an unknown last-row
-/// time is, if anything, WORSE than a known-old one — we'd rather flag a
-/// possible stuck sweep than silently report "working" while blind). Missing
-/// `gpu_busy_percent` is mapped to `0.0` (we cannot confirm the GPU is pegged,
-/// so a single missing GPU reading does not by itself manufacture a `Stuck`
-/// verdict — it takes the busy signal to trigger `Stuck` at all).
-///
-/// `service_active: None` (systemctl itself unavailable/erroring) is treated
-/// as `false` (`Idle`) — the conservative direction: we never claim a sweep
-/// is `Stuck` when we could not even confirm its unit is running.
+/// Precedence (first match wins):
+/// 1. `service_active == Some(false)` → always `Idle`, regardless of any
+///    other signal — an inactive unit cannot be "stuck mid-generate".
+/// 2. `service_active == None` (systemctl itself unavailable) → `Unknown`.
+///    An active-but-unobservable sweep must not be reported as `Idle`.
+/// 3. `db_available == false` (DB unreachable, not merely empty) →
+///    `Unknown`. We have no row-age signal at all here and cannot rule out
+///    `Stuck` — surface the ambiguity instead of forcing a confident verdict
+///    in either direction.
+/// 4. `db_available == true` but `latest_row_age_secs == None` → the table
+///    is reachable and simply has zero rows yet (e.g. a sweep that just
+///    started, or `assistant_profile_run` before it's accumulated history).
+///    This is a legitimate start-up state, not a failure — graced as
+///    `Working` rather than `Unknown`/`Stuck`.
+/// 5. Otherwise we have a real row age. If `gpu_busy_percent` is known,
+///    apply the normal `Stuck` heuristic (busy GPU + stale row). If the GPU
+///    reading is missing: a stale row plus an unknown GPU state means we
+///    cannot confirm health, so that's `Unknown` — but a *fresh* row is
+///    `Working` regardless of the GPU reading (nothing to be suspicious of
+///    yet).
 pub fn compute_verdict_optional(
     service_active: Option<bool>,
+    db_available: bool,
     latest_row_age_secs: Option<i64>,
     gpu_busy_percent: Option<f64>,
     stuck_age_secs: i64,
     gpu_busy_threshold: f64,
 ) -> Verdict {
-    compute_verdict(
-        service_active.unwrap_or(false),
-        latest_row_age_secs.unwrap_or(i64::MAX),
-        gpu_busy_percent.unwrap_or(0.0),
-        stuck_age_secs,
-        gpu_busy_threshold,
-    )
+    if service_active == Some(false) {
+        return Verdict::Idle;
+    }
+    if service_active.is_none() {
+        return Verdict::Unknown;
+    }
+    // service_active == Some(true) from here on.
+
+    if !db_available {
+        return Verdict::Unknown;
+    }
+
+    let age = match latest_row_age_secs {
+        Some(age) => age,
+        // DB available, table empty (never populated / just started): a
+        // start-up grace period, not an instant Stuck/Unknown verdict.
+        None => return Verdict::Working,
+    };
+
+    match gpu_busy_percent {
+        Some(gpu) if gpu >= gpu_busy_threshold && age > stuck_age_secs => Verdict::Stuck,
+        Some(_) => Verdict::Working,
+        None if age > stuck_age_secs => Verdict::Unknown,
+        None => Verdict::Working,
+    }
 }
 
 /// Roll up per-sweep verdicts into one overall verdict:
 /// - any `Stuck` → overall `Stuck` (a single wedged sweep is worth surfacing
-///   even if another sweep is healthy).
+///   even if another sweep is healthy — this is the "go look at it now"
+///   signal and must not be masked by an unrelated `Unknown`).
+/// - else, any `Unknown` → overall `Unknown` (we couldn't confirm every
+///   sweep's health; that's worth surfacing over a false "all clear").
 /// - else, all `Idle` (including the degenerate empty-list case — nothing to
 ///   report as working) → overall `Idle`.
 /// - else → `Working`.
 pub fn overall_verdict(verdicts: &[Verdict]) -> Verdict {
     if verdicts.iter().any(|v| *v == Verdict::Stuck) {
         return Verdict::Stuck;
+    }
+    if verdicts.iter().any(|v| *v == Verdict::Unknown) {
+        return Verdict::Unknown;
     }
     if verdicts.iter().all(|v| *v == Verdict::Idle) {
         return Verdict::Idle;
@@ -210,38 +256,84 @@ mod tests {
 
     // ── compute_verdict_optional: missing-signal handling ──────────────────
 
+    // Helper for brevity: default thresholds.
+    fn cvo(
+        service_active: Option<bool>,
+        db_available: bool,
+        latest_row_age_secs: Option<i64>,
+        gpu_busy_percent: Option<f64>,
+    ) -> Verdict {
+        compute_verdict_optional(
+            service_active,
+            db_available,
+            latest_row_age_secs,
+            gpu_busy_percent,
+            DEFAULT_STUCK_AGE_SECS,
+            DEFAULT_GPU_BUSY_THRESHOLD_PERCENT,
+        )
+    }
+
     #[test]
-    fn optional_missing_service_state_defaults_to_idle() {
+    fn optional_service_inactive_is_always_idle_even_with_bad_signals() {
+        // service_active explicitly false wins over everything, including a
+        // DB that's unreachable.
+        assert_eq!(cvo(Some(false), false, None, None), Verdict::Idle);
+        assert_eq!(cvo(Some(false), true, Some(999_999), Some(100.0)), Verdict::Idle);
+    }
+
+    #[test]
+    fn optional_systemctl_unavailable_is_unknown_not_idle() {
+        // systemctl itself couldn't be run: we never confirmed the unit is
+        // inactive, so this must NOT collapse to Idle (that would hide an
+        // active-but-unobservable sweep).
+        assert_eq!(cvo(None, true, Some(30), Some(10.0)), Verdict::Unknown);
+        assert_eq!(cvo(None, false, None, None), Verdict::Unknown);
+    }
+
+    #[test]
+    fn optional_db_unreachable_is_unknown_not_stuck() {
+        // Active service, but the DB itself is unreachable (not just an
+        // empty table) — we have no row-age signal and must not force a
+        // confident Stuck (or Working) from missing data alone, even with a
+        // pegged GPU.
+        assert_eq!(cvo(Some(true), false, None, Some(99.0)), Verdict::Unknown);
+        assert_eq!(cvo(Some(true), false, None, None), Verdict::Unknown);
+    }
+
+    #[test]
+    fn optional_db_available_empty_table_is_startup_grace_working() {
+        // DB reachable, table simply has zero rows yet (fresh/new sweep, or
+        // assistant_profile_run before it's accumulated history) — this is a
+        // legitimate start-up state, not Stuck/Unknown, even with the GPU
+        // pegged.
+        assert_eq!(cvo(Some(true), true, None, Some(99.0)), Verdict::Working);
+        assert_eq!(cvo(Some(true), true, None, None), Verdict::Working);
+    }
+
+    #[test]
+    fn optional_gpu_missing_with_stale_row_is_unknown() {
+        // Row is stale and we can't read the GPU: an unobservable GPU must
+        // not "paper over" a stale DB with a confident Working.
         assert_eq!(
-            compute_verdict_optional(None, Some(999_999), Some(100.0), DEFAULT_STUCK_AGE_SECS, DEFAULT_GPU_BUSY_THRESHOLD_PERCENT),
-            Verdict::Idle
+            cvo(Some(true), true, Some(DEFAULT_STUCK_AGE_SECS + 1), None),
+            Verdict::Unknown
         );
     }
 
     #[test]
-    fn optional_missing_row_age_with_busy_gpu_and_active_service_is_stuck() {
-        // Unknown last-row age is treated as "possibly ancient" — worth flagging
-        // rather than silently reporting Working while blind to the DB.
+    fn optional_gpu_missing_with_fresh_row_is_working() {
+        // Row is fresh — nothing suspicious yet, regardless of the missing
+        // GPU reading.
+        assert_eq!(cvo(Some(true), true, Some(10), None), Verdict::Working);
+    }
+
+    #[test]
+    fn optional_all_signals_present_uses_normal_heuristic() {
         assert_eq!(
-            compute_verdict_optional(Some(true), None, Some(85.0), DEFAULT_STUCK_AGE_SECS, DEFAULT_GPU_BUSY_THRESHOLD_PERCENT),
+            cvo(Some(true), true, Some(7 * 3600), Some(99.0)),
             Verdict::Stuck
         );
-    }
-
-    #[test]
-    fn optional_missing_gpu_reading_alone_does_not_manufacture_stuck() {
-        assert_eq!(
-            compute_verdict_optional(Some(true), Some(999_999), None, DEFAULT_STUCK_AGE_SECS, DEFAULT_GPU_BUSY_THRESHOLD_PERCENT),
-            Verdict::Working
-        );
-    }
-
-    #[test]
-    fn optional_all_missing_but_active_is_working_not_stuck() {
-        assert_eq!(
-            compute_verdict_optional(Some(true), None, None, DEFAULT_STUCK_AGE_SECS, DEFAULT_GPU_BUSY_THRESHOLD_PERCENT),
-            Verdict::Working
-        );
+        assert_eq!(cvo(Some(true), true, Some(30), Some(95.0)), Verdict::Working);
     }
 
     // ── overall_verdict roll-up ─────────────────────────────────────────────
@@ -272,10 +364,23 @@ mod tests {
     }
 
     #[test]
+    fn overall_stuck_wins_over_unknown() {
+        assert_eq!(overall_verdict(&[Verdict::Unknown, Verdict::Stuck]), Verdict::Stuck);
+    }
+
+    #[test]
+    fn overall_unknown_wins_over_idle_and_working() {
+        assert_eq!(overall_verdict(&[Verdict::Unknown, Verdict::Idle]), Verdict::Unknown);
+        assert_eq!(overall_verdict(&[Verdict::Unknown, Verdict::Working]), Verdict::Unknown);
+        assert_eq!(overall_verdict(&[Verdict::Unknown]), Verdict::Unknown);
+    }
+
+    #[test]
     fn verdict_as_str() {
         assert_eq!(Verdict::Working.as_str(), "working");
         assert_eq!(Verdict::Stuck.as_str(), "stuck");
         assert_eq!(Verdict::Idle.as_str(), "idle");
+        assert_eq!(Verdict::Unknown.as_str(), "unknown");
     }
 
     #[test]
@@ -283,5 +388,6 @@ mod tests {
         assert_eq!(serde_json::to_string(&Verdict::Stuck).unwrap(), "\"stuck\"");
         assert_eq!(serde_json::to_string(&Verdict::Working).unwrap(), "\"working\"");
         assert_eq!(serde_json::to_string(&Verdict::Idle).unwrap(), "\"idle\"");
+        assert_eq!(serde_json::to_string(&Verdict::Unknown).unwrap(), "\"unknown\"");
     }
 }

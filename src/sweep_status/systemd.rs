@@ -11,9 +11,9 @@
 ///   all of these; we still read stdout rather than trusting the exit code.
 /// - `None` — `systemctl` itself could not be run (missing binary, spawn
 ///   error). Callers must treat this as "cannot confirm", not "inactive" —
-///   [`crate::sweep_status::verdict::compute_verdict_optional`] already maps
-///   `None` to the conservative `Idle` direction rather than risking a false
-///   `Stuck`.
+///   [`crate::sweep_status::verdict::compute_verdict_optional`] maps `None`
+///   to `Verdict::Unknown` rather than assuming `Idle` (which would hide an
+///   active-but-unobservable sweep) or `Stuck`.
 pub async fn is_unit_active(unit: &str) -> Option<bool> {
     match tokio::process::Command::new("systemctl")
         .args(["is-active", unit])
