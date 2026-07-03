@@ -220,6 +220,17 @@ async fn main() {
     chord_proxy::snap::spawn_health_monitor(snap_cfg);
     info!("SNAP observability subsystem started (vram/activity/inventory/analytics)");
 
+    // ── Sweep-status monitor (additive) ──
+    // Background poller (every CHORD_SWEEP_POLL_INTERVAL_SECS, default 30s)
+    // watching intake-coder-sweep.service / intake-assistant-sweep.service for
+    // the gfx1151 GPU-MoE-wedge failure signature (GPU pegged + no fresh DB
+    // rows + service still active). Best-effort, same fail-open discipline as
+    // SNAP/the eviction sweep: an unconfigured intake DB degrades to
+    // `db_configured: false` snapshots rather than blocking startup.
+    let sweep_status_cfg = chord_proxy::sweep_status::config::SweepMonitorConfig::from_env();
+    chord_proxy::sweep_status::poll::spawn(sweep_status_cfg);
+    info!("sweep-status monitor started (GET /v1/sweep/status, /v1/sweep/status/history)");
+
     let control_port = config.control_port;
     let control_router = chord_proxy::control::build_control_router(state.clone());
 

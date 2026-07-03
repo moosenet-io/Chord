@@ -775,6 +775,9 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
         .route("/v1/agent/execute", axum::routing::post(agent_execute))
         .route("/v1/chat/completions", axum::routing::post(chat_completions))
         .route("/v1/infer", axum::routing::post(infer))
+        // Sweep-status observability (no auth, same bar as /health and
+        // /v1/audit/summary — aggregate health, no identities/secrets).
+        .merge(crate::sweep_status::api::sweep_status_routes())
         .with_state(state)
 }
 
