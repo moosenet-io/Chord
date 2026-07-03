@@ -22,6 +22,13 @@ pub const DEFAULT_STUCK_AGE_SECS: i64 = 360;
 /// Default GPU-busy threshold (percent) — mirrors the host watchdog's 70%.
 pub const DEFAULT_GPU_BUSY_THRESHOLD_PERCENT: f64 = 70.0;
 
+/// Default bound (seconds) on the "empty table, service active" start-up
+/// grace period — matches [`DEFAULT_STUCK_AGE_SECS`] (6 min). Past this
+/// window, a service that's active with an unreachable-yet-empty table is
+/// no longer given an unconditional `Working` — see
+/// [`compute_verdict_optional`].
+pub const DEFAULT_STARTUP_GRACE_SECS: i64 = 360;
+
 /// Health verdict for a single sweep, or the fleet-wide overall verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -100,13 +107,26 @@ pub fn compute_verdict(
 ///    is reachable and simply has zero rows yet (e.g. a sweep that just
 ///    started, or `assistant_profile_run` before it's accumulated history).
 ///    This is a legitimate start-up state, not a failure — graced as
-///    `Working` rather than `Unknown`/`Stuck`.
+///    `Working`, but ONLY for up to `startup_grace_secs` of continuous
+///    empty-table observation (`empty_table_elapsed_secs`, tracked by the
+///    caller — see `sweep_status::poll::EmptyTableTracker` — since this
+///    pure function has no notion of time passing between calls). Past that
+///    window a sweep that is active, has a reachable-but-still-empty table,
+///    and has GPU pegged the whole time IS the exact stuck signature this
+///    subsystem exists to catch (active + GPU busy + no fresh output for
+///    longer than the stuck-age threshold), so that's `Stuck`. If the GPU
+///    reading is unavailable past the grace window there's no evidence
+///    either way, so that's `Unknown` rather than a confident guess in
+///    either direction — "forever confidently Working" (the bug this fixes)
+///    is wrong, but so would be an unconditional `Stuck` with no GPU signal
+///    to back it up.
 /// 5. Otherwise we have a real row age. If `gpu_busy_percent` is known,
 ///    apply the normal `Stuck` heuristic (busy GPU + stale row). If the GPU
 ///    reading is missing: a stale row plus an unknown GPU state means we
 ///    cannot confirm health, so that's `Unknown` — but a *fresh* row is
 ///    `Working` regardless of the GPU reading (nothing to be suspicious of
 ///    yet).
+#[allow(clippy::too_many_arguments)]
 pub fn compute_verdict_optional(
     service_active: Option<bool>,
     db_available: bool,
@@ -114,6 +134,8 @@ pub fn compute_verdict_optional(
     gpu_busy_percent: Option<f64>,
     stuck_age_secs: i64,
     gpu_busy_threshold: f64,
+    empty_table_elapsed_secs: Option<i64>,
+    startup_grace_secs: i64,
 ) -> Verdict {
     if service_active == Some(false) {
         return Verdict::Idle;
@@ -130,8 +152,28 @@ pub fn compute_verdict_optional(
     let age = match latest_row_age_secs {
         Some(age) => age,
         // DB available, table empty (never populated / just started): a
-        // start-up grace period, not an instant Stuck/Unknown verdict.
-        None => return Verdict::Working,
+        // *bounded* start-up grace period, not an unconditional Working
+        // forever. `empty_table_elapsed_secs` is how long the caller has
+        // continuously observed this exact state; `None` means "just
+        // arrived at it" (treated the same as 0 elapsed — still within any
+        // positive grace window).
+        None => {
+            let elapsed = empty_table_elapsed_secs.unwrap_or(0);
+            return if elapsed <= startup_grace_secs {
+                Verdict::Working
+            } else {
+                match gpu_busy_percent {
+                    // Active + GPU pegged + no rows for longer than the
+                    // grace window: the stuck signature, just observed via
+                    // "zero rows ever" instead of "a stale row".
+                    Some(gpu) if gpu >= gpu_busy_threshold => Verdict::Stuck,
+                    // GPU not pegged, or unobservable: no positive evidence
+                    // of a wedge, but "confidently Working" is no longer
+                    // honest either.
+                    _ => Verdict::Unknown,
+                }
+            };
+        }
     };
 
     match gpu_busy_percent {
@@ -256,7 +298,11 @@ mod tests {
 
     // ── compute_verdict_optional: missing-signal handling ──────────────────
 
-    // Helper for brevity: default thresholds.
+    // Helper for brevity: default thresholds, and `empty_table_elapsed_secs
+    // = None` (i.e. "just arrived at empty-table state" / not applicable to
+    // the test) since most tests below don't exercise the empty-table
+    // branch at all. Tests that specifically exercise the bounded grace
+    // period use `cvo_grace` instead.
     fn cvo(
         service_active: Option<bool>,
         db_available: bool,
@@ -270,6 +316,24 @@ mod tests {
             gpu_busy_percent,
             DEFAULT_STUCK_AGE_SECS,
             DEFAULT_GPU_BUSY_THRESHOLD_PERCENT,
+            None,
+            DEFAULT_STARTUP_GRACE_SECS,
+        )
+    }
+
+    // Helper for the bounded-startup-grace tests: same defaults as `cvo`,
+    // but with an explicit `empty_table_elapsed_secs` so tests can place
+    // themselves inside or outside the grace window.
+    fn cvo_grace(gpu_busy_percent: Option<f64>, empty_table_elapsed_secs: Option<i64>) -> Verdict {
+        compute_verdict_optional(
+            Some(true),
+            true,
+            None,
+            gpu_busy_percent,
+            DEFAULT_STUCK_AGE_SECS,
+            DEFAULT_GPU_BUSY_THRESHOLD_PERCENT,
+            empty_table_elapsed_secs,
+            DEFAULT_STARTUP_GRACE_SECS,
         )
     }
 
@@ -305,9 +369,70 @@ mod tests {
         // DB reachable, table simply has zero rows yet (fresh/new sweep, or
         // assistant_profile_run before it's accumulated history) — this is a
         // legitimate start-up state, not Stuck/Unknown, even with the GPU
-        // pegged.
+        // pegged, as long as we're within the grace window (here: just
+        // arrived at the state, `empty_table_elapsed_secs = None`).
         assert_eq!(cvo(Some(true), true, None, Some(99.0)), Verdict::Working);
         assert_eq!(cvo(Some(true), true, None, None), Verdict::Working);
+    }
+
+    // ── compute_verdict_optional: bounded start-up grace period ────────────
+    // (regression coverage for the "Working forever" bug: an empty table
+    // with the service active used to grant Working unconditionally, with
+    // no time bound, so a sweep that wedges before its very first row could
+    // never be flagged.)
+
+    #[test]
+    fn grace_within_window_is_working_even_with_gpu_pegged() {
+        // Well inside the grace window (well under DEFAULT_STARTUP_GRACE_SECS):
+        // still a legitimate start-up state regardless of GPU reading.
+        assert_eq!(cvo_grace(Some(99.0), Some(0)), Verdict::Working);
+        assert_eq!(cvo_grace(Some(99.0), Some(DEFAULT_STARTUP_GRACE_SECS / 2)), Verdict::Working);
+        assert_eq!(cvo_grace(None, Some(DEFAULT_STARTUP_GRACE_SECS / 2)), Verdict::Working);
+    }
+
+    #[test]
+    fn grace_boundary_exactly_at_window_is_still_working() {
+        // elapsed > grace is required (strictly greater), matching the
+        // stuck-age boundary convention elsewhere in this module.
+        assert_eq!(cvo_grace(Some(99.0), Some(DEFAULT_STARTUP_GRACE_SECS)), Verdict::Working);
+    }
+
+    #[test]
+    fn grace_past_window_with_gpu_pegged_is_stuck() {
+        // Past the grace window, active, empty table, AND the GPU has been
+        // pegged >= threshold the whole time: this is the exact stuck
+        // signature the whole subsystem exists to catch (active + GPU busy
+        // + no fresh output for longer than the tolerated window) — just
+        // observed via "zero rows ever" rather than "a stale row present".
+        // Chosen deliberately over `Unknown`: GPU-pegged-and-silent past the
+        // grace window is positive evidence of a wedge, not merely an
+        // unobservable signal, so reporting `Unknown` here would under-alert
+        // on a real incident of exactly this shape.
+        assert_eq!(
+            cvo_grace(Some(DEFAULT_GPU_BUSY_THRESHOLD_PERCENT), Some(DEFAULT_STARTUP_GRACE_SECS + 1)),
+            Verdict::Stuck
+        );
+        assert_eq!(cvo_grace(Some(99.0), Some(DEFAULT_STARTUP_GRACE_SECS + 3600)), Verdict::Stuck);
+    }
+
+    #[test]
+    fn grace_past_window_with_gpu_not_pegged_is_unknown() {
+        // Past the grace window, but the GPU is NOT pegged: no positive
+        // evidence of a wedge (a sweep can legitimately sit idle-ish between
+        // test cases with an empty table if it just started slowly), so
+        // this is `Unknown` rather than a confident `Working` (which is the
+        // bug being fixed) or a confident `Stuck` (which isn't justified
+        // without the GPU signal backing it up).
+        assert_eq!(cvo_grace(Some(5.0), Some(DEFAULT_STARTUP_GRACE_SECS + 1)), Verdict::Unknown);
+    }
+
+    #[test]
+    fn grace_past_window_with_gpu_unknown_is_unknown() {
+        // Past the grace window and the GPU reading itself is unavailable:
+        // no evidence either way, so `Unknown` — matches the existing
+        // "gpu missing + stale row -> Unknown" precedent elsewhere in this
+        // function rather than inventing a different rule for this branch.
+        assert_eq!(cvo_grace(None, Some(DEFAULT_STARTUP_GRACE_SECS + 1)), Verdict::Unknown);
     }
 
     #[test]

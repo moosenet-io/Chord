@@ -97,9 +97,9 @@ impl SweepStatusLog {
         // them: today, today-1, ..., today-(retention_days-1). A file dated
         // exactly `today - retention_days` is the first day *outside* that
         // window, so it (and anything older) must be deleted. Using
-        // `today - retention_days` as the cutoff below with `date < cutoff`
-        // gets exactly that: with retention_days=10 the oldest surviving date
-        // is `today - 9`, i.e. 10 files total, not 11.
+        // `today - (retention_days - 1)` as the cutoff below with
+        // `date < cutoff` gets exactly that: with retention_days=10 the
+        // oldest surviving date is `today - 9`, i.e. 10 files total, not 11.
         let cutoff = now.date_naive() - chrono::Duration::days(self.retention_days as i64 - 1);
         let stem = self.stem();
         let ext = self.ext();

@@ -32,6 +32,15 @@ pub const STUCK_AGE_SECS_ENV: &str = "CHORD_SWEEP_STUCK_AGE_SECS";
 /// `CHORD_SWEEP_GPU_BUSY_THRESHOLD`, default 70.0.
 pub const GPU_BUSY_THRESHOLD_ENV: &str = "CHORD_SWEEP_GPU_BUSY_THRESHOLD";
 
+/// Bound (seconds) on the "service active, DB reachable, table still empty"
+/// start-up grace period — past this window an empty table no longer
+/// unconditionally reports `Working` (see `verdict::compute_verdict_optional`).
+/// `CHORD_SWEEP_STARTUP_GRACE_SECS`, default 360 (6 min), matching the
+/// existing stuck-age default: there's no principled reason a sweep should
+/// be allowed to sit at "zero rows ever" any longer than one that already
+/// has a stale row before the stuck heuristic engages.
+pub const STARTUP_GRACE_SECS_ENV: &str = "CHORD_SWEEP_STARTUP_GRACE_SECS";
+
 /// Local Ollama base URL to poll `/api/ps` on. `CHORD_SWEEP_OLLAMA_URL`,
 /// default `http://localhost:11434`.
 pub const OLLAMA_URL_ENV: &str = "CHORD_SWEEP_OLLAMA_URL";
@@ -61,6 +70,7 @@ pub struct SweepMonitorConfig {
     pub retention_days: u32,
     pub stuck_age_secs: i64,
     pub gpu_busy_threshold: f64,
+    pub startup_grace_secs: i64,
     pub ollama_url: String,
     pub coder_service: String,
     pub assistant_service: String,
@@ -98,6 +108,10 @@ impl SweepMonitorConfig {
                 GPU_BUSY_THRESHOLD_ENV,
                 crate::sweep_status::verdict::DEFAULT_GPU_BUSY_THRESHOLD_PERCENT,
             ),
+            startup_grace_secs: env_parse_or(
+                STARTUP_GRACE_SECS_ENV,
+                crate::sweep_status::verdict::DEFAULT_STARTUP_GRACE_SECS,
+            ),
             ollama_url: env_or(OLLAMA_URL_ENV, DEFAULT_OLLAMA_URL),
             coder_service: env_or(CODER_SERVICE_ENV, DEFAULT_CODER_SERVICE),
             assistant_service: env_or(ASSISTANT_SERVICE_ENV, DEFAULT_ASSISTANT_SERVICE),
@@ -114,6 +128,7 @@ impl SweepMonitorConfig {
             retention_days: 10,
             stuck_age_secs: crate::sweep_status::verdict::DEFAULT_STUCK_AGE_SECS,
             gpu_busy_threshold: crate::sweep_status::verdict::DEFAULT_GPU_BUSY_THRESHOLD_PERCENT,
+            startup_grace_secs: crate::sweep_status::verdict::DEFAULT_STARTUP_GRACE_SECS,
             ollama_url: DEFAULT_OLLAMA_URL.to_string(),
             coder_service: DEFAULT_CODER_SERVICE.to_string(),
             assistant_service: DEFAULT_ASSISTANT_SERVICE.to_string(),
@@ -146,6 +161,7 @@ mod tests {
         std::env::remove_var(RETENTION_DAYS_ENV);
         std::env::remove_var(STUCK_AGE_SECS_ENV);
         std::env::remove_var(GPU_BUSY_THRESHOLD_ENV);
+        std::env::remove_var(STARTUP_GRACE_SECS_ENV);
         std::env::remove_var(OLLAMA_URL_ENV);
         std::env::remove_var(CODER_SERVICE_ENV);
         std::env::remove_var(ASSISTANT_SERVICE_ENV);
@@ -157,6 +173,7 @@ mod tests {
         assert_eq!(cfg.retention_days, 10);
         assert_eq!(cfg.stuck_age_secs, 360);
         assert_eq!(cfg.gpu_busy_threshold, 70.0);
+        assert_eq!(cfg.startup_grace_secs, 360);
         assert_eq!(cfg.ollama_url, DEFAULT_OLLAMA_URL);
         assert_eq!(cfg.coder_service, DEFAULT_CODER_SERVICE);
         assert_eq!(cfg.assistant_service, DEFAULT_ASSISTANT_SERVICE);
@@ -171,6 +188,7 @@ mod tests {
         std::env::set_var(RETENTION_DAYS_ENV, "3");
         std::env::set_var(STUCK_AGE_SECS_ENV, "120");
         std::env::set_var(GPU_BUSY_THRESHOLD_ENV, "50");
+        std::env::set_var(STARTUP_GRACE_SECS_ENV, "90");
         std::env::set_var(OLLAMA_URL_ENV, "http://localhost:9999");
         std::env::set_var(CODER_SERVICE_ENV, "custom-coder.service");
         std::env::set_var(ASSISTANT_SERVICE_ENV, "custom-assistant.service");
@@ -181,6 +199,7 @@ mod tests {
         assert_eq!(cfg.retention_days, 3);
         assert_eq!(cfg.stuck_age_secs, 120);
         assert_eq!(cfg.gpu_busy_threshold, 50.0);
+        assert_eq!(cfg.startup_grace_secs, 90);
         assert_eq!(cfg.ollama_url, "http://localhost:9999");
         assert_eq!(cfg.coder_service, "custom-coder.service");
         assert_eq!(cfg.assistant_service, "custom-assistant.service");
@@ -190,6 +209,7 @@ mod tests {
         std::env::remove_var(RETENTION_DAYS_ENV);
         std::env::remove_var(STUCK_AGE_SECS_ENV);
         std::env::remove_var(GPU_BUSY_THRESHOLD_ENV);
+        std::env::remove_var(STARTUP_GRACE_SECS_ENV);
         std::env::remove_var(OLLAMA_URL_ENV);
         std::env::remove_var(CODER_SERVICE_ENV);
         std::env::remove_var(ASSISTANT_SERVICE_ENV);

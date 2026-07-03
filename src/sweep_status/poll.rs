@@ -25,6 +25,38 @@ use super::verdict::compute_verdict_optional;
 pub static LATEST_SNAPSHOT: Lazy<Arc<RwLock<Option<SweepStatusSnapshot>>>> =
     Lazy::new(|| Arc::new(RwLock::new(None)));
 
+/// Tracks how long a single sweep has been *continuously* observed in the
+/// "service active + DB available + table still empty" state, so the
+/// verdict layer (`verdict::compute_verdict_optional`) can bound its
+/// start-up grace period instead of granting `Working` forever. Reset to
+/// "not observed" the instant the sweep leaves that state — a real row
+/// lands, the service goes inactive, or the DB becomes unreachable — since
+/// none of those still describe the state being timed.
+///
+/// This is deliberately NOT part of the pure `verdict` module: `verdict.rs`
+/// stays a dependency-free function of its inputs (easy to unit-test with
+/// synthetic timestamps), while wall-clock bookkeeping across ticks lives
+/// here in the stateful poll loop where it belongs.
+#[derive(Debug, Default)]
+struct EmptyTableTracker {
+    first_observed: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl EmptyTableTracker {
+    /// Call once per tick with whether this sweep is currently in the
+    /// "active + db-available + empty table" state. Returns how many
+    /// seconds that state has been continuously observed (0 the tick it
+    /// first appears), or `None` if the sweep isn't currently in that state.
+    fn observe(&mut self, in_empty_state: bool, now: chrono::DateTime<chrono::Utc>) -> Option<i64> {
+        if !in_empty_state {
+            self.first_observed = None;
+            return None;
+        }
+        let first = *self.first_observed.get_or_insert(now);
+        Some((now - first).num_seconds().max(0))
+    }
+}
+
 /// Spawn the sweep-status background monitor. Never blocks the caller and
 /// never panics the process: a missing/unreachable intake DB degrades to
 /// `db_configured: false` (or per-tick `available: false`) snapshots rather
@@ -71,10 +103,21 @@ async fn run(cfg: SweepMonitorConfig) {
         "sweep-status monitor started"
     );
 
+    let mut coder_empty_tracker = EmptyTableTracker::default();
+    let mut assistant_empty_tracker = EmptyTableTracker::default();
+
     let mut ticker = tokio::time::interval(cfg.poll_interval);
     loop {
         ticker.tick().await;
-        let snapshot = tick(&cfg, pool.as_ref(), &http_client, db_configured).await;
+        let snapshot = tick(
+            &cfg,
+            pool.as_ref(),
+            &http_client,
+            db_configured,
+            &mut coder_empty_tracker,
+            &mut assistant_empty_tracker,
+        )
+        .await;
 
         if let Err(e) = log.append(snapshot.timestamp, &snapshot).await {
             warn!(target: "chord.sweep_status", error = %e, "failed to append sweep-status snapshot to log");
@@ -95,6 +138,8 @@ async fn tick(
     pool: Option<&sqlx::PgPool>,
     http_client: &reqwest::Client,
     db_configured: bool,
+    coder_empty_tracker: &mut EmptyTableTracker,
+    assistant_empty_tracker: &mut EmptyTableTracker,
 ) -> SweepStatusSnapshot {
     let timestamp = chrono::Utc::now();
 
@@ -113,6 +158,15 @@ async fn tick(
         None => unconfigured_db_stats(),
     };
 
+    let coder_empty_elapsed = coder_empty_tracker.observe(
+        coder_active == Some(true) && coder_db.available && coder_db.latest_row_age_secs.is_none(),
+        timestamp,
+    );
+    let assistant_empty_elapsed = assistant_empty_tracker.observe(
+        assistant_active == Some(true) && assistant_db.available && assistant_db.latest_row_age_secs.is_none(),
+        timestamp,
+    );
+
     let coder_verdict = compute_verdict_optional(
         coder_active,
         coder_db.available,
@@ -120,6 +174,8 @@ async fn tick(
         gpu_busy_percent,
         cfg.stuck_age_secs,
         cfg.gpu_busy_threshold,
+        coder_empty_elapsed,
+        cfg.startup_grace_secs,
     );
     let assistant_verdict = compute_verdict_optional(
         assistant_active,
@@ -128,6 +184,8 @@ async fn tick(
         gpu_busy_percent,
         cfg.stuck_age_secs,
         cfg.gpu_busy_threshold,
+        assistant_empty_elapsed,
+        cfg.startup_grace_secs,
     );
 
     let coder = SweepStatus {
@@ -182,8 +240,10 @@ mod tests {
         // and use a service name that will never be active in this sandbox.
         cfg.drm_root = tmp.path().join("drm");
         let client = reqwest::Client::new();
+        let mut coder_tracker = EmptyTableTracker::default();
+        let mut assistant_tracker = EmptyTableTracker::default();
 
-        let snapshot = tick(&cfg, None, &client, false).await;
+        let snapshot = tick(&cfg, None, &client, false, &mut coder_tracker, &mut assistant_tracker).await;
 
         assert!(!snapshot.db_configured);
         assert!(!snapshot.coder.db.available);
@@ -202,5 +262,47 @@ mod tests {
         // served over HTTP).
         let json = serde_json::to_string(&snapshot).unwrap();
         assert!(json.contains("\"overall_verdict\":\"idle\""));
+    }
+
+    // ── EmptyTableTracker ────────────────────────────────────────────────
+
+    #[test]
+    fn empty_table_tracker_starts_at_zero_elapsed() {
+        let mut tracker = EmptyTableTracker::default();
+        let t0 = chrono::Utc::now();
+        assert_eq!(tracker.observe(true, t0), Some(0));
+    }
+
+    #[test]
+    fn empty_table_tracker_accumulates_elapsed_across_ticks() {
+        let mut tracker = EmptyTableTracker::default();
+        let t0 = chrono::Utc::now();
+        assert_eq!(tracker.observe(true, t0), Some(0));
+        assert_eq!(tracker.observe(true, t0 + chrono::Duration::seconds(30)), Some(30));
+        assert_eq!(tracker.observe(true, t0 + chrono::Duration::seconds(400)), Some(400));
+    }
+
+    #[test]
+    fn empty_table_tracker_resets_when_state_is_left() {
+        // A row lands (or the service/DB signal changes) -> the very next
+        // tick where `in_empty_state` is false must clear the clock, so a
+        // *later* empty-table spell starts its own fresh grace window
+        // instead of inheriting stale elapsed time.
+        let mut tracker = EmptyTableTracker::default();
+        let t0 = chrono::Utc::now();
+        assert_eq!(tracker.observe(true, t0), Some(0));
+        assert_eq!(tracker.observe(true, t0 + chrono::Duration::seconds(100)), Some(100));
+
+        assert_eq!(tracker.observe(false, t0 + chrono::Duration::seconds(150)), None);
+
+        // Re-entering the empty-table state later starts counting from zero
+        // again, not from the old 100s.
+        assert_eq!(tracker.observe(true, t0 + chrono::Duration::seconds(200)), Some(0));
+    }
+
+    #[test]
+    fn empty_table_tracker_never_observed_returns_none() {
+        let mut tracker = EmptyTableTracker::default();
+        assert_eq!(tracker.observe(false, chrono::Utc::now()), None);
     }
 }
