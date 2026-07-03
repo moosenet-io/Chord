@@ -210,9 +210,15 @@ impl McpSession {
         let status = response.status();
         let body = response.text().await.map_err(ProxyError::Http)?;
 
+        // Never include the raw backend response body here: this call is on the
+        // authenticated boundary (the outbound request carries our bearer
+        // token), and a misconfigured/debug-mode backend could reflect request
+        // headers back in an error body. Status-code-only mirrors the existing
+        // upstream-failure convention used for the LLM proxy path (see
+        // `routes.rs`'s `format!("upstream returned HTTP {status}")`).
         if !status.is_success() {
             return Err(ProxyError::McpBackend(format!(
-                "MCP backend returned HTTP {status}: {body}"
+                "MCP backend returned HTTP {status}"
             )));
         }
 
@@ -233,8 +239,11 @@ impl McpSession {
             return Ok(Value::Null);
         }
 
+        // Same rationale as the non-2xx branch above: never echo the raw backend
+        // body into an error that flows into logs/responses on this
+        // authenticated boundary.
         let rpc_response: JsonRpcResponse = serde_json::from_str(&json_str)
-            .map_err(|e| ProxyError::McpBackend(format!("Invalid JSON response: {e} — body: {json_str}")))?;
+            .map_err(|e| ProxyError::McpBackend(format!("Invalid JSON response: {e}")))?;
 
         if let Some(err) = rpc_response.error {
             return Err(ProxyError::McpBackend(err.message));

@@ -322,7 +322,7 @@ mod tests {
             when.body_contains("notifications/initialized");
             then.status(200).body("");
         });
-        mock_server.mock(|when, then| {
+        let call_mock = mock_server.mock(|when, then| {
             when.body_contains("tools/call");
             then.status(401).body("Unauthorized: missing or invalid bearer token");
         });
@@ -354,12 +354,35 @@ mod tests {
         };
 
         let proxy = McpProxy::new(&config, make_registry_with_echo());
+
+        // Warm the catalog and mark `echo_test` as MCP-sourced. Without this,
+        // `tool_call` sees `in_rust && !in_mcp` (the tool is Rust-fallback-only
+        // in an unwarmed/empty catalog) and takes the Rust-fallback-first
+        // branch, returning before the MCP backend is ever called — so the
+        // mocked 401 endpoint would get zero hits and this test would pass
+        // without ever exercising the 401-then-fallback path it claims to
+        // cover. Marking the tool as `mcp`-sourced here forces `tool_call` to
+        // try the MCP backend first, hit the mocked 401, and only then fall
+        // back to the Rust implementation.
+        {
+            let mut cat = proxy.catalog.lock().await;
+            cat.update(
+                vec![ToolEntry::from_mcp(
+                    "echo_test".into(),
+                    "MCP-sourced echo (test double)".into(),
+                    serde_json::json!({}),
+                )],
+                vec![],
+            );
+        }
+
         let (result, source) = proxy
             .tool_call("echo_test", serde_json::json!({"text": "fallback on 401"}))
             .await
             .unwrap();
         assert_eq!(result, "fallback on 401");
         assert_eq!(source, "chord"); // 401 routed through the same fallback as any other MCP error
+        call_mock.assert_hits(1); // the MCP backend's 401 endpoint was actually hit
     }
 
     #[tokio::test]

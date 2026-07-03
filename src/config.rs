@@ -56,7 +56,7 @@ impl RateLimitConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// URL of the MCP backend — reads MCP_BACKEND_URL env var
     pub mcp_backend_url: String,
@@ -135,6 +135,52 @@ pub struct Config {
     /// unless a caller honours this flag — it is exposed for operators who must
     /// debug a runtime that misbehaves with the opt-outs set.
     pub runtime_telemetry_off: bool,
+}
+
+/// Manual `Debug` impl: every field is passed through as the derive would,
+/// EXCEPT `mcp_backend_token`, which is always redacted. This is a landmine
+/// otherwise — nothing currently does `{:?}` on a whole `Config`, but a future
+/// debug-log of it must never print the bearer token verbatim. Redaction text
+/// mirrors the existing `chord-tui::secret::SecretValue` convention
+/// (`"***redacted***"`) used elsewhere in this workspace for secret values.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("mcp_backend_url", &self.mcp_backend_url)
+            .field("jwt_secret", &self.jwt_secret)
+            .field(
+                "mcp_backend_token",
+                &self.mcp_backend_token.as_ref().map(|_| "***redacted***"),
+            )
+            .field("tool_timeout_secs", &self.tool_timeout_secs)
+            .field("catalog_cache_secs", &self.catalog_cache_secs)
+            .field("listen_port", &self.listen_port)
+            .field("control_port", &self.control_port)
+            .field("rate_limits", &self.rate_limits)
+            .field("llm_backend_url", &self.llm_backend_url)
+            .field("model_aliases", &self.model_aliases)
+            .field("model_archive_path", &self.model_archive_path)
+            .field("model_local_path", &self.model_local_path)
+            .field("model_protected", &self.model_protected)
+            .field("model_pull_timeout_secs", &self.model_pull_timeout_secs)
+            .field("model_registry_path", &self.model_registry_path)
+            .field(
+                "model_disk_pressure_percent",
+                &self.model_disk_pressure_percent,
+            )
+            .field(
+                "model_sweep_interval_secs",
+                &self.model_sweep_interval_secs,
+            )
+            .field(
+                "model_warm_cooldown_hours",
+                &self.model_warm_cooldown_hours,
+            )
+            .field("model_source_allowlist", &self.model_source_allowlist)
+            .field("outbound_proxy", &self.outbound_proxy)
+            .field("runtime_telemetry_off", &self.runtime_telemetry_off)
+            .finish()
+    }
 }
 
 /// Parse a comma/space-separated `MODEL_SOURCE_ALLOWLIST` value into a list of
@@ -661,6 +707,20 @@ mod tests {
         std::env::remove_var("CHORD_CATALOG_CACHE_SECS");
         std::env::remove_var("CHORD_PROXY_PORT");
         std::env::remove_var("CHORD_CONTROL_PORT");
+    }
+
+    #[test]
+    fn test_config_debug_redacts_mcp_backend_token() {
+        let mut cfg = Config::test_default();
+        cfg.mcp_backend_token = Some("hunter2-super-secret".to_string());
+        let debug_str = format!("{cfg:?}");
+        assert!(!debug_str.contains("hunter2-super-secret"));
+        assert!(debug_str.contains("***redacted***"));
+
+        cfg.mcp_backend_token = None;
+        let debug_str = format!("{cfg:?}");
+        assert!(!debug_str.contains("***redacted***"));
+        assert!(debug_str.contains("mcp_backend_token: None"));
     }
 
     #[test]
