@@ -37,6 +37,12 @@ struct JsonRpcResponse {
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcError {
+    code: i64,
+    /// Deliberately never surfaced verbatim — see the `send_request` error
+    /// branch below. A misconfigured/debug-mode backend could construct this
+    /// field by echoing request content (including a reflected Authorization
+    /// header) back to the client, so only `code` is forwarded to callers.
+    #[allow(dead_code)]
     message: String,
 }
 
@@ -245,8 +251,17 @@ impl McpSession {
         let rpc_response: JsonRpcResponse = serde_json::from_str(&json_str)
             .map_err(|e| ProxyError::McpBackend(format!("Invalid JSON response: {e}")))?;
 
+        // Same rationale as the two branches above: `err.message` is
+        // structured JSON-RPC content, but it is still backend-controlled. A
+        // misconfigured/debug-mode MCP backend could build its error message
+        // by echoing request content — including a reflected Authorization
+        // header — straight back to us, and this error is logged/returned to
+        // callers. Only the numeric `code` is forwarded; never the message.
         if let Some(err) = rpc_response.error {
-            return Err(ProxyError::McpBackend(err.message));
+            return Err(ProxyError::McpBackend(format!(
+                "MCP backend returned JSON-RPC error (code {})",
+                err.code
+            )));
         }
 
         Ok(rpc_response.result.unwrap_or(Value::Null))
@@ -466,7 +481,60 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ProxyError::McpBackend(_)));
-        assert!(err.to_string().contains("Method not found"));
+        // The JSON-RPC error code is surfaced; the backend-controlled message
+        // text is not (see test below for the security-motivated case).
+        assert!(err.to_string().contains("-32601"));
+        assert!(!err.to_string().contains("Method not found"));
+    }
+
+    #[tokio::test]
+    async fn test_backend_jsonrpc_error_message_does_not_leak_reflected_token() {
+        // A misconfigured/debug-mode MCP backend could construct its JSON-RPC
+        // `error.message` by echoing request content back to the client —
+        // including a reflected `Authorization` header carrying our bearer
+        // token. That message must never surface in the ProxyError (it would
+        // otherwise flow straight into logs/responses).
+        let mock_server = httpmock::MockServer::start_async().await;
+
+        mock_server.mock(|when, then| {
+            when.body_contains(r#""method":"initialize""#);
+            then.status(200)
+                .header("Mcp-Session-Id", "leak-test")
+                .json_body(serde_json::json!({"jsonrpc":"2.0","id":1,"result":{}}));
+        });
+        mock_server.mock(|when, then| {
+            when.body_contains("notifications/initialized");
+            then.status(200).body("");
+        });
+        mock_server.mock(|when, then| {
+            when.body_contains("tools/call");
+            then.status(200).json_body(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "error": {
+                    "code": -32000,
+                    "message": "bad request, saw header Authorization: Bearer super-secret-token-xyz"
+                }
+            }));
+        });
+
+        let session =
+            McpSession::with_token(mock_server.base_url(), 10, Some("super-secret-token-xyz".to_string()));
+        let err = session
+            .send_request("tools/call", Some(serde_json::json!({})))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProxyError::McpBackend(_)));
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains("super-secret-token-xyz"),
+            "reflected token must not leak into the error: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("Bearer"),
+            "reflected Authorization header must not leak into the error: {rendered:?}"
+        );
+        assert!(rendered.contains("-32000"));
     }
 
     // ── MCP_BACKEND_TOKEN bearer-auth wiring ──────────────────────────────
