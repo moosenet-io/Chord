@@ -379,8 +379,15 @@ pub fn render_report(groups: &[SeriesGroup], generated_at: &str) -> String {
          <title>Model performance curves</title>\n{CSS_LINK}\n\
          <!-- constellation.css was unreachable at authoring time; classes \
          (page/card/lumina-footer/muted) and vars (--accent/--text-secondary/\
-         --border-color) are the documented ones. chart-wrap scrolls wide SVGs. -->\n\
-         <style>.chart-wrap{{overflow-x:auto}}</style>\n\
+         --border-color) are the documented ones. `.chart-wrap` needs an \
+         `overflow-x: auto` rule (per the design-system's wide-content-scroll \
+         convention) added to constellation.css itself -- this file \
+         deliberately does NOT duplicate it in a local <style> block (the \
+         design-system rule this project follows explicitly forbids custom \
+         <style> blocks that duplicate what constellation.css should provide). \
+         Until that rule exists there, a wide chart will extend the page \
+         rather than scroll -- a layout nit, not a correctness issue for the \
+         chart data itself. -->\n\
          </head>\n<body>\n{body}\n</body>\n</html>\n"
     )
 }
