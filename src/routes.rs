@@ -7,6 +7,7 @@
 //!   POST /v1/tools/discover    → search catalog by query
 //!   POST /v1/agent/execute     → guarded agentic tool-calling loop
 //!   POST /v1/chat/completions  → OpenAI-compatible LLM proxy (→ CHORD_LLM_URL)
+//!   POST /v1/coding/select     → CPROX-03/04: fleet-driven coding-model resolution
 //!   GET  /health               → health check (no auth)
 
 use axum::{
@@ -72,6 +73,13 @@ pub struct AppState {
     /// A background refresh (if added later) replaces the whole map, same as
     /// [`crate::serving::profile::RoutingMap::load`] already guarantees.
     pub routing_map: Arc<Mutex<crate::serving::profile::RoutingMap>>,
+    /// CPROX-02/03: fleet-driven coding-model data source. Best-effort, same
+    /// fail-open discipline as `routing_map`/`model_registry`: `None` when the
+    /// intake DB isn't configured/reachable, in which case
+    /// `POST /v1/coding/select` returns a clear 503
+    /// ([`crate::coding_proxy::CodingSelectError::NotConfigured`]) rather than
+    /// blocking startup or panicking.
+    pub coding_profile_source: crate::coding_proxy::SharedCodingProfileSource,
 }
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -516,13 +524,16 @@ pub async fn chat_completions(
     // backend if needed. Untagged models resolve to the default backend (whose
     // URL matches CHORD_LLM_URL), so behavior is unchanged until models are
     // tagged. On any failure we fall back to CHORD_LLM_URL.
-    let llm_url = crate::models::routing::resolve_and_ensure(
+    // `bearer_key` is `Some` only for backends with `api_key_env` set (e.g.
+    // OpenRouter) — re-injected as an outbound Authorization header below,
+    // after the inbound-header copy loop strips the caller's own JWT.
+    let (llm_url, bearer_key) = crate::models::routing::resolve_and_ensure(
         &state.model_registry,
         &registry_key,
         &resolved_model,
     )
     .await
-    .unwrap_or(llm_url);
+    .unwrap_or((llm_url, None));
 
     // ── YARN-06: per-request thinking honoring ──────────────────────────────
     // Harmony (THINK-01/02) may send an optional top-level `thinking: "on"|"off"`
@@ -593,6 +604,14 @@ pub async fn chat_completions(
     }
     if !had_content_type {
         upstream_req = upstream_req.header("content-type", "application/json");
+    }
+    // Re-add an Authorization header ONLY for backends that need one (e.g.
+    // OpenRouter) — the loop above stripped the caller's own JWT via
+    // `is_unforwardable_request_header`, so this can never leak the caller's
+    // token to the upstream provider; it's a fresh value from `bearer_key`,
+    // resolved by `resolve_and_ensure` from the backend's own `api_key_env`.
+    if let Some(key) = &bearer_key {
+        upstream_req = upstream_req.header("authorization", format!("Bearer {key}"));
     }
 
     let upstream = match upstream_req.send().await {
@@ -778,6 +797,7 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
         // Sweep-status observability (no auth, same bar as /health and
         // /v1/audit/summary — aggregate health, no identities/secrets).
         .merge(crate::sweep_status::api::sweep_status_routes())
+        .route("/v1/coding/select", axum::routing::post(crate::coding_proxy::coding_select))
         .with_state(state)
 }
 
@@ -879,6 +899,12 @@ mod tests {
         Arc::new(Mutex::new(crate::serving::profile::RoutingMap::empty()))
     }
 
+    /// An unconfigured coding-profile source for state builders that don't
+    /// exercise CPROX-03 — `POST /v1/coding/select` reports 503 `NotConfigured`.
+    fn empty_coding_profile_source() -> crate::coding_proxy::SharedCodingProfileSource {
+        Arc::new(Mutex::new(None))
+    }
+
     fn test_state(mcp_url: String) -> Arc<AppState> {
         let mut reg = FallbackRegistry::new();
         reg.register(Box::new(PingTool));
@@ -934,7 +960,7 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(default_rate_config())));
         let audit_logger = Arc::new(AuditLogger::new(std::path::PathBuf::from("/dev/null")));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map() })
+        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source() })
     }
 
     /// State with auth disabled and an explicit upstream LLM URL for chat/completions tests.
@@ -1000,6 +1026,7 @@ mod tests {
             pull_coordinator,
             local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168,
             routing_map,
+            coding_profile_source: empty_coding_profile_source(),
         })
     }
 
@@ -1056,7 +1083,7 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(default_rate_config())));
         let audit_logger = Arc::new(AuditLogger::new(std::path::PathBuf::from("/dev/null")));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: secret, audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map() })
+        Arc::new(AppState { proxy, jwt_secret: secret, audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source() })
     }
 
     /// Build a state with a very tight user tool limit for rate limit tests.
@@ -1124,7 +1151,7 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(tight)));
         let audit_logger = Arc::new(AuditLogger::new(std::path::PathBuf::from("/dev/null")));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map() })
+        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source() })
     }
 
     #[tokio::test]
@@ -1991,6 +2018,7 @@ mod tests {
             pull_coordinator: coordinator,
             local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168,
             routing_map: empty_routing_map(),
+            coding_profile_source: empty_coding_profile_source(),
         })
     }
 

@@ -559,6 +559,7 @@ mod tests {
             disk_pressure_percent: 80,
             model_warm_cooldown_hours: 168,
             routing_map,
+            coding_profile_source: Arc::new(Mutex::new(None)),
         })
     }
 

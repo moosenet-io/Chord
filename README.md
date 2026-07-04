@@ -155,13 +155,26 @@ Component explainers (written from the source in [`src/`](src)) live in
 - **[docs/test-results.md](docs/test-results.md)** — the S86 coder-fleet sweep
   results: themed BLITZ vs MULTI-FILE pass-rate charts, leaderboard, table, and
   takeaways.
+- **[docs/model-testing-methodology.md](docs/model-testing-methodology.md)**
+  — the full model benchmarking methodology (coder + assistant harnesses,
+  scoring, judge panel, YaRN collapse detection, `mem_config` hardware
+  tagging, gfx1151 backend quirks). The harness code lives in
+  [`moosenet/Terminus`](../Terminus)`/src/intake/`, not in this repo.
+- **[docs/assistant-results.md](docs/assistant-results.md)** — the S84 ASMT
+  assistant-fleet sweep results, generated from Postgres, partial/in-progress.
+- **[docs/contributing-results.md](docs/contributing-results.md)** — how to
+  benchmark your own hardware and tag results so they aren't blended with
+  the numbers here.
 - **[docs/README.md](docs/README.md)** — the docs index.
 
 ## Test Results
 
 Results from the **S86 coder-fleet sweep** on `gfx1151` (MINT v2 harness,
 `qwen3:8b` judge) — full charts, table, and takeaways in
-[`docs/test-results.md`](docs/test-results.md).
+[`docs/test-results.md`](docs/test-results.md). Assistant-fleet results
+(S84 ASMT sweep, in progress) are in
+[`docs/assistant-results.md`](docs/assistant-results.md). Full methodology
+in [`docs/model-testing-methodology.md`](docs/model-testing-methodology.md).
 
 [![BLITZ vs MULTI-FILE pass rate by model](docs/charts/coder-sweep-blitz-vs-multi.svg)](docs/test-results.md)
 
