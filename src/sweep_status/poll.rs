@@ -250,18 +250,30 @@ mod tests {
         assert!(snapshot.coder.db.error_message.as_deref().unwrap().contains("INTAKE_DATABASE_URL"));
         assert!(!snapshot.assistant.as_ref().unwrap().db.available);
         assert!(snapshot.gpu_busy_percent.is_none());
-        // No systemd unit named this exists, so `systemctl is-active` reports
-        // "inactive" (Some(false)) -> Idle, never Stuck/Unknown, regardless of
-        // the DB being unconfigured. (If systemctl itself were unrunnable,
-        // `is_unit_active` would return `None` and the verdict would be
-        // `Unknown` instead — see the `verdict` module's own unit tests.)
-        assert_eq!(snapshot.coder.verdict, super::super::verdict::Verdict::Idle);
-        assert_eq!(snapshot.overall_verdict, super::super::verdict::Verdict::Idle);
+        // This test's own service name never exists, so `service_active` is
+        // never confirmed-true, and — regardless of whether the *real*
+        // `systemctl is-active` in whatever environment runs this test can
+        // reach D-Bus — the resulting verdict must land on one of the two
+        // "not confirmed active" outcomes: `Idle` (systemctl cleanly answered
+        // "inactive") or `Unknown` (systemctl couldn't be queried at all,
+        // e.g. no D-Bus in a sandbox/CI container). Which of the two depends
+        // on host D-Bus availability, not on this tick's own logic, so this
+        // test intentionally does not pin one — that distinction is already
+        // exhaustively covered, environment-independently, by
+        // `systemd::classify_is_active_output`'s own unit tests. What this
+        // test verifies is the DB-pool-absent degrade path itself: no panic,
+        // a usable snapshot, and never a false confirmed-active/Stuck read.
+        assert_ne!(snapshot.coder.service_active, Some(true));
+        assert!(matches!(
+            snapshot.coder.verdict,
+            super::super::verdict::Verdict::Idle | super::super::verdict::Verdict::Unknown
+        ));
+        assert_eq!(snapshot.coder.verdict, snapshot.overall_verdict);
 
         // The snapshot must be JSON-serializable (this is what gets logged +
         // served over HTTP).
         let json = serde_json::to_string(&snapshot).unwrap();
-        assert!(json.contains("\"overall_verdict\":\"idle\""));
+        assert!(json.contains("\"overall_verdict\":\"idle\"") || json.contains("\"overall_verdict\":\"unknown\""));
     }
 
     // ── EmptyTableTracker ────────────────────────────────────────────────
