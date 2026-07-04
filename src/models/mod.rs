@@ -7,6 +7,7 @@
 //! See `specs/S79-model-tiering.md` (TIER-01).
 
 pub mod backends;
+pub mod batch_suitability;
 pub mod coding_selector;
 pub mod eviction;
 pub mod registry;

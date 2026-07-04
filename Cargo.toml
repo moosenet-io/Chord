@@ -18,6 +18,11 @@ readme = "README.md"
 name = "chord-proxy"
 path = "src/main.rs"
 
+# BSUIT-02: read-only performance-curve report generator for run_score_points.
+[[bin]]
+name = "batch-report"
+path = "src/bin/batch-report.rs"
+
 [lib]
 name = "chord_proxy"
 path = "src/lib.rs"

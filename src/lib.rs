@@ -1,6 +1,7 @@
 pub mod agentic;
 pub mod audit;
 pub mod auth;
+pub mod batch_report;
 pub mod catalog;
 pub mod coding_proxy;
 pub mod config;
