@@ -1182,6 +1182,7 @@ mod tests {
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
+            mcp_backend_token: None,
         };
         Arc::new(McpProxy::new(&config, Arc::new(reg)))
     }

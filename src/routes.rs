@@ -929,6 +929,7 @@ mod tests {
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
+            mcp_backend_token: None,
         };
         let proxy = McpProxy::new(&config, Arc::new(reg));
         let proxy_arc = Arc::new(McpProxy::new(
@@ -953,6 +954,7 @@ mod tests {
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
+            mcp_backend_token: None,
             },
             Arc::new(FallbackRegistry::new()),
         ));
@@ -1006,6 +1008,7 @@ mod tests {
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
+            mcp_backend_token: None,
         };
         let proxy = McpProxy::new(&config, Arc::new(FallbackRegistry::new()));
         let proxy_arc = Arc::new(McpProxy::new(&config, Arc::new(FallbackRegistry::new())));
@@ -1052,6 +1055,7 @@ mod tests {
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
+            mcp_backend_token: None,
         };
         let proxy = McpProxy::new(&config, Arc::new(FallbackRegistry::new()));
         let proxy_arc = Arc::new(McpProxy::new(
@@ -1076,6 +1080,7 @@ mod tests {
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
+            mcp_backend_token: None,
             },
             Arc::new(FallbackRegistry::new()),
         ));
@@ -1120,6 +1125,7 @@ mod tests {
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
+            mcp_backend_token: None,
         };
         let proxy = McpProxy::new(&config, Arc::new(reg));
         let proxy_arc = Arc::new(McpProxy::new(
@@ -1144,6 +1150,7 @@ mod tests {
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
+            mcp_backend_token: None,
             },
             Arc::new(FallbackRegistry::new()),
         ));
@@ -1999,6 +2006,7 @@ mod tests {
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
+            mcp_backend_token: None,
         };
         let proxy = McpProxy::new(&config, Arc::new(FallbackRegistry::new()));
         let proxy_arc = Arc::new(McpProxy::new(&config, Arc::new(FallbackRegistry::new())));

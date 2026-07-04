@@ -56,12 +56,19 @@ impl RateLimitConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// URL of the MCP backend — reads MCP_BACKEND_URL env var
     pub mcp_backend_url: String,
     /// JWT secret for validating incoming requests — reads CHORD_JWT_SECRET env var
     pub jwt_secret: String,
+    /// Shared bearer token sent as `Authorization: Bearer <token>` on every outbound
+    /// MCP request (initialize/tools-list/tools-call) to `MCP_BACKEND_URL`. Reads
+    /// `MCP_BACKEND_TOKEN`. `None` (unset/blank) preserves the pre-hardening
+    /// behavior of sending no `Authorization` header at all — this is intentional
+    /// for backward-compatible rollout, not a silent failure. Never log this value;
+    /// only ever log whether it is configured (see `config::mcp_backend_token`).
+    pub mcp_backend_token: Option<String>,
     /// Per-tool call timeout in seconds — reads CHORD_TOOL_TIMEOUT_SECS (default 30)
     pub tool_timeout_secs: u64,
     /// Tool catalog cache TTL in seconds — reads CHORD_CATALOG_CACHE_SECS (default 300)
@@ -130,6 +137,52 @@ pub struct Config {
     pub runtime_telemetry_off: bool,
 }
 
+/// Manual `Debug` impl: every field is passed through as the derive would,
+/// EXCEPT `mcp_backend_token`, which is always redacted. This is a landmine
+/// otherwise — nothing currently does `{:?}` on a whole `Config`, but a future
+/// debug-log of it must never print the bearer token verbatim. Redaction text
+/// mirrors the existing `chord-tui::secret::SecretValue` convention
+/// (`"***redacted***"`) used elsewhere in this workspace for secret values.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("mcp_backend_url", &self.mcp_backend_url)
+            .field("jwt_secret", &self.jwt_secret)
+            .field(
+                "mcp_backend_token",
+                &self.mcp_backend_token.as_ref().map(|_| "***redacted***"),
+            )
+            .field("tool_timeout_secs", &self.tool_timeout_secs)
+            .field("catalog_cache_secs", &self.catalog_cache_secs)
+            .field("listen_port", &self.listen_port)
+            .field("control_port", &self.control_port)
+            .field("rate_limits", &self.rate_limits)
+            .field("llm_backend_url", &self.llm_backend_url)
+            .field("model_aliases", &self.model_aliases)
+            .field("model_archive_path", &self.model_archive_path)
+            .field("model_local_path", &self.model_local_path)
+            .field("model_protected", &self.model_protected)
+            .field("model_pull_timeout_secs", &self.model_pull_timeout_secs)
+            .field("model_registry_path", &self.model_registry_path)
+            .field(
+                "model_disk_pressure_percent",
+                &self.model_disk_pressure_percent,
+            )
+            .field(
+                "model_sweep_interval_secs",
+                &self.model_sweep_interval_secs,
+            )
+            .field(
+                "model_warm_cooldown_hours",
+                &self.model_warm_cooldown_hours,
+            )
+            .field("model_source_allowlist", &self.model_source_allowlist)
+            .field("outbound_proxy", &self.outbound_proxy)
+            .field("runtime_telemetry_off", &self.runtime_telemetry_off)
+            .finish()
+    }
+}
+
 /// Parse a comma/space-separated `MODEL_SOURCE_ALLOWLIST` value into a list of
 /// host/domain strings, trimming whitespace and dropping empties. An empty result
 /// (unset or blank) means NO source is allowed — the caller fails closed (never
@@ -180,6 +233,12 @@ impl Config {
         })?;
 
         let jwt_secret = std::env::var("CHORD_JWT_SECRET").unwrap_or_default();
+
+        // Outbound MCP auth. Loud-if-missing (mirrors the ISO-01 allow-list posture)
+        // but NOT fail-closed: an unset token preserves today's unauthenticated
+        // behavior so rollout can happen without a coordinated flag-day. The token
+        // value itself is never logged — only whether it is present.
+        let mcp_backend_token = mcp_backend_token(&mcp_backend_url);
 
         let tool_timeout_secs = std::env::var("CHORD_TOOL_TIMEOUT_SECS")
             .ok()
@@ -253,6 +312,7 @@ impl Config {
         Ok(Config {
             mcp_backend_url,
             jwt_secret,
+            mcp_backend_token,
             tool_timeout_secs,
             catalog_cache_secs,
             listen_port,
@@ -282,6 +342,7 @@ impl Config {
         Config {
             mcp_backend_url: "http://mcp.invalid:3200".into(),
             jwt_secret: String::new(),
+            mcp_backend_token: None,
             tool_timeout_secs: 30,
             catalog_cache_secs: 300,
             listen_port: 9099,
@@ -340,6 +401,32 @@ pub fn model_source_allowlist() -> Vec<String> {
 /// S88 ISO-01 telemetry toggle: read `CHORD_RUNTIME_TELEMETRY_OFF` (default `true`).
 /// Controls whether runtime launches advertise the telemetry-off / offline opt-outs.
 /// Any value other than a case-insensitive `false`/`0`/`no` keeps the opt-outs ON.
+/// Read `MCP_BACKEND_TOKEN`: the shared bearer token attached as
+/// `Authorization: Bearer <token>` to every outbound MCP request. Unset or
+/// blank → `None`, which preserves today's unauthenticated behavior (backward
+/// compatible during rollout) — this is deliberately NOT fail-closed like the
+/// ISO-01 egress allow-list, since the remote backend does not enforce auth
+/// yet. A missing token still gets a loud one-line `tracing::warn!` at startup
+/// so the pre-hardening state is visible in logs. **The token value itself is
+/// never included in any log line, here or at any call site.**
+pub fn mcp_backend_token(mcp_backend_url: &str) -> Option<String> {
+    let token = std::env::var("MCP_BACKEND_TOKEN")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+
+    if token.is_none() && !mcp_backend_url.trim().is_empty() {
+        tracing::warn!(
+            target: "chord.mcp",
+            "MCP_BACKEND_URL is set but MCP_BACKEND_TOKEN is not — outbound MCP \
+             requests to the backend are UNAUTHENTICATED (pre-hardening state); \
+             set MCP_BACKEND_TOKEN once the backend enforces bearer auth"
+        );
+    }
+
+    token
+}
+
 pub fn runtime_telemetry_off() -> bool {
     match std::env::var("CHORD_RUNTIME_TELEMETRY_OFF") {
         Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no" | "off"),
@@ -620,6 +707,75 @@ mod tests {
         std::env::remove_var("CHORD_CATALOG_CACHE_SECS");
         std::env::remove_var("CHORD_PROXY_PORT");
         std::env::remove_var("CHORD_CONTROL_PORT");
+    }
+
+    #[test]
+    fn test_config_debug_redacts_mcp_backend_token() {
+        let mut cfg = Config::test_default();
+        cfg.mcp_backend_token = Some("hunter2-super-secret".to_string());
+        let debug_str = format!("{cfg:?}");
+        assert!(!debug_str.contains("hunter2-super-secret"));
+        assert!(debug_str.contains("***redacted***"));
+
+        cfg.mcp_backend_token = None;
+        let debug_str = format!("{cfg:?}");
+        assert!(!debug_str.contains("***redacted***"));
+        assert!(debug_str.contains("mcp_backend_token: None"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_mcp_backend_token_absent_when_env_unset() {
+        std::env::remove_var("MCP_BACKEND_TOKEN");
+        std::env::set_var("MCP_BACKEND_URL", "http://mcp-test-backend:3200");
+
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(cfg.mcp_backend_token, None);
+
+        std::env::remove_var("MCP_BACKEND_URL");
+    }
+
+    #[test]
+    #[serial]
+    fn test_mcp_backend_token_absent_when_env_blank() {
+        std::env::set_var("MCP_BACKEND_URL", "http://mcp-test-backend:3200");
+        std::env::set_var("MCP_BACKEND_TOKEN", "   ");
+
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(cfg.mcp_backend_token, None);
+
+        std::env::remove_var("MCP_BACKEND_URL");
+        std::env::remove_var("MCP_BACKEND_TOKEN");
+    }
+
+    #[test]
+    #[serial]
+    fn test_mcp_backend_token_present_when_env_set() {
+        std::env::set_var("MCP_BACKEND_URL", "http://mcp-test-backend:3200");
+        std::env::set_var("MCP_BACKEND_TOKEN", "shared-secret-123");
+
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(cfg.mcp_backend_token, Some("shared-secret-123".to_string()));
+
+        std::env::remove_var("MCP_BACKEND_URL");
+        std::env::remove_var("MCP_BACKEND_TOKEN");
+    }
+
+    #[test]
+    #[serial]
+    fn test_mcp_backend_token_fn_trims_and_filters_blank() {
+        // Direct unit test of the free function (no shared process-env access
+        // beyond MCP_BACKEND_TOKEN itself) — kept separate from the `#[serial]`
+        // Config::from_env tests above since it does not touch MCP_BACKEND_URL.
+        std::env::set_var("MCP_BACKEND_TOKEN", "  padded-token  ");
+        assert_eq!(
+            mcp_backend_token("http://x"),
+            Some("padded-token".to_string())
+        );
+        std::env::remove_var("MCP_BACKEND_TOKEN");
+
+        std::env::remove_var("MCP_BACKEND_TOKEN");
+        assert_eq!(mcp_backend_token("http://x"), None);
     }
 
     // `normalize_llm_url` is tested directly (no process-env mutation) to avoid
