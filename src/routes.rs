@@ -325,6 +325,18 @@ pub async fn agent_execute(
         Err(e) => return auth_error_response(e),
     };
 
+    // ── GPU-exclusive gate ────────────────────────────────────────────────────
+    // Same gate as `chat_completions`/`infer`: this route makes LLM calls too
+    // (via `agentic_executor.execute`, which dispatches to CHORD_LLM_URL), so it
+    // must not be allowed to load a model / contend for the GPU while the intake
+    // harness holds exclusive access. Placed AFTER auth, BEFORE the rate-limit
+    // check or any dispatch work.
+    if let Some(record) =
+        crate::gpu_exclusive::GPU_EXCLUSIVE.active_holder(crate::gpu_exclusive::now_epoch())
+    {
+        return gpu_exclusively_held_response(&record);
+    }
+
     // Count an agentic execution against the LLM budget (it makes LLM calls).
     let role = UserRole::from_claim(claims.role.as_deref());
     let rl_result = {
@@ -432,6 +444,17 @@ pub async fn chat_completions(
             return auth_error_response(e);
         }
     };
+
+    // ── GPU-exclusive gate ────────────────────────────────────────────────────
+    // While the GPU is exclusively held (by the intake harness), do NOT load a
+    // model / dispatch inference and contend for VRAM — return a clear, structured
+    // 503 instead. Placed AFTER auth (so an unauthenticated caller still gets 401)
+    // and BEFORE any rate-limit/pull/upstream work.
+    if let Some(record) =
+        crate::gpu_exclusive::GPU_EXCLUSIVE.active_holder(crate::gpu_exclusive::now_epoch())
+    {
+        return gpu_exclusively_held_response(&record);
+    }
 
     // Endpoint disabled when no upstream LLM URL is configured.
     let Some(llm_url) = state.llm_backend_url.clone() else {
@@ -794,11 +817,167 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
         .route("/v1/agent/execute", axum::routing::post(agent_execute))
         .route("/v1/chat/completions", axum::routing::post(chat_completions))
         .route("/v1/infer", axum::routing::post(infer))
+        // GPU-exclusive coordination: the intake harness ACQUIREs the GPU here
+        // instead of `systemctl stop chord.service` — Chord stays up, only its
+        // inference paths gate. Same JWT auth as every other endpoint.
+        .route(
+            "/v1/gpu-exclusive/acquire",
+            axum::routing::post(gpu_exclusive_acquire),
+        )
+        .route(
+            "/v1/gpu-exclusive/release",
+            axum::routing::post(gpu_exclusive_release),
+        )
+        .route(
+            "/v1/gpu-exclusive/status",
+            axum::routing::get(gpu_exclusive_status),
+        )
         // Sweep-status observability (no auth, same bar as /health and
         // /v1/audit/summary — aggregate health, no identities/secrets).
         .merge(crate::sweep_status::api::sweep_status_routes())
         .route("/v1/coding/select", axum::routing::post(crate::coding_proxy::coding_select))
         .with_state(state)
+}
+
+// ── GPU-exclusive coordination endpoints ─────────────────────────────────────
+//
+// The intake benchmarking harness (Terminus `intake::gpu_authority`) calls
+// these to take exclusive GPU control WITHOUT taking Chord down. See
+// `crate::gpu_exclusive` for the lock/TTL/heartbeat model.
+
+/// Build the structured 503 an inference path returns while the GPU is
+/// exclusively held. Shared by `chat_completions` and `infer` so the contract is
+/// identical on every gated path.
+fn gpu_exclusively_held_response(record: &crate::gpu_exclusive::LockRecord) -> Response {
+    let body = serde_json::json!({
+        "error": "gpu_exclusively_held",
+        "holder": record.holder,
+        "since": crate::gpu_exclusive::iso_utc(record.acquired_at),
+    });
+    (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct GpuExclusiveBody {
+    /// Short label identifying the acquirer (e.g. `intake_coder_sweep`).
+    pub holder: Option<String>,
+}
+
+/// `POST /v1/gpu-exclusive/acquire` — grant the GPU to `holder`. On a fresh
+/// grant Chord best-effort evicts any resident Ollama model; a re-acquire by the
+/// same holder is a heartbeat refresh (no re-eviction). 409 if a DIFFERENT live
+/// holder owns it.
+pub async fn gpu_exclusive_acquire(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<GpuExclusiveBody>,
+) -> Response {
+    if let Err(e) = auth_check(&headers, &state.jwt_secret) {
+        return auth_error_response(e);
+    }
+    let holder = body.holder.unwrap_or_default();
+    if holder.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "holder required" })),
+        )
+            .into_response();
+    }
+    let now = crate::gpu_exclusive::now_epoch();
+    match crate::gpu_exclusive::GPU_EXCLUSIVE.acquire(&holder, now) {
+        crate::gpu_exclusive::AcquireOutcome::Granted { record, new_grant } => {
+            if new_grant {
+                tracing::info!(holder = %record.holder, "gpu-exclusive: granted — evicting resident models");
+                if let Some(base) = crate::gpu_exclusive::ollama_base_from_env() {
+                    let unloaded =
+                        crate::gpu_exclusive::evict_resident_models(&state.http_client, &base).await;
+                    tracing::info!(holder = %record.holder, unloaded, "gpu-exclusive: acquire eviction complete");
+                }
+            }
+            let body = serde_json::json!({
+                "status": "acquired",
+                "holder": record.holder,
+                "since": crate::gpu_exclusive::iso_utc(record.acquired_at),
+                "new_grant": new_grant,
+            });
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        crate::gpu_exclusive::AcquireOutcome::Blocked { record } => {
+            tracing::warn!(
+                requested_by = %holder, current_holder = %record.holder,
+                "gpu-exclusive: acquire refused — held by another"
+            );
+            (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": "gpu_exclusively_held",
+                "holder": record.holder,
+                "since": crate::gpu_exclusive::iso_utc(record.acquired_at),
+            })))
+                .into_response()
+        }
+    }
+}
+
+/// `POST /v1/gpu-exclusive/release` — clear `holder`'s lock and resume normal
+/// serving. Idempotent (no lock ⇒ 200). 409 if a DIFFERENT holder owns it.
+pub async fn gpu_exclusive_release(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<GpuExclusiveBody>,
+) -> Response {
+    if let Err(e) = auth_check(&headers, &state.jwt_secret) {
+        return auth_error_response(e);
+    }
+    let holder = body.holder.unwrap_or_default();
+    if holder.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "holder required" })),
+        )
+            .into_response();
+    }
+    match crate::gpu_exclusive::GPU_EXCLUSIVE.release(&holder) {
+        crate::gpu_exclusive::ReleaseOutcome::Released => {
+            tracing::info!(holder = %holder, "gpu-exclusive: released — normal serving resumed");
+            (StatusCode::OK, Json(serde_json::json!({ "status": "released" }))).into_response()
+        }
+        crate::gpu_exclusive::ReleaseOutcome::Mismatch { record } => {
+            tracing::warn!(
+                requested_by = %holder, current_holder = %record.holder,
+                "gpu-exclusive: release refused — held by another"
+            );
+            (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": "lock_held_by_other",
+                "holder": record.holder,
+                "since": crate::gpu_exclusive::iso_utc(record.acquired_at),
+            })))
+                .into_response()
+        }
+    }
+}
+
+/// `GET /v1/gpu-exclusive/status` — inspect the current lock (holder, since,
+/// last heartbeat, whether it has expired/abandoned) for stale-lock diagnosis.
+pub async fn gpu_exclusive_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = auth_check(&headers, &state.jwt_secret) {
+        return auth_error_response(e);
+    }
+    let now = crate::gpu_exclusive::now_epoch();
+    let ttl = crate::gpu_exclusive::GPU_EXCLUSIVE.ttl();
+    let body = match crate::gpu_exclusive::GPU_EXCLUSIVE.snapshot(now) {
+        Some((record, expired)) => serde_json::json!({
+            "held": !expired,
+            "holder": record.holder,
+            "since": crate::gpu_exclusive::iso_utc(record.acquired_at),
+            "last_heartbeat": crate::gpu_exclusive::iso_utc(record.last_heartbeat),
+            "expired": expired,
+            "ttl_secs": ttl,
+        }),
+        None => serde_json::json!({ "held": false, "ttl_secs": ttl }),
+    };
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 /// `POST /v1/infer` request: run one prompt on the model's tagged backend and
@@ -821,6 +1000,13 @@ pub async fn infer(
 ) -> Response {
     if let Err(e) = auth_check(&headers, &state.jwt_secret) {
         return auth_error_response(e);
+    }
+    // GPU-exclusive gate (see `chat_completions`): never run inference while the
+    // GPU is exclusively held — return the same structured 503 instead.
+    if let Some(record) =
+        crate::gpu_exclusive::GPU_EXCLUSIVE.active_holder(crate::gpu_exclusive::now_epoch())
+    {
+        return gpu_exclusively_held_response(&record);
     }
     let timeout = std::time::Duration::from_secs(req.timeout_secs.unwrap_or(300));
     let metrics = terminus_rs::intake::infer::infer_with_metrics(
