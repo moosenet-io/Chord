@@ -325,6 +325,18 @@ pub async fn agent_execute(
         Err(e) => return auth_error_response(e),
     };
 
+    // ── GPU-exclusive gate ────────────────────────────────────────────────────
+    // Same gate as `chat_completions`/`infer`: this route makes LLM calls too
+    // (via `agentic_executor.execute`, which dispatches to CHORD_LLM_URL), so it
+    // must not be allowed to load a model / contend for the GPU while the intake
+    // harness holds exclusive access. Placed AFTER auth, BEFORE the rate-limit
+    // check or any dispatch work.
+    if let Some(record) =
+        crate::gpu_exclusive::GPU_EXCLUSIVE.active_holder(crate::gpu_exclusive::now_epoch())
+    {
+        return gpu_exclusively_held_response(&record);
+    }
+
     // Count an agentic execution against the LLM budget (it makes LLM calls).
     let role = UserRole::from_claim(claims.role.as_deref());
     let rl_result = {
