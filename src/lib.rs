@@ -8,6 +8,7 @@ pub mod config;
 pub mod control;
 pub mod error;
 pub mod fallback;
+pub mod gpu_exclusive;
 pub mod harness;
 pub mod middleware;
 pub mod mcp_proxy;
