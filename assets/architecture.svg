@@ -1,0 +1,131 @@
+<svg width="1280" height="760" viewBox="0 0 1280 760" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bg2" cx="50%" cy="30%" r="85%">
+      <stop offset="0%" stop-color="#241a3f"/>
+      <stop offset="55%" stop-color="#1a1430"/>
+      <stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/>
+    </marker>
+    <marker id="arrowB" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0 0 L9 4.5 L0 9 z" fill="#4a6cf6"/>
+    </marker>
+  </defs>
+
+  <rect width="1280" height="760" fill="url(#bg2)"/>
+
+  <!-- header -->
+  <text x="640" y="52" text-anchor="middle" fill="#b9b0d8" font-size="15" letter-spacing="7" font-weight="500">INFERENCE MANAGER</text>
+  <text x="640" y="92" text-anchor="middle" fill="#ffffff" font-size="34" font-weight="700" letter-spacing="3">CHORD · SYSTEM ARCHITECTURE</text>
+  <line x1="490" y1="112" x2="790" y2="112" stroke="#6b5bbf" stroke-width="1" opacity="0.5"/>
+
+  <!-- ===================== CLIENTS (top) ===================== -->
+  <g>
+    <rect x="360" y="146" width="240" height="58" rx="10" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadow)"/>
+    <text x="480" y="172" text-anchor="middle" fill="#e8e3f7" font-size="15" font-weight="600">Lumina (assistant)</text>
+    <text x="480" y="191" text-anchor="middle" fill="#9b92c0" font-size="11.5" font-family="'Courier New',monospace">control · :8090</text>
+
+    <rect x="680" y="146" width="240" height="58" rx="10" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadow)"/>
+    <text x="800" y="172" text-anchor="middle" fill="#e8e3f7" font-size="15" font-weight="600">Harmony (coders)</text>
+    <text x="800" y="191" text-anchor="middle" fill="#9b92c0" font-size="11.5" font-family="'Courier New',monospace">agentic · :8099</text>
+  </g>
+
+  <!-- arrows clients -> chord core -->
+  <line x1="480" y1="204" x2="540" y2="250" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrow)" opacity="0.85"/>
+  <line x1="800" y1="204" x2="740" y2="250" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrow)" opacity="0.85"/>
+
+  <!-- ===================== CHORD CORE (center band) ===================== -->
+  <rect x="150" y="256" width="980" height="232" rx="16" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6" opacity="0.96"/>
+  <text x="175" y="284" fill="#a78bff" font-size="13" letter-spacing="4" font-weight="600">CHORD CORE</text>
+
+  <!-- focal hub mark inside core -->
+  <circle cx="640" cy="300" r="5" fill="#c9b8ff"/>
+
+  <!-- core sub-modules -->
+  <g font-size="13.5" font-weight="600">
+    <!-- Router -->
+    <rect x="185" y="312" width="210" height="150" rx="11" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+    <text x="290" y="338" text-anchor="middle" fill="#e8e3f7">Routing</text>
+    <g fill="#a89fc8" font-size="11.5" font-weight="400" font-family="'Courier New',monospace">
+      <text x="205" y="364">serving-profile</text>
+      <text x="205" y="384">lookup</text>
+      <text x="205" y="410">best_runtime +</text>
+      <text x="205" y="430">backend per model</text>
+      <text x="205" y="452">chat-role pin</text>
+    </g>
+
+    <!-- Memory coordinator -->
+    <rect x="425" y="312" width="210" height="150" rx="11" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+    <text x="530" y="338" text-anchor="middle" fill="#e8e3f7">Memory Coordinator</text>
+    <g fill="#a89fc8" font-size="11.5" font-weight="400" font-family="'Courier New',monospace">
+      <text x="445" y="364">substrate-aware</text>
+      <text x="445" y="384">admission</text>
+      <text x="445" y="410">SeparateCeilings /</text>
+      <text x="445" y="430">UnifiedPool</text>
+      <text x="445" y="452">tier-aware eviction</text>
+    </g>
+
+    <!-- Clean-swap launcher -->
+    <rect x="665" y="312" width="210" height="150" rx="11" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+    <text x="770" y="338" text-anchor="middle" fill="#e8e3f7">Clean-Swap Launcher</text>
+    <g fill="#a89fc8" font-size="11.5" font-weight="400" font-family="'Courier New',monospace">
+      <text x="685" y="364">teardown -></text>
+      <text x="685" y="384">verify release -></text>
+      <text x="685" y="410">launch w/ explicit -c</text>
+      <text x="685" y="430">orphan force-kill</text>
+      <text x="685" y="452">false-OOM guard</text>
+    </g>
+
+    <!-- Mode controller -->
+    <rect x="905" y="312" width="205" height="150" rx="11" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+    <text x="1007" y="338" text-anchor="middle" fill="#e8e3f7">Mode Controller</text>
+    <g fill="#a89fc8" font-size="11.5" font-weight="400" font-family="'Courier New',monospace">
+      <text x="925" y="364">assistant-live</text>
+      <text x="925" y="384">(pin + swap around)</text>
+      <text x="925" y="410">batch-coder</text>
+      <text x="925" y="430">(full GPU, 1-at-a-time)</text>
+      <text x="925" y="452">persisted state</text>
+    </g>
+  </g>
+
+  <!-- arrows core -> backends -->
+  <line x1="430" y1="488" x2="360" y2="556" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrow)" opacity="0.85"/>
+  <line x1="640" y1="488" x2="640" y2="556" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrow)" opacity="0.85"/>
+  <line x1="850" y1="488" x2="920" y2="556" stroke="#4a6cf6" stroke-width="1.6" marker-end="url(#arrowB)" opacity="0.8"/>
+
+  <!-- ===================== BACKENDS (bottom) ===================== -->
+  <!-- GPU tier 1: llama.cpp-rocm -->
+  <g>
+    <rect x="190" y="560" width="270" height="92" rx="12" fill="#231b40" stroke="#8b5cf6" stroke-width="1.3" filter="url(#cardShadow)"/>
+    <circle cx="214" cy="586" r="6" fill="#8b5cf6"/>
+    <text x="230" y="591" fill="#e8e3f7" font-size="14.5" font-weight="600">llama.cpp-rocm</text>
+    <text x="210" y="615" fill="#9b92c0" font-size="11.5" font-family="'Courier New',monospace">GPU · broadest + VRAM-efficient</text>
+    <text x="210" y="634" fill="#9b92c0" font-size="11.5" font-family="'Courier New',monospace">--no-mmap · keep-warm big models</text>
+  </g>
+  <!-- GPU tier 2: ollama-rocm -->
+  <g>
+    <rect x="505" y="560" width="270" height="92" rx="12" fill="#231b40" stroke="#8b5cf6" stroke-width="1.3" filter="url(#cardShadow)"/>
+    <circle cx="529" cy="586" r="6" fill="#8b5cf6"/>
+    <text x="545" y="591" fill="#e8e3f7" font-size="14.5" font-weight="600">ollama-rocm</text>
+    <text x="525" y="615" fill="#9b92c0" font-size="11.5" font-family="'Courier New',monospace">GPU · archs llama.cpp can't load</text>
+    <text x="525" y="634" fill="#9b92c0" font-size="11.5" font-family="'Courier New',monospace">gemma / gpt-oss / glm / qwen3.5-6</text>
+  </g>
+  <!-- CPU tier -->
+  <g>
+    <rect x="820" y="560" width="270" height="92" rx="12" fill="#231b40" stroke="#4a6cf6" stroke-width="1.3" filter="url(#cardShadow)"/>
+    <circle cx="844" cy="586" r="6" fill="#4a6cf6"/>
+    <text x="860" y="591" fill="#e8e3f7" font-size="14.5" font-weight="600">CPU tier</text>
+    <text x="840" y="615" fill="#9b92c0" font-size="11.5" font-family="'Courier New',monospace">genuine system-RAM fallback</text>
+    <text x="840" y="634" fill="#9b92c0" font-size="11.5" font-family="'Courier New',monospace">small models · last resort</text>
+  </g>
+
+  <!-- tier label -->
+  <text x="640" y="690" text-anchor="middle" fill="#6b6390" font-size="12" letter-spacing="2">THREE-TIER ROUTING · llama.cpp-rocm → ollama-rocm → CPU</text>
+
+  <!-- profile feedback note -->
+  <text x="640" y="722" text-anchor="middle" fill="#564d75" font-size="11.5" letter-spacing="0.4">Per-model serving profiles measured by the intake harness drive routing, admission, and launch flags.</text>
+</svg>

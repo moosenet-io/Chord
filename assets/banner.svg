@@ -1,0 +1,123 @@
+<svg width="1280" height="640" viewBox="0 0 1280 640" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <!-- Background radial vignette: lifted center, dark corners -->
+    <radialGradient id="bg" cx="50%" cy="38%" r="75%">
+      <stop offset="0%" stop-color="#241a3f"/>
+      <stop offset="45%" stop-color="#1a1430"/>
+      <stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <!-- Soft elliptical glow behind the wordmark -->
+    <radialGradient id="titleGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#5b3fb0" stop-opacity="0.55"/>
+      <stop offset="60%" stop-color="#3a2a6e" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#3a2a6e" stop-opacity="0"/>
+    </radialGradient>
+    <!-- Focal hub glow -->
+    <radialGradient id="hubGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#a78bff" stop-opacity="0.95"/>
+      <stop offset="40%" stop-color="#7c5cff" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#7c5cff" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="soft" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="2.2"/>
+    </filter>
+  </defs>
+
+  <!-- Base -->
+  <rect width="1280" height="640" fill="url(#bg)"/>
+
+  <!-- Starfield (scattered, varied opacity) -->
+  <g fill="#ffffff">
+    <circle cx="70" cy="180" r="1.1" opacity="0.5"/>
+    <circle cx="150" cy="55" r="0.9" opacity="0.35"/>
+    <circle cx="240" cy="300" r="1.3" opacity="0.55"/>
+    <circle cx="60" cy="430" r="1" opacity="0.4"/>
+    <circle cx="320" cy="120" r="0.8" opacity="0.3"/>
+    <circle cx="200" cy="500" r="1.1" opacity="0.45"/>
+    <circle cx="500" cy="60" r="0.9" opacity="0.4"/>
+    <circle cx="820" cy="40" r="1" opacity="0.4"/>
+    <circle cx="1040" cy="90" r="1.2" opacity="0.5"/>
+    <circle cx="1180" cy="200" r="0.9" opacity="0.4"/>
+    <circle cx="1230" cy="120" r="1.1" opacity="0.45"/>
+    <circle cx="1120" cy="330" r="1" opacity="0.4"/>
+    <circle cx="960" cy="250" r="0.8" opacity="0.3"/>
+    <circle cx="1210" cy="470" r="1.1" opacity="0.45"/>
+    <circle cx="1080" cy="520" r="0.9" opacity="0.35"/>
+    <circle cx="40" cy="300" r="0.9" opacity="0.35"/>
+    <circle cx="380" cy="240" r="0.8" opacity="0.3"/>
+    <circle cx="900" cy="470" r="0.9" opacity="0.35"/>
+    <circle cx="660" cy="520" r="0.8" opacity="0.3"/>
+  </g>
+
+  <!-- ===== CHORD MOTIF: routing hub fanning to hardware-tagged backends ===== -->
+  <!-- Conceptual sibling to Harmony's constellation, but reads as a conductor/router:
+       one central hub, lines fanning out to GPU-tier and CPU-tier backend nodes. -->
+  <g stroke-width="1" fill="none">
+    <!-- fan lines from hub (640,138) to backends -->
+    <g stroke="#7c5cff" opacity="0.55">
+      <line x1="640" y1="138" x2="470" y2="70"/>
+      <line x1="640" y1="138" x2="545" y2="120"/>
+      <line x1="640" y1="138" x2="735" y2="120"/>
+      <line x1="640" y1="138" x2="810" y2="70"/>
+    </g>
+    <g stroke="#4a6cf6" opacity="0.4">
+      <line x1="640" y1="138" x2="360" y2="140"/>
+      <line x1="640" y1="138" x2="920" y2="140"/>
+    </g>
+    <!-- faint outer arcs connecting the spread (chord/string feel) -->
+    <g stroke="#6b5bbf" opacity="0.22">
+      <path d="M470 70 Q640 20 810 70"/>
+      <path d="M360 140 Q640 250 920 140"/>
+    </g>
+  </g>
+
+  <!-- backend nodes -->
+  <g>
+    <!-- GPU-tier (violet) -->
+    <circle cx="545" cy="120" r="7" fill="#8b5cf6"/>
+    <circle cx="735" cy="120" r="7" fill="#8b5cf6"/>
+    <circle cx="470" cy="70" r="5.5" fill="#8b5cf6" opacity="0.9"/>
+    <circle cx="810" cy="70" r="5.5" fill="#8b5cf6" opacity="0.9"/>
+    <!-- CPU-tier (blue, outer) -->
+    <circle cx="360" cy="140" r="6" fill="#4a6cf6"/>
+    <circle cx="920" cy="140" r="6" fill="#4a6cf6"/>
+    <!-- accent (green) top -->
+    <circle cx="640" cy="28" r="6" fill="#10b981"/>
+    <circle cx="640" cy="262" r="5" fill="#10b981" opacity="0.85"/>
+    <!-- focal hub -->
+    <circle cx="640" cy="138" r="26" fill="url(#hubGlow)"/>
+    <circle cx="640" cy="138" r="9" fill="#c9b8ff"/>
+    <circle cx="640" cy="138" r="4.5" fill="#ffffff"/>
+  </g>
+
+  <!-- ===== TEXT BLOCK ===== -->
+  <!-- elliptical glow behind wordmark -->
+  <ellipse cx="640" cy="300" rx="270" ry="62" fill="url(#titleGlow)"/>
+
+  <!-- eyebrow -->
+  <text x="640" y="228" text-anchor="middle" fill="#b9b0d8" font-size="20" letter-spacing="9" font-weight="500">INFERENCE MANAGER</text>
+
+  <!-- wordmark -->
+  <text x="640" y="322" text-anchor="middle" fill="#ffffff" font-size="92" font-weight="700" letter-spacing="2">CHORD</text>
+
+  <!-- mono tagline -->
+  <text x="640" y="372" text-anchor="middle" fill="#7c5cff" font-size="19" letter-spacing="6" font-weight="600" font-family="'Courier New', monospace">HARDWARE-TAGGED  INFERENCE  ROUTING</text>
+
+  <!-- version divider  (EDIT v1.0 -> real crate version) -->
+  <g>
+    <line x1="545" y1="418" x2="600" y2="418" stroke="#6b5bbf" stroke-width="1" opacity="0.6"/>
+    <text x="640" y="423" text-anchor="middle" fill="#9b92c0" font-size="13" letter-spacing="3" font-family="'Courier New', monospace">v1.0</text>
+    <line x1="680" y1="418" x2="735" y2="418" stroke="#6b5bbf" stroke-width="1" opacity="0.6"/>
+  </g>
+
+  <!-- three-feature row -->
+  <g fill="#8d84ad" font-size="15" letter-spacing="2" font-weight="500">
+    <text x="412" y="470" text-anchor="middle">GPU / CPU BACKENDS</text>
+    <text x="640" y="470" text-anchor="middle">VRAM COORDINATOR</text>
+    <text x="868" y="470" text-anchor="middle">AUTO-LAUNCH RUNTIMES</text>
+  </g>
+
+  <!-- footer -->
+  <text x="640" y="567" text-anchor="middle" fill="#564d75" font-size="12" letter-spacing="4">CHORD</text>
+  <text x="640" y="592" text-anchor="middle" fill="#473f63" font-size="11.5" letter-spacing="0.4">Multi-backend inference routing, clean-swap serving, and per-model profiles.</text>
+</svg>

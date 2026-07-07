@@ -1,0 +1,32 @@
+[package]
+name = "chord-tui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Chord control TUI — a read-mostly ratatui client for Chord + Terminus-fleet control planes (S91)"
+readme = "README.md"
+
+[[bin]]
+name = "chord-tui"
+path = "src/main.rs"
+
+[dependencies]
+# Terminal UI.
+ratatui = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
+# Async runtime + non-blocking HTTP so a slow/dead instance never freezes
+# the event loop.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+async-trait = "0.1"
+thiserror = "1.0"
+tracing = "0.1"
+dirs = "5"
+futures-util = { version = "0.3", features = ["std"], default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time", "sync", "test-util"] }
+tempfile = "3"
