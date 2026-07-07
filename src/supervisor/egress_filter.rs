@@ -106,7 +106,7 @@ fn apply_nft_in_ns(ns: &str, ip_bin: &str, nft_bin: &str, ruleset: &str) -> Resu
 }
 
 /// Deterministic per-namespace /30 link addresses + gateway. Uses the namespace
-/// name hash to pick a subnet in the RFC1918 `<internal-ip>/16` space reserved here // pii-test-fixture
+/// name hash to pick a subnet in the RFC1918 `10.255.x.x/16` space reserved here
 /// for Chord's transient veths, keeping each launch's link distinct. Returns
 /// `(host_addr_cidr, ns_addr_cidr, gateway_ip)`.
 #[cfg(target_os = "linux")]
