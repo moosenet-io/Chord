@@ -3450,11 +3450,17 @@ mod tests {
             test_state_with_personal("http://does-not-exist:9999".into(), mock_server.base_url());
         let app = build_router(state);
 
+        // Deliberately a non-core tool name (NOT on tool_allowlist::is_core_tool) —
+        // proves this exercises the filter_core_tools == false bypass in
+        // tool_call's hard gate, not just a name that would also pass the core
+        // allowlist (a prior version of this test used "health", which is
+        // core-allowlisted and so could not distinguish "bypass works" from
+        // "gate was never actually reached").
         let req = Request::builder()
             .method(Method::POST)
             .uri("/v1/personal/tools/call")
             .header("Content-Type", "application/json")
-            .body(Body::from(r#"{"name":"health","arguments":{}}"#))
+            .body(Body::from(r#"{"name":"vitals_today","arguments":{}}"#))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -3464,6 +3470,104 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["result"], "pong-from-terminus-personal");
         assert_eq!(json["source"], "mcp");
+    }
+
+    /// `/v1/personal/tools/list` and `/v1/personal/tools/call` must enforce the
+    /// same JWT auth as the default tool routes — a request with no bearer
+    /// token is rejected with 401 even when a personal backend IS configured
+    /// (using a mocked server here just to prove auth is checked before the
+    /// personal proxy is ever reached).
+    #[tokio::test]
+    async fn test_personal_routes_require_auth() {
+        let mock_server = httpmock::MockServer::start_async().await;
+        // No mocks registered: if auth were skipped and the proxy were reached,
+        // the unmocked request would 5xx/timeout rather than 401 — making this
+        // a meaningful negative test, not a vacuous pass.
+
+        let mut reg = FallbackRegistry::new();
+        reg.register(Box::new(PingTool));
+        let config = Config {
+            mcp_backend_url: "http://does-not-exist:9999".into(),
+            jwt_secret: "<REDACTED-SECRET>".into(),
+            tool_timeout_secs: 5,
+            catalog_cache_secs: 300,
+            listen_port: 9099,
+            control_port: 8090,
+            rate_limits: default_rate_config(),
+            llm_backend_url: None,
+            model_aliases: std::collections::HashMap::new(),
+            model_archive_path: "/var/lib/model-archive".into(),
+            model_local_path: "/opt/ollama-models".into(),
+            model_protected: vec![],
+            model_pull_timeout_secs: 600,
+            model_registry_path: "<path>/model-registry.json".into(),
+            model_disk_pressure_percent: 80,
+            model_sweep_interval_secs: 1800,
+            model_warm_cooldown_hours: 168,
+            model_source_allowlist: Vec::new(),
+            outbound_proxy: None,
+            runtime_telemetry_off: true,
+            mcp_backend_token: None,
+            personal_backend_url: Some(mock_server.base_url()),
+            personal_backend_token: None,
+        };
+        let proxy = McpProxy::new(&config, Arc::new(reg));
+        let personal_proxy = Some(Arc::new(McpProxy::new_unfiltered(
+            &config,
+            Arc::new(FallbackRegistry::new()),
+        )));
+        let proxy_arc = Arc::new(McpProxy::new(
+            &Config {
+                mcp_backend_url: "http://does-not-exist:9999".into(),
+                ..config.clone()
+            },
+            Arc::new(FallbackRegistry::new()),
+        ));
+        let agentic_executor = Arc::new(AgenticExecutor::new(proxy_arc));
+        let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(default_rate_config())));
+        let audit_logger = Arc::new(AuditLogger::new(std::path::PathBuf::from("/dev/null")));
+        let (model_registry, pull_coordinator) = empty_model_state();
+        let state = Arc::new(AppState {
+            proxy,
+            jwt_secret: "<REDACTED-SECRET>".into(),
+            audit_logger,
+            rate_limiter,
+            agentic_executor,
+            llm_backend_url: None,
+            model_aliases: std::collections::HashMap::new(),
+            http_client: reqwest::Client::new(),
+            model_registry,
+            pull_coordinator,
+            local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(
+                std::path::PathBuf::from("/tmp"),
+            )),
+            disk_op_lock: crate::models::eviction::new_disk_op_lock(),
+            disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe),
+            disk_pressure_percent: 80,
+            model_warm_cooldown_hours: 168,
+            routing_map: empty_routing_map(),
+            coding_profile_source: empty_coding_profile_source(),
+            personal_proxy,
+        });
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/personal/tools/list")
+            .header("Content-Type", "application/json")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/personal/tools/call")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"name":"vitals_today","arguments":{}}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// LIVE integration test (Task 2): actually calls through to the REAL

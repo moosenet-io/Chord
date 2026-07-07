@@ -118,7 +118,21 @@ impl McpProxy {
 
         let rust_tools = self.fallback.as_catalog_entries();
 
-        // Attempt to fetch from MCP backend
+        // Attempt to fetch from MCP backend.
+        //
+        // Known limitation (flagged in Task 2 review, pre-existing for the core
+        // proxy too): any fetch error here — timeout, connection refused,
+        // malformed JSON — degrades to an empty list rather than surfacing a
+        // 502/504 to the caller. For the core proxy this is masked by the Rust
+        // fallback catalog, so callers still see tools. For the Task 2
+        // federation proxy (`filter_core_tools == false`, no Rust fallback by
+        // design — see `main.rs`), a genuinely down/misbehaving
+        // `terminus_personal` backend is indistinguishable from "it has zero
+        // tools" via `/v1/personal/tools/list`. Not fixed here: doing so
+        // properly means threading a distinct error variant through
+        // `tool_list`'s `Result` for both proxies, which is a broader change
+        // than this task's scope. Tracked as a follow-up rather than papered
+        // over silently.
         let mcp_tools = match self.fetch_mcp_tools().await {
             Ok(tools) => {
                 debug!("Fetched {} MCP tools", tools.len());
