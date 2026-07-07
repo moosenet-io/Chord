@@ -115,12 +115,12 @@ fn make_jwt(secret: &str) -> String {
 
 // ── Fallback tools for tests ──────────────────────────────────────────────────
 
-/// A "calendar_today" Rust fallback tool for discover tests.
+/// A "gitea_calendar_today" Rust fallback tool for discover tests.
 struct CalendarTodayTool;
 
 #[async_trait::async_trait]
 impl FallbackTool for CalendarTodayTool {
-    fn name(&self) -> &str { "calendar_today" }
+    fn name(&self) -> &str { "gitea_calendar_today" }
     fn description(&self) -> &str { "Get calendar events for today" }
     fn parameters(&self) -> Value { serde_json::json!({}) }
     async fn execute(&self, _: Value) -> Result<String, chord_proxy::error::ProxyError> {
@@ -133,7 +133,7 @@ struct EchoFallbackTool;
 
 #[async_trait::async_trait]
 impl FallbackTool for EchoFallbackTool {
-    fn name(&self) -> &str { "echo_rust" }
+    fn name(&self) -> &str { "gitea_echo_rust" }
     fn description(&self) -> &str { "Echo back the input text" }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -474,8 +474,12 @@ async fn test_tool_list_returns_merged_catalog() {
     let server = httpmock::MockServer::start_async().await;
     mock_mcp_handshake(&server, "session-list-merged");
     mock_tools_list(&server, &[
-        ("mcp_search", "Search via MCP"),
-        ("mcp_weather", "Get weather via MCP"),
+        ("gitea_search", "Search via MCP"),
+        ("gitea_weather", "Get weather via MCP"),
+        // Deliberately non-core: the upstream MCP backend may still register
+        // this (it's a real Terminus tool name), but Chord must never serve
+        // it. If the allowlist filter regresses, this assertion below fails.
+        ("infisical_get_secret", "Fetch a secret via MCP"),
     ]);
 
     let state = make_state(server.base_url());
@@ -489,24 +493,57 @@ async fn test_tool_list_returns_merged_catalog() {
 
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
-    // MCP tools must appear
-    assert!(names.contains(&"mcp_search"), "mcp_search from MCP must appear");
-    assert!(names.contains(&"mcp_weather"), "mcp_weather from MCP must appear");
+    // MCP tools on the core allowlist must appear
+    assert!(names.contains(&"gitea_search"), "gitea_search from MCP must appear");
+    assert!(names.contains(&"gitea_weather"), "gitea_weather from MCP must appear");
 
     // Rust fallback tools must also appear
-    assert!(names.contains(&"echo_rust"), "echo_rust (Rust fallback) must appear");
-    assert!(names.contains(&"calendar_today"), "calendar_today (Rust fallback) must appear");
+    assert!(names.contains(&"gitea_echo_rust"), "gitea_echo_rust (Rust fallback) must appear");
+    assert!(names.contains(&"gitea_calendar_today"), "gitea_calendar_today (Rust fallback) must appear");
+
+    // Non-core tools registered upstream (MCP backend) must be excluded from
+    // what Chord serves, even though the backend returned them.
+    assert!(
+        !names.contains(&"infisical_get_secret"),
+        "infisical_get_secret must be excluded from Chord's served catalog"
+    );
 
     // Sources must be correctly tagged
-    let mcp_tool = tools.iter().find(|t| t["name"] == "mcp_search").unwrap();
+    let mcp_tool = tools.iter().find(|t| t["name"] == "gitea_search").unwrap();
     assert_eq!(mcp_tool["source"], "mcp", "MCP tools must have source=mcp");
 
-    let rust_tool = tools.iter().find(|t| t["name"] == "echo_rust").unwrap();
+    let rust_tool = tools.iter().find(|t| t["name"] == "gitea_echo_rust").unwrap();
     assert_eq!(rust_tool["source"], "chord", "Rust fallback tools must have source=chord");
 
     // Count field must match array length
     let count = json["count"].as_u64().expect("count must be present");
     assert_eq!(count as usize, tools.len(), "count must equal tools.len()");
+}
+
+// ── Test 1b: non-core tool_call is rejected even when the MCP backend has it ──
+
+#[tokio::test]
+async fn test_tool_call_rejects_non_core_tool_even_when_mcp_has_it() {
+    let server = httpmock::MockServer::start_async().await;
+    mock_mcp_handshake(&server, "session-call-rejected");
+    // The MCP backend would happily serve this if asked directly — Chord must
+    // refuse to dispatch it regardless, proving the gate is enforced in
+    // tool_call (not just hidden from tool_list/tool_discover).
+    mock_tools_call_success(&server, "SECRET VALUE — should never reach the caller");
+
+    let state = make_state(server.base_url());
+    let app = build_router(state);
+
+    let resp = app
+        .oneshot(call_request("infisical_get_secret", serde_json::json!({"path": "/some/secret"})))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "tool_call for a non-core tool must be rejected (404), not routed to MCP"
+    );
 }
 
 // ── Test 2: tool call routes to MCP backend ───────────────────────────────────
@@ -515,13 +552,13 @@ async fn test_tool_list_returns_merged_catalog() {
 async fn test_tool_call_routes_to_mcp() {
     let server = httpmock::MockServer::start_async().await;
     mock_mcp_handshake(&server, "session-mcp-route");
-    mock_tools_call_success(&server, "MCP result for searxng_search");
+    mock_tools_call_success(&server, "MCP result for gitea_search");
 
     let state = make_state(server.base_url());
     let app = build_router(state);
 
     let resp = app
-        .oneshot(call_request("searxng_search", serde_json::json!({"q": "test"})))
+        .oneshot(call_request("gitea_search", serde_json::json!({"q": "test"})))
         .await
         .unwrap();
 
@@ -529,7 +566,7 @@ async fn test_tool_call_routes_to_mcp() {
 
     let json = body_json(resp).await;
     assert_eq!(
-        json["result"], "MCP result for searxng_search",
+        json["result"], "MCP result for gitea_search",
         "result must be the MCP response text"
     );
     assert_eq!(
@@ -546,12 +583,12 @@ async fn test_tool_call_falls_back_to_rust() {
     mock_mcp_handshake(&server, "session-fallback");
     mock_tools_call_500(&server);
 
-    // echo_rust is registered as a Rust fallback
+    // gitea_echo_rust is registered as a Rust fallback
     let state = make_state(server.base_url());
     let app = build_router(state);
 
     let resp = app
-        .oneshot(call_request("echo_rust", serde_json::json!({"text": "fallback_works"})))
+        .oneshot(call_request("gitea_echo_rust", serde_json::json!({"text": "fallback_works"})))
         .await
         .unwrap();
 
@@ -575,7 +612,7 @@ async fn test_tool_discover_returns_relevant_tools() {
     let server = httpmock::MockServer::start_async().await;
     mock_mcp_handshake(&server, "session-discover");
     mock_tools_list(&server, &[
-        ("calendar_today", "Get calendar events for today"),
+        ("gitea_calendar_today", "Get calendar events for today"),
         ("email_inbox", "Read email messages"),
     ]);
 
@@ -593,11 +630,11 @@ async fn test_tool_discover_returns_relevant_tools() {
     let tools = json["tools"].as_array().expect("tools must be an array");
     assert!(!tools.is_empty(), "calendar query must return at least one tool");
 
-    // The most relevant result for "calendar" should be calendar_today
+    // The most relevant result for "calendar" should be gitea_calendar_today
     let first_name = tools[0]["name"].as_str().unwrap_or("");
     assert_eq!(
-        first_name, "calendar_today",
-        "calendar_today must rank first for query 'calendar'"
+        first_name, "gitea_calendar_today",
+        "gitea_calendar_today must rank first for query 'calendar'"
     );
 
     // Echo back the query
@@ -775,7 +812,7 @@ async fn test_audit_logger_writes_parseable_jsonl() {
     let logger = AuditLogger::new(log_path.clone());
 
     logger.log_llm_call("lumina", "test-model", 42, Status::Success, None);
-    logger.log_tool_call("lumina", "searxng_search", 150, Status::Success, None);
+    logger.log_tool_call("lumina", "gitea_search", 150, Status::Success, None);
     logger.log_auth_failure(Some("bad-token"), 5);
 
     let contents = std::fs::read_to_string(&log_path).unwrap();
@@ -845,7 +882,7 @@ async fn test_tool_list_graceful_degradation_when_mcp_down() {
 
     // Rust fallback tools should still be present
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
-    assert!(names.contains(&"echo_rust"), "echo_rust must be in the degraded catalog");
+    assert!(names.contains(&"gitea_echo_rust"), "gitea_echo_rust must be in the degraded catalog");
 }
 
 /// Calling a tool that exists in neither MCP nor Rust catalog returns 404.
@@ -895,7 +932,7 @@ async fn test_rust_fallback_sets_source_chord() {
     let app = build_router(state);
 
     let resp = app
-        .oneshot(call_request("echo_rust", serde_json::json!({"text": "source_check"})))
+        .oneshot(call_request("gitea_echo_rust", serde_json::json!({"text": "source_check"})))
         .await
         .unwrap();
 
