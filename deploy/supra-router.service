@@ -1,0 +1,36 @@
+[Unit]
+Description=Supra-Router-51M local routing-classifier daemon (S92 ROUT-01)
+Documentation=https://git.example.com/moosenet/Chord
+After=network.target
+
+[Service]
+Type=simple
+# Loopback-only HTTP; chord-proxy's SupraRouterClient (src/agentic/model_router.rs)
+# reaches it over localhost. This daemon is an internal pre-classifier and must
+# never be exposed beyond 127.0.0.1.
+Environment=SUPRA_ROUTER_BIND=127.0.0.1
+Environment=SUPRA_ROUTER_HTTP_PORT=8878
+Environment=SUPRA_ROUTER_MODEL_PATH=/opt/chord-data/supra-router-eval/models/supra-router-51m-Q8_0.gguf
+# Small (51.7M param) model — serving via the same llama.cpp toolchain used for
+# DiffusionGemma (dgem.service), CPU-only is expected to be fast enough
+# (this session measured ~0.24s mean CPU latency for a single classify call).
+ExecStart=/opt/chord-data/llama-router/build/bin/llama-server \
+  -m ${SUPRA_ROUTER_MODEL_PATH} \
+  --host ${SUPRA_ROUTER_BIND} --port ${SUPRA_ROUTER_HTTP_PORT} \
+  -c 512 -t 4 --no-webui
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
+
+# ── Deployment status (S92 build) ──────────────────────────────────────────
+# This unit mirrors the dgem.service pattern (verified on <host> this session)
+# exactly in shape: Type=simple, loopback bind, Restart=on-failure, model path
+# via Environment=. It has NOT been installed/started on <host> as part of this
+# build — the HF→GGUF conversion of SupraLabs/Supra-Router-51M (real model
+# download + llama.cpp quantization) was not executed; see the S92 build
+# report for why. `crates/chord-proxy`'s SupraRouterClient (ROUT-04) degrades
+# cleanly to the existing keyword heuristic whenever this daemon is not
+# running, so shipping the integration code ahead of the live daemon is safe.

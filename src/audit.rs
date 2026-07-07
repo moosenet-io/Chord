@@ -29,6 +29,8 @@ pub enum RequestType {
     ToolCall,
     ToolDiscover,
     AuthFailure,
+    /// ROUT-06: a turn-zero hybrid routing decision (shadow and/or actual).
+    RoutingDecision,
 }
 
 /// Outcome of the request.
@@ -66,6 +68,42 @@ pub struct AuditEntry {
     /// The raw token is NEVER stored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_hash_prefix: Option<String>,
+    /// ROUT-06: hybrid routing decision detail. Only present for
+    /// `RequestType::RoutingDecision` entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing: Option<RoutingDecisionDetail>,
+}
+
+/// ROUT-06: sanitized detail of one turn-zero hybrid routing decision.
+///
+/// Follows this log's existing no-sensitive-content convention: the raw
+/// prompt is NEVER stored, only an 8-hex-char SHA-256 prefix (via
+/// `token_hash_prefix`) sufficient to correlate entries without being
+/// reversible.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RoutingDecisionDetail {
+    /// `"shadow"` or `"active"` — the `ROUTER_MODE` in effect for this decision.
+    pub mode: String,
+    /// `"supra_router"` or `"heuristic_fallback"` — what actually drove `acted_escalate`.
+    pub source: String,
+    /// What the pre-existing keyword heuristic alone would decide.
+    pub heuristic_would_escalate: bool,
+    /// `"small"` / `"big"` if the daemon returned a usable classification, else absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hybrid_route: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hybrid_complexity: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hybrid_math: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hybrid_code: Option<bool>,
+    /// The decision actually acted on (escalated or not).
+    pub acted_escalate: bool,
+    /// Whether the shadow (hybrid) and actual (heuristic) decisions agreed —
+    /// the key signal for the shadow-vs-actual agreement report.
+    pub shadow_actual_agree: bool,
+    /// First 8 hex chars of SHA-256(prompt). The raw prompt is NEVER stored.
+    pub prompt_hash_prefix: String,
 }
 
 impl AuditEntry {
@@ -85,6 +123,7 @@ impl AuditEntry {
             status: Status::Success,
             error_message: None,
             token_hash_prefix: None,
+            routing: None,
         }
     }
 
@@ -106,6 +145,7 @@ impl AuditEntry {
             status,
             error_message,
             token_hash_prefix: None,
+            routing: None,
         }
     }
 
@@ -122,6 +162,49 @@ impl AuditEntry {
             status: Status::Error,
             error_message: Some("Authentication failed".to_string()),
             token_hash_prefix: hash_prefix,
+            routing: None,
+        }
+    }
+
+    /// ROUT-06: construct a routing-decision entry. `raw_prompt` is hashed
+    /// immediately and discarded — it is never stored or logged verbatim.
+    #[allow(clippy::too_many_arguments)]
+    pub fn routing_decision(
+        user_id: &str,
+        duration_ms: u64,
+        raw_prompt: &str,
+        mode: &str,
+        source: &str,
+        heuristic_would_escalate: bool,
+        hybrid_route: Option<&str>,
+        hybrid_complexity: Option<u8>,
+        hybrid_math: Option<bool>,
+        hybrid_code: Option<bool>,
+        acted_escalate: bool,
+        shadow_actual_agree: bool,
+    ) -> Self {
+        let detail = RoutingDecisionDetail {
+            mode: mode.to_string(),
+            source: source.to_string(),
+            heuristic_would_escalate,
+            hybrid_route: hybrid_route.map(str::to_string),
+            hybrid_complexity,
+            hybrid_math,
+            hybrid_code,
+            acted_escalate,
+            shadow_actual_agree,
+            prompt_hash_prefix: token_hash_prefix(raw_prompt),
+        };
+        Self {
+            timestamp: utc_now_rfc3339(),
+            user_id: user_id.to_string(),
+            request_type: RequestType::RoutingDecision,
+            target: hybrid_route.unwrap_or("n/a").to_string(),
+            duration_ms,
+            status: Status::Success,
+            error_message: None,
+            token_hash_prefix: None,
+            routing: Some(detail),
         }
     }
 }
@@ -219,6 +302,42 @@ impl AuditLogger {
     /// Log a generic entry (used by middleware for list/discover/health).
     pub fn log_entry(&self, entry: &AuditEntry) {
         self.write_entry(entry);
+    }
+
+    /// ROUT-06: log one turn-zero hybrid routing decision (both the shadow
+    /// classifier opinion and the decision actually acted on). `raw_prompt`
+    /// is hashed inside `AuditEntry::routing_decision` and never stored.
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_routing_decision(
+        &self,
+        user_id: &str,
+        duration_ms: u64,
+        raw_prompt: &str,
+        mode: &str,
+        source: &str,
+        heuristic_would_escalate: bool,
+        hybrid_route: Option<&str>,
+        hybrid_complexity: Option<u8>,
+        hybrid_math: Option<bool>,
+        hybrid_code: Option<bool>,
+        acted_escalate: bool,
+        shadow_actual_agree: bool,
+    ) {
+        let entry = AuditEntry::routing_decision(
+            user_id,
+            duration_ms,
+            raw_prompt,
+            mode,
+            source,
+            heuristic_would_escalate,
+            hybrid_route,
+            hybrid_complexity,
+            hybrid_math,
+            hybrid_code,
+            acted_escalate,
+            shadow_actual_agree,
+        );
+        self.write_entry(&entry);
     }
 
     // ── Write path ────────────────────────────────────────────────────────────
@@ -812,5 +931,84 @@ mod tests {
 
         logger.log_llm_call("lumina", "model", 1, Status::Success, None);
         assert!(log_path.exists(), "log file should be created with parent dirs");
+    }
+
+    // ── ROUT-06: routing-decision logging ─────────────────────────────────────
+
+    #[test]
+    fn test_routing_decision_logs_expected_fields() {
+        let (logger, _dir) = temp_logger();
+        logger.log_routing_decision(
+            "lumina",
+            3,
+            "please analyze this dataset",
+            "shadow",
+            "heuristic_fallback",
+            true,
+            Some("big"),
+            Some(4),
+            Some(false),
+            Some(false),
+            true,
+            true,
+        );
+
+        let contents = std::fs::read_to_string(&logger.log_path).unwrap();
+        let entry: AuditEntry = serde_json::from_str(contents.trim()).unwrap();
+
+        assert_eq!(entry.request_type, RequestType::RoutingDecision);
+        assert_eq!(entry.target, "big");
+        let routing = entry.routing.expect("routing detail must be present");
+        assert_eq!(routing.mode, "shadow");
+        assert_eq!(routing.source, "heuristic_fallback");
+        assert!(routing.heuristic_would_escalate);
+        assert_eq!(routing.hybrid_route.as_deref(), Some("big"));
+        assert_eq!(routing.hybrid_complexity, Some(4));
+        assert!(routing.acted_escalate);
+        assert!(routing.shadow_actual_agree);
+    }
+
+    #[test]
+    fn test_routing_decision_never_stores_raw_prompt() {
+        let (logger, _dir) = temp_logger();
+        let raw_prompt = "the secret sauce prompt content should never appear";
+        logger.log_routing_decision(
+            "lumina", 1, raw_prompt, "active", "supra_router", false,
+            Some("small"), Some(1), Some(false), Some(false), false, true,
+        );
+
+        let contents = std::fs::read_to_string(&logger.log_path).unwrap();
+        assert!(!contents.contains(raw_prompt), "raw prompt must never be logged");
+
+        let entry: AuditEntry = serde_json::from_str(contents.trim()).unwrap();
+        let routing = entry.routing.unwrap();
+        assert_eq!(routing.prompt_hash_prefix.len(), 8);
+        assert_eq!(routing.prompt_hash_prefix, token_hash_prefix(raw_prompt));
+    }
+
+    #[test]
+    fn test_routing_decision_omits_hybrid_fields_when_daemon_unavailable() {
+        let (logger, _dir) = temp_logger();
+        logger.log_routing_decision(
+            "lumina", 2, "hello there", "active", "heuristic_fallback", false,
+            None, None, None, None, false, true,
+        );
+
+        let contents = std::fs::read_to_string(&logger.log_path).unwrap();
+        // Omitted Option fields must not appear as explicit nulls.
+        assert!(!contents.contains("\"hybrid_route\":null"));
+        let entry: AuditEntry = serde_json::from_str(contents.trim()).unwrap();
+        assert_eq!(entry.routing.unwrap().hybrid_route, None);
+    }
+
+    #[test]
+    fn test_routing_decision_counted_in_daily_summary_by_type() {
+        let (logger, _dir) = temp_logger();
+        logger.log_routing_decision(
+            "lumina", 1, "q1", "shadow", "heuristic_fallback", false,
+            Some("small"), Some(1), Some(false), Some(false), false, true,
+        );
+        let summary = logger.daily_summary();
+        assert_eq!(summary.by_type.get("routing_decision").copied().unwrap_or(0), 1);
     }
 }

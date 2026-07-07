@@ -210,6 +210,235 @@ impl Default for AgenticModelRouter {
     }
 }
 
+// ── ROUT-04: Hybrid turn-zero routing ─────────────────────────────────────────
+//
+// This session's evaluation found `SupraLabs/Supra-Router-51M` (a local
+// classifier daemon, see ROUT-01) beats the keyword heuristic above on raw
+// accuracy (71% vs 67% on a 47-prompt set) and gives richer signal. This
+// section wires it in as the turn-zero decision source while preserving the
+// existing mid-session escalation (`ComplexityHeuristic`/`escalate()` above)
+// unchanged as an upgrade-only path layered on top.
+//
+// `SupraLabs/Supra-Router-51M` has no declared license (ROUT-05). `RouterMode`
+// therefore defaults to `Shadow` everywhere — the hybrid decision is always
+// computed and logged, but never acted on, until the operator explicitly
+// resolves licensing and flips `ROUTER_MODE=active`.
+
+use crate::agentic::router_classifier::{
+    parse_classification, route_for, ClassificationError, Route, RouterClassification,
+};
+use std::time::Duration;
+
+/// Default timeout for a single classify call to the local daemon. This
+/// session measured ~0.24s mean CPU latency; 500ms gives headroom without
+/// risking the request stalling on a slow/wedged daemon.
+const DEFAULT_DAEMON_TIMEOUT_MS: u64 = 500;
+
+/// Default loopback endpoint for the Supra-Router daemon (see ROUT-01's
+/// `dgem.service`-pattern deployment). Override via `SUPRA_ROUTER_URL` — no
+/// infrastructure value is hardcoded outside this default-fallback string.
+const DEFAULT_SUPRA_ROUTER_URL: &str = "http://127.0.0.1:8878";
+
+/// `ROUTER_MODE` gate. **Always defaults to `Shadow`** — see ROUT-05: the
+/// model's license is undetermined, so live behavior must never depend on its
+/// output until that is explicitly resolved by the operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouterMode {
+    /// Compute and log the hybrid decision (ROUT-06); act on the existing
+    /// heuristic only. This is today's behavior, unchanged.
+    Shadow,
+    /// Act on the hybrid (Supra-Router-led) decision.
+    Active,
+}
+
+impl RouterMode {
+    /// Read `ROUTER_MODE` from the environment. Unset, empty, or any value
+    /// other than a case-insensitive `"active"` all resolve to `Shadow` —
+    /// the safe default is not a single string match away from an accident.
+    pub fn from_env() -> Self {
+        match std::env::var("ROUTER_MODE") {
+            Ok(v) if v.eq_ignore_ascii_case("active") => RouterMode::Active,
+            _ => RouterMode::Shadow,
+        }
+    }
+}
+
+impl Default for RouterMode {
+    fn default() -> Self {
+        RouterMode::Shadow
+    }
+}
+
+/// Where a turn-zero routing decision that was actually *acted on* came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionSource {
+    /// The Supra-Router daemon returned a usable classification and
+    /// `RouterMode::Active` was in effect.
+    SupraRouter,
+    /// The daemon was unreachable, timed out, returned "unavailable", or
+    /// `RouterMode::Shadow` was in effect — the existing keyword heuristic
+    /// was used instead.
+    HeuristicFallback,
+}
+
+/// Full detail of one turn-zero routing decision — enough to log both the
+/// shadow (hybrid) and actual (acted-on) decisions per ROUT-06, and to know
+/// whether they agreed.
+#[derive(Debug, Clone)]
+pub struct TurnZeroDecision {
+    /// What the existing keyword heuristic alone would decide.
+    pub heuristic_would_escalate: bool,
+    /// The Supra-Router's classification, if the daemon returned a usable
+    /// result (`None` on unreachable/timeout/malformed-output).
+    pub hybrid_classification: Option<RouterClassification>,
+    /// The route the hybrid classifier computed, if available.
+    pub hybrid_route: Option<Route>,
+    /// Which mode was in effect for this decision.
+    pub mode: RouterMode,
+    /// Which signal actually drove `escalate()` for this turn.
+    pub source: DecisionSource,
+    /// The decision actually acted on (i.e. whether `escalate()` was called).
+    pub acted_escalate: bool,
+}
+
+impl TurnZeroDecision {
+    /// True when the hybrid classifier was available and its route decision
+    /// agreed with the keyword heuristic's decision — useful for the ROUT-06
+    /// shadow-vs-actual agreement reporting.
+    pub fn shadow_actual_agree(&self) -> bool {
+        match self.hybrid_route {
+            Some(route) => (route == Route::Big) == self.heuristic_would_escalate,
+            None => true, // no hybrid opinion to disagree with
+        }
+    }
+}
+
+/// Thin HTTP client for the local Supra-Router-51M classifier daemon
+/// (ROUT-01). Bound to loopback only — this is an internal pre-classifier,
+/// never externally reachable.
+pub struct SupraRouterClient {
+    base_url: String,
+    timeout: Duration,
+    http: reqwest::Client,
+}
+
+impl SupraRouterClient {
+    /// Build a client from environment variables:
+    ///   `SUPRA_ROUTER_URL` (default `http://127.0.0.1:8878`)
+    ///   `SUPRA_ROUTER_TIMEOUT_MS` (default 500)
+    pub fn from_env() -> Self {
+        let base_url = std::env::var("SUPRA_ROUTER_URL")
+            .unwrap_or_else(|_| DEFAULT_SUPRA_ROUTER_URL.to_string());
+        let timeout_ms = std::env::var("SUPRA_ROUTER_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_DAEMON_TIMEOUT_MS);
+        Self {
+            base_url,
+            timeout: Duration::from_millis(timeout_ms),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    /// Explicit constructor for tests (points at an `httpmock` server).
+    pub fn with_base_url(base_url: impl Into<String>, timeout: Duration) -> Self {
+        Self {
+            base_url: base_url.into(),
+            timeout,
+            http: reqwest::Client::new(),
+        }
+    }
+
+    /// Call the daemon's `/classify` endpoint. Returns the raw text body on
+    /// success. ANY failure mode (connection refused, timeout, non-2xx,
+    /// network error) returns `None` uniformly — the caller must fall back
+    /// cleanly and must never block or error the request on this failing.
+    ///
+    /// The timeout covers the ENTIRE round trip (connect + send + headers +
+    /// body read), not just `.send()` — a daemon that returns fast headers
+    /// then stalls the body must not be able to block past `self.timeout`.
+    pub async fn classify_raw(&self, prompt: &str) -> Option<String> {
+        let url = format!("{}/classify", self.base_url.trim_end_matches('/'));
+        let call = async {
+            let resp = self
+                .http
+                .post(&url)
+                .json(&serde_json::json!({ "prompt": prompt }))
+                .send()
+                .await
+                .ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            resp.text().await.ok()
+        };
+
+        match tokio::time::timeout(self.timeout, call).await {
+            Ok(body) => body,
+            Err(_elapsed) => None,
+        }
+    }
+}
+
+impl AgenticModelRouter {
+    /// ROUT-04: the turn-zero hybrid decision.
+    ///
+    /// 1. Call the Supra-Router daemon for a classification of `query`.
+    /// 2. If it returns a usable result (parses via ROUT-02/03), compute its
+    ///    route recommendation.
+    /// 3. Always also compute what the existing keyword heuristic would do
+    ///    (turn-zero: 0 tool results, 0 chars, the initial query) — this is
+    ///    the fallback, and the shadow-mode baseline.
+    /// 4. In `RouterMode::Active` with a usable hybrid result, act on the
+    ///    hybrid route. Otherwise (daemon unavailable/unreachable/timeout/
+    ///    malformed, OR `RouterMode::Shadow`) act on the heuristic — today's
+    ///    behavior, unchanged.
+    /// 5. If the acted-on decision says escalate, call `self.escalate()` —
+    ///    this reuses the existing upgrade-only, max-one-escalation
+    ///    invariant unchanged; mid-session escalation later in the same
+    ///    execution can still fire but can never downgrade.
+    pub async fn decide_turn_zero(
+        &mut self,
+        client: &SupraRouterClient,
+        mode: RouterMode,
+        query: &str,
+    ) -> TurnZeroDecision {
+        let heuristic_would_escalate = self.heuristic.assess_complexity(0, 0, query);
+
+        let hybrid: Option<(Route, RouterClassification)> = match client.classify_raw(query).await {
+            Some(raw) => match parse_classification(&raw) {
+                Ok(classification) => {
+                    let route = route_for(query, &classification);
+                    Some((route, classification))
+                }
+                Err(ClassificationError::Unavailable) => None,
+            },
+            None => None,
+        };
+
+        let (acted_escalate, source) = match (&hybrid, mode) {
+            (Some((route, _)), RouterMode::Active) => {
+                (*route == Route::Big, DecisionSource::SupraRouter)
+            }
+            _ => (heuristic_would_escalate, DecisionSource::HeuristicFallback),
+        };
+
+        if acted_escalate {
+            self.escalate();
+        }
+
+        TurnZeroDecision {
+            heuristic_would_escalate,
+            hybrid_route: hybrid.as_ref().map(|(r, _)| *r),
+            hybrid_classification: hybrid.map(|(_, c)| c),
+            mode,
+            source,
+            acted_escalate,
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -513,5 +742,208 @@ mod tests {
         assert!(router.should_escalate(5, 10000, "analyze and compare everything"));
         assert!(router.escalate().is_none()); // slot already used
         assert_eq!(router.current_model(), "deep-120b"); // still deep
+    }
+
+    // ── ROUT-04: RouterMode ────────────────────────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn test_router_mode_defaults_to_shadow_when_unset() {
+        std::env::remove_var("ROUTER_MODE");
+        assert_eq!(RouterMode::from_env(), RouterMode::Shadow);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_router_mode_defaults_to_shadow_on_garbage_value() {
+        std::env::set_var("ROUTER_MODE", "banana");
+        assert_eq!(RouterMode::from_env(), RouterMode::Shadow);
+        std::env::remove_var("ROUTER_MODE");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_router_mode_active_case_insensitive() {
+        std::env::set_var("ROUTER_MODE", "ACTIVE");
+        assert_eq!(RouterMode::from_env(), RouterMode::Active);
+        std::env::remove_var("ROUTER_MODE");
+    }
+
+    #[test]
+    fn test_router_mode_default_impl_is_shadow() {
+        assert_eq!(RouterMode::default(), RouterMode::Shadow);
+    }
+
+    // ── ROUT-04: decide_turn_zero — hybrid integration ─────────────────────────
+
+    fn clean_mock_response(complexity: u8, math: bool, code: bool) -> String {
+        format!(
+            "Domain: general | Complexity: {complexity} | Math: {math} | Code: {code} | Route: n/a | Justification: n/a"
+        )
+    }
+
+    #[tokio::test]
+    async fn test_shadow_mode_ignores_hybrid_even_when_daemon_available() {
+        let server = httpmock::MockServer::start_async().await;
+        let _mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/classify");
+                then.status(200).body(clean_mock_response(5, false, false));
+            })
+            .await;
+
+        let client = SupraRouterClient::with_base_url(server.base_url(), Duration::from_millis(500));
+        let mut router = AgenticModelRouter::with_models("fast", "deep");
+
+        // Heuristic alone would NOT escalate for this trivial query, even
+        // though the daemon says Complexity=5 (would be Big). Shadow mode
+        // must ignore the daemon's opinion for the acted-on decision.
+        let decision = router
+            .decide_turn_zero(&client, RouterMode::Shadow, "hello there")
+            .await;
+
+        assert_eq!(decision.source, DecisionSource::HeuristicFallback);
+        assert!(!decision.acted_escalate, "shadow mode must not act on hybrid result");
+        assert_eq!(router.current_model(), "fast", "shadow mode leaves model unchanged from heuristic");
+        // But the hybrid opinion is still captured for logging (ROUT-06).
+        assert_eq!(decision.hybrid_route, Some(Route::Big));
+    }
+
+    #[tokio::test]
+    async fn test_active_mode_acts_on_daemon_classification() {
+        let server = httpmock::MockServer::start_async().await;
+        let _mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/classify");
+                then.status(200).body(clean_mock_response(4, false, false));
+            })
+            .await;
+
+        let client = SupraRouterClient::with_base_url(server.base_url(), Duration::from_millis(500));
+        let mut router = AgenticModelRouter::with_models("fast", "deep");
+
+        let decision = router
+            .decide_turn_zero(&client, RouterMode::Active, "trivial query")
+            .await;
+
+        assert_eq!(decision.source, DecisionSource::SupraRouter);
+        assert!(decision.acted_escalate);
+        assert_eq!(router.current_model(), "deep");
+    }
+
+    #[tokio::test]
+    async fn test_active_mode_falls_back_when_daemon_unreachable() {
+        // No server started at all — connection must fail immediately.
+        let client = SupraRouterClient::with_base_url("http://127.0.0.1:1", Duration::from_millis(200));
+        let mut router = AgenticModelRouter::with_models("fast", "deep");
+
+        let decision = router
+            .decide_turn_zero(&client, RouterMode::Active, "hello there")
+            .await;
+
+        assert_eq!(decision.source, DecisionSource::HeuristicFallback);
+        assert_eq!(router.current_model(), "fast");
+    }
+
+    #[tokio::test]
+    async fn test_active_mode_falls_back_when_daemon_returns_malformed_output() {
+        let server = httpmock::MockServer::start_async().await;
+        let _mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/classify");
+                then.status(200).body("complete garbage with no structure");
+            })
+            .await;
+
+        let client = SupraRouterClient::with_base_url(server.base_url(), Duration::from_millis(500));
+        let mut router = AgenticModelRouter::with_models("fast", "deep");
+
+        let decision = router
+            .decide_turn_zero(&client, RouterMode::Active, "analyze this")
+            .await;
+
+        // Malformed daemon output -> ClassificationError::Unavailable -> falls
+        // back to heuristic, which DOES escalate on "analyze" here.
+        assert_eq!(decision.source, DecisionSource::HeuristicFallback);
+        assert!(decision.acted_escalate);
+        assert_eq!(router.current_model(), "deep");
+    }
+
+    #[tokio::test]
+    async fn test_daemon_timeout_falls_back_cleanly_never_blocks() {
+        let server = httpmock::MockServer::start_async().await;
+        let _mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/classify");
+                then.status(200)
+                    .delay(Duration::from_millis(300))
+                    .body(clean_mock_response(5, false, false));
+            })
+            .await;
+
+        // Timeout shorter than the mock's delay -> must fall back, not hang.
+        let client = SupraRouterClient::with_base_url(server.base_url(), Duration::from_millis(50));
+        let mut router = AgenticModelRouter::with_models("fast", "deep");
+
+        let start = std::time::Instant::now();
+        let decision = router
+            .decide_turn_zero(&client, RouterMode::Active, "hello there")
+            .await;
+        assert!(start.elapsed() < Duration::from_millis(250), "must not block past the configured timeout");
+
+        assert_eq!(decision.source, DecisionSource::HeuristicFallback);
+        assert_eq!(router.current_model(), "fast");
+    }
+
+    #[tokio::test]
+    async fn test_mid_session_escalation_is_upgrade_only_after_hybrid_turn_zero() {
+        let server = httpmock::MockServer::start_async().await;
+        let _mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/classify");
+                then.status(200).body(clean_mock_response(4, false, false));
+            })
+            .await;
+
+        let client = SupraRouterClient::with_base_url(server.base_url(), Duration::from_millis(500));
+        let mut router = AgenticModelRouter::with_models("fast", "deep");
+
+        // Turn zero escalates via hybrid (active mode).
+        let decision = router
+            .decide_turn_zero(&client, RouterMode::Active, "trivial")
+            .await;
+        assert!(decision.acted_escalate);
+        assert_eq!(router.current_model(), "deep");
+
+        // Mid-session heuristic escalation attempt must be a no-op — never
+        // downgrades, and the one-escalation slot is already consumed.
+        assert!(router.escalate().is_none());
+        assert_eq!(router.current_model(), "deep");
+    }
+
+    #[test]
+    fn test_shadow_actual_agree_true_when_no_hybrid_opinion() {
+        let decision = TurnZeroDecision {
+            heuristic_would_escalate: false,
+            hybrid_classification: None,
+            hybrid_route: None,
+            mode: RouterMode::Shadow,
+            source: DecisionSource::HeuristicFallback,
+            acted_escalate: false,
+        };
+        assert!(decision.shadow_actual_agree());
+    }
+
+    #[test]
+    fn test_shadow_actual_agree_detects_disagreement() {
+        let decision = TurnZeroDecision {
+            heuristic_would_escalate: false,
+            hybrid_classification: None,
+            hybrid_route: Some(Route::Big),
+            mode: RouterMode::Shadow,
+            source: DecisionSource::HeuristicFallback,
+            acted_escalate: false,
+        };
+        assert!(!decision.shadow_actual_agree());
     }
 }

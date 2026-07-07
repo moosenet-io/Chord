@@ -7,6 +7,7 @@ pub mod model_router;
 pub mod permissions;
 pub mod response_guard;
 pub mod result_guard;
+pub mod router_classifier;
 pub mod streaming;
 pub mod synthesis;
 
