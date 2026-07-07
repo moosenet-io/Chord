@@ -9,6 +9,19 @@
 //!   POST /v1/chat/completions  → OpenAI-compatible LLM proxy (→ CHORD_LLM_URL)
 //!   POST /v1/coding/select     → CPROX-03/04: fleet-driven coding-model resolution
 //!   GET  /health               → health check (no auth)
+//!
+//! ## Audit logging (tools/list, tools/call, tools/discover)
+//! Every reachable outcome of these three handlers — auth failure, rate-limit
+//! rejection, and the underlying proxy call's success/error — produces exactly
+//! one `AuditLogger` entry (never tool arguments or raw discover query text;
+//! see `crate::audit` and `proxy_error_kind` below). One outcome is NOT
+//! covered: a malformed request body fails Axum's `Json<T>` extractor before
+//! the handler body runs, so it never reaches an audit call. Closing that gap
+//! would require moving auth/audit into a `tower` layer ahead of the
+//! extractor (the existing `AuditLayer` in `middleware.rs` sketches this but
+//! is not wired in) — tracked as a follow-up, not attempted here to keep this
+//! change scoped to the handler-body audit gap the tool-allowlist review
+//! flagged.
 
 use axum::{
     body::Body,
@@ -120,6 +133,34 @@ fn proxy_error_response(err: ProxyError) -> Response {
     (status, Json(body)).into_response()
 }
 
+/// Coarse-grained, argument-free classification of a `ProxyError` for audit
+/// logging. Deliberately NEVER uses the error's `Display`/`to_string()` text:
+/// `ProxyError::ToolExecution`/`McpBackend`/`Session` wrap strings that can
+/// originate from a tool backend's own response, which may echo back content
+/// derived from the (potentially sensitive) call arguments. The audit log gets
+/// only this fixed, safe classification — full detail stays in the (separate,
+/// non-persistent) `tracing::warn!` diagnostic already logged alongside it.
+fn proxy_error_kind(err: &ProxyError) -> &'static str {
+    match err {
+        ProxyError::McpBackend(_) => "mcp_backend_error",
+        ProxyError::Session(_) => "session_error",
+        ProxyError::ToolNotFound(_) => "tool_not_found",
+        ProxyError::ToolExecution(_) => "tool_execution_error",
+        ProxyError::Timeout(_) => "timeout",
+        ProxyError::Http(_) => "http_error",
+        ProxyError::Json(_) => "json_error",
+        ProxyError::Config(_) => "config_error",
+    }
+}
+
+/// Map a `ProxyError` to the audit `Status` it represents.
+fn proxy_error_audit_status(err: &ProxyError) -> AuditStatus {
+    match err {
+        ProxyError::Timeout(_) => AuditStatus::Timeout,
+        _ => AuditStatus::Error,
+    }
+}
+
 /// Build response headers for rate limit information.
 fn rate_limit_headers(result: &RateLimitResult) -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -168,9 +209,20 @@ pub async fn tools_list(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Response {
+    let start = Instant::now();
+
     let claims = match auth_check(&headers, &state.jwt_secret) {
         Ok(c) => c,
-        Err(e) => return auth_error_response(e),
+        Err(e) => {
+            let raw = headers
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|h| extract_bearer(h).ok());
+            state
+                .audit_logger
+                .log_auth_failure(raw, start.elapsed().as_millis() as u64);
+            return auth_error_response(e);
+        }
     };
 
     // Tool calls (list) count against the tool budget.
@@ -181,6 +233,12 @@ pub async fn tools_list(
     };
 
     if !rl_result.allowed {
+        state.audit_logger.log_tool_list(
+            &claims.sub,
+            start.elapsed().as_millis() as u64,
+            AuditStatus::Error,
+            Some("rate_limited".to_string()),
+        );
         return rate_limit_exceeded_response(&rl_result, CallType::Tool);
     }
 
@@ -188,12 +246,24 @@ pub async fn tools_list(
     match state.proxy.tool_list().await {
         Ok(tools) => {
             let count = tools.len();
+            state.audit_logger.log_tool_list(
+                &claims.sub,
+                start.elapsed().as_millis() as u64,
+                AuditStatus::Success,
+                None,
+            );
             let mut response = Json(ToolListResponse { tools, count }).into_response();
             response.headers_mut().extend(rl_headers);
             response
         }
         Err(e) => {
             warn!("tools/list error: {e}");
+            state.audit_logger.log_tool_list(
+                &claims.sub,
+                start.elapsed().as_millis() as u64,
+                proxy_error_audit_status(&e),
+                Some(proxy_error_kind(&e).to_string()),
+            );
             proxy_error_response(e)
         }
     }
@@ -219,24 +289,54 @@ pub async fn tools_call(
     headers: HeaderMap,
     Json(req): Json<ToolCallRequest>,
 ) -> Response {
+    let start = Instant::now();
+
     let claims = match auth_check(&headers, &state.jwt_secret) {
         Ok(c) => c,
-        Err(e) => return auth_error_response(e),
+        Err(e) => {
+            let raw = headers
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|h| extract_bearer(h).ok());
+            state
+                .audit_logger
+                .log_auth_failure(raw, start.elapsed().as_millis() as u64);
+            return auth_error_response(e);
+        }
     };
 
     let role = UserRole::from_claim(claims.role.as_deref());
+    // Captured before `req.arguments` is moved into `tool_call` below (and
+    // before the rate-limit check, so a 429 can still be audited with the
+    // tool name) — the audit log records WHICH tool was invoked, never the
+    // (potentially sensitive) `req.arguments` payload itself.
+    let tool_name = req.name.clone();
     let rl_result = {
         let mut rl = state.rate_limiter.lock().await;
         rl.check_and_record(&claims.sub, role, CallType::Tool)
     };
 
     if !rl_result.allowed {
+        state.audit_logger.log_tool_call(
+            &claims.sub,
+            &tool_name,
+            start.elapsed().as_millis() as u64,
+            AuditStatus::Error,
+            Some("rate_limited".to_string()),
+        );
         return rate_limit_exceeded_response(&rl_result, CallType::Tool);
     }
 
     let rl_headers = rate_limit_headers(&rl_result);
     match state.proxy.tool_call(&req.name, req.arguments).await {
         Ok((result, source)) => {
+            state.audit_logger.log_tool_call(
+                &claims.sub,
+                &tool_name,
+                start.elapsed().as_millis() as u64,
+                AuditStatus::Success,
+                None,
+            );
             let mut response = Json(ToolCallResponse {
                 result,
                 source: Some(source.to_string()),
@@ -245,7 +345,14 @@ pub async fn tools_call(
             response
         }
         Err(e) => {
-            warn!("tools/call error for {}: {e}", req.name);
+            warn!("tools/call error for {}: {e}", tool_name);
+            state.audit_logger.log_tool_call(
+                &claims.sub,
+                &tool_name,
+                start.elapsed().as_millis() as u64,
+                proxy_error_audit_status(&e),
+                Some(proxy_error_kind(&e).to_string()),
+            );
             proxy_error_response(e)
         }
     }
@@ -274,9 +381,20 @@ pub async fn tools_discover(
     headers: HeaderMap,
     Json(req): Json<ToolDiscoverRequest>,
 ) -> Response {
+    let start = Instant::now();
+
     let claims = match auth_check(&headers, &state.jwt_secret) {
         Ok(c) => c,
-        Err(e) => return auth_error_response(e),
+        Err(e) => {
+            let raw = headers
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|h| extract_bearer(h).ok());
+            state
+                .audit_logger
+                .log_auth_failure(raw, start.elapsed().as_millis() as u64);
+            return auth_error_response(e);
+        }
     };
 
     let role = UserRole::from_claim(claims.role.as_deref());
@@ -286,6 +404,13 @@ pub async fn tools_discover(
     };
 
     if !rl_result.allowed {
+        state.audit_logger.log_tool_discover(
+            &claims.sub,
+            "",
+            start.elapsed().as_millis() as u64,
+            AuditStatus::Error,
+            Some("rate_limited".to_string()),
+        );
         return rate_limit_exceeded_response(&rl_result, CallType::Tool);
     }
 
@@ -294,6 +419,15 @@ pub async fn tools_discover(
     match state.proxy.tool_discover(&req.query, max).await {
         Ok(tools) => {
             let count = tools.len();
+            // The raw query text is NEVER logged — only a safe, pre-summarised
+            // result count. See `AuditLogger::log_tool_discover`.
+            state.audit_logger.log_tool_discover(
+                &claims.sub,
+                &format!("results={count}"),
+                start.elapsed().as_millis() as u64,
+                AuditStatus::Success,
+                None,
+            );
             let query = req.query.clone();
             let mut response = Json(ToolDiscoverResponse { tools, query, count }).into_response();
             response.headers_mut().extend(rl_headers);
@@ -301,6 +435,13 @@ pub async fn tools_discover(
         }
         Err(e) => {
             warn!("tools/discover error: {e}");
+            state.audit_logger.log_tool_discover(
+                &claims.sub,
+                "",
+                start.elapsed().as_millis() as u64,
+                proxy_error_audit_status(&e),
+                Some(proxy_error_kind(&e).to_string()),
+            );
             proxy_error_response(e)
         }
     }
@@ -1040,6 +1181,23 @@ mod tests {
         async fn execute(&self, _: Value) -> Result<String, ProxyError> { Ok("pong".into()) }
     }
 
+    /// A tool whose backend failure message embeds content that could plausibly
+    /// derive from caller-supplied arguments (e.g. an upstream API echoing back
+    /// an invalid field value). Used to prove `proxy_error_kind()` strips this
+    /// down to a fixed classification rather than persisting it verbatim.
+    struct FailingTool;
+    #[async_trait::async_trait]
+    impl FallbackTool for FailingTool {
+        fn name(&self) -> &str { "gitea_fail_test" }
+        fn description(&self) -> &str { "Always fails with backend-echoed content" }
+        fn parameters(&self) -> Value { serde_json::json!({}) }
+        async fn execute(&self, _: Value) -> Result<String, ProxyError> {
+            Err(ProxyError::ToolExecution(
+                "backend rejected field api_key=<REDACTED-SECRET>".into(),
+            ))
+        }
+    }
+
     fn default_rate_config() -> RateLimitConfig {
         RateLimitConfig {
             user_llm_limit: 200,
@@ -1147,6 +1305,135 @@ mod tests {
         let agentic_executor = Arc::new(AgenticExecutor::new(proxy_arc));
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(default_rate_config())));
         let audit_logger = Arc::new(AuditLogger::new(std::path::PathBuf::from("/dev/null")));
+        let (model_registry, pull_coordinator) = empty_model_state();
+        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source() })
+    }
+
+    /// Like `test_state`, but the audit logger writes to a real file (instead of
+    /// `/dev/null`) so tests can assert on the JSONL entries it produces.
+    fn test_state_with_audit_path(mcp_url: String, audit_path: std::path::PathBuf) -> Arc<AppState> {
+        let mut reg = FallbackRegistry::new();
+        reg.register(Box::new(PingTool));
+        let config = Config {
+            mcp_backend_url: mcp_url,
+            jwt_secret: String::new(), // auth disabled for most tests
+            tool_timeout_secs: 5,
+            catalog_cache_secs: 300,
+            listen_port: 9099,
+            control_port: 8090,
+            rate_limits: default_rate_config(),
+            llm_backend_url: None,
+            model_aliases: std::collections::HashMap::new(),
+            model_archive_path: "/var/lib/model-archive".into(),
+            model_local_path: "/opt/ollama-models".into(),
+            model_protected: vec![],
+            model_pull_timeout_secs: 600,
+            model_registry_path: "<path>/model-registry.json".into(),
+            model_disk_pressure_percent: 80,
+            model_sweep_interval_secs: 1800,
+            model_warm_cooldown_hours: 168,
+            model_source_allowlist: Vec::new(),
+            outbound_proxy: None,
+            runtime_telemetry_off: true,
+            mcp_backend_token: None,
+        };
+        let proxy = McpProxy::new(&config, Arc::new(reg));
+        let proxy_arc = Arc::new(McpProxy::new(
+            &Config {
+                mcp_backend_url: "http://does-not-exist:9999".into(),
+                jwt_secret: String::new(),
+                tool_timeout_secs: 5,
+                catalog_cache_secs: 300,
+                listen_port: 9099,
+                control_port: 8090,
+                rate_limits: default_rate_config(),
+                llm_backend_url: None,
+                model_aliases: std::collections::HashMap::new(),
+                model_archive_path: "/var/lib/model-archive".into(),
+                model_local_path: "/opt/ollama-models".into(),
+                model_protected: vec![],
+                model_pull_timeout_secs: 600,
+                model_registry_path: "<path>/model-registry.json".into(),
+                model_disk_pressure_percent: 80,
+                model_sweep_interval_secs: 1800,
+                model_warm_cooldown_hours: 168,
+                model_source_allowlist: Vec::new(),
+                outbound_proxy: None,
+                runtime_telemetry_off: true,
+                mcp_backend_token: None,
+            },
+            Arc::new(FallbackRegistry::new()),
+        ));
+        let agentic_executor = Arc::new(AgenticExecutor::new(proxy_arc));
+        let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(default_rate_config())));
+        let audit_logger = Arc::new(AuditLogger::new(audit_path));
+        let (model_registry, pull_coordinator) = empty_model_state();
+        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source() })
+    }
+
+    /// Like `test_state_with_audit_path`, but registers `FailingTool` instead of
+    /// `PingTool` — for tests proving a `ToolExecution` error (whose Display text
+    /// may echo backend-side content derived from caller arguments) never
+    /// reaches the persisted audit log.
+    fn test_state_with_failing_tool_and_audit_path(
+        mcp_url: String,
+        audit_path: std::path::PathBuf,
+    ) -> Arc<AppState> {
+        let mut reg = FallbackRegistry::new();
+        reg.register(Box::new(FailingTool));
+        let config = Config {
+            mcp_backend_url: mcp_url,
+            jwt_secret: String::new(),
+            tool_timeout_secs: 5,
+            catalog_cache_secs: 300,
+            listen_port: 9099,
+            control_port: 8090,
+            rate_limits: default_rate_config(),
+            llm_backend_url: None,
+            model_aliases: std::collections::HashMap::new(),
+            model_archive_path: "/var/lib/model-archive".into(),
+            model_local_path: "/opt/ollama-models".into(),
+            model_protected: vec![],
+            model_pull_timeout_secs: 600,
+            model_registry_path: "<path>/model-registry.json".into(),
+            model_disk_pressure_percent: 80,
+            model_sweep_interval_secs: 1800,
+            model_warm_cooldown_hours: 168,
+            model_source_allowlist: Vec::new(),
+            outbound_proxy: None,
+            runtime_telemetry_off: true,
+            mcp_backend_token: None,
+        };
+        let proxy = McpProxy::new(&config, Arc::new(reg));
+        let proxy_arc = Arc::new(McpProxy::new(
+            &Config {
+                mcp_backend_url: "http://does-not-exist:9999".into(),
+                jwt_secret: String::new(),
+                tool_timeout_secs: 5,
+                catalog_cache_secs: 300,
+                listen_port: 9099,
+                control_port: 8090,
+                rate_limits: default_rate_config(),
+                llm_backend_url: None,
+                model_aliases: std::collections::HashMap::new(),
+                model_archive_path: "/var/lib/model-archive".into(),
+                model_local_path: "/opt/ollama-models".into(),
+                model_protected: vec![],
+                model_pull_timeout_secs: 600,
+                model_registry_path: "<path>/model-registry.json".into(),
+                model_disk_pressure_percent: 80,
+                model_sweep_interval_secs: 1800,
+                model_warm_cooldown_hours: 168,
+                model_source_allowlist: Vec::new(),
+                outbound_proxy: None,
+                runtime_telemetry_off: true,
+                mcp_backend_token: None,
+            },
+            Arc::new(FallbackRegistry::new()),
+        ));
+        let agentic_executor = Arc::new(AgenticExecutor::new(proxy_arc));
+        let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(default_rate_config())));
+        let audit_logger = Arc::new(AuditLogger::new(audit_path));
         let (model_registry, pull_coordinator) = empty_model_state();
         Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source() })
     }
@@ -1347,6 +1634,79 @@ mod tests {
         Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source() })
     }
 
+    /// Like `test_state_tight_limits`, but the audit logger writes to a real
+    /// file so a 429 rate-limit rejection's audit entry can be asserted on.
+    fn test_state_tight_limits_with_audit_path(
+        mcp_url: String,
+        audit_path: std::path::PathBuf,
+    ) -> Arc<AppState> {
+        let mut reg = FallbackRegistry::new();
+        reg.register(Box::new(PingTool));
+        let tight = RateLimitConfig {
+            user_llm_limit: 200,
+            user_tool_limit: 2, // low limit for fast test (auth-disabled → User role)
+            user_deep_limit: 50,
+            guest_llm_limit: 3,
+            guest_tool_limit: 2,
+            guest_deep_limit: 1,
+        };
+        let config = Config {
+            mcp_backend_url: mcp_url,
+            jwt_secret: String::new(),
+            tool_timeout_secs: 5,
+            catalog_cache_secs: 300,
+            listen_port: 9099,
+            control_port: 8090,
+            rate_limits: tight.clone(),
+            llm_backend_url: None,
+            model_aliases: std::collections::HashMap::new(),
+            model_archive_path: "/var/lib/model-archive".into(),
+            model_local_path: "/opt/ollama-models".into(),
+            model_protected: vec![],
+            model_pull_timeout_secs: 600,
+            model_registry_path: "<path>/model-registry.json".into(),
+            model_disk_pressure_percent: 80,
+            model_sweep_interval_secs: 1800,
+            model_warm_cooldown_hours: 168,
+            model_source_allowlist: Vec::new(),
+            outbound_proxy: None,
+            runtime_telemetry_off: true,
+            mcp_backend_token: None,
+        };
+        let proxy = McpProxy::new(&config, Arc::new(reg));
+        let proxy_arc = Arc::new(McpProxy::new(
+            &Config {
+                mcp_backend_url: "http://does-not-exist:9999".into(),
+                jwt_secret: String::new(),
+                tool_timeout_secs: 5,
+                catalog_cache_secs: 300,
+                listen_port: 9099,
+                control_port: 8090,
+                rate_limits: tight.clone(),
+                llm_backend_url: None,
+                model_aliases: std::collections::HashMap::new(),
+                model_archive_path: "/var/lib/model-archive".into(),
+                model_local_path: "/opt/ollama-models".into(),
+                model_protected: vec![],
+                model_pull_timeout_secs: 600,
+                model_registry_path: "<path>/model-registry.json".into(),
+                model_disk_pressure_percent: 80,
+                model_sweep_interval_secs: 1800,
+                model_warm_cooldown_hours: 168,
+                model_source_allowlist: Vec::new(),
+                outbound_proxy: None,
+                runtime_telemetry_off: true,
+                mcp_backend_token: None,
+            },
+            Arc::new(FallbackRegistry::new()),
+        ));
+        let agentic_executor = Arc::new(AgenticExecutor::new(proxy_arc));
+        let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(tight)));
+        let audit_logger = Arc::new(AuditLogger::new(audit_path));
+        let (model_registry, pull_coordinator) = empty_model_state();
+        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source() })
+    }
+
     #[tokio::test]
     async fn test_health_endpoint_no_auth() {
         let state = test_state("http://does-not-exist:9999".into());
@@ -1533,6 +1893,240 @@ mod tests {
         let json: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(json["tools"].is_array());
         assert_eq!(json["query"], "ping");
+    }
+
+    // ── Tool-dispatch audit logging (HOFIX: tool_list/tool_call/tool_discover
+    // were never audited — AuditLogger only covered LLM calls) ────────────────
+
+    fn read_audit_entries(path: &std::path::Path) -> Vec<crate::audit::AuditEntry> {
+        let contents = std::fs::read_to_string(path).unwrap_or_default();
+        contents
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("audit line must be valid JSON"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_success_produces_audit_entry_with_tool_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("chord-audit.jsonl");
+        let state = test_state_with_audit_path("http://does-not-exist:9999".into(), audit_path.clone());
+        let app = build_router(state);
+
+        // Arguments deliberately contain secret-shaped content — it must never
+        // reach the audit log.
+        let body = serde_json::to_string(&serde_json::json!({
+            "name": "gitea_ping",
+            "arguments": {"token": "<REDACTED-SECRET>", "note": "hunter2"}
+        })).unwrap();
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/tools/call")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let entries = read_audit_entries(&audit_path);
+        assert_eq!(entries.len(), 1, "exactly one audit entry expected");
+        let entry = &entries[0];
+        assert_eq!(entry.request_type, crate::audit::RequestType::ToolCall);
+        assert_eq!(entry.target, "gitea_ping");
+        assert_eq!(entry.status, crate::audit::Status::Success);
+
+        // No argument content leaks into the log file at all.
+        let raw = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(!raw.contains("<REDACTED-SECRET>"));
+        assert!(!raw.contains("hunter2"));
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_error_produces_audit_entry_no_leak() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("chord-audit.jsonl");
+        let state = test_state_with_audit_path("http://does-not-exist:9999".into(), audit_path.clone());
+        let app = build_router(state);
+
+        let body = serde_json::to_string(&serde_json::json!({
+            "name": "nonexistent_tool",
+            "arguments": {"api_key": "<REDACTED-SECRET>"}
+        })).unwrap();
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/tools/call")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let entries = read_audit_entries(&audit_path);
+        assert_eq!(entries.len(), 1, "a failed tool_call must still be audited");
+        let entry = &entries[0];
+        assert_eq!(entry.request_type, crate::audit::RequestType::ToolCall);
+        assert_eq!(entry.target, "nonexistent_tool");
+        assert_eq!(entry.status, crate::audit::Status::Error);
+        assert_eq!(entry.error_message.as_deref(), Some("tool_not_found"));
+
+        let raw = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(!raw.contains("<REDACTED-SECRET>"));
+    }
+
+    #[tokio::test]
+    async fn test_tools_list_produces_audit_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("chord-audit.jsonl");
+        let state = test_state_with_audit_path("http://does-not-exist:9999".into(), audit_path.clone());
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/tools/list")
+            .header("Content-Type", "application/json")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let entries = read_audit_entries(&audit_path);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].request_type, crate::audit::RequestType::ToolList);
+        assert_eq!(entries[0].status, crate::audit::Status::Success);
+    }
+
+    #[tokio::test]
+    async fn test_tools_discover_produces_audit_entry_without_query_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("chord-audit.jsonl");
+        let state = test_state_with_audit_path("http://does-not-exist:9999".into(), audit_path.clone());
+        let app = build_router(state);
+
+        let sensitive_query = "find the tool that stores api_key <REDACTED-SECRET>";
+        let body = serde_json::to_string(&serde_json::json!({
+            "query": sensitive_query,
+            "max_results": 5
+        })).unwrap();
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/tools/discover")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let entries = read_audit_entries(&audit_path);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].request_type, crate::audit::RequestType::ToolDiscover);
+        assert_eq!(entries[0].status, crate::audit::Status::Success);
+
+        // The raw query text must never appear in the audit log.
+        let raw = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(!raw.contains("<REDACTED-SECRET>"));
+        assert!(!raw.contains(sensitive_query));
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_error_execution_variant_redacts_backend_text() {
+        // ProxyError::ToolExecution's Display text can echo backend content
+        // derived from caller-supplied arguments (unlike ToolNotFound, whose
+        // Display carries only the tool name). Prove proxy_error_kind() strips
+        // this down to a fixed classification rather than persisting it.
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("chord-audit.jsonl");
+        let state = test_state_with_failing_tool_and_audit_path(
+            "http://does-not-exist:9999".into(),
+            audit_path.clone(),
+        );
+        let app = build_router(state);
+
+        let body = serde_json::to_string(&serde_json::json!({
+            "name": "gitea_fail_test",
+            "arguments": {}
+        })).unwrap();
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/tools/call")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let entries = read_audit_entries(&audit_path);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].request_type, crate::audit::RequestType::ToolCall);
+        assert_eq!(entries[0].target, "gitea_fail_test");
+        assert_eq!(entries[0].status, crate::audit::Status::Error);
+        assert_eq!(entries[0].error_message.as_deref(), Some("tool_execution_error"));
+
+        // The backend's echoed "secret" must never appear in the audit log,
+        // even though FailingTool's ProxyError::ToolExecution Display text
+        // contains it.
+        let raw = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(!raw.contains("<REDACTED-SECRET>"));
+        assert!(!raw.contains("api_key"));
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_rate_limited_produces_audit_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("chord-audit.jsonl");
+        let state = test_state_tight_limits_with_audit_path(
+            "http://does-not-exist:9999".into(),
+            audit_path.clone(),
+        );
+        let app = build_router(state);
+
+        // user_tool_limit is 2 — the 3rd call in the same test should 429.
+        for _ in 0..2 {
+            let body = serde_json::to_string(&serde_json::json!({
+                "name": "gitea_ping",
+                "arguments": {}
+            })).unwrap();
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/v1/tools/call")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        let body = serde_json::to_string(&serde_json::json!({
+            "name": "gitea_ping",
+            "arguments": {"secret_arg": "<REDACTED-SECRET>"}
+        })).unwrap();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/tools/call")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let entries = read_audit_entries(&audit_path);
+        assert_eq!(entries.len(), 3, "2 successful calls + 1 rate-limited call");
+        let last = entries.last().unwrap();
+        assert_eq!(last.request_type, crate::audit::RequestType::ToolCall);
+        assert_eq!(last.target, "gitea_ping");
+        assert_eq!(last.status, crate::audit::Status::Error);
+        assert_eq!(last.error_message.as_deref(), Some("rate_limited"));
+
+        let raw = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(!raw.contains("<REDACTED-SECRET>"));
     }
 
     // ── Rate limit header tests ───────────────────────────────────────────────
