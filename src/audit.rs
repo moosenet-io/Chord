@@ -585,10 +585,12 @@ mod tests {
     #[test]
     fn test_tool_discover_never_carries_query_text() {
         let (logger, _dir) = temp_logger();
-        // Callers must pass a pre-summarised target (e.g. a result count), never
-        // the raw query. Simulate a caller that (incorrectly) tried to pass
-        // sensitive-looking query text — assert it's the caller's job to avoid
-        // that, and that a properly summarised target contains no such content.
+        // This method has no access to the raw query at all — only a
+        // pre-summarised `target` (e.g. a result count) that the caller (see
+        // `routes::tools_discover`) is responsible for constructing without the
+        // raw query text. Assert a properly summarised target round-trips
+        // and, by construction, cannot contain query content it was never
+        // given.
         logger.log_tool_discover("lumina", "results=3", 12, Status::Success, None);
 
         let contents = std::fs::read_to_string(&logger.log_path).unwrap();
@@ -597,6 +599,26 @@ mod tests {
         assert_eq!(entry.request_type, RequestType::ToolDiscover);
         assert_eq!(entry.target, "results=3");
         assert_eq!(entry.status, Status::Success);
+    }
+
+    #[test]
+    fn test_tool_discover_error_produces_correct_fields() {
+        let (logger, _dir) = temp_logger();
+        logger.log_tool_discover(
+            "lumina",
+            "",
+            9,
+            Status::Error,
+            Some("mcp_backend_error".into()),
+        );
+
+        let contents = std::fs::read_to_string(&logger.log_path).unwrap();
+        let entry: AuditEntry = serde_json::from_str(contents.trim()).unwrap();
+
+        assert_eq!(entry.request_type, RequestType::ToolDiscover);
+        assert_eq!(entry.target, "");
+        assert_eq!(entry.status, Status::Error);
+        assert_eq!(entry.error_message.as_deref(), Some("mcp_backend_error"));
     }
 
     #[test]
