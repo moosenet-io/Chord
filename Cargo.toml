@@ -27,6 +27,14 @@ path = "src/bin/batch-report.rs"
 name = "chord_proxy"
 path = "src/lib.rs"
 
+[features]
+# Task 2 (federation): gates the live integration test that calls through to
+# the REAL running `terminus_personal` backend. NOT part of default
+# `cargo test --workspace` — run explicitly with
+# `cargo test --features personal-live-test` from a host that can reach it,
+# with PERSONAL_BACKEND_URL/PERSONAL_BACKEND_TOKEN set.
+personal-live-test = []
+
 [dependencies]
 axum = { version = "0.7", features = ["json", "macros"] }
 tokio = { version = "1", features = ["full"] }

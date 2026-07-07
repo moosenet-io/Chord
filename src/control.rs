@@ -531,6 +531,8 @@ mod tests {
             outbound_proxy: None,
             runtime_telemetry_off: true,
             mcp_backend_token: None,
+            personal_backend_url: None,
+            personal_backend_token: None,
         };
         let proxy = McpProxy::new(&config, Arc::new(FallbackRegistry::new()));
         let proxy_arc = Arc::new(McpProxy::new(&config, Arc::new(FallbackRegistry::new())));
@@ -561,6 +563,7 @@ mod tests {
             model_warm_cooldown_hours: 168,
             routing_map,
             coding_profile_source: Arc::new(Mutex::new(None)),
+            personal_proxy: None,
         })
     }
 

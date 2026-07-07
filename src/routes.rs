@@ -93,6 +93,15 @@ pub struct AppState {
     /// ([`crate::coding_proxy::CodingSelectError::NotConfigured`]) rather than
     /// blocking startup or panicking.
     pub coding_profile_source: crate::coding_proxy::SharedCodingProfileSource,
+    /// Task 2 (federation): a second, independent `McpProxy` instance pointed
+    /// at the standalone `terminus_personal` Rust MCP binary, when
+    /// `PERSONAL_BACKEND_URL` is configured. `None` when unset — the
+    /// `/v1/personal/*` routes then return a clean 503 rather than panicking
+    /// or hanging. Constructed with `McpProxy::new_unfiltered` (no
+    /// `tool_allowlist::is_core_tool` scoping) and deliberately never merged
+    /// into `proxy` / `/v1/tools/list` — reachable only via
+    /// `/v1/personal/tools/list` and `/v1/personal/tools/call`.
+    pub personal_proxy: Option<Arc<McpProxy>>,
 }
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -346,6 +355,168 @@ pub async fn tools_call(
         }
         Err(e) => {
             warn!("tools/call error for {}: {e}", tool_name);
+            state.audit_logger.log_tool_call(
+                &claims.sub,
+                &tool_name,
+                start.elapsed().as_millis() as u64,
+                proxy_error_audit_status(&e),
+                Some(proxy_error_kind(&e).to_string()),
+            );
+            proxy_error_response(e)
+        }
+    }
+}
+
+// ── /v1/personal/tools/list, /v1/personal/tools/call ─────────────────────────
+//
+// Task 2 (federation): these mirror `tools_list`/`tools_call` above but
+// operate on `state.personal_proxy` — the second, unfiltered `McpProxy`
+// instance pointed at `terminus_personal`. Kept as separate handler functions
+// (rather than parameterizing the existing ones) so the default
+// `/v1/tools/*` catalog's code path is untouched by this change, per the
+// regression guard in
+// `tests::test_default_tools_list_unchanged_when_personal_unconfigured`.
+//
+// Auth/rate-limiting/audit logging reuse the exact same JWT + `ProxyRateLimiter`
+// + `AuditLogger` machinery as the default tool routes — this is a second
+// catalog, not a second security posture.
+
+/// Returns a clean 503 (never a panic or hang) when `PERSONAL_BACKEND_URL` is
+/// unset, i.e. `state.personal_proxy` is `None`.
+fn personal_backend_unconfigured_response() -> Response {
+    let body = serde_json::json!({
+        "error": "personal backend not configured (PERSONAL_BACKEND_URL unset)"
+    });
+    (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+}
+
+pub async fn personal_tools_list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let start = Instant::now();
+
+    let Some(proxy) = state.personal_proxy.as_ref() else {
+        return personal_backend_unconfigured_response();
+    };
+
+    let claims = match auth_check(&headers, &state.jwt_secret) {
+        Ok(c) => c,
+        Err(e) => {
+            let raw = headers
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|h| extract_bearer(h).ok());
+            state
+                .audit_logger
+                .log_auth_failure(raw, start.elapsed().as_millis() as u64);
+            return auth_error_response(e);
+        }
+    };
+
+    let role = UserRole::from_claim(claims.role.as_deref());
+    let rl_result = {
+        let mut rl = state.rate_limiter.lock().await;
+        rl.check_and_record(&claims.sub, role, CallType::Tool)
+    };
+
+    if !rl_result.allowed {
+        state.audit_logger.log_tool_list(
+            &claims.sub,
+            start.elapsed().as_millis() as u64,
+            AuditStatus::Error,
+            Some("rate_limited".to_string()),
+        );
+        return rate_limit_exceeded_response(&rl_result, CallType::Tool);
+    }
+
+    let rl_headers = rate_limit_headers(&rl_result);
+    match proxy.tool_list().await {
+        Ok(tools) => {
+            let count = tools.len();
+            state.audit_logger.log_tool_list(
+                &claims.sub,
+                start.elapsed().as_millis() as u64,
+                AuditStatus::Success,
+                None,
+            );
+            let mut response = Json(ToolListResponse { tools, count }).into_response();
+            response.headers_mut().extend(rl_headers);
+            response
+        }
+        Err(e) => {
+            warn!("personal tools/list error: {e}");
+            state.audit_logger.log_tool_list(
+                &claims.sub,
+                start.elapsed().as_millis() as u64,
+                proxy_error_audit_status(&e),
+                Some(proxy_error_kind(&e).to_string()),
+            );
+            proxy_error_response(e)
+        }
+    }
+}
+
+pub async fn personal_tools_call(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<ToolCallRequest>,
+) -> Response {
+    let start = Instant::now();
+
+    let Some(proxy) = state.personal_proxy.as_ref() else {
+        return personal_backend_unconfigured_response();
+    };
+
+    let claims = match auth_check(&headers, &state.jwt_secret) {
+        Ok(c) => c,
+        Err(e) => {
+            let raw = headers
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|h| extract_bearer(h).ok());
+            state
+                .audit_logger
+                .log_auth_failure(raw, start.elapsed().as_millis() as u64);
+            return auth_error_response(e);
+        }
+    };
+
+    let role = UserRole::from_claim(claims.role.as_deref());
+    let tool_name = req.name.clone();
+    let rl_result = {
+        let mut rl = state.rate_limiter.lock().await;
+        rl.check_and_record(&claims.sub, role, CallType::Tool)
+    };
+
+    if !rl_result.allowed {
+        state.audit_logger.log_tool_call(
+            &claims.sub,
+            &tool_name,
+            start.elapsed().as_millis() as u64,
+            AuditStatus::Error,
+            Some("rate_limited".to_string()),
+        );
+        return rate_limit_exceeded_response(&rl_result, CallType::Tool);
+    }
+
+    let rl_headers = rate_limit_headers(&rl_result);
+    match proxy.tool_call(&req.name, req.arguments).await {
+        Ok((result, source)) => {
+            state.audit_logger.log_tool_call(
+                &claims.sub,
+                &tool_name,
+                start.elapsed().as_millis() as u64,
+                AuditStatus::Success,
+                None,
+            );
+            let mut response = Json(ToolCallResponse {
+                result,
+                source: Some(source.to_string()),
+            })
+            .into_response();
+            response.headers_mut().extend(rl_headers);
+            response
+        }
+        Err(e) => {
+            warn!("personal tools/call error for {}: {e}", tool_name);
             state.audit_logger.log_tool_call(
                 &claims.sub,
                 &tool_name,
@@ -955,6 +1126,10 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
         .route("/v1/tools/list", axum::routing::post(tools_list))
         .route("/v1/tools/call", axum::routing::post(tools_call))
         .route("/v1/tools/discover", axum::routing::post(tools_discover))
+        // Task 2 (federation): terminus_personal's ~147-tool catalog,
+        // reachable ONLY here — never merged into /v1/tools/list above.
+        .route("/v1/personal/tools/list", axum::routing::post(personal_tools_list))
+        .route("/v1/personal/tools/call", axum::routing::post(personal_tools_call))
         .route("/v1/agent/execute", axum::routing::post(agent_execute))
         .route("/v1/chat/completions", axum::routing::post(chat_completions))
         .route("/v1/infer", axum::routing::post(infer))
@@ -1274,6 +1449,8 @@ mod tests {
             outbound_proxy: None,
             runtime_telemetry_off: true,
             mcp_backend_token: None,
+            personal_backend_url: None,
+            personal_backend_token: None,
         };
         let proxy = McpProxy::new(&config, Arc::new(reg));
         let proxy_arc = Arc::new(McpProxy::new(
@@ -1299,6 +1476,8 @@ mod tests {
             outbound_proxy: None,
             runtime_telemetry_off: true,
             mcp_backend_token: None,
+            personal_backend_url: None,
+            personal_backend_token: None,
             },
             Arc::new(FallbackRegistry::new()),
         ));
@@ -1306,7 +1485,86 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(default_rate_config())));
         let audit_logger = Arc::new(AuditLogger::new(std::path::PathBuf::from("/dev/null")));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source() })
+        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None })
+    }
+
+    /// Task 2: like `test_state`, but with `personal_proxy` set to an
+    /// unfiltered `McpProxy` pointed at `personal_url`. Used by the
+    /// `/v1/personal/tools/*` tests below. `mcp_url` still backs the
+    /// default/core `proxy` exactly as in `test_state` — this builder only
+    /// adds the second, independent federation proxy on top.
+    fn test_state_with_personal(mcp_url: String, personal_url: String) -> Arc<AppState> {
+        let mut reg = FallbackRegistry::new();
+        reg.register(Box::new(PingTool));
+        let config = Config {
+            mcp_backend_url: mcp_url,
+            jwt_secret: String::new(),
+            tool_timeout_secs: 5,
+            catalog_cache_secs: 300,
+            listen_port: 9099,
+            control_port: 8090,
+            rate_limits: default_rate_config(),
+            llm_backend_url: None,
+            model_aliases: std::collections::HashMap::new(),
+            model_archive_path: "/var/lib/model-archive".into(),
+            model_local_path: "/opt/ollama-models".into(),
+            model_protected: vec![],
+            model_pull_timeout_secs: 600,
+            model_registry_path: "<path>/model-registry.json".into(),
+            model_disk_pressure_percent: 80,
+            model_sweep_interval_secs: 1800,
+            model_warm_cooldown_hours: 168,
+            model_source_allowlist: Vec::new(),
+            outbound_proxy: None,
+            runtime_telemetry_off: true,
+            mcp_backend_token: None,
+            personal_backend_url: Some(personal_url.clone()),
+            personal_backend_token: None,
+        };
+        let proxy = McpProxy::new(&config, Arc::new(reg));
+
+        let personal_config = Config {
+            mcp_backend_url: personal_url,
+            ..config.clone()
+        };
+        let personal_proxy = Some(Arc::new(McpProxy::new_unfiltered(
+            &personal_config,
+            Arc::new(FallbackRegistry::new()),
+        )));
+
+        let proxy_arc = Arc::new(McpProxy::new(
+            &Config {
+                mcp_backend_url: "http://does-not-exist:9999".into(),
+                ..config.clone()
+            },
+            Arc::new(FallbackRegistry::new()),
+        ));
+        let agentic_executor = Arc::new(AgenticExecutor::new(proxy_arc));
+        let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(default_rate_config())));
+        let audit_logger = Arc::new(AuditLogger::new(std::path::PathBuf::from("/dev/null")));
+        let (model_registry, pull_coordinator) = empty_model_state();
+        Arc::new(AppState {
+            proxy,
+            jwt_secret: String::new(),
+            audit_logger,
+            rate_limiter,
+            agentic_executor,
+            llm_backend_url: None,
+            model_aliases: std::collections::HashMap::new(),
+            http_client: reqwest::Client::new(),
+            model_registry,
+            pull_coordinator,
+            local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(
+                std::path::PathBuf::from("/tmp"),
+            )),
+            disk_op_lock: crate::models::eviction::new_disk_op_lock(),
+            disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe),
+            disk_pressure_percent: 80,
+            model_warm_cooldown_hours: 168,
+            routing_map: empty_routing_map(),
+            coding_profile_source: empty_coding_profile_source(),
+            personal_proxy,
+        })
     }
 
     /// Like `test_state`, but the audit logger writes to a real file (instead of
@@ -1336,6 +1594,8 @@ mod tests {
             outbound_proxy: None,
             runtime_telemetry_off: true,
             mcp_backend_token: None,
+            personal_backend_url: None,
+            personal_backend_token: None,
         };
         let proxy = McpProxy::new(&config, Arc::new(reg));
         let proxy_arc = Arc::new(McpProxy::new(
@@ -1361,6 +1621,8 @@ mod tests {
                 outbound_proxy: None,
                 runtime_telemetry_off: true,
                 mcp_backend_token: None,
+                personal_backend_url: None,
+                personal_backend_token: None,
             },
             Arc::new(FallbackRegistry::new()),
         ));
@@ -1368,7 +1630,7 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(default_rate_config())));
         let audit_logger = Arc::new(AuditLogger::new(audit_path));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source() })
+        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None })
     }
 
     /// Like `test_state_with_audit_path`, but registers `FailingTool` instead of
@@ -1403,6 +1665,8 @@ mod tests {
             outbound_proxy: None,
             runtime_telemetry_off: true,
             mcp_backend_token: None,
+            personal_backend_url: None,
+            personal_backend_token: None,
         };
         let proxy = McpProxy::new(&config, Arc::new(reg));
         let proxy_arc = Arc::new(McpProxy::new(
@@ -1428,6 +1692,8 @@ mod tests {
                 outbound_proxy: None,
                 runtime_telemetry_off: true,
                 mcp_backend_token: None,
+                personal_backend_url: None,
+                personal_backend_token: None,
             },
             Arc::new(FallbackRegistry::new()),
         ));
@@ -1435,7 +1701,7 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(default_rate_config())));
         let audit_logger = Arc::new(AuditLogger::new(audit_path));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source() })
+        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None })
     }
 
     /// State with auth disabled and an explicit upstream LLM URL for chat/completions tests.
@@ -1482,6 +1748,8 @@ mod tests {
             outbound_proxy: None,
             runtime_telemetry_off: true,
             mcp_backend_token: None,
+            personal_backend_url: None,
+            personal_backend_token: None,
         };
         let proxy = McpProxy::new(&config, Arc::new(FallbackRegistry::new()));
         let proxy_arc = Arc::new(McpProxy::new(&config, Arc::new(FallbackRegistry::new())));
@@ -1503,6 +1771,7 @@ mod tests {
             local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168,
             routing_map,
             coding_profile_source: empty_coding_profile_source(),
+            personal_proxy: None,
         })
     }
 
@@ -1529,6 +1798,8 @@ mod tests {
             outbound_proxy: None,
             runtime_telemetry_off: true,
             mcp_backend_token: None,
+            personal_backend_url: None,
+            personal_backend_token: None,
         };
         let proxy = McpProxy::new(&config, Arc::new(FallbackRegistry::new()));
         let proxy_arc = Arc::new(McpProxy::new(
@@ -1554,6 +1825,8 @@ mod tests {
             outbound_proxy: None,
             runtime_telemetry_off: true,
             mcp_backend_token: None,
+            personal_backend_url: None,
+            personal_backend_token: None,
             },
             Arc::new(FallbackRegistry::new()),
         ));
@@ -1561,7 +1834,7 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(default_rate_config())));
         let audit_logger = Arc::new(AuditLogger::new(std::path::PathBuf::from("/dev/null")));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: secret, audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source() })
+        Arc::new(AppState { proxy, jwt_secret: secret, audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None })
     }
 
     /// Build a state with a very tight user tool limit for rate limit tests.
@@ -1599,6 +1872,8 @@ mod tests {
             outbound_proxy: None,
             runtime_telemetry_off: true,
             mcp_backend_token: None,
+            personal_backend_url: None,
+            personal_backend_token: None,
         };
         let proxy = McpProxy::new(&config, Arc::new(reg));
         let proxy_arc = Arc::new(McpProxy::new(
@@ -1624,6 +1899,8 @@ mod tests {
             outbound_proxy: None,
             runtime_telemetry_off: true,
             mcp_backend_token: None,
+            personal_backend_url: None,
+            personal_backend_token: None,
             },
             Arc::new(FallbackRegistry::new()),
         ));
@@ -1631,7 +1908,7 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(tight)));
         let audit_logger = Arc::new(AuditLogger::new(std::path::PathBuf::from("/dev/null")));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source() })
+        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None })
     }
 
     /// Like `test_state_tight_limits`, but the audit logger writes to a real
@@ -1672,6 +1949,8 @@ mod tests {
             outbound_proxy: None,
             runtime_telemetry_off: true,
             mcp_backend_token: None,
+            personal_backend_url: None,
+            personal_backend_token: None,
         };
         let proxy = McpProxy::new(&config, Arc::new(reg));
         let proxy_arc = Arc::new(McpProxy::new(
@@ -1697,6 +1976,8 @@ mod tests {
                 outbound_proxy: None,
                 runtime_telemetry_off: true,
                 mcp_backend_token: None,
+                personal_backend_url: None,
+                personal_backend_token: None,
             },
             Arc::new(FallbackRegistry::new()),
         ));
@@ -1704,7 +1985,7 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(tight)));
         let audit_logger = Arc::new(AuditLogger::new(audit_path));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source() })
+        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None })
     }
 
     #[tokio::test]
@@ -2787,6 +3068,8 @@ mod tests {
             outbound_proxy: None,
             runtime_telemetry_off: true,
             mcp_backend_token: None,
+            personal_backend_url: None,
+            personal_backend_token: None,
         };
         let proxy = McpProxy::new(&config, Arc::new(FallbackRegistry::new()));
         let proxy_arc = Arc::new(McpProxy::new(&config, Arc::new(FallbackRegistry::new())));
@@ -2807,6 +3090,7 @@ mod tests {
             local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168,
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
+            personal_proxy: None,
         })
     }
 
@@ -2979,5 +3263,263 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         mock.assert_async().await;
+    }
+
+    // ── Task 2 (federation): /v1/personal/tools/* ────────────────────────────
+
+    /// Regression guard: `/v1/tools/list`'s core catalog must be unaffected by
+    /// this change when `PERSONAL_BACKEND_URL` is unset — `test_state` builds
+    /// an `AppState` with `personal_proxy: None`, exactly the pre-Task-2
+    /// shape. Asserts both the status and that the known Rust-fallback tool
+    /// (`gitea_ping`, registered on the CORE registry only) is present,
+    /// proving the core `proxy`'s tool_list path is untouched.
+    #[tokio::test]
+    async fn test_default_tools_list_unchanged_when_personal_unconfigured() {
+        let state = test_state("http://does-not-exist:9999".into());
+        assert!(
+            state.personal_proxy.is_none(),
+            "test_state must not configure a personal proxy"
+        );
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/tools/list")
+            .header("Content-Type", "application/json")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let names: Vec<&str> = json["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"gitea_ping"),
+            "core catalog must still contain the Rust-fallback test tool: {names:?}"
+        );
+    }
+
+    /// `/v1/personal/tools/list` and `/v1/personal/tools/call` must return a
+    /// clean 503 (never panic, never hang) when `PERSONAL_BACKEND_URL` is
+    /// unset — i.e. `state.personal_proxy` is `None`.
+    #[tokio::test]
+    async fn test_personal_routes_return_503_when_unconfigured() {
+        let state = test_state("http://does-not-exist:9999".into());
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/personal/tools/list")
+            .header("Content-Type", "application/json")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/personal/tools/call")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"name":"health","arguments":{}}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Happy path against a mocked `terminus_personal` backend: proves
+    /// `/v1/personal/tools/list` returns the backend's full (unfiltered)
+    /// catalog — including a tool name that is NOT on Chord's
+    /// `tool_allowlist::is_core_tool` list — and that `/v1/tools/list` (the
+    /// default/core catalog) does NOT include it, demonstrating the two
+    /// catalogs stay separate.
+    #[tokio::test]
+    async fn test_personal_tools_list_happy_path_mocked_backend() {
+        let mock_server = httpmock::MockServer::start_async().await;
+        mock_server.mock(|when, then| {
+            when.body_contains(r#""method":"initialize""#);
+            then.status(200)
+                .header("Mcp-Session-Id", "personal-test")
+                .json_body(serde_json::json!({"jsonrpc":"2.0","id":1,"result":{}}));
+        });
+        mock_server.mock(|when, then| {
+            when.body_contains("notifications/initialized");
+            then.status(200).body("");
+        });
+        mock_server.mock(|when, then| {
+            when.body_contains("tools/list");
+            then.status(200).json_body(serde_json::json!({
+                "jsonrpc": "2.0", "id": 2,
+                "result": {
+                    "tools": [
+                        // Deliberately NOT on tool_allowlist::is_core_tool — proves
+                        // the personal proxy's catalog is unfiltered.
+                        {"name": "vitals_today", "description": "Today's health vitals", "inputSchema": {}}
+                    ]
+                }
+            }));
+        });
+
+        let state =
+            test_state_with_personal("http://does-not-exist:9999".into(), mock_server.base_url());
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/personal/tools/list")
+            .header("Content-Type", "application/json")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let names: Vec<&str> = json["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"vitals_today"),
+            "personal catalog must include the non-core tool: {names:?}"
+        );
+
+        // The default/core catalog must NOT pick up the personal-only tool —
+        // the two catalogs never merge.
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/tools/list")
+            .header("Content-Type", "application/json")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let core_names: Vec<&str> = json["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            !core_names.contains(&"vitals_today"),
+            "core catalog must never merge in the personal-only tool: {core_names:?}"
+        );
+    }
+
+    /// Happy path: `/v1/personal/tools/call` executes a tool through the
+    /// mocked personal backend and returns its result.
+    #[tokio::test]
+    async fn test_personal_tools_call_happy_path_mocked_backend() {
+        let mock_server = httpmock::MockServer::start_async().await;
+        mock_server.mock(|when, then| {
+            when.body_contains(r#""method":"initialize""#);
+            then.status(200)
+                .header("Mcp-Session-Id", "personal-call-test")
+                .json_body(serde_json::json!({"jsonrpc":"2.0","id":1,"result":{}}));
+        });
+        mock_server.mock(|when, then| {
+            when.body_contains("notifications/initialized");
+            then.status(200).body("");
+        });
+        mock_server.mock(|when, then| {
+            when.body_contains("tools/call");
+            then.status(200).json_body(serde_json::json!({
+                "jsonrpc": "2.0", "id": 2,
+                "result": {
+                    "content": [{"type": "text", "text": "pong-from-terminus-personal"}]
+                }
+            }));
+        });
+
+        let state =
+            test_state_with_personal("http://does-not-exist:9999".into(), mock_server.base_url());
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/personal/tools/call")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"name":"health","arguments":{}}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["result"], "pong-from-terminus-personal");
+        assert_eq!(json["source"], "mcp");
+    }
+
+    /// LIVE integration test (Task 2): actually calls through to the REAL
+    /// running `terminus_personal` backend and asserts a real tool list comes
+    /// back. Feature-gated behind `personal-live-test` — NOT part of default
+    /// `cargo test --workspace`. Run explicitly from a host that can reach
+    /// the deployed `terminus_personal` backend with:
+    ///   `PERSONAL_BACKEND_URL=<terminus_personal's base URL> \
+    ///    PERSONAL_BACKEND_TOKEN=<terminus_personal's TERMINUS_PERSONAL_TOKEN> \
+    ///    cargo test --features personal-live-test test_personal_live_backend -- --ignored`
+    #[cfg(feature = "personal-live-test")]
+    #[tokio::test]
+    #[ignore = "requires network access to the real terminus_personal backend"]
+    async fn test_personal_live_backend_tools_list() {
+        let personal_url = std::env::var("PERSONAL_BACKEND_URL")
+            .expect("set PERSONAL_BACKEND_URL to run this live test");
+        let personal_token = std::env::var("PERSONAL_BACKEND_TOKEN").ok();
+
+        let config = Config {
+            mcp_backend_url: personal_url,
+            jwt_secret: String::new(),
+            tool_timeout_secs: 15,
+            catalog_cache_secs: 0,
+            listen_port: 9099,
+            control_port: 8090,
+            rate_limits: default_rate_config(),
+            llm_backend_url: None,
+            model_aliases: std::collections::HashMap::new(),
+            model_archive_path: "/var/lib/model-archive".into(),
+            model_local_path: "/opt/ollama-models".into(),
+            model_protected: vec![],
+            model_pull_timeout_secs: 600,
+            model_registry_path: "<path>/model-registry.json".into(),
+            model_disk_pressure_percent: 80,
+            model_sweep_interval_secs: 1800,
+            model_warm_cooldown_hours: 168,
+            model_source_allowlist: Vec::new(),
+            outbound_proxy: None,
+            runtime_telemetry_off: true,
+            mcp_backend_token: personal_token,
+            personal_backend_url: None,
+            personal_backend_token: None,
+        };
+        let proxy = McpProxy::new_unfiltered(&config, Arc::new(FallbackRegistry::new()));
+        let tools = proxy
+            .tool_list()
+            .await
+            .expect("live terminus_personal tools/list call failed");
+        assert!(
+            !tools.is_empty(),
+            "expected a real, non-empty tool catalog from terminus_personal"
+        );
+        println!(
+            "LIVE terminus_personal catalog: {} tools: {:?}",
+            tools.len(),
+            tools.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
     }
 }

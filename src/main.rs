@@ -64,6 +64,31 @@ async fn main() {
         })),
     ));
     let agentic_executor = Arc::new(AgenticExecutor::new(proxy_arc));
+
+    // ── Task 2 (federation): optional second McpProxy for terminus_personal ──
+    // Only constructed when PERSONAL_BACKEND_URL is configured — Chord runs fine
+    // with this unset (no hard dependency). Deliberately unfiltered (no
+    // tool_allowlist::is_core_tool scoping) and reachable only via
+    // /v1/personal/tools/{list,call}, never merged into the default catalog.
+    let personal_proxy = config.personal_backend_url.clone().map(|url| {
+        info!("personal backend federation enabled -> {url}");
+        let mut personal_config = config.clone();
+        personal_config.mcp_backend_url = url;
+        personal_config.mcp_backend_token = config.personal_backend_token.clone();
+        // No Rust fallback registry here (deliberately empty): this proxy's
+        // whole purpose is a pure passthrough to terminus_personal's own
+        // 147-tool catalog — it must never silently serve Chord's own
+        // in-process Rust tools under the personal-catalog routes.
+        Arc::new(McpProxy::new_unfiltered(
+            &personal_config,
+            Arc::new(chord_proxy::mcp_proxy::FallbackRegistry::new()),
+        ))
+    });
+    if personal_proxy.is_none() {
+        info!(
+            "personal backend federation disabled (PERSONAL_BACKEND_URL unset) — /v1/personal/* returns 503"
+        );
+    }
     let audit_logger = Arc::new(AuditLogger::from_env());
     let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(config.rate_limits.clone())));
     let http_client = reqwest::Client::builder()
@@ -243,6 +268,7 @@ async fn main() {
         model_warm_cooldown_hours: config.model_warm_cooldown_hours,
         routing_map,
         coding_profile_source,
+        personal_proxy,
     });
     // TIER-05: the model-tier control API runs on a SECOND listener (control port,
     // default 8090), sharing the same AppState. Build it before `state` is moved

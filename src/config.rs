@@ -135,6 +135,18 @@ pub struct Config {
     /// unless a caller honours this flag — it is exposed for operators who must
     /// debug a runtime that misbehaves with the opt-outs set.
     pub runtime_telemetry_off: bool,
+    /// Task 2 (federation): base URL of the standalone `terminus_personal`
+    /// Rust MCP binary. Reads `PERSONAL_BACKEND_URL`. `None` (unset/blank) →
+    /// the `/v1/personal/*` routes are disabled and return a clean 503, and
+    /// Chord's second `McpProxy` instance is never constructed. This is
+    /// deliberately optional — Chord must run fine with this unset, no hard
+    /// dependency on `terminus_personal` being reachable.
+    pub personal_backend_url: Option<String>,
+    /// Bearer token attached as `Authorization: Bearer <token>` to every outbound
+    /// request to `personal_backend_url`. Reads `PERSONAL_BACKEND_TOKEN`. This is
+    /// `terminus_personal`'s own `TERMINUS_PERSONAL_TOKEN`, read from its `.env`
+    /// at deploy time — never fetched fresh from <secret-manager> by Chord. Never logged.
+    pub personal_backend_token: Option<String>,
 }
 
 /// Manual `Debug` impl: every field is passed through as the derive would,
@@ -179,6 +191,11 @@ impl std::fmt::Debug for Config {
             .field("model_source_allowlist", &self.model_source_allowlist)
             .field("outbound_proxy", &self.outbound_proxy)
             .field("runtime_telemetry_off", &self.runtime_telemetry_off)
+            .field("personal_backend_url", &self.personal_backend_url)
+            .field(
+                "personal_backend_token",
+                &self.personal_backend_token.as_ref().map(|_| "***redacted***"),
+            )
             .finish()
     }
 }
@@ -309,6 +326,21 @@ impl Config {
             .filter(|v| !v.is_empty());
         let runtime_telemetry_off = runtime_telemetry_off();
 
+        // Task 2: optional federation to `terminus_personal`. Unset →
+        // `/v1/personal/*` disabled, no second McpProxy instantiated.
+        let personal_backend_url = normalize_llm_url(std::env::var("PERSONAL_BACKEND_URL").ok());
+        let personal_backend_token = std::env::var("PERSONAL_BACKEND_TOKEN")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        if personal_backend_url.is_some() && personal_backend_token.is_none() {
+            tracing::warn!(
+                target: "chord.personal",
+                "PERSONAL_BACKEND_URL is set but PERSONAL_BACKEND_TOKEN is not — \
+                 outbound requests to terminus_personal will be UNAUTHENTICATED"
+            );
+        }
+
         Ok(Config {
             mcp_backend_url,
             jwt_secret,
@@ -331,6 +363,8 @@ impl Config {
             model_source_allowlist,
             outbound_proxy,
             runtime_telemetry_off,
+            personal_backend_url,
+            personal_backend_token,
         })
     }
 
@@ -361,6 +395,8 @@ impl Config {
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
+            personal_backend_url: None,
+            personal_backend_token: None,
         }
     }
 }
