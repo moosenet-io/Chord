@@ -1495,7 +1495,7 @@ mod tests {
 
         // Result guard
         let rg = ResultGuard::new();
-        let (_, evs3) = rg.scan("searxng_search", "<internal-ip> is the host");
+        let (_, evs3) = rg.scan("searxng_search", "<internal-ip> is the host"); // pii-test-fixture
         assert!(!evs3.is_empty());
         assert_eq!(evs3[0].guard_name, "result_guard");
 
