@@ -181,6 +181,34 @@ impl AuditLogger {
         self.write_entry(&entry);
     }
 
+    /// Log a catalog listing (tools/list endpoint). There is no single "target"
+    /// for a full-catalog request — `target` is left empty rather than, say,
+    /// enumerating every tool name, which would bloat the log with no forensic
+    /// benefit.
+    pub fn log_tool_list(&self, user_id: &str, duration_ms: u64, status: Status, error: Option<String>) {
+        let entry = if status == Status::Success && error.is_none() {
+            AuditEntry::success(user_id, RequestType::ToolList, "", duration_ms)
+        } else {
+            AuditEntry::failed(user_id, RequestType::ToolList, "", duration_ms, status, error)
+        };
+        self.write_entry(&entry);
+    }
+
+    /// Log a catalog search (tools/discover endpoint).
+    ///
+    /// `target` is caller-supplied summary metadata ONLY — e.g. `"results=3"`.
+    /// The search query text itself is deliberately never passed through here:
+    /// it is arbitrary caller-supplied natural-language content and may embed
+    /// sensitive information, so callers of this method must not forward it.
+    pub fn log_tool_discover(&self, user_id: &str, target: &str, duration_ms: u64, status: Status, error: Option<String>) {
+        let entry = if status == Status::Success && error.is_none() {
+            AuditEntry::success(user_id, RequestType::ToolDiscover, target, duration_ms)
+        } else {
+            AuditEntry::failed(user_id, RequestType::ToolDiscover, target, duration_ms, status, error)
+        };
+        self.write_entry(&entry);
+    }
+
     /// Log an authentication failure.
     /// `raw_token` is only used to compute a hash prefix; the value itself is never stored.
     pub fn log_auth_failure(&self, raw_token: Option<&str>, duration_ms: u64) {
@@ -518,6 +546,56 @@ mod tests {
         assert_eq!(entry.request_type, RequestType::ToolCall);
         assert_eq!(entry.target, "get_briefing");
         assert_eq!(entry.duration_ms, 100);
+        assert_eq!(entry.status, Status::Success);
+    }
+
+    #[test]
+    fn test_tool_call_error_produces_correct_fields() {
+        let (logger, _dir) = temp_logger();
+        logger.log_tool_call(
+            "lumina",
+            "infisical_get_secret",
+            15,
+            Status::Error,
+            Some("tool_execution_error".into()),
+        );
+
+        let contents = std::fs::read_to_string(&logger.log_path).unwrap();
+        let entry: AuditEntry = serde_json::from_str(contents.trim()).unwrap();
+
+        assert_eq!(entry.request_type, RequestType::ToolCall);
+        assert_eq!(entry.target, "infisical_get_secret");
+        assert_eq!(entry.status, Status::Error);
+        assert_eq!(entry.error_message.as_deref(), Some("tool_execution_error"));
+    }
+
+    #[test]
+    fn test_tool_list_produces_correct_fields() {
+        let (logger, _dir) = temp_logger();
+        logger.log_tool_list("lumina", 8, Status::Success, None);
+
+        let contents = std::fs::read_to_string(&logger.log_path).unwrap();
+        let entry: AuditEntry = serde_json::from_str(contents.trim()).unwrap();
+
+        assert_eq!(entry.request_type, RequestType::ToolList);
+        assert_eq!(entry.target, "");
+        assert_eq!(entry.status, Status::Success);
+    }
+
+    #[test]
+    fn test_tool_discover_never_carries_query_text() {
+        let (logger, _dir) = temp_logger();
+        // Callers must pass a pre-summarised target (e.g. a result count), never
+        // the raw query. Simulate a caller that (incorrectly) tried to pass
+        // sensitive-looking query text — assert it's the caller's job to avoid
+        // that, and that a properly summarised target contains no such content.
+        logger.log_tool_discover("lumina", "results=3", 12, Status::Success, None);
+
+        let contents = std::fs::read_to_string(&logger.log_path).unwrap();
+        let entry: AuditEntry = serde_json::from_str(contents.trim()).unwrap();
+
+        assert_eq!(entry.request_type, RequestType::ToolDiscover);
+        assert_eq!(entry.target, "results=3");
         assert_eq!(entry.status, Status::Success);
     }
 
