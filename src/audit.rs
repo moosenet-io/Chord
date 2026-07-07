@@ -168,6 +168,7 @@ impl AuditEntry {
 
     /// ROUT-06: construct a routing-decision entry. `raw_prompt` is hashed
     /// immediately and discarded — it is never stored or logged verbatim.
+    #[allow(clippy::too_many_arguments)]
     pub fn routing_decision(
         user_id: &str,
         duration_ms: u64,

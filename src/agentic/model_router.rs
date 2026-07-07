@@ -354,17 +354,29 @@ impl SupraRouterClient {
     /// success. ANY failure mode (connection refused, timeout, non-2xx,
     /// network error) returns `None` uniformly — the caller must fall back
     /// cleanly and must never block or error the request on this failing.
+    ///
+    /// The timeout covers the ENTIRE round trip (connect + send + headers +
+    /// body read), not just `.send()` — a daemon that returns fast headers
+    /// then stalls the body must not be able to block past `self.timeout`.
     pub async fn classify_raw(&self, prompt: &str) -> Option<String> {
         let url = format!("{}/classify", self.base_url.trim_end_matches('/'));
-        let request = self
-            .http
-            .post(&url)
-            .json(&serde_json::json!({ "prompt": prompt }))
-            .send();
+        let call = async {
+            let resp = self
+                .http
+                .post(&url)
+                .json(&serde_json::json!({ "prompt": prompt }))
+                .send()
+                .await
+                .ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            resp.text().await.ok()
+        };
 
-        match tokio::time::timeout(self.timeout, request).await {
-            Ok(Ok(resp)) if resp.status().is_success() => resp.text().await.ok(),
-            _ => None,
+        match tokio::time::timeout(self.timeout, call).await {
+            Ok(body) => body,
+            Err(_elapsed) => None,
         }
     }
 }

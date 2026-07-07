@@ -184,11 +184,19 @@ pub fn is_trivial_code(prompt: &str) -> bool {
     if CONTROL_FLOW_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
         return false;
     }
+    // Code-like punctuation required for the weaker keyword matches
+    // (`return`/`function`) so a plain-English sentence that happens to
+    // contain those words (e.g. "what would you return in that case") isn't
+    // misclassified as trivial code. `def `/`lambda`/`=>` are themselves
+    // unambiguous enough not to need this extra check.
+    let looks_like_code_syntax =
+        lower.contains('(') && lower.contains(')') || lower.contains(':') || lower.contains('=');
+
     lower.starts_with("def ")
         || lower.contains("lambda")
         || lower.contains("=>")
-        || lower.contains("return ")
-        || lower.contains("function ")
+        || (lower.contains("return ") && looks_like_code_syntax)
+        || (lower.contains("function ") && looks_like_code_syntax)
 }
 
 /// A prompt is "trivial arithmetic" if it is exactly one binary arithmetic
@@ -363,6 +371,24 @@ mod tests {
         let c = RouterClassification { complexity: 1, math: false, code: true, raw_domain: None };
         assert_eq!(route_for("def f(x): return x+1", &c), Route::Small);
         assert_eq!(route_for("lambda x: x * 2", &c), Route::Small);
+    }
+
+    #[test]
+    fn test_plain_english_return_sentence_is_not_trivial_code() {
+        // Secondary-review nit: a plain-English sentence containing the word
+        // "return" must not be misclassified as trivial code just because it
+        // matches the bare substring — it lacks any code-like punctuation.
+        let c = RouterClassification { complexity: 1, math: false, code: true, raw_domain: None };
+        assert_eq!(
+            route_for("what would you return in that case", &c),
+            Route::Big
+        );
+    }
+
+    #[test]
+    fn test_return_with_code_punctuation_is_still_trivial() {
+        let c = RouterClassification { complexity: 1, math: false, code: true, raw_domain: None };
+        assert_eq!(route_for("function double(x): return x*2", &c), Route::Small);
     }
 
     #[test]
