@@ -1034,7 +1034,7 @@ mod tests {
     struct PingTool;
     #[async_trait::async_trait]
     impl FallbackTool for PingTool {
-        fn name(&self) -> &str { "ping" }
+        fn name(&self) -> &str { "gitea_ping" }
         fn description(&self) -> &str { "Ping" }
         fn parameters(&self) -> Value { serde_json::json!({}) }
         async fn execute(&self, _: Value) -> Result<String, ProxyError> { Ok("pong".into()) }
@@ -1469,7 +1469,7 @@ mod tests {
         let app = build_router(state);
 
         let body = serde_json::to_string(&serde_json::json!({
-            "name": "ping",
+            "name": "gitea_ping",
             "arguments": {}
         })).unwrap();
 

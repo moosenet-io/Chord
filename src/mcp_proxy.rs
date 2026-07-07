@@ -108,6 +108,20 @@ impl McpProxy {
             }
         };
 
+        // Scope down to Chord's core served-tool allowlist (build pipeline /
+        // model routing only). Everything else — secrets access, personal-
+        // utility tools, general Lumina-fleet orchestration — stays registered
+        // in the upstream MCP backend / Rust fallback registry (still reachable
+        // there directly) but is excluded from what Chord serves.
+        let mcp_tools: Vec<ToolEntry> = mcp_tools
+            .into_iter()
+            .filter(|t| crate::tool_allowlist::is_core_tool(&t.name))
+            .collect();
+        let rust_tools: Vec<ToolEntry> = rust_tools
+            .into_iter()
+            .filter(|t| crate::tool_allowlist::is_core_tool(&t.name))
+            .collect();
+
         cat.update(mcp_tools, rust_tools);
         Ok(cat.all().to_vec())
     }
@@ -120,6 +134,16 @@ impl McpProxy {
     ///
     /// Returns `(result_text, source)` where source is "mcp" or "chord" (Rust fallback).
     pub async fn tool_call(&self, name: &str, args: Value) -> Result<(String, &'static str), ProxyError> {
+        // Hard gate: only tools on Chord's core allowlist are servable, even if
+        // registered in the MCP backend or Rust fallback — this must be checked
+        // here (not just filtered out of the catalog), since a caller who
+        // already knows a tool name could otherwise invoke it directly without
+        // it ever appearing in /v1/tools/list or /v1/tools/discover.
+        if !crate::tool_allowlist::is_core_tool(name) {
+            warn!("Rejected tool_call for non-allowlisted tool: {name}");
+            return Err(ProxyError::ToolNotFound(name.to_string()));
+        }
+
         // If the tool is in the Rust fallback registry and NOT in the warmed MCP
         // catalog (or the catalog isn't warmed yet), skip MCP entirely.
         // This avoids the case where MCP returns HTTP 200 "Unknown tool: X" which
@@ -198,7 +222,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl FallbackTool for EchoTool {
-        fn name(&self) -> &str { "echo_test" }
+        fn name(&self) -> &str { "gitea_echo_test" }
         fn description(&self) -> &str { "Echo the input" }
         fn parameters(&self) -> Value {
             serde_json::json!({"type": "object", "properties": {"text": {"type": "string"}}})
@@ -232,7 +256,7 @@ mod tests {
         reg.register(Box::new(EchoTool));
         let entries = reg.as_catalog_entries();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "echo_test");
+        assert_eq!(entries[0].name, "gitea_echo_test");
         assert_eq!(entries[0].source, "chord");
     }
 
@@ -240,7 +264,7 @@ mod tests {
     async fn test_fallback_registry_call_found() {
         let mut reg = FallbackRegistry::new();
         reg.register(Box::new(EchoTool));
-        let result = reg.call("echo_test", serde_json::json!({"text": "hello"})).await;
+        let result = reg.call("gitea_echo_test", serde_json::json!({"text": "hello"})).await;
         assert!(result.is_some());
         assert_eq!(result.unwrap().unwrap(), "hello");
     }
@@ -298,7 +322,7 @@ mod tests {
 
         let proxy = McpProxy::new(&config, make_registry_with_echo());
         let (result, source) = proxy
-            .tool_call("echo_test", serde_json::json!({"text": "fallback works"}))
+            .tool_call("gitea_echo_test", serde_json::json!({"text": "fallback works"}))
             .await
             .unwrap();
         assert_eq!(result, "fallback works");
@@ -368,7 +392,7 @@ mod tests {
             let mut cat = proxy.catalog.lock().await;
             cat.update(
                 vec![ToolEntry::from_mcp(
-                    "echo_test".into(),
+                    "gitea_echo_test".into(),
                     "MCP-sourced echo (test double)".into(),
                     serde_json::json!({}),
                 )],
@@ -377,7 +401,7 @@ mod tests {
         }
 
         let (result, source) = proxy
-            .tool_call("echo_test", serde_json::json!({"text": "fallback on 401"}))
+            .tool_call("gitea_echo_test", serde_json::json!({"text": "fallback on 401"}))
             .await
             .unwrap();
         assert_eq!(result, "fallback on 401");
@@ -455,7 +479,7 @@ mod tests {
                     "jsonrpc": "2.0", "id": 2,
                     "result": {
                         "tools": [
-                            {"name": "mcp_tool_a", "description": "From MCP", "inputSchema": {}}
+                            {"name": "gitea_tool_a", "description": "From MCP", "inputSchema": {}}
                         ]
                     }
                 }));
@@ -490,8 +514,8 @@ mod tests {
 
         assert!(tools.len() >= 2); // at least mcp_tool_a + echo_test
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.contains(&"mcp_tool_a"));
-        assert!(names.contains(&"echo_test"));
+        assert!(names.contains(&"gitea_tool_a"));
+        assert!(names.contains(&"gitea_echo_test"));
     }
 
     #[tokio::test]
@@ -525,7 +549,7 @@ mod tests {
 
         // Should still return Rust tools even when MCP is down
         assert!(!tools.is_empty());
-        assert!(tools.iter().any(|t| t.name == "echo_test"));
+        assert!(tools.iter().any(|t| t.name == "gitea_echo_test"));
     }
 
     #[tokio::test]
@@ -549,8 +573,8 @@ mod tests {
                     "jsonrpc": "2.0", "id": 2,
                     "result": {
                         "tools": [
-                            {"name": "calendar_today", "description": "Get calendar events today"},
-                            {"name": "email_inbox", "description": "Read email inbox"}
+                            {"name": "gitea_calendar_events_today", "description": "Get calendar events today"},
+                            {"name": "gitea_email_inbox_reader", "description": "Read email inbox"}
                         ]
                     }
                 }));
@@ -584,6 +608,6 @@ mod tests {
         let proxy = McpProxy::new(&config, reg);
         let results = proxy.tool_discover("calendar events", 5).await.unwrap();
         assert!(!results.is_empty());
-        assert_eq!(results[0].name, "calendar_today");
+        assert_eq!(results[0].name, "gitea_calendar_events_today");
     }
 }
