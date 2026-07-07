@@ -228,7 +228,7 @@ pub fn seed_from_env() -> HashMap<String, Backend> {
     // mode, not latency-sensitive interactive traffic. Same generic on-demand
     // shape as `llama-gpu`: serves ANY requested model's Ollama blob on the GPU.
     //
-    // Validated on <host>: llama3.3:70b (Q4_K_M, 42.5GB) — cold-load ~13s, peak
+    // Validated on the GPU inference host: llama3.3:70b (Q4_K_M, 42.5GB) — cold-load ~13s, peak
     // VRAM 50.6GB/96GB at 32k context, generation 5.3 tok/s (prompt 22–24
     // tok/s), dmesg clean.
     let vk_bin = std::env::var("VULKAN_LLAMA_BIN")

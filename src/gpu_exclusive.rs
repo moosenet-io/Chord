@@ -1,9 +1,9 @@
 //! GPU-exclusive coordination — a "service mode" that hands the single host GPU
 //! to an external, GPU-heavy job (the Terminus intake benchmarking harness on
-//! <host>) WITHOUT ever taking Chord down.
+//! the GPU inference host) WITHOUT ever taking Chord down.
 //!
 //! ## Why this exists
-//! <host> is a dedicated, single-GPU (gfx1151 APU, no multi-tenancy) host. Chord
+//! The GPU inference host is a dedicated, single-GPU (gfx1151 APU, no multi-tenancy) host. Chord
 //! is the always-on backbone proxy for the whole fleet. The benchmarking harness
 //! (`intake_coder_sweep` / `intake_assistant_sweep`, in the Terminus repo) needs
 //! EXCLUSIVE GPU access while it profiles models — two inference jobs stacked in
