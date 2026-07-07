@@ -69,10 +69,31 @@ pub struct McpProxy {
     catalog: Mutex<ToolCatalog>,
     fallback: Arc<FallbackRegistry>,
     timeout: Duration,
+    /// Whether `crate::tool_allowlist::is_core_tool` scopes this instance's
+    /// served catalog/callable tools. `true` for Chord's default/core proxy
+    /// (the ~56-tool build-pipeline catalog — this is the allowlist's whole
+    /// purpose). `false` for the Task 2 `terminus_personal` federation proxy,
+    /// whose entire ~147-tool personal/utility catalog is intentionally
+    /// served — just never merged into the default catalog (see
+    /// `new_unfiltered` and the separate `/v1/personal/*` routes).
+    filter_core_tools: bool,
 }
 
 impl McpProxy {
     pub fn new(config: &Config, fallback: Arc<FallbackRegistry>) -> Self {
+        Self::new_inner(config, fallback, true)
+    }
+
+    /// Like [`Self::new`], but does NOT apply `tool_allowlist::is_core_tool`
+    /// filtering to the catalog or `tool_call` gate. Used for the Task 2
+    /// `terminus_personal` federation proxy: that allowlist exists to scope
+    /// Chord's own default catalog, and must not accidentally narrow a
+    /// second, deliberately-separate backend's full tool surface.
+    pub fn new_unfiltered(config: &Config, fallback: Arc<FallbackRegistry>) -> Self {
+        Self::new_inner(config, fallback, false)
+    }
+
+    fn new_inner(config: &Config, fallback: Arc<FallbackRegistry>, filter_core_tools: bool) -> Self {
         Self {
             session: McpSession::with_token(
                 config.mcp_backend_url.clone(),
@@ -82,6 +103,7 @@ impl McpProxy {
             catalog: Mutex::new(ToolCatalog::new(config.catalog_cache_secs)),
             fallback,
             timeout: Duration::from_secs(config.tool_timeout_secs),
+            filter_core_tools,
         }
     }
 
@@ -96,7 +118,21 @@ impl McpProxy {
 
         let rust_tools = self.fallback.as_catalog_entries();
 
-        // Attempt to fetch from MCP backend
+        // Attempt to fetch from MCP backend.
+        //
+        // Known limitation (flagged in Task 2 review, pre-existing for the core
+        // proxy too): any fetch error here — timeout, connection refused,
+        // malformed JSON — degrades to an empty list rather than surfacing a
+        // 502/504 to the caller. For the core proxy this is masked by the Rust
+        // fallback catalog, so callers still see tools. For the Task 2
+        // federation proxy (`filter_core_tools == false`, no Rust fallback by
+        // design — see `main.rs`), a genuinely down/misbehaving
+        // `terminus_personal` backend is indistinguishable from "it has zero
+        // tools" via `/v1/personal/tools/list`. Not fixed here: doing so
+        // properly means threading a distinct error variant through
+        // `tool_list`'s `Result` for both proxies, which is a broader change
+        // than this task's scope. Tracked as a follow-up rather than papered
+        // over silently.
         let mcp_tools = match self.fetch_mcp_tools().await {
             Ok(tools) => {
                 debug!("Fetched {} MCP tools", tools.len());
@@ -113,14 +149,25 @@ impl McpProxy {
         // utility tools, general Lumina-fleet orchestration — stays registered
         // in the upstream MCP backend / Rust fallback registry (still reachable
         // there directly) but is excluded from what Chord serves.
-        let mcp_tools: Vec<ToolEntry> = mcp_tools
-            .into_iter()
-            .filter(|t| crate::tool_allowlist::is_core_tool(&t.name))
-            .collect();
-        let rust_tools: Vec<ToolEntry> = rust_tools
-            .into_iter()
-            .filter(|t| crate::tool_allowlist::is_core_tool(&t.name))
-            .collect();
+        //
+        // Skipped entirely for the Task 2 federation proxy (`filter_core_tools
+        // == false`): that instance's whole point is to serve
+        // `terminus_personal`'s full catalog through `/v1/personal/tools/list`,
+        // which must never be scoped by an allowlist meant for Chord's own
+        // default catalog.
+        let (mcp_tools, rust_tools) = if self.filter_core_tools {
+            let mcp_tools: Vec<ToolEntry> = mcp_tools
+                .into_iter()
+                .filter(|t| crate::tool_allowlist::is_core_tool(&t.name))
+                .collect();
+            let rust_tools: Vec<ToolEntry> = rust_tools
+                .into_iter()
+                .filter(|t| crate::tool_allowlist::is_core_tool(&t.name))
+                .collect();
+            (mcp_tools, rust_tools)
+        } else {
+            (mcp_tools, rust_tools)
+        };
 
         cat.update(mcp_tools, rust_tools);
         Ok(cat.all().to_vec())
@@ -139,7 +186,10 @@ impl McpProxy {
         // here (not just filtered out of the catalog), since a caller who
         // already knows a tool name could otherwise invoke it directly without
         // it ever appearing in /v1/tools/list or /v1/tools/discover.
-        if !crate::tool_allowlist::is_core_tool(name) {
+        //
+        // Not applied when `filter_core_tools == false` (the Task 2 federation
+        // proxy) — see `tool_list` above for why.
+        if self.filter_core_tools && !crate::tool_allowlist::is_core_tool(name) {
             warn!("Rejected tool_call for non-allowlisted tool: {name}");
             return Err(ProxyError::ToolNotFound(name.to_string()));
         }
@@ -318,6 +368,8 @@ mod tests {
             outbound_proxy: None,
             runtime_telemetry_off: true,
             mcp_backend_token: None,
+            personal_backend_url: None,
+            personal_backend_token: None,
         };
 
         let proxy = McpProxy::new(&config, make_registry_with_echo());
@@ -375,6 +427,8 @@ mod tests {
             // Deliberately unset/wrong-on-the-remote-side: the mock 401s regardless,
             // simulating a backend that has since turned on auth enforcement.
             mcp_backend_token: None,
+            personal_backend_url: None,
+            personal_backend_token: None,
         };
 
         let proxy = McpProxy::new(&config, make_registry_with_echo());
@@ -450,6 +504,8 @@ mod tests {
             outbound_proxy: None,
             runtime_telemetry_off: true,
             mcp_backend_token: None,
+            personal_backend_url: None,
+            personal_backend_token: None,
         };
 
         let reg = Arc::new(FallbackRegistry::new()); // no tools registered
@@ -507,6 +563,8 @@ mod tests {
             outbound_proxy: None,
             runtime_telemetry_off: true,
             mcp_backend_token: None,
+            personal_backend_url: None,
+            personal_backend_token: None,
         };
 
         let proxy = McpProxy::new(&config, make_registry_with_echo());
@@ -542,6 +600,8 @@ mod tests {
             outbound_proxy: None,
             runtime_telemetry_off: true,
             mcp_backend_token: None,
+            personal_backend_url: None,
+            personal_backend_token: None,
         };
 
         let proxy = McpProxy::new(&config, make_registry_with_echo());
@@ -602,6 +662,8 @@ mod tests {
             outbound_proxy: None,
             runtime_telemetry_off: true,
             mcp_backend_token: None,
+            personal_backend_url: None,
+            personal_backend_token: None,
         };
 
         let reg = Arc::new(FallbackRegistry::new());

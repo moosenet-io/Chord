@@ -76,6 +76,8 @@ fn make_noop_executor() -> Arc<AgenticExecutor> {
         outbound_proxy: None,
         runtime_telemetry_off: true,
         mcp_backend_token: None,
+        personal_backend_url: None,
+        personal_backend_token: None,
         control_port: 8090,
     };
     Arc::new(AgenticExecutor::new(Arc::new(McpProxy::new(
@@ -186,6 +188,8 @@ fn make_state(mcp_url: String) -> Arc<AppState> {
         outbound_proxy: None,
         runtime_telemetry_off: true,
         mcp_backend_token: None,
+        personal_backend_url: None,
+        personal_backend_token: None,
         control_port: 8090,
     };
     let proxy = McpProxy::new(&config, Arc::new(reg));
@@ -204,7 +208,7 @@ fn make_state(mcp_url: String) -> Arc<AppState> {
         http_client: reqwest::Client::new(),
         model_registry,
         pull_coordinator,
-        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: std::sync::Arc::new(Mutex::new(chord_proxy::serving::profile::RoutingMap::empty())), coding_profile_source: std::sync::Arc::new(Mutex::new(None)),
+        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: std::sync::Arc::new(Mutex::new(chord_proxy::serving::profile::RoutingMap::empty())), coding_profile_source: std::sync::Arc::new(Mutex::new(None)), personal_proxy: None,
     })
 }
 
@@ -231,6 +235,8 @@ fn make_state_with_auth(mcp_url: String, secret: String) -> Arc<AppState> {
         outbound_proxy: None,
         runtime_telemetry_off: true,
         mcp_backend_token: None,
+        personal_backend_url: None,
+        personal_backend_token: None,
         control_port: 8090,
     };
     let proxy = McpProxy::new(&config, Arc::new(FallbackRegistry::new()));
@@ -249,7 +255,7 @@ fn make_state_with_auth(mcp_url: String, secret: String) -> Arc<AppState> {
         http_client: reqwest::Client::new(),
         model_registry,
         pull_coordinator,
-        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: std::sync::Arc::new(Mutex::new(chord_proxy::serving::profile::RoutingMap::empty())), coding_profile_source: std::sync::Arc::new(Mutex::new(None)),
+        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: std::sync::Arc::new(Mutex::new(chord_proxy::serving::profile::RoutingMap::empty())), coding_profile_source: std::sync::Arc::new(Mutex::new(None)), personal_proxy: None,
     })
 }
 
@@ -284,6 +290,8 @@ fn make_state_tight_limits(mcp_url: String) -> Arc<AppState> {
         outbound_proxy: None,
         runtime_telemetry_off: true,
         mcp_backend_token: None,
+        personal_backend_url: None,
+        personal_backend_token: None,
         control_port: 8090,
     };
     let proxy = McpProxy::new(&config, Arc::new(FallbackRegistry::new()));
@@ -302,7 +310,7 @@ fn make_state_tight_limits(mcp_url: String) -> Arc<AppState> {
         http_client: reqwest::Client::new(),
         model_registry,
         pull_coordinator,
-        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: std::sync::Arc::new(Mutex::new(chord_proxy::serving::profile::RoutingMap::empty())), coding_profile_source: std::sync::Arc::new(Mutex::new(None)),
+        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: std::sync::Arc::new(Mutex::new(chord_proxy::serving::profile::RoutingMap::empty())), coding_profile_source: std::sync::Arc::new(Mutex::new(None)), personal_proxy: None,
     })
 }
 
@@ -332,6 +340,8 @@ fn make_state_with_audit(mcp_url: String, dir: &TempDir) -> Arc<AppState> {
         outbound_proxy: None,
         runtime_telemetry_off: true,
         mcp_backend_token: None,
+        personal_backend_url: None,
+        personal_backend_token: None,
         control_port: 8090,
     };
     let proxy = McpProxy::new(&config, Arc::new(reg));
@@ -350,7 +360,7 @@ fn make_state_with_audit(mcp_url: String, dir: &TempDir) -> Arc<AppState> {
         http_client: reqwest::Client::new(),
         model_registry,
         pull_coordinator,
-        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: std::sync::Arc::new(Mutex::new(chord_proxy::serving::profile::RoutingMap::empty())), coding_profile_source: std::sync::Arc::new(Mutex::new(None)),
+        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: std::sync::Arc::new(Mutex::new(chord_proxy::serving::profile::RoutingMap::empty())), coding_profile_source: std::sync::Arc::new(Mutex::new(None)), personal_proxy: None,
     })
 }
 
@@ -992,6 +1002,8 @@ async fn test_tool_call_both_backends_fail_returns_404() {
         outbound_proxy: None,
         runtime_telemetry_off: true,
         mcp_backend_token: None,
+        personal_backend_url: None,
+        personal_backend_token: None,
         control_port: 8090,
     };
     let proxy = McpProxy::new(&config, Arc::new(FallbackRegistry::new()));
@@ -1010,7 +1022,7 @@ async fn test_tool_call_both_backends_fail_returns_404() {
         http_client: reqwest::Client::new(),
         model_registry,
         pull_coordinator,
-        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: std::sync::Arc::new(Mutex::new(chord_proxy::serving::profile::RoutingMap::empty())), coding_profile_source: std::sync::Arc::new(Mutex::new(None)),
+        local_evictor: std::sync::Arc::new(chord_proxy::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: chord_proxy::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(chord_proxy::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: std::sync::Arc::new(Mutex::new(chord_proxy::serving::profile::RoutingMap::empty())), coding_profile_source: std::sync::Arc::new(Mutex::new(None)), personal_proxy: None,
     });
     let app = build_router(state);
 
