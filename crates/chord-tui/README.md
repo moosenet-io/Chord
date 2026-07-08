@@ -67,6 +67,28 @@ Secrets come from a vault-backed `SecretManager`. The config file stores only a
 `Serialize`, so persisting one is a compile error. Secret values are never
 displayed or logged.
 
+Two `SecretManager` implementations exist, selected automatically at startup by
+`secret::default_secret_manager()`:
+
+- **`InfisicalSecretManager`** (CSEC-03) — the default when <secret-manager> is
+  configured: `INFISICAL_URL`/`INFISICAL_CLIENT_ID`/`INFISICAL_CLIENT_SECRET`
+  (Chord's own bootstrap identity, shared with `chord-proxy`'s CSEC-02 startup
+  fetch) plus `CHORD_INFISICAL_PROJECT_ID` (required; no default) and optional
+  `CHORD_INFISICAL_ENVIRONMENT` (default `prod`) / `CHORD_INFISICAL_SECRET_PATH`
+  (default `/`). Resolves each `SecretRef` via CSEC-01's shared `chord-secrets`
+  Universal Auth client, caching a fetched batch for
+  `CHORD_TUI_INFISICAL_CACHE_TTL_SECS` (default 30s) so the connection
+  manager's per-instance polling doesn't re-authenticate against <secret-manager>
+  every poll tick.
+- **`EnvSecretManager`** — the fallback when <secret-manager> isn't configured (any
+  of the three bootstrap vars or the project id missing): reads each
+  `SecretRef` directly from the process environment, exactly as before. Used
+  automatically for un-migrated deployments and in tests.
+
+Either way, `resolve()` returns `None` rather than panicking or erroring when a
+value can't be produced (missing key, or — for the <secret-manager> path — an
+unreachable vault/auth failure/malformed response), matching `SecretStatus::Missing`.
+
 ## Config
 
 Persisted at the platform config dir (`chord-tui/config.toml`). Missing config →

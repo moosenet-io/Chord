@@ -26,7 +26,12 @@ thiserror = "1.0"
 tracing = "0.1"
 dirs = "5"
 futures-util = { version = "0.3", features = ["std"], default-features = false }
+# CSEC-03: shared <secret-manager> Universal Auth client (CSEC-01) — chord-tui's
+# InfisicalSecretManager wraps this rather than duplicating the auth flow.
+chord-secrets = { path = "../chord-secrets" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "time", "sync", "test-util"] }
 tempfile = "3"
+httpmock = "0.7"
+serial_test = "3"
