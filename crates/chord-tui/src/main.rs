@@ -25,7 +25,7 @@ use chord_tui::connection::{ConnectionManager, HttpHealthProbe, InstanceStatus};
 use chord_tui::modes::chord::chord_client::{ChordClient, ChordSnapshot};
 use chord_tui::modes::chord::models::pull_mutation;
 use chord_tui::modes::chord::ChordPanel;
-use chord_tui::secret::EnvSecretManager;
+use chord_tui::secret::{default_secret_manager, SecretManager};
 use chord_tui::ui::{self, Framedata};
 
 #[tokio::main]
@@ -35,8 +35,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let loaded = Config::load(&cfg_path);
     let config = loaded.config;
 
-    // Vault-backed secrets (env injected by the vault agent; never literals).
-    let secrets = Arc::new(EnvSecretManager::from_env());
+    // Vault-backed secrets (CSEC-03): InfisicalSecretManager when
+    // INFISICAL_URL/INFISICAL_CLIENT_ID/INFISICAL_CLIENT_SECRET +
+    // CHORD_INFISICAL_PROJECT_ID are configured, EnvSecretManager (env
+    // injected by the vault agent; never literals) otherwise.
+    let secrets: Arc<dyn SecretManager> = default_secret_manager();
 
     // Async multi-instance health manager — one task per instance, never blocks.
     let manager = ConnectionManager::spawn(
@@ -81,7 +84,7 @@ async fn run_loop<B: ratatui::backend::Backend>(
     app: &mut App,
     manager: &ConnectionManager,
     chord_client: Option<&ChordClient>,
-    secrets: Arc<EnvSecretManager>,
+    secrets: Arc<dyn SecretManager>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut events = EventStream::new();
     let mut redraw = interval(Duration::from_millis(250));
