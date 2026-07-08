@@ -2,7 +2,10 @@
 # The root `chord-proxy` package plus S91's control TUI client sub-crate.
 # `chord-tui` is a CLIENT of Chord's stable control endpoints — it never
 # links or restarts the proxy binary.
-members = [".", "crates/chord-tui"]
+# `chord-secrets` (CSEC-01) is a shared, dependency-light <secret-manager> Universal
+# Auth client — both `chord-proxy` and `chord-tui` depend on it so the auth
+# flow is written once, not duplicated.
+members = [".", "crates/chord-tui", "crates/chord-secrets"]
 resolver = "2"
 
 [package]
