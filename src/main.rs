@@ -31,6 +31,16 @@ async fn main() {
         )
         .init();
 
+    // CSEC-02: attempt to fetch CHORD_JWT_SECRET/CHORD_API_KEY fresh from
+    // <secret-manager> and set them into the process environment BEFORE
+    // Config::from_env() (below) or HarnessVramManager::from_env() (called
+    // later, from harness_integration) read them — see src/secrets_bootstrap.rs
+    // for the full fallback contract. Never a hard startup failure: falls back
+    // to the static environment when <secret-manager> isn't configured or the fetch
+    // fails.
+    let secret_outcome = chord_proxy::secrets_bootstrap::fetch_and_apply_downstream_secrets().await;
+    chord_proxy::secrets_bootstrap::log_secret_fetch_outcome(&secret_outcome);
+
     let config = Config::from_env().unwrap_or_else(|e| {
         eprintln!("Configuration error: {e}");
         std::process::exit(1);

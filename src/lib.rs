@@ -16,6 +16,7 @@ pub mod models;
 pub mod rate_limiter;
 pub mod routes;
 pub mod routing;
+pub mod secrets_bootstrap;
 pub mod serving;
 pub mod session;
 pub mod snap;
