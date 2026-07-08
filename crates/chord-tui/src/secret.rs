@@ -225,13 +225,37 @@ impl InfisicalSecretManager {
     /// Return the cached batch if still fresh, otherwise fetch a new one and
     /// cache it. A fetch failure is NOT cached — the next call retries rather
     /// than sticking with a stale "everything missing" result.
+    ///
+    /// Single-flight on cache miss: `ConnectionManager` spawns one poll task
+    /// per configured instance, so a cold or just-expired cache would
+    /// otherwise see every task's fast-path read-check fail at the same
+    /// instant and each independently re-authenticate against <secret-manager>
+    /// (a refresh storm, not the "cache" this is meant to be). Instead, a
+    /// miss acquires the write lock and holds it ACROSS the fetch `.await` —
+    /// every other concurrent caller blocks on that same lock rather than
+    /// starting its own fetch, then rechecks freshness once it acquires the
+    /// lock (now populated by whichever caller got there first) before
+    /// deciding it still needs to fetch.
     async fn fetch_batch(&self) -> Option<HashMap<String, String>> {
+        // Fast path: fresh cache under a read lock — the common case doesn't
+        // contend with other readers.
         {
             let cache = self.cache.read().await;
             if let Some((fetched_at, map)) = cache.as_ref() {
                 if fetched_at.elapsed() < self.cache_ttl {
                     return Some(map.clone());
                 }
+            }
+        }
+
+        // Cold/expired cache: serialize on the write lock so concurrent
+        // callers coalesce into a single fetch instead of a refresh storm.
+        let mut cache = self.cache.write().await;
+        if let Some((fetched_at, map)) = cache.as_ref() {
+            if fetched_at.elapsed() < self.cache_ttl {
+                // Another caller already refreshed it while we waited for
+                // the lock — use that instead of fetching again.
+                return Some(map.clone());
             }
         }
 
@@ -244,7 +268,7 @@ impl InfisicalSecretManager {
         .await
         {
             Ok(map) => {
-                *self.cache.write().await = Some((Instant::now(), map.clone()));
+                *cache = Some((Instant::now(), map.clone()));
                 Some(map)
             }
             Err(_) => None,
@@ -401,6 +425,56 @@ mod tests {
         let _ = mgr.resolve(&SecretRef::new("K")).await;
 
         assert_eq!(login_mock.hits(), 1, "second/third resolve should hit the cache, not re-auth");
+        clear_infisical_env();
+    }
+
+    /// Regression test for a real review finding (codex): `ConnectionManager`
+    /// spawns one poll task per configured instance, so a cold/expired cache
+    /// must not let each task's fast-path miss trigger its own independent
+    /// <secret-manager> fetch (a refresh storm). Concurrent resolves against a cold
+    /// cache must coalesce into exactly one login/fetch pair.
+    #[tokio::test]
+    #[serial]
+    async fn infisical_manager_coalesces_concurrent_cold_cache_fetches() {
+        let server = MockServer::start();
+        let login_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/auth/universal-auth/login");
+            // A visible delay widens the race window: without single-flight,
+            // every concurrent caller's fast-path read-check would miss and
+            // each would independently start its own login call while this
+            // one is still "in flight".
+            then.status(200)
+                .delay(Duration::from_millis(50))
+                .json_body(serde_json::json!({ "accessToken": "tok" }));
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v3/secrets/raw");
+            then.status(200).json_body(serde_json::json!({
+                "secrets": [{ "secretKey": "K", "secretValue": "v" }]
+            }));
+        });
+
+        clear_infisical_env();
+        set_bootstrap_env(&server.base_url(), "proj1");
+        let mgr = Arc::new(InfisicalSecretManager::from_env().expect("should be configured"));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let mgr = mgr.clone();
+            handles.push(tokio::spawn(async move {
+                mgr.resolve(&SecretRef::new("K")).await
+            }));
+        }
+        for h in handles {
+            let resolved = h.await.unwrap();
+            assert_eq!(resolved.map(|v| v.expose().to_string()), Some("v".to_string()));
+        }
+
+        assert_eq!(
+            login_mock.hits(),
+            1,
+            "8 concurrent resolves against a cold cache must coalesce into a single <secret-manager> login"
+        );
         clear_infisical_env();
     }
 
