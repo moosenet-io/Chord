@@ -20,9 +20,15 @@ deterministic: it measures each model's serving profile, routes accordingly,
 admits work only when memory genuinely allows, swaps models cleanly, and tracks
 the operating mode of the whole fleet.
 
-Chord is part of the **Lumina constellation**. It is currently being separated
-out of the `lumina-constellation` monorepo (the `chord-proxy` crate) into this
-standalone repository.
+Chord is also the constellation's **MCP tool front door**: it embeds the
+`terminus-rs` tool registry and exposes it over an authenticated HTTP surface
+(`/v1/tools/*`), so agents reach the build-pipeline toolset (Gitea, GitHub,
+Plane, DiffusionGemma review, model-serving introspection) and the LLM backends
+through one JWT-guarded service. See [MCP tool dispatch](#mcp-tool-dispatch)
+below.
+
+Chord ships as the standalone crate `chord-proxy`, extracted from the former
+`lumina-constellation` monorepo into this repository.
 
 ## Architecture
 
@@ -126,14 +132,106 @@ it via the model registry. See
 [docs/serving.md](docs/serving.md#serving-backends) for details and the validated
 `llama3.3:70b` numbers.
 
+## MCP tool dispatch
+
+Beyond model serving, Chord is the constellation's authenticated MCP tool
+gateway. Every tool endpoint requires JWT auth when `CHORD_JWT_SECRET` is
+configured (the same secret as the LLM calls; an empty secret disables auth for
+local/dev use) and is rate-limited per role. Tool-call outcomes are recorded to
+a sanitized audit log that never captures tool arguments or raw query text.
+
+### Core registry — `/v1/tools/*`
+
+The core catalog ([`src/catalog.rs`](src/catalog.rs)) is the merge of two
+sources: MCP tools from the upstream MCP backend (`MCP_BACKEND_URL`) and the
+embedded `terminus-rs` Rust registry, which acts as the fallback position
+(an MCP tool wins when a name collides). The catalog is cached
+(`CHORD_CATALOG_CACHE_SECS`, default 5 min).
+
+What Chord *serves* is deliberately narrower than what it can *reach*: a static
+**core allowlist** ([`src/tool_allowlist.rs`](src/tool_allowlist.rs)) scopes
+`/v1/tools/list`, `/v1/tools/discover`, and `/v1/tools/call` to Chord's actual
+job — the build/spec-execution pipeline (`gitea_*`, `github_*`, `plane_*`),
+DiffusionGemma review (`dgem_*`), and Chord's own model-serving domain
+(`model_advisor_*`, `serving_profile*`, `serving_residency*`, `model_intake*`),
+plus a few built-ins. Anything off the list is excluded from `list`/`discover`
+**and** rejected outright by `call`, even if a caller already knows the name.
+General personal-utility / secrets / fleet-ops tools are intentionally *not*
+served here — that surface belongs to Lumina core talking to Terminus directly.
+
+- `POST /v1/tools/list` — merged, allowlisted catalog.
+- `POST /v1/tools/call` — execute an allowlisted tool by name.
+- `POST /v1/tools/discover` — model-free keyword search over the catalog, so a
+  caller assembles a small per-turn toolset instead of the whole hub.
+- `POST /v1/agent/execute` — the guarded agentic tool-calling loop.
+
+### Personal federation — `/v1/personal/tools/*`
+
+A second, **independent and unfiltered** `McpProxy` is federated in when
+`PERSONAL_BACKEND_URL` is set, pointed at the standalone `terminus_personal`
+Rust MCP binary (which self-fetches its own secrets from the vault). It is
+reachable *only* at `/v1/personal/tools/list` and `/v1/personal/tools/call` and
+is **never** merged into the core `/v1/tools/*` catalog — the two share auth,
+rate-limiting, and audit machinery, but are separate catalogs, not one relaxed
+security posture. When `PERSONAL_BACKEND_URL` is unset the personal routes
+return a clean `503` (never a panic or hang), and the core catalog is provably
+unchanged.
+
+### Agentic model routing (S92 hybrid)
+
+Chord's agentic loop ([`src/agentic/model_router.rs`](src/agentic/model_router.rs))
+runs on a **fast** model by default (`CHORD_FAST_MODEL`) and escalates **once**
+per execution to a **deep** model (`CHORD_DEEP_MODEL`) when a turn gets complex.
+The escalation decision is *hybrid*: a cheap, deterministic keyword-and-size
+heuristic (a small conservative reasoning-word list, plus tool-result-count and
+total-character thresholds) is complemented by a local **Supra-Router-51M**
+daemon (`SUPRA_ROUTER_URL`, deployed with the loopback-bound `dgem.service`
+pattern) that classifies the same turn. The router is gated by `ROUTER_MODE`,
+which **defaults to `Shadow`**: today the Supra decision is computed and logged
+alongside the heuristic (shadow-vs-actual agreement reporting) but the
+**heuristic still drives the actual routing**, because the 51M model's license
+is unresolved — only an explicit `ROUTER_MODE=active` lets the Supra decision
+lead. A user `/deep` prefix forces the deep model outright, and escalation is
+capped at one per execution so a single request never thrashes VRAM.
+
+## Secrets (own <secret-manager> client)
+
+Chord fetches its own runtime secrets rather than having them written into a
+unit file or brokered by another service. A shared, dependency-light <secret-manager>
+Universal-Auth client ([`crates/chord-secrets`](crates/chord-secrets), used by
+both `chord-proxy` and the `chord-tui` control client) authenticates with
+Chord's own machine identity (`INFISICAL_URL` / `INFISICAL_CLIENT_ID` /
+`INFISICAL_CLIENT_SECRET` plus `CHORD_INFISICAL_PROJECT_ID` /
+`CHORD_INFISICAL_ENVIRONMENT` / `CHORD_INFISICAL_SECRET_PATH`). The client
+itself is intentionally stateless — it authenticates fresh per call and keeps no
+token cache or background refresh thread. `chord-proxy` uses it for a one-shot
+startup fetch of values such as `CHORD_JWT_SECRET` / `CHORD_API_KEY`; the
+`chord-tui` control client wraps it in an `InfisicalSecretManager` whose TTL
+cache coalesces concurrent cold-cache misses so its poll tasks never stampede
+<secret-manager> with a re-auth storm. When <secret-manager> config is absent the sanctioned
+env-var fallback is used — no secret is ever hardcoded.
+
 ## Status
 
-Chord ships as the standalone Rust crate `chord-proxy`, version **1.4**. It
-depends on `terminus-rs` 1.1 (the serving-profile types + intake DB config) from
-the Gitea crate registry. The core inference manager — routing, the substrate-aware
-Memory Coordinator, the verified Clean-Swap Launcher, the Mode Controller, the
-SNAP observability subsystem, and per-runtime kernel egress isolation — is in
-place; the coder benchmark charts are the remaining pending item.
+Chord ships as the standalone Rust crate `chord-proxy`, version **1.4**. The
+core inference manager — routing, the substrate-aware Memory Coordinator, the
+verified Clean-Swap Launcher, the Mode Controller, the SNAP observability
+subsystem, and per-runtime kernel egress isolation — is in place, as is the MCP
+tool-dispatch surface, the personal federation, the S92 hybrid agentic router,
+and Chord's own <secret-manager> client.
+
+The core `/v1/tools/*` registry embeds **`terminus-rs` pinned at `1.1.0`** (the
+serving-profile types + intake DB config + the tool registry), resolved from the
+Gitea crate registry. That pin currently **predates** the latest Terminus
+plane-helper additions (`PLANE_PAT_<NAME>` multi-identity, the shared-Redis GET
+cache / rate-limit queue, the prefix registry, and the module-management tools).
+A dependency bump to pick those up is **tracked and pending** — operator-gated on
+the new `terminus-rs` being published to the Gitea registry, then a Chord rebuild
+and redeploy. Until that lands, those newest plane-helper tools are reachable via
+the standalone `terminus_personal` path (personal federation), **not** the core
+`/v1/tools/*` route on the currently deployed binary. The S86 coder-fleet
+benchmark charts and leaderboard are published (see
+[Test Results](#test-results) below).
 
 ## Documentation
 
