@@ -37,6 +37,11 @@ const ALLOWED_EXACT: &[&str] = &[
 ///   pipeline (SKILL v3.4).
 /// - `model_advisor_` / `serving_profile` / `serving_residency` /
 ///   `model_intake` — Chord's own model-routing/serving domain.
+/// - `git_public` — the git-public forge family (`git_public`,
+///   `git_public_capabilities`, `git_public_mirror_status/prepare/approve/
+///   push`), part of the build/mirror pipeline. Deliberately does NOT cover
+///   `git_private`, which stays personal-only and must never be served by
+///   Chord.
 const ALLOWED_PREFIXES: &[&str] = &[
     "gitea_",
     "github_",
@@ -46,6 +51,7 @@ const ALLOWED_PREFIXES: &[&str] = &[
     "serving_profile",
     "serving_residency",
     "model_intake",
+    "git_public",
 ];
 
 /// Returns true if `name` is in Chord's core served-tool allowlist.
@@ -79,9 +85,26 @@ mod tests {
             "model_advisor_recommend",
             "serving_profile_get",
             "serving_residency_status",
+            "git_public",
+            "git_public_capabilities",
+            "git_public_mirror_push",
         ] {
             assert!(is_core_tool(name), "{name} should be allowed");
         }
+    }
+
+    #[test]
+    fn excludes_git_private_while_allowing_git_public_family() {
+        // Guard against over-matching: git_private is personal-only and
+        // must never be served by Chord, even though it shares the `git_`
+        // root with the allowed git_public family.
+        assert!(!is_core_tool("git_private"), "git_private must be excluded");
+        assert!(is_core_tool("git_public"));
+        assert!(is_core_tool("git_public_capabilities"));
+        assert!(is_core_tool("git_public_mirror_status"));
+        assert!(is_core_tool("git_public_mirror_prepare"));
+        assert!(is_core_tool("git_public_mirror_approve"));
+        assert!(is_core_tool("git_public_mirror_push"));
     }
 
     #[test]
