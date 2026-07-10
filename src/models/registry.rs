@@ -278,6 +278,25 @@ struct DiscoveredModel {
     mtime: i64,
 }
 
+/// Owned snapshot of the SLOW manifest-tree filesystem scan produced by
+/// [`ModelRegistry::scan_disk`] and consumed by
+/// [`ModelRegistry::apply_reconcile`]. Opaque to callers (they only move it from
+/// the `spawn_blocking` scan into the brief-locked apply). Holding this owned
+/// snapshot is what lets reconcile run its NFS/FS I/O WITHOUT the registry lock
+/// and then apply the result under the lock in milliseconds — see the S111
+/// regression note on [`ModelRegistry::scan_disk`].
+///
+/// `Send` (all fields are owned `Vec`/`bool`), so it crosses the
+/// `spawn_blocking` boundary.
+pub struct ReconcileScan {
+    /// Models found under the local manifest tree.
+    local: Vec<DiscoveredModel>,
+    /// Models found under the archive manifest tree (empty when unmounted).
+    archive: Vec<DiscoveredModel>,
+    /// Whether the archive root was present/mounted at scan time.
+    archive_present: bool,
+}
+
 /// Parse the registry file, accepting BOTH the new `{models, backends}` wrapper
 /// and the legacy bare `{name: ModelRecord}` map. New format is detected by a
 /// top-level `models`/`backends` key — every Ollama model name carries a `:tag`,
@@ -479,25 +498,55 @@ impl ModelRegistry {
         tagged
     }
 
-    /// Reconcile the registry against the on-disk reality.
+    /// SLOW half of reconcile: walk the local and (if mounted) archive Ollama
+    /// manifest trees and return an owned [`ReconcileScan`].
     ///
-    /// Scans the local manifest tree and (if mounted) the archive manifest tree
-    /// and updates records:
+    /// This is pure filesystem I/O — it takes NO `&self` and holds NO lock, so
+    /// callers MUST run it OFF the registry `Mutex` (via
+    /// `tokio::task::spawn_blocking`) and only then apply the result under a
+    /// brief lock with [`apply_reconcile`](Self::apply_reconcile).
+    ///
+    /// **Why this split exists (S111 production regression).** The archive scan
+    /// walks the QNAP NFS store; with ~66 cold models it took ~84s live. The old
+    /// `reconcile(&mut self)` ran that scan while the sweep held the registry
+    /// `Mutex` (`registry.lock().await.reconcile()`), so every
+    /// `chat_completions` / `update_last_requested` — which take the SAME lock on
+    /// every request — froze for the full scan, wedging all inference and the
+    /// control API. The lock must NEVER be held across FS/NFS I/O; only across
+    /// the fast in-memory apply.
+    pub fn scan_disk(local_path: PathBuf, archive_path: PathBuf) -> ReconcileScan {
+        let local = scan_manifest_tree(&local_path.join("manifests"));
+        // `exists()` on an NFS mount is itself a (cheap) stat; do it here, off
+        // the lock, so `apply_reconcile` never touches the filesystem.
+        let archive_present = archive_path.exists();
+        let archive = if archive_present {
+            scan_manifest_tree(&archive_path.join("manifests"))
+        } else {
+            Vec::new()
+        };
+        ReconcileScan { local, archive, archive_present }
+    }
+
+    /// FAST half of reconcile: apply a [`ReconcileScan`] to the in-memory
+    /// records. Pure in-memory work — NO filesystem I/O — so a caller holds the
+    /// registry `Mutex` ONLY for this call (milliseconds), never across
+    /// [`scan_disk`](Self::scan_disk). Persisting afterwards (`save()`) is the
+    /// caller's job.
+    ///
+    /// Record updates:
     /// - Local model already known → tier becomes `Warm` (left `Hot` if Hot),
     ///   `local_path` set; new → added as `Warm` with `last_requested = mtime`.
     /// - Archive-only model already known → tier `Cold`, `archive_path` set;
     ///   new → added as `Cold`.
     /// - Registry entries found in neither tier are left in place with a warning
     ///   (never deleted).
-    ///
-    /// A missing/unmounted archive path is skipped with a warning and reconcile
-    /// continues with local-only data (it must never crash).
-    pub fn reconcile(&mut self) {
-        // --- Local scan ---
-        let local_manifests = self.local_path.join("manifests");
-        let local = scan_manifest_tree(&local_manifests);
+    /// - A missing/unmounted archive (`archive_present == false`) is skipped with
+    ///   a warning; local-only data is applied (it must never crash).
+    pub fn apply_reconcile(&mut self, scan: ReconcileScan) {
+        let ReconcileScan { local, archive, archive_present } = scan;
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+        // --- Local ---
         for m in &local {
             seen.insert(m.name.clone());
             let protected = self.protected.iter().any(|p| p == &m.name);
@@ -548,15 +597,13 @@ impl ModelRegistry {
             }
         }
 
-        // --- Archive scan (skip gracefully if not mounted) ---
-        let archive_manifests = self.archive_path.join("manifests");
-        if !self.archive_path.exists() {
+        // --- Archive (skipped gracefully when not mounted) ---
+        if !archive_present {
             tracing::warn!(
                 archive_path = %self.archive_path.display(),
                 "archive path not present / not mounted; reconciling with local-only data"
             );
         } else {
-            let archive = scan_manifest_tree(&archive_manifests);
             let archive_root = self.archive_path.to_string_lossy().to_string();
             for m in &archive {
                 seen.insert(m.name.clone());
@@ -603,6 +650,35 @@ impl ModelRegistry {
                 );
             }
         }
+
+        // --- MSM-05: MODEL_PROTECTED env is authoritative, re-applied every reconcile ---
+        // The scans above only union `protected` into records they actually touch (a
+        // model present locally and/or in archive this pass). A registry-flag loss (or
+        // a record that only exists in-memory) must not leave a configured-protected
+        // model unprotected. Union the env list into every matching record
+        // unconditionally so protection never depends on persisted state alone — this
+        // closes the S111 incident where an empty MODEL_PROTECTED + registry loss would
+        // have unprotected the pinned production models.
+        for name in &self.protected {
+            if let Some(rec) = self.records.get_mut(name) {
+                rec.protected = true;
+            }
+        }
+    }
+
+    /// Reconcile the registry against on-disk reality, synchronously (scan +
+    /// apply in one call). Convenience for startup and tests where blocking is
+    /// acceptable (single-threaded startup, no concurrent lock contention).
+    ///
+    /// **Do NOT call this while holding the registry `Mutex` in a request-serving
+    /// process** — it runs the (potentially multi-second NFS) archive scan
+    /// inline. The background sweep and the `/api/models/reconcile` control
+    /// endpoint instead call [`scan_disk`](Self::scan_disk) in
+    /// `spawn_blocking` and then [`apply_reconcile`](Self::apply_reconcile)
+    /// under a brief lock — see the S111 note on `scan_disk`.
+    pub fn reconcile(&mut self) {
+        let scan = Self::scan_disk(self.local_path.clone(), self.archive_path.clone());
+        self.apply_reconcile(scan);
     }
 
     /// Register (or update) a model whose lifecycle is NOT managed by Ollama — e.g. a GGUF served by
@@ -1504,6 +1580,62 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_rewarms_stale_cold_record_when_local_manifest_exists() {
+        // MSM-01: the periodic sweep now calls reconcile() every tick (not just at
+        // startup), so a registry entry left stale at Cold (e.g. from a crash right
+        // after a pull promoted it locally but before `promote_to_warm`/`save()`
+        // landed) must be corrected the next time reconcile runs, purely from disk
+        // reality — a local manifest existing is authoritative over a stale tier.
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        write_manifest(&base.join("local"), "registry.ollama.ai", "library", "stale", "1", 10, &[20]);
+        let mut reg = reg_at(base, vec![]);
+        reg.reconcile();
+        assert_eq!(reg.get("stale:1").unwrap().tier, StorageTier::Warm);
+
+        // Force the record stale (simulating drift): mark it Cold with no local_path,
+        // as if an external process/crash left the registry out of sync with disk.
+        {
+            let rec = reg.records.get_mut("stale:1").unwrap();
+            rec.tier = StorageTier::Cold;
+            rec.local_path = None;
+        }
+        assert_eq!(reg.get("stale:1").unwrap().tier, StorageTier::Cold);
+
+        // Local manifest still exists on disk → the next reconcile self-heals it.
+        reg.reconcile();
+        let rec = reg.get("stale:1").unwrap();
+        assert_eq!(rec.tier, StorageTier::Warm, "reconcile re-warms a stale-cold record whose local manifest exists");
+        assert!(rec.local_path.is_some());
+    }
+
+    #[test]
+    fn reconcile_reapplies_env_protected_set_authoritatively() {
+        // MSM-05: MODEL_PROTECTED must be re-applied on every reconcile, not just
+        // unioned in for records the local/archive scans happen to touch — a
+        // persisted `protected: false` (e.g. after a registry loss/rebuild) must not
+        // leave a configured-protected model unprotected.
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        write_manifest(&base.join("local"), "registry.ollama.ai", "library", "pinned", "1", 1, &[1]);
+        let mut reg = reg_at(base, vec!["pinned:1".to_string()]);
+        reg.reconcile();
+        assert!(reg.get("pinned:1").unwrap().protected);
+
+        // Simulate a registry rebuild that lost the persisted flag.
+        reg.records.get_mut("pinned:1").unwrap().protected = false;
+        assert!(!reg.get("pinned:1").unwrap().protected, "flag forced false for the test");
+
+        // A second reconcile must re-mark it protected purely from the env list,
+        // even though the model was already known (not newly discovered).
+        reg.reconcile();
+        assert!(
+            reg.get("pinned:1").unwrap().protected,
+            "MODEL_PROTECTED must be re-applied authoritatively on every reconcile"
+        );
+    }
+
+    #[test]
     fn update_last_requested_sets_timestamp() {
         let tmp = tempdir().unwrap();
         let base = tmp.path();
@@ -1925,5 +2057,107 @@ mod tests {
         let mut reg = reg_at(tmp.path(), vec![]);
         reg.register_external("ollama-managed:1b", "ollama", Some("/warm/x".to_string()), None, 1);
         assert!(reg.ingest_rope_scaling("ollama-managed:1b").is_none());
+    }
+
+    // ── S111: reconcile must not hold the registry lock across the FS scan ────
+
+    #[tokio::test]
+    async fn reconcile_scan_off_lock_never_blocks_concurrent_update() {
+        // Models the production sweep's CORRECT reconcile shape: the slow
+        // manifest scan runs in spawn_blocking OFF the registry lock, and only
+        // the fast in-memory `apply_reconcile` takes the lock. A concurrent
+        // inference-style `update_last_requested` (registry lock) must acquire
+        // the lock ~immediately rather than waiting for the whole scan — the
+        // regression was the old `registry.lock().await.reconcile()` holding the
+        // lock across the ~84s NFS scan and freezing all inference.
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        use tokio::sync::Mutex;
+
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        write_manifest(&base.join("local"), "registry.ollama.ai", "library", "m", "1", 1, &[1]);
+        let mut reg = reg_at(base, vec![]);
+        reg.reconcile(); // seed so "m:1" exists
+        let registry = Arc::new(Mutex::new(reg));
+
+        // Reconcile the correct way, with an injected slow scan (400ms) that runs
+        // entirely inside spawn_blocking (lock is free during it).
+        let reg_for_scan = registry.clone();
+        let local = base.join("local");
+        let archive = base.join("archive");
+        let scan_task = tokio::spawn(async move {
+            let scan = tokio::task::spawn_blocking(move || {
+                std::thread::sleep(Duration::from_millis(400)); // simulate slow NFS scan
+                ModelRegistry::scan_disk(local, archive)
+            })
+            .await
+            .unwrap();
+            // Brief-locked apply.
+            let mut reg = reg_for_scan.lock().await;
+            reg.apply_reconcile(scan);
+        });
+
+        // Let the scan task enter its spawn_blocking (the lock is now free).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The concurrent update must NOT wait ~400ms for the scan.
+        let start = Instant::now();
+        {
+            let mut reg = registry.lock().await;
+            reg.update_last_requested("m:1");
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "update_last_requested blocked for {elapsed:?}; reconcile must not hold the \
+             registry lock across the manifest scan"
+        );
+
+        scan_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_gc_and_reconcile_apply_both_complete_no_deadlock() {
+        // Lock-ordering / disjointness check: GC holds ONLY `disk_op_lock`
+        // (never the registry lock), reconcile-apply holds ONLY the registry
+        // lock (never disk_op) — so they can never deadlock regardless of
+        // interleaving. Assert both complete well within a generous timeout.
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Mutex;
+
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        write_manifest(&base.join("local"), "registry.ollama.ai", "library", "m", "1", 1, &[1]);
+        std::fs::create_dir_all(base.join("archive")).unwrap();
+        let mut reg = reg_at(base, vec![]);
+        reg.reconcile();
+        let registry = Arc::new(Mutex::new(reg));
+        let disk_op = crate::models::eviction::new_disk_op_lock();
+        let local = base.join("local");
+        let archive = base.join("archive");
+
+        let reg_gc = registry.clone();
+        let dl = disk_op.clone();
+        let (lg, ag) = (local.clone(), archive.clone());
+        let gc = tokio::spawn(async move {
+            crate::models::gc::run_gc(&reg_gc, &lg, &ag, &dl, 0).await
+        });
+
+        let reg_rc = registry.clone();
+        let (lr, ar) = (local.clone(), archive.clone());
+        let rc = tokio::spawn(async move {
+            let scan =
+                tokio::task::spawn_blocking(move || ModelRegistry::scan_disk(lr, ar)).await.unwrap();
+            reg_rc.lock().await.apply_reconcile(scan);
+        });
+
+        tokio::time::timeout(Duration::from_secs(10), async move {
+            gc.await.unwrap();
+            rc.await.unwrap();
+        })
+        .await
+        .expect("concurrent GC + reconcile-apply deadlocked (canonical disk_op→registry order broken)");
     }
 }

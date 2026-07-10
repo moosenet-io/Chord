@@ -76,6 +76,16 @@ pub struct AppState {
     pub disk_pressure_percent: u8,
     /// TIER-05: cooldown window for the manual sweep (hours before warm model is eligible).
     pub model_warm_cooldown_hours: u64,
+    /// MSM-02/04: maximum duration (seconds) for a single warm→cold eviction
+    /// copy before it aborts, cleans up partial archive files, and leaves the
+    /// model Warm for retry. Shared by the background sweep, the manual
+    /// `/api/models/sweep` trigger, and `/api/models/:name/archive`.
+    pub model_archive_copy_timeout_secs: u64,
+    /// MSM-03/04: minimum age (seconds) a local blob must have before the
+    /// orphan-GC pass (`POST /api/storage/gc`) will delete it — the B1
+    /// defense-in-depth grace window that keeps an in-flight archive pull's
+    /// just-copied blobs from being treated as orphans.
+    pub model_gc_min_age_secs: u64,
     /// YARN-06: SRV-04 serving-profile routing map — the source of a model's
     /// [`crate::serving::profile::ThinkingConfig`] (capability advertisement +
     /// per-request thinking honoring in `chat_completions`). Best-effort: when
@@ -1445,6 +1455,8 @@ mod tests {
             model_disk_pressure_percent: 80,
             model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
@@ -1472,6 +1484,8 @@ mod tests {
                 model_disk_pressure_percent: 80,
                 model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
@@ -1485,7 +1499,7 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(default_rate_config())));
         let audit_logger = Arc::new(AuditLogger::new(std::path::PathBuf::from("/dev/null")));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None })
+        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None })
     }
 
     /// Task 2: like `test_state`, but with `personal_proxy` set to an
@@ -1514,6 +1528,8 @@ mod tests {
             model_disk_pressure_percent: 80,
             model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
@@ -1561,6 +1577,8 @@ mod tests {
             disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe),
             disk_pressure_percent: 80,
             model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
             personal_proxy,
@@ -1590,6 +1608,8 @@ mod tests {
             model_disk_pressure_percent: 80,
             model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
@@ -1617,6 +1637,8 @@ mod tests {
                 model_disk_pressure_percent: 80,
                 model_sweep_interval_secs: 1800,
                 model_warm_cooldown_hours: 168,
+                model_archive_copy_timeout_secs: 1800,
+                model_gc_min_age_secs: 300,
                 model_source_allowlist: Vec::new(),
                 outbound_proxy: None,
                 runtime_telemetry_off: true,
@@ -1630,7 +1652,7 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(default_rate_config())));
         let audit_logger = Arc::new(AuditLogger::new(audit_path));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None })
+        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None })
     }
 
     /// Like `test_state_with_audit_path`, but registers `FailingTool` instead of
@@ -1661,6 +1683,8 @@ mod tests {
             model_disk_pressure_percent: 80,
             model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
@@ -1688,6 +1712,8 @@ mod tests {
                 model_disk_pressure_percent: 80,
                 model_sweep_interval_secs: 1800,
                 model_warm_cooldown_hours: 168,
+                model_archive_copy_timeout_secs: 1800,
+                model_gc_min_age_secs: 300,
                 model_source_allowlist: Vec::new(),
                 outbound_proxy: None,
                 runtime_telemetry_off: true,
@@ -1701,7 +1727,7 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(default_rate_config())));
         let audit_logger = Arc::new(AuditLogger::new(audit_path));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None })
+        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None })
     }
 
     /// State with auth disabled and an explicit upstream LLM URL for chat/completions tests.
@@ -1744,6 +1770,8 @@ mod tests {
             model_disk_pressure_percent: 80,
             model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
@@ -1768,7 +1796,7 @@ mod tests {
             http_client: reqwest::Client::new(),
             model_registry,
             pull_coordinator,
-            local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168,
+            local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300,
             routing_map,
             coding_profile_source: empty_coding_profile_source(),
             personal_proxy: None,
@@ -1794,6 +1822,8 @@ mod tests {
             model_disk_pressure_percent: 80,
             model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
@@ -1821,6 +1851,8 @@ mod tests {
                 model_disk_pressure_percent: 80,
                 model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
@@ -1834,7 +1866,7 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(default_rate_config())));
         let audit_logger = Arc::new(AuditLogger::new(std::path::PathBuf::from("/dev/null")));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: secret, audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None })
+        Arc::new(AppState { proxy, jwt_secret: secret, audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None })
     }
 
     /// Build a state with a very tight user tool limit for rate limit tests.
@@ -1868,6 +1900,8 @@ mod tests {
             model_disk_pressure_percent: 80,
             model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
@@ -1895,6 +1929,8 @@ mod tests {
                 model_disk_pressure_percent: 80,
                 model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
@@ -1908,7 +1944,7 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(tight)));
         let audit_logger = Arc::new(AuditLogger::new(std::path::PathBuf::from("/dev/null")));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None })
+        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None })
     }
 
     /// Like `test_state_tight_limits`, but the audit logger writes to a real
@@ -1945,6 +1981,8 @@ mod tests {
             model_disk_pressure_percent: 80,
             model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
@@ -1972,6 +2010,8 @@ mod tests {
                 model_disk_pressure_percent: 80,
                 model_sweep_interval_secs: 1800,
                 model_warm_cooldown_hours: 168,
+                model_archive_copy_timeout_secs: 1800,
+                model_gc_min_age_secs: 300,
                 model_source_allowlist: Vec::new(),
                 outbound_proxy: None,
                 runtime_telemetry_off: true,
@@ -1985,7 +2025,7 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(tight)));
         let audit_logger = Arc::new(AuditLogger::new(audit_path));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None })
+        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None })
     }
 
     #[tokio::test]
@@ -3064,6 +3104,8 @@ mod tests {
             model_disk_pressure_percent: 80,
             model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
@@ -3087,7 +3129,7 @@ mod tests {
             http_client: reqwest::Client::new(),
             model_registry: registry,
             pull_coordinator: coordinator,
-            local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168,
+            local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300,
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
             personal_proxy: None,
@@ -3504,6 +3546,8 @@ mod tests {
             model_disk_pressure_percent: 80,
             model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
@@ -3545,6 +3589,8 @@ mod tests {
             disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe),
             disk_pressure_percent: 80,
             model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
             personal_proxy,
@@ -3604,6 +3650,8 @@ mod tests {
             model_disk_pressure_percent: 80,
             model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
