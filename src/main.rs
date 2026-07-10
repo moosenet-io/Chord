@@ -9,6 +9,7 @@ use chord_proxy::{
     fallback::build_fallback_registry,
     mcp_proxy::McpProxy,
     models::eviction::{new_disk_op_lock, run_eviction_sweep, FsLocalEvictor},
+    models::gc,
     models::registry::ModelRegistry,
     models::transfer::{PullCoordinator, StatvfsProbe},
     rate_limiter::ProxyRateLimiter,
@@ -139,15 +140,26 @@ async fn main() {
         FsLocalEvictor::new(std::path::PathBuf::from(&config.model_local_path)),
     );
 
+    let archive_copy_timeout =
+        std::time::Duration::from_secs(config.model_archive_copy_timeout_secs);
+
     let pull_coordinator = Arc::new(
         PullCoordinator::new(
             model_registry.clone(),
             std::time::Duration::from_secs(config.model_pull_timeout_secs),
         )
-        .with_eviction(local_evictor.clone(), disk_op_lock.clone()),
+        .with_eviction(local_evictor.clone(), disk_op_lock.clone())
+        .with_archive_copy_timeout(archive_copy_timeout),
     );
 
     // Background disk-pressure eviction sweep (non-fatal; logs and continues).
+    //
+    // MSM-01: every tick starts with reconcile() + an atomic persist so the
+    // on-disk registry never lags in-memory reality by more than one sweep
+    // interval, self-healing drift (e.g. a stale tier, a lost protected flag —
+    // MSM-05) without waiting for a restart. Both reconcile and persist are
+    // best-effort: a failure is logged and the sweep continues, it never aborts
+    // startup or the loop.
     {
         let registry = model_registry.clone();
         let evictor = local_evictor.clone();
@@ -155,6 +167,10 @@ async fn main() {
         let threshold = config.model_disk_pressure_percent;
         let interval = config.model_sweep_interval_secs;
         let cooldown_hours = config.model_warm_cooldown_hours;
+        let copy_timeout = archive_copy_timeout;
+        let gc_min_age_secs = config.model_gc_min_age_secs;
+        let local_path = std::path::PathBuf::from(&config.model_local_path);
+        let archive_path = std::path::PathBuf::from(&config.model_archive_path);
         if cooldown_hours == 0 {
             warn!("MODEL_WARM_COOLDOWN_HOURS=0; cooldown eviction (warm→cold after inactivity) is DISABLED");
         }
@@ -164,6 +180,16 @@ async fn main() {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval.max(1)));
             loop {
                 ticker.tick().await;
+
+                // MSM-01: reconcile + persist before this tick's eviction passes.
+                {
+                    let mut reg = registry.lock().await;
+                    reg.reconcile();
+                    if let Err(e) = reg.save() {
+                        warn!("eviction sweep: failed to persist registry after reconcile: {e}");
+                    }
+                }
+
                 run_eviction_sweep(
                     &registry,
                     threshold,
@@ -171,8 +197,33 @@ async fn main() {
                     &probe,
                     evictor.as_ref(),
                     &lock,
+                    copy_timeout,
                 )
                 .await;
+
+                // MSM-01: persist again — eviction may have changed tiers since the
+                // reconcile-time snapshot above (evict_to_archive already saves per
+                // model, but this covers any change made outside that path).
+                {
+                    let reg = registry.lock().await;
+                    if let Err(e) = reg.save() {
+                        warn!("eviction sweep: failed to persist registry after eviction: {e}");
+                    }
+                }
+
+                // MSM-03: orphan-blob GC, after eviction so newly-orphaned blobs
+                // (from this sweep's evictions) are considered too. Best-effort;
+                // failures are logged and never abort the sweep loop.
+                let gc_result =
+                    gc::run_gc(&registry, &local_path, &archive_path, &lock, gc_min_age_secs).await;
+                if gc_result.orphans_deleted > 0 || !gc_result.errors.is_empty() {
+                    info!(
+                        orphans_deleted = gc_result.orphans_deleted,
+                        freed_bytes = gc_result.freed_bytes,
+                        errors = gc_result.errors.len(),
+                        "eviction sweep: orphan-blob GC pass complete"
+                    );
+                }
             }
         });
     }
@@ -276,6 +327,8 @@ async fn main() {
         disk_probe: std::sync::Arc::new(StatvfsProbe),
         disk_pressure_percent: config.model_disk_pressure_percent,
         model_warm_cooldown_hours: config.model_warm_cooldown_hours,
+        model_archive_copy_timeout_secs: config.model_archive_copy_timeout_secs,
+        model_gc_min_age_secs: config.model_gc_min_age_secs,
         routing_map,
         coding_profile_source,
         personal_proxy,

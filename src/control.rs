@@ -16,6 +16,8 @@
 //! | POST   | `/api/models/:name/protect`  | yes  | toggle/set the protected flag |
 //! | GET    | `/api/storage`                | yes  | disk usage summary (local + archive) |
 //! | POST   | `/api/models/sweep`           | yes  | trigger a disk-pressure eviction sweep |
+//! | POST   | `/api/models/reconcile`       | yes  | MSM-04: reconcile + persist the registry, return before/after tier counts |
+//! | POST   | `/api/storage/gc`             | yes  | MSM-04: run the MSM-03 orphan-blob GC pass, return freed bytes |
 //!
 //! ## Auth choice
 //! **All** endpoints — including the GETs — require the same JWT auth as the
@@ -38,6 +40,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::models::eviction::{self, run_eviction_sweep, EvictError, FsLocalEvictor};
+use crate::models::gc;
 use crate::models::registry::{ModelRecord, StorageTier};
 use crate::models::transfer::DiskSpaceProbe;
 use crate::routes::{auth_check, auth_error_response, AppState};
@@ -226,8 +229,14 @@ pub async fn archive_model(
         }
     }
 
-    match eviction::evict_to_archive(&state.model_registry, &name, state.local_evictor.as_ref())
-        .await
+    let copy_timeout = std::time::Duration::from_secs(state.model_archive_copy_timeout_secs);
+    match eviction::evict_to_archive(
+        &state.model_registry,
+        &name,
+        state.local_evictor.as_ref(),
+        copy_timeout,
+    )
+    .await
     {
         Ok(ev) => Json(serde_json::json!({
             "status": "archived",
@@ -246,6 +255,9 @@ pub async fn archive_model(
             StatusCode::CONFLICT,
             format!("model {name} is not warm; only warm models can be archived"),
         ),
+        Err(e @ EvictError::Timeout(..)) => {
+            error_response(StatusCode::GATEWAY_TIMEOUT, e.to_string())
+        }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -415,15 +427,103 @@ pub async fn trigger_sweep(
     let probe = state.disk_probe.clone();
     let threshold = state.disk_pressure_percent;
     let cooldown_hours = state.model_warm_cooldown_hours;
+    let copy_timeout = std::time::Duration::from_secs(state.model_archive_copy_timeout_secs);
     info!("control API: manual eviction sweep triggered");
     tokio::spawn(async move {
-        run_eviction_sweep(&registry, threshold, cooldown_hours, probe.as_ref(), evictor.as_ref(), &lock).await;
+        run_eviction_sweep(
+            &registry,
+            threshold,
+            cooldown_hours,
+            probe.as_ref(),
+            evictor.as_ref(),
+            &lock,
+            copy_timeout,
+        )
+        .await;
     });
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "status": "sweep started" })),
     )
         .into_response()
+}
+
+// ── POST /api/models/reconcile ───────────────────────────────────────────────
+
+/// MSM-04: reconcile the registry against on-disk reality and persist it,
+/// returning the tier counts before and after. Synchronous (unlike the sweep
+/// trigger below) — reconcile is a fast, non-destructive filesystem scan, so
+/// the caller (e.g. the MSM-06 external watchdog) gets an immediate,
+/// meaningful result rather than a 202.
+pub async fn trigger_reconcile(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = auth_check(&headers, &state.jwt_secret) {
+        return auth_error_response(e);
+    }
+    let mut reg = state.model_registry.lock().await;
+    let (hot_before, warm_before, cold_before) = reg.tier_counts();
+    reg.reconcile();
+    let (hot_after, warm_after, cold_after) = reg.tier_counts();
+    let persisted = match reg.save() {
+        Ok(()) => true,
+        Err(e) => {
+            warn!("control API: failed to persist registry after reconcile: {e}");
+            false
+        }
+    };
+    info!(
+        hot_before, warm_before, cold_before, hot_after, warm_after, cold_after, persisted,
+        "control API: manual reconcile complete"
+    );
+    Json(serde_json::json!({
+        "status": "reconciled",
+        "persisted": persisted,
+        "before": { "hot": hot_before, "warm": warm_before, "cold": cold_before },
+        "after": { "hot": hot_after, "warm": warm_after, "cold": cold_after },
+    }))
+    .into_response()
+}
+
+// ── POST /api/storage/gc ─────────────────────────────────────────────────────
+
+/// MSM-04: run the MSM-03 orphan-blob GC pass synchronously and return freed
+/// bytes. Bounded and non-destructive-by-default (only ever removes blobs
+/// confirmed orphaned — see `models::gc`), so unlike the sweep trigger this
+/// returns the result directly rather than 202-and-forget.
+pub async fn trigger_gc(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(e) = auth_check(&headers, &state.jwt_secret) {
+        return auth_error_response(e);
+    }
+    let (local_path, archive_path) = {
+        let reg = state.model_registry.lock().await;
+        (
+            reg.local_path().to_path_buf(),
+            reg.archive_path().to_path_buf(),
+        )
+    };
+    let result = gc::run_gc(
+        &state.model_registry,
+        &local_path,
+        &archive_path,
+        &state.disk_op_lock,
+        state.model_gc_min_age_secs,
+    )
+    .await;
+    info!(
+        orphans_deleted = result.orphans_deleted,
+        freed_bytes = result.freed_bytes,
+        errors = result.errors.len(),
+        "control API: manual GC pass complete"
+    );
+    Json(serde_json::json!({
+        "status": "gc complete",
+        "orphans_deleted": result.orphans_deleted,
+        "freed_bytes": result.freed_bytes,
+        "errors": result.errors,
+    }))
+    .into_response()
 }
 
 // ── GET /health (control port) ───────────────────────────────────────────────
@@ -448,11 +548,13 @@ pub fn build_control_router(state: Arc<AppState>) -> axum::Router {
         .route("/health", get(control_health))
         .route("/api/models", get(list_models))
         .route("/api/models/sweep", post(trigger_sweep))
+        .route("/api/models/reconcile", post(trigger_reconcile))
         .route("/api/models/:name", get(get_model))
         .route("/api/models/:name/archive", post(archive_model))
         .route("/api/models/:name/pull", post(pull_model))
         .route("/api/models/:name/protect", post(protect_model))
         .route("/api/storage", get(storage_summary))
+        .route("/api/storage/gc", post(trigger_gc))
         // SNAP observability routes (additive; distinct paths, same JWT auth):
         // /api/vram, /api/activity, /api/inventory, /api/analytics/*.
         .merge(crate::snap::api::snap_routes())
@@ -527,6 +629,8 @@ mod tests {
             model_disk_pressure_percent: 80,
             model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
@@ -561,10 +665,30 @@ mod tests {
             disk_probe: probe,
             disk_pressure_percent: 80,
             model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            // Tests write fresh blobs and assert immediate GC collection, so the
+            // grace window is disabled here (0) — the B1 age-guard itself is
+            // exercised directly in `models::gc`'s unit tests.
+            model_gc_min_age_secs: 0,
             routing_map,
             coding_profile_source: Arc::new(Mutex::new(None)),
             personal_proxy: None,
         })
+    }
+
+    /// Like `control_state` but with a real (non-empty) `jwt_secret`, so auth is
+    /// enforced — used by tests asserting the 401 path on the new MSM-04
+    /// endpoints.
+    fn control_state_with_secret(
+        registry: Arc<Mutex<ModelRegistry>>,
+        local_root: std::path::PathBuf,
+        secret: &str,
+    ) -> Arc<AppState> {
+        let state = control_state(registry, local_root, Arc::new(StatvfsProbe));
+        // Freshly constructed above with a single owner, so this never fails.
+        let mut owned = Arc::try_unwrap(state).ok().expect("sole Arc owner");
+        owned.jwt_secret = secret.to_string();
+        Arc::new(owned)
     }
 
     /// Write a manifest + referenced blobs under `root`, returning the model name.
@@ -967,5 +1091,96 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    // ── MSM-04: /api/models/reconcile, /api/storage/gc ─────────────────────────
+
+    #[tokio::test]
+    async fn reconcile_requires_auth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let reg = reg_at(base, vec![]);
+        let registry = Arc::new(Mutex::new(reg));
+        let state = control_state_with_secret(registry, base.join("local"), "s");
+        let app = build_control_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/models/reconcile")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn reconcile_returns_before_after_tier_counts_and_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        // A model on disk that the in-memory registry doesn't know about yet —
+        // reconcile must discover it and the response must reflect the change.
+        make_model(&base.join("local"), "fresh", "1", &[100]);
+        let reg = reg_at(base, vec![]); // deliberately NOT reconciled yet
+        let registry = Arc::new(Mutex::new(reg));
+        let state = control_state(registry.clone(), base.join("local"), Arc::new(StatvfsProbe));
+        let app = build_control_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/models/reconcile")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["before"]["warm"], 0);
+        assert_eq!(json["after"]["warm"], 1);
+        assert_eq!(json["persisted"], true);
+
+        // Registry actually updated in place.
+        assert_eq!(registry.lock().await.get("fresh:1").unwrap().tier, StorageTier::Warm);
+        // And persisted to disk (MSM-01).
+        assert!(base.join("registry.json").is_file());
+    }
+
+    #[tokio::test]
+    async fn gc_endpoint_deletes_orphan_and_reports_freed_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        // Local orphan blob (no referencing manifest) also present in archive.
+        std::fs::create_dir_all(base.join("local/blobs")).unwrap();
+        std::fs::create_dir_all(base.join("archive/blobs")).unwrap();
+        std::fs::write(base.join("local/blobs/sha256-orphan1"), vec![b'x'; 64]).unwrap();
+        std::fs::write(base.join("archive/blobs/sha256-orphan1"), vec![b'x'; 64]).unwrap();
+        let reg = reg_at(base, vec![]);
+        let registry = Arc::new(Mutex::new(reg));
+        let state = control_state(registry, base.join("local"), Arc::new(StatvfsProbe));
+        let app = build_control_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/storage/gc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["orphans_deleted"], 1);
+        assert_eq!(json["freed_bytes"], 64);
+        assert!(!base.join("local/blobs/sha256-orphan1").exists());
     }
 }

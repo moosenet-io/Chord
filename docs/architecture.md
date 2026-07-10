@@ -257,7 +257,44 @@ exposes the registry and tiering controls:
 | POST | `/api/models/:name/protect` | toggle/set the protected flag |
 | GET | `/api/storage` | local + archive disk usage |
 | POST | `/api/models/sweep` | trigger an eviction sweep (202 Accepted, runs async) |
+| POST | `/api/models/reconcile` | **MSM-04**: reconcile the registry against on-disk reality and persist it; returns before/after `{hot,warm,cold}` tier counts (200, synchronous) |
+| POST | `/api/storage/gc` | **MSM-04**: run the MSM-03 orphan-blob GC pass; returns `{orphans_deleted, freed_bytes, errors}` (200, synchronous) |
 | GET | `/health` | version metadata (no auth) |
+
+**MSM-01..06 (S111): anti-drift + crash-safety hardening.** A 2026-07-10
+incident (`MODEL_ARCHIVE_PATH` unset after a redeploy silently disabling all
+eviction, a stalled NFS write wedging the in-process sweep, a stale on-disk
+registry, and `MODEL_PROTECTED` losing effect on a registry rebuild) motivated:
+- **MSM-01**: `reconcile()` now runs at the start of every background sweep
+  tick (not just startup), and the registry is persisted atomically
+  (`ModelRegistry::save`, temp-file + rename) after every reconcile and every
+  eviction — the on-disk `model-registry.json` never lags in-memory by more
+  than one sweep interval. Persist failures are non-fatal (warn + continue).
+- **MSM-02**: the warm→cold eviction copy (`eviction::evict_to_archive`) is now
+  wrapped in a `tokio::time::timeout` (`MODEL_ARCHIVE_COPY_TIMEOUT_SECS`,
+  default 1800s), mirroring TIER-02's pull-side timeout. On timeout or a
+  mid-copy I/O error, any archive files that specific attempt wrote are
+  cleaned up (never a pre-existing/shared archive blob), the model stays Warm
+  for retry on the next sweep, and the shared disk-op lock is always released
+  — a stalled NFS write can no longer wedge the sweep indefinitely.
+- **MSM-03**: a new orphan-blob GC pass (`models::gc::run_gc`) finds local
+  blobs referenced by no local manifest (an interrupted eviction can leave
+  these behind) and safely deletes them when a cold copy exists in the
+  archive, or when they're truly unreferenced anywhere (no local manifest, no
+  archive manifest, no archive blob file). A blob referenced by any local
+  manifest, or one an archive manifest expects but whose archive blob file is
+  missing, is never deleted. Runs as part of the background sweep, after
+  eviction, and via `POST /api/storage/gc`.
+- **MSM-05**: `MODEL_PROTECTED` is now authoritative and re-applied on every
+  reconcile (not just unioned into records the local/archive scans happen to
+  touch), so a registry rebuild/loss can never silently unprotect a
+  configured-protected model.
+- **MSM-06**: [`deploy/model-storage-manager/`](../deploy/model-storage-manager/)
+  — an external systemd service + timer that drives
+  reconcile → sweep → gc every ~15 min via the control API, entirely
+  out-of-process (so it can never be wedged by Chord's own disk-op lock),
+  with a JSON heartbeat and alerting on failure or an unrelieved high-water
+  disk condition.
 
 `GET /api/models` / `GET /api/models/:name` response fields (per model,
 `ModelView` in [`control.rs`](../src/control.rs)) include a **YARN-06**
