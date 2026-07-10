@@ -14,6 +14,7 @@ pub mod middleware;
 pub mod mcp_proxy;
 pub mod models;
 pub mod rate_limiter;
+pub mod router;
 pub mod routes;
 pub mod routing;
 pub mod secrets_bootstrap;
