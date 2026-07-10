@@ -119,21 +119,6 @@ pub struct Config {
     /// pressure. Reads MODEL_WARM_COOLDOWN_HOURS (default 168 = 7 days). A value
     /// of `0` disables cooldown eviction entirely (a startup warning is logged).
     pub model_warm_cooldown_hours: u64,
-    /// MSM-02: maximum duration (seconds) for a single warm→cold eviction copy
-    /// (the reverse of the TIER-02 pull) before it aborts, cleans up any partial
-    /// archive files it wrote, and leaves the model Warm for retry on the next
-    /// sweep. Reads MODEL_ARCHIVE_COPY_TIMEOUT_SECS (default 1800 = 30 min) —
-    /// mirrors `model_pull_timeout_secs` for the opposite direction.
-    pub model_archive_copy_timeout_secs: u64,
-    /// MSM-03 (B1 defense-in-depth): minimum age (seconds) a local blob must
-    /// have before the orphan-GC pass will consider deleting it. A blob whose
-    /// mtime is within this window is skipped — an in-flight archive pull writes
-    /// blobs to their final path before the referencing manifest lands, so a
-    /// too-young "orphan" may actually be mid-copy. The primary guard is the
-    /// shared disk-op lock (the pull-copy phase holds it), but this grace window
-    /// protects against any future path that forgets the lock. Reads
-    /// MODEL_GC_MIN_AGE_SECS (default 300 = 5 min).
-    pub model_gc_min_age_secs: u64,
     /// S88 ISO-01: the egress allow-list of model-source hosts/domains a `Pull`
     /// runtime may reach. Reads `MODEL_SOURCE_ALLOWLIST` (comma/space separated).
     /// **UNSET → empty**, which makes every pull `Denied` (FAIL CLOSED). This is
@@ -203,11 +188,6 @@ impl std::fmt::Debug for Config {
                 "model_warm_cooldown_hours",
                 &self.model_warm_cooldown_hours,
             )
-            .field(
-                "model_archive_copy_timeout_secs",
-                &self.model_archive_copy_timeout_secs,
-            )
-            .field("model_gc_min_age_secs", &self.model_gc_min_age_secs)
             .field("model_source_allowlist", &self.model_source_allowlist)
             .field("outbound_proxy", &self.outbound_proxy)
             .field("runtime_telemetry_off", &self.runtime_telemetry_off)
@@ -338,16 +318,6 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(168u64);
 
-        let model_archive_copy_timeout_secs = std::env::var("MODEL_ARCHIVE_COPY_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1800u64);
-
-        let model_gc_min_age_secs = std::env::var("MODEL_GC_MIN_AGE_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(300u64);
-
         // S88 ISO-01: egress config surface. Allow-list is loud-on-empty (fail closed).
         let model_source_allowlist = model_source_allowlist();
         let outbound_proxy = std::env::var("CHORD_OUTBOUND_PROXY")
@@ -390,8 +360,6 @@ impl Config {
             model_disk_pressure_percent,
             model_sweep_interval_secs,
             model_warm_cooldown_hours,
-            model_archive_copy_timeout_secs,
-            model_gc_min_age_secs,
             model_source_allowlist,
             outbound_proxy,
             runtime_telemetry_off,
@@ -424,8 +392,6 @@ impl Config {
             model_disk_pressure_percent: 80,
             model_sweep_interval_secs: 1800,
             model_warm_cooldown_hours: 168,
-            model_archive_copy_timeout_secs: 1800,
-            model_gc_min_age_secs: 300,
             model_source_allowlist: Vec::new(),
             outbound_proxy: None,
             runtime_telemetry_off: true,
@@ -936,8 +902,6 @@ mod tests {
         std::env::remove_var("MODEL_DISK_PRESSURE_PERCENT");
         std::env::remove_var("MODEL_SWEEP_INTERVAL_SECS");
         std::env::remove_var("MODEL_WARM_COOLDOWN_HOURS");
-        std::env::remove_var("MODEL_ARCHIVE_COPY_TIMEOUT_SECS");
-        std::env::remove_var("MODEL_GC_MIN_AGE_SECS");
         let cfg = Config::from_env().unwrap();
         assert_eq!(cfg.model_archive_path, "/var/lib/model-archive");
         assert_eq!(cfg.model_local_path, "/opt/ollama-models");
@@ -951,9 +915,6 @@ mod tests {
         assert_eq!(cfg.model_sweep_interval_secs, 1800);
         // Cooldown default (TIER-04): 168h / 7 days.
         assert_eq!(cfg.model_warm_cooldown_hours, 168);
-        // MSM-02/MSM-03 defaults.
-        assert_eq!(cfg.model_archive_copy_timeout_secs, 1800);
-        assert_eq!(cfg.model_gc_min_age_secs, 300);
 
         std::env::remove_var("MCP_BACKEND_URL");
     }
@@ -975,15 +936,11 @@ mod tests {
         std::env::set_var("MODEL_DISK_PRESSURE_PERCENT", "90");
         std::env::set_var("MODEL_SWEEP_INTERVAL_SECS", "60");
         std::env::set_var("MODEL_WARM_COOLDOWN_HOURS", "24");
-        std::env::set_var("MODEL_ARCHIVE_COPY_TIMEOUT_SECS", "900");
-        std::env::set_var("MODEL_GC_MIN_AGE_SECS", "60");
         let cfg = Config::from_env().unwrap();
         assert_eq!(cfg.model_pull_timeout_secs, 120);
         assert_eq!(cfg.model_disk_pressure_percent, 90);
         assert_eq!(cfg.model_sweep_interval_secs, 60);
         assert_eq!(cfg.model_warm_cooldown_hours, 24);
-        assert_eq!(cfg.model_archive_copy_timeout_secs, 900);
-        assert_eq!(cfg.model_gc_min_age_secs, 60);
 
         std::env::remove_var("MCP_BACKEND_URL");
         std::env::remove_var("MODEL_ARCHIVE_PATH");
@@ -993,8 +950,6 @@ mod tests {
         std::env::remove_var("MODEL_DISK_PRESSURE_PERCENT");
         std::env::remove_var("MODEL_SWEEP_INTERVAL_SECS");
         std::env::remove_var("MODEL_WARM_COOLDOWN_HOURS");
-        std::env::remove_var("MODEL_ARCHIVE_COPY_TIMEOUT_SECS");
-        std::env::remove_var("MODEL_GC_MIN_AGE_SECS");
     }
 
     #[test]

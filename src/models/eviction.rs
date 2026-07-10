@@ -27,16 +27,15 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use super::registry::{
-    collect_manifest_leaves, parse_manifest_blobs, ManifestBlobs, ModelRegistry, StorageTier,
+    collect_manifest_leaves, parse_manifest_blobs, ModelRegistry, StorageTier,
 };
-use super::transfer::{blob_filename, cleanup_partial, find_manifest_leaf, DiskSpaceProbe};
+use super::transfer::{blob_filename, find_manifest_leaf, DiskSpaceProbe};
 
 const BYTES_PER_GB: f64 = 1_073_741_824.0; // 1 GiB
 const SECS_PER_HOUR: i64 = 3_600;
@@ -87,12 +86,6 @@ pub enum EvictError {
     /// Copying the model to the archive failed (I/O error). Local copy untouched.
     #[error("archive copy failed for {0}: {1}")]
     ArchiveCopy(String, String),
-    /// MSM-02: the archive copy did not finish within `MODEL_ARCHIVE_COPY_TIMEOUT_SECS`
-    /// (e.g. a stalled NFS write). Any partial archive files this copy wrote are
-    /// cleaned up; the local copy is untouched and the model stays Warm for retry on
-    /// the next sweep.
-    #[error("archive copy for {0} timed out after {1:?}")]
-    Timeout(String, Duration),
     /// The archive copy did not verify (a blob/manifest missing or size
     /// mismatch). Local copy is intentionally left in place.
     #[error("archive copy verification failed for {0}: {1}")]
@@ -225,10 +218,7 @@ pub struct Evicted {
 /// Steps:
 /// 1. Validate the model is Warm, non-protected (else a typed error/skip).
 /// 2. Copy its manifest + referenced blobs local → archive (skipping blobs that
-///    already exist in the archive with a matching size), bounded by
-///    `copy_timeout` (MSM-02). On timeout or a mid-copy I/O error, any archive
-///    files *this* copy wrote are removed (best-effort) and the model is left
-///    Warm — never Cold, and the local copy is never touched.
+///    already exist in the archive with a matching size).
 /// 3. **Verify** every referenced blob + the manifest exist in the archive with
 ///    matching sizes. On failure: do NOT delete locally; return [`EvictError`].
 /// 4. Remove the local copy via the injected [`LocalEvictor`] (GC-aware).
@@ -240,7 +230,6 @@ pub async fn evict_to_archive(
     registry: &Arc<Mutex<ModelRegistry>>,
     model: &str,
     evictor: &dyn LocalEvictor,
-    copy_timeout: Duration,
 ) -> Result<Evicted, EvictError> {
     // ── Snapshot tier/paths + validate under a short lock ──
     let (local_root, archive_root) = {
@@ -270,37 +259,11 @@ pub async fn evict_to_archive(
 
     let local_manifest = find_manifest_leaf(&local_root, model)
         .ok_or_else(|| EvictError::MissingLocalManifest(model.to_string()))?;
-    let blobs = parse_manifest_blobs(&local_manifest);
-    let planned = planned_archive_paths(&blobs, &local_manifest, &local_root, &archive_root);
-    // Snapshot which of the planned archive paths ALREADY exist before we start
-    // copying — e.g. a blob shared with another already-archived model. On a
-    // timeout we must clean up only what *this* attempt could plausibly have
-    // written, never a pre-existing/shared archive file (GC-aware, mirrors the
-    // "never delete a blob referenced elsewhere" invariant from the local side).
-    let pre_existing: HashSet<PathBuf> = planned.iter().filter(|p| p.exists()).cloned().collect();
 
-    // ── Copy local → archive (reverse pull), bounded by copy_timeout (MSM-02) ──
-    let copy_fut = copy_model_to_archive(model, &local_root, &local_manifest, &archive_root);
-    match tokio::time::timeout(copy_timeout, copy_fut).await {
-        Ok(Ok(())) => {}
-        Ok(Err((e, written))) => {
-            // Mid-copy failure: clean up exactly the files this attempt wrote.
-            cleanup_partial(&written);
-            return Err(EvictError::ArchiveCopy(model.to_string(), e));
-        }
-        Err(_elapsed) => {
-            // Timed out (e.g. a stalled NFS write): we don't have the precise
-            // in-flight written list, so remove every planned archive path that
-            // now exists AND did not exist before this attempt started — never a
-            // pre-existing/shared archive file. The disk-op lock held by the
-            // caller (cooldown_pass/sweep loop) is released when this function
-            // returns, so the sweep is never wedged.
-            let to_clean: Vec<PathBuf> =
-                planned.into_iter().filter(|p| !pre_existing.contains(p)).collect();
-            cleanup_partial(&to_clean);
-            return Err(EvictError::Timeout(model.to_string(), copy_timeout));
-        }
-    }
+    // ── Copy local → archive (reverse pull) ──
+    copy_model_to_archive(model, &local_root, &local_manifest, &archive_root)
+        .await
+        .map_err(|e| EvictError::ArchiveCopy(model.to_string(), e))?;
 
     // ── Verify the archive copy BEFORE any local deletion ──
     let freed_bytes = verify_archive_copy(model, &local_manifest, &archive_root)
@@ -327,99 +290,53 @@ pub async fn evict_to_archive(
 
 /// Copy a model's manifest + referenced blobs from the local root to the archive
 /// root, preserving the `manifests/.../<tag>` + `blobs/sha256-…` layout. Blobs
-/// already present in the archive with a matching size are skipped (and never
-/// added to the returned `written` list, so a mid-copy failure never causes a
-/// pre-existing/shared archive blob to be cleaned up). Blobs are copied before
-/// the manifest so the archive never has a manifest whose blobs are missing.
-///
-/// On error, returns `(message, written)` where `written` is every archive path
-/// *this* call actually created — used by [`evict_to_archive`] to clean up
-/// precisely on a mid-copy failure (MSM-02).
+/// already present in the archive with a matching size are skipped. Blobs are
+/// copied before the manifest so the archive never has a manifest whose blobs are
+/// missing. Returns a stringly error (mapped to [`EvictError::ArchiveCopy`]).
 async fn copy_model_to_archive(
     _model: &str,
     local_root: &Path,
     local_manifest: &Path,
     archive_root: &Path,
-) -> Result<(), (String, Vec<PathBuf>)> {
-    let mut written: Vec<PathBuf> = Vec::new();
+) -> Result<(), String> {
     let blobs = parse_manifest_blobs(local_manifest);
     let local_blobs = local_root.join("blobs");
     let archive_blobs = archive_root.join("blobs");
-    if let Err(e) = tokio::fs::create_dir_all(&archive_blobs).await {
-        return Err((format!("create archive blobs dir: {e}"), written));
-    }
+    tokio::fs::create_dir_all(&archive_blobs)
+        .await
+        .map_err(|e| format!("create archive blobs dir: {e}"))?;
 
     for digest in &blobs.digests {
         let fname = blob_filename(digest);
         let src = local_blobs.join(&fname);
         let dst = archive_blobs.join(&fname);
         // Skip if already in archive with matching size (content-addressed →
-        // identical content for the same digest + size). NOT added to `written`
-        // — a pre-existing archive blob (possibly shared with another already
-        // archived model) must never be deleted by this copy's cleanup path.
+        // identical content for the same digest + size).
         if let (Ok(s), Ok(d)) = (tokio::fs::metadata(&src).await, tokio::fs::metadata(&dst).await) {
             if s.len() == d.len() {
                 continue;
             }
         }
-        if let Err(e) = tokio::fs::copy(&src, &dst).await {
-            written.push(dst);
-            return Err((format!("copy blob {fname}: {e}"), written));
-        }
-        written.push(dst);
+        tokio::fs::copy(&src, &dst)
+            .await
+            .map_err(|e| format!("copy blob {fname}: {e}"))?;
     }
 
     // Manifest leaf — mirror its path relative to the local manifests root.
     let local_manifests = local_root.join("manifests");
-    let rel = match local_manifest.strip_prefix(&local_manifests) {
-        Ok(r) => r,
-        Err(_) => {
-            return Err((
-                "local manifest path outside manifests root".to_string(),
-                written,
-            ))
-        }
-    };
+    let rel = local_manifest
+        .strip_prefix(&local_manifests)
+        .map_err(|_| "local manifest path outside manifests root".to_string())?;
     let dst_manifest = archive_root.join("manifests").join(rel);
     if let Some(parent) = dst_manifest.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return Err((format!("create archive manifest dir: {e}"), written));
-        }
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("create archive manifest dir: {e}"))?;
     }
-    if let Err(e) = tokio::fs::copy(local_manifest, &dst_manifest).await {
-        written.push(dst_manifest);
-        return Err((format!("copy manifest: {e}"), written));
-    }
-    written.push(dst_manifest);
+    tokio::fs::copy(local_manifest, &dst_manifest)
+        .await
+        .map_err(|e| format!("copy manifest: {e}"))?;
     Ok(())
-}
-
-/// Every archive path a warm→cold copy of `local_manifest`'s model *would*
-/// create (every referenced blob + the manifest), used for best-effort cleanup
-/// when a copy times out and the precise in-flight `written` list is
-/// unavailable (mirrors TIER-02's `archive_pull`/`planned_local_paths` for the
-/// opposite direction — see transfer.rs). Only paths that exist are ever
-/// removed by [`cleanup_partial`]; a blob that already existed in the archive
-/// before this copy started is included here too (same accepted trade-off
-/// `archive_pull`'s timeout cleanup makes for the local side: a half-copied
-/// blob is corrupt and must go, and a real collision on a content-addressed
-/// digest+size is not expected in practice).
-fn planned_archive_paths(
-    blobs: &ManifestBlobs,
-    local_manifest: &Path,
-    local_root: &Path,
-    archive_root: &Path,
-) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    let archive_blobs = archive_root.join("blobs");
-    for digest in &blobs.digests {
-        paths.push(archive_blobs.join(blob_filename(digest)));
-    }
-    let local_manifests = local_root.join("manifests");
-    if let Ok(rel) = local_manifest.strip_prefix(&local_manifests) {
-        paths.push(archive_root.join("manifests").join(rel));
-    }
-    paths
 }
 
 /// Verify the archive holds a complete copy of the model: the manifest exists,
@@ -508,7 +425,6 @@ async fn cooldown_pass(
     now_secs: i64,
     evictor: &dyn LocalEvictor,
     disk_op_lock: &DiskOpLock,
-    copy_timeout: Duration,
 ) {
     if cooldown_hours == 0 {
         return; // cooldown eviction disabled
@@ -546,7 +462,7 @@ async fn cooldown_pass(
         } else {
             idle_secs / SECS_PER_HOUR
         };
-        match evict_to_archive(registry, &name, evictor, copy_timeout).await {
+        match evict_to_archive(registry, &name, evictor).await {
             Ok(ev) => {
                 info!("cooldown_eviction model={} idle_hours={}", name, hours_idle);
                 let _ = ev; // freed bytes not surfaced for cooldown evictions
@@ -581,7 +497,6 @@ pub async fn run_eviction_sweep(
     probe: &dyn DiskSpaceProbe,
     evictor: &dyn LocalEvictor,
     disk_op_lock: &DiskOpLock,
-    copy_timeout: Duration,
 ) {
     run_eviction_sweep_at(
         registry,
@@ -591,7 +506,6 @@ pub async fn run_eviction_sweep(
         probe,
         evictor,
         disk_op_lock,
-        copy_timeout,
     )
     .await
 }
@@ -599,7 +513,6 @@ pub async fn run_eviction_sweep(
 /// Sweep with an injected `now_secs` so the cooldown decision is deterministic
 /// in tests. Production calls go through [`run_eviction_sweep`] which supplies
 /// the real wall-clock time.
-#[allow(clippy::too_many_arguments)]
 pub async fn run_eviction_sweep_at(
     registry: &Arc<Mutex<ModelRegistry>>,
     threshold_pct: u8,
@@ -608,7 +521,6 @@ pub async fn run_eviction_sweep_at(
     probe: &dyn DiskSpaceProbe,
     evictor: &dyn LocalEvictor,
     disk_op_lock: &DiskOpLock,
-    copy_timeout: Duration,
 ) {
     // Snapshot paths under a short lock.
     let (local_root, archive_root) = {
@@ -629,7 +541,7 @@ pub async fn run_eviction_sweep_at(
     }
 
     // ── Cooldown pass (always runs, independent of disk pressure) ──
-    cooldown_pass(registry, cooldown_hours, now_secs, evictor, disk_op_lock, copy_timeout).await;
+    cooldown_pass(registry, cooldown_hours, now_secs, evictor, disk_op_lock).await;
 
     // ── Disk-pressure pass (only if still over threshold) ──
     if !check_disk_pressure(&local_root, threshold_pct, probe) {
@@ -668,7 +580,7 @@ pub async fn run_eviction_sweep_at(
         // don't retry it, and try the next.
         let mut evicted_any = false;
         for name in candidates {
-            match evict_to_archive(registry, &name, evictor, copy_timeout).await {
+            match evict_to_archive(registry, &name, evictor).await {
                 Ok(ev) => {
                     info!(
                         "disk_pressure_eviction model={} freed_gb={:.2}",
@@ -708,7 +620,6 @@ pub async fn run_eviction_sweep_at(
 ///
 /// Caller (the pull path) re-checks free space afterwards and surfaces the
 /// existing insufficient-space error if still short.
-#[allow(clippy::too_many_arguments)]
 pub async fn evict_for_space(
     registry: &Arc<Mutex<ModelRegistry>>,
     needed_bytes: u64,
@@ -716,7 +627,6 @@ pub async fn evict_for_space(
     probe: &dyn DiskSpaceProbe,
     evictor: &dyn LocalEvictor,
     disk_op_lock: &DiskOpLock,
-    copy_timeout: Duration,
 ) -> usize {
     let _guard = disk_op_lock.lock().await;
     let target = crate::models::transfer::nearest_existing_ancestor(local_root);
@@ -739,7 +649,7 @@ pub async fn evict_for_space(
         let Some(name) = next else {
             return evicted; // no more candidates; caller surfaces the error
         };
-        match evict_to_archive(registry, &name, evictor, copy_timeout).await {
+        match evict_to_archive(registry, &name, evictor).await {
             Ok(ev) => {
                 info!(
                     "pre_pull_eviction model={} freed_gb={:.2}",
@@ -765,10 +675,6 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
-
-    /// Generous default copy timeout for tests that aren't exercising MSM-02's
-    /// timeout path itself (fast in-memory/tempdir copies never approach this).
-    const TEST_COPY_TIMEOUT: Duration = Duration::from_secs(30);
 
     /// Write a manifest + its referenced blob files under `root`, returning the
     /// model name. Blob digests derive from `model`+index. Config blob included.
@@ -906,7 +812,7 @@ mod tests {
         let registry = Arc::new(Mutex::new(reg));
         let evictor = fs_evictor(base);
 
-        evict_to_archive(&registry, &model, &evictor, TEST_COPY_TIMEOUT).await.unwrap();
+        evict_to_archive(&registry, &model, &evictor).await.unwrap();
 
         // Registry now cold, local cleared, archive set.
         let reg = registry.lock().await;
@@ -926,83 +832,6 @@ mod tests {
             .join("local/manifests/registry.ollama.ai/library/warm/1")
             .is_file());
         assert!(!base.join("local/blobs/sha256-warm0").is_file());
-    }
-
-    // ── MSM-02: timeout-wrapped, crash-safe eviction copy ────────────────────
-
-    #[tokio::test]
-    async fn eviction_copy_timeout_cleans_partial_archive_and_leaves_model_warm() {
-        // A stalled/slow archive copy (e.g. an NFS write during a volume resize)
-        // must not wedge the sweep: it times out, cleans up whatever partial
-        // archive files this attempt wrote, and leaves the model Warm so it is
-        // retried on the next sweep — never marked Cold, local never touched.
-        let tmp = tempdir().unwrap();
-        let base = tmp.path();
-        fs::create_dir_all(base.join("archive")).unwrap();
-        // A large blob so the copy can't finish within a ~1ns timeout (mirrors the
-        // TIER-02 `archive_pull` timeout test in transfer.rs).
-        let model = make_model(&base.join("local"), "slow", "1", &[8 * 1024 * 1024]);
-        let mut reg = reg_with(base, vec![]);
-        reg.reconcile();
-        let registry = Arc::new(Mutex::new(reg));
-        let evictor = fs_evictor(base);
-
-        let err = evict_to_archive(&registry, &model, &evictor, Duration::from_nanos(1))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, EvictError::Timeout(..)), "got {err:?}");
-
-        // Model stays Warm; local copy untouched.
-        {
-            let reg = registry.lock().await;
-            assert_eq!(reg.get(&model).unwrap().tier, StorageTier::Warm);
-        }
-        assert!(base
-            .join("local/manifests/registry.ollama.ai/library/slow/1")
-            .is_file());
-
-        // No partial archive blob left behind.
-        assert!(
-            !base.join("archive/blobs/sha256-slow0").is_file(),
-            "partial archive blob must be cleaned up on timeout"
-        );
-
-        // The disk-op lock/registry are not wedged: a retry with a real timeout
-        // succeeds (proving the failed attempt released everything it held).
-        evict_to_archive(&registry, &model, &evictor, TEST_COPY_TIMEOUT)
-            .await
-            .unwrap();
-        assert_eq!(registry.lock().await.get(&model).unwrap().tier, StorageTier::Cold);
-    }
-
-    #[tokio::test]
-    async fn eviction_timeout_never_deletes_preexisting_archive_blob() {
-        // A blob already present in the archive (e.g. shared with a model archived
-        // in an earlier sweep) must never be removed by a LATER eviction's timeout
-        // cleanup, even though that later copy also references it.
-        let tmp = tempdir().unwrap();
-        let base = tmp.path();
-        fs::create_dir_all(base.join("archive/blobs")).unwrap();
-        let shared = "sha256:sharedblob";
-        let large = 8 * 1024 * 1024u64;
-        // Pre-seed the archive as if `beta` (not modeled here) already evicted it.
-        fs::write(base.join("archive/blobs/sha256-sharedblob"), vec![b'x'; large as usize]).unwrap();
-
-        let a = make_model_sharing(&base.join("local"), "alpha", "1", shared, large);
-        let mut reg = reg_with(base, vec![]);
-        reg.reconcile();
-        let registry = Arc::new(Mutex::new(reg));
-        let evictor = fs_evictor(base);
-
-        // Copy times out immediately; the shared blob is skip-matched (same
-        // digest+size) so it's never re-copied, but MUST also never be swept up
-        // by the timeout's best-effort cleanup of "planned" archive paths.
-        let _ = evict_to_archive(&registry, &a, &evictor, Duration::from_nanos(1)).await;
-
-        assert!(
-            base.join("archive/blobs/sha256-sharedblob").is_file(),
-            "pre-existing archive blob must survive another model's copy timeout"
-        );
     }
 
     #[tokio::test]
@@ -1056,7 +885,7 @@ mod tests {
             }
         }
         let lock = new_disk_op_lock();
-        run_eviction_sweep(&registry, 80, 0, &Full, &evictor, &lock, TEST_COPY_TIMEOUT).await;
+        run_eviction_sweep(&registry, 80, 0, &Full, &evictor, &lock).await;
 
         let reg = registry.lock().await;
         assert_eq!(reg.get(&good).unwrap().tier, StorageTier::Cold, "good evicted");
@@ -1089,7 +918,7 @@ mod tests {
         let evictor = fs_evictor(base);
         let lock = new_disk_op_lock();
 
-        run_eviction_sweep(&registry, 80, 0, &probe, &evictor, &lock, TEST_COPY_TIMEOUT).await;
+        run_eviction_sweep(&registry, 80, 0, &probe, &evictor, &lock).await;
 
         // Model untouched: still warm, still local.
         let reg = registry.lock().await;
@@ -1122,7 +951,7 @@ mod tests {
         let spy_calls = Arc::new(AtomicUsize::new(0));
         let spy = SpyEvictor(spy_calls.clone());
 
-        let err = evict_to_archive(&registry, &model, &spy, TEST_COPY_TIMEOUT).await.unwrap_err();
+        let err = evict_to_archive(&registry, &model, &spy).await.unwrap_err();
         assert!(matches!(err, EvictError::ArchiveCopy(..)), "got {err:?}");
         // Local removal never invoked; model still warm + local present.
         assert_eq!(spy_calls.load(Ordering::SeqCst), 0, "must not remove before a good copy");
@@ -1176,7 +1005,7 @@ mod tests {
         let spy_calls = Arc::new(AtomicUsize::new(0));
         let spy = SpyEvictor(spy_calls.clone());
 
-        let err = evict_to_archive(&registry, "mm:1", &spy, TEST_COPY_TIMEOUT).await.unwrap_err();
+        let err = evict_to_archive(&registry, "mm:1", &spy).await.unwrap_err();
         assert!(
             matches!(err, EvictError::ArchiveCopy(..) | EvictError::VerifyFailed(..)),
             "got {err:?}"
@@ -1223,7 +1052,7 @@ mod tests {
         let registry = Arc::new(Mutex::new(reg));
         let evictor = fs_evictor(base);
 
-        evict_to_archive(&registry, &a, &evictor, TEST_COPY_TIMEOUT).await.unwrap();
+        evict_to_archive(&registry, &a, &evictor).await.unwrap();
 
         // alpha's manifest gone; shared blob KEPT (beta still references it).
         assert!(!base
@@ -1265,7 +1094,7 @@ mod tests {
         let evictor = fs_evictor(base);
         let lock = new_disk_op_lock();
 
-        let n = evict_for_space(&registry, 500, &base.join("local"), &probe, &evictor, &lock, TEST_COPY_TIMEOUT).await;
+        let n = evict_for_space(&registry, 500, &base.join("local"), &probe, &evictor, &lock).await;
         assert_eq!(n, 1, "one model evicted to free space");
         assert_eq!(registry.lock().await.get(&warm).unwrap().tier, StorageTier::Cold);
     }
@@ -1284,7 +1113,7 @@ mod tests {
         let evictor = fs_evictor(base);
         let lock = new_disk_op_lock();
 
-        run_eviction_sweep(&registry, 80, 0, &probe, &evictor, &lock, TEST_COPY_TIMEOUT).await;
+        run_eviction_sweep(&registry, 80, 0, &probe, &evictor, &lock).await;
         // No archive → no eviction even under max pressure.
         assert_eq!(registry.lock().await.get(&model).unwrap().tier, StorageTier::Warm);
     }
@@ -1323,7 +1152,7 @@ mod tests {
         let evictor = fs_evictor(base);
         let lock = new_disk_op_lock();
 
-        run_eviction_sweep_at(&registry, 80, 168, NOW, &NoPressureProbe, &evictor, &lock, TEST_COPY_TIMEOUT).await;
+        run_eviction_sweep_at(&registry, 80, 168, NOW, &NoPressureProbe, &evictor, &lock).await;
 
         let reg = registry.lock().await;
         let rec = reg.get(&model).unwrap();
@@ -1348,7 +1177,7 @@ mod tests {
         let evictor = fs_evictor(base);
         let lock = new_disk_op_lock();
 
-        run_eviction_sweep_at(&registry, 80, 168, NOW, &NoPressureProbe, &evictor, &lock, TEST_COPY_TIMEOUT).await;
+        run_eviction_sweep_at(&registry, 80, 168, NOW, &NoPressureProbe, &evictor, &lock).await;
 
         assert_eq!(
             registry.lock().await.get(&model).unwrap().tier,
@@ -1372,7 +1201,7 @@ mod tests {
         let evictor = fs_evictor(base);
         let lock = new_disk_op_lock();
 
-        run_eviction_sweep_at(&registry, 80, 168, NOW, &NoPressureProbe, &evictor, &lock, TEST_COPY_TIMEOUT).await;
+        run_eviction_sweep_at(&registry, 80, 168, NOW, &NoPressureProbe, &evictor, &lock).await;
 
         assert_eq!(
             registry.lock().await.get(&model).unwrap().tier,
@@ -1396,7 +1225,7 @@ mod tests {
         let evictor = fs_evictor(base);
         let lock = new_disk_op_lock();
 
-        run_eviction_sweep_at(&registry, 80, 0, NOW, &NoPressureProbe, &evictor, &lock, TEST_COPY_TIMEOUT).await;
+        run_eviction_sweep_at(&registry, 80, 0, NOW, &NoPressureProbe, &evictor, &lock).await;
 
         assert_eq!(
             registry.lock().await.get(&model).unwrap().tier,
@@ -1420,7 +1249,7 @@ mod tests {
         let evictor = fs_evictor(base);
         let lock = new_disk_op_lock();
 
-        run_eviction_sweep_at(&registry, 80, 168, NOW, &NoPressureProbe, &evictor, &lock, TEST_COPY_TIMEOUT).await;
+        run_eviction_sweep_at(&registry, 80, 168, NOW, &NoPressureProbe, &evictor, &lock).await;
 
         assert_eq!(
             registry.lock().await.get(&model).unwrap().tier,

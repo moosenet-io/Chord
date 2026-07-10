@@ -603,20 +603,6 @@ impl ModelRegistry {
                 );
             }
         }
-
-        // --- MSM-05: MODEL_PROTECTED env is authoritative, re-applied every reconcile ---
-        // The scans above only union `protected` into records they actually touch (a
-        // model present locally and/or in archive this pass). A registry-flag loss (or
-        // a record that only exists in-memory) must not leave a configured-protected
-        // model unprotected. Union the env list into every matching record
-        // unconditionally so protection never depends on persisted state alone — this
-        // closes the S111 incident where an empty MODEL_PROTECTED + registry loss would
-        // have unprotected the pinned production models.
-        for name in &self.protected {
-            if let Some(rec) = self.records.get_mut(name) {
-                rec.protected = true;
-            }
-        }
     }
 
     /// Register (or update) a model whose lifecycle is NOT managed by Ollama — e.g. a GGUF served by
@@ -1515,62 +1501,6 @@ mod tests {
         // Reconcile again — local model that is Hot stays Hot, not demoted to Warm.
         reg.reconcile();
         assert_eq!(reg.get("hotmodel:1").unwrap().tier, StorageTier::Hot);
-    }
-
-    #[test]
-    fn reconcile_rewarms_stale_cold_record_when_local_manifest_exists() {
-        // MSM-01: the periodic sweep now calls reconcile() every tick (not just at
-        // startup), so a registry entry left stale at Cold (e.g. from a crash right
-        // after a pull promoted it locally but before `promote_to_warm`/`save()`
-        // landed) must be corrected the next time reconcile runs, purely from disk
-        // reality — a local manifest existing is authoritative over a stale tier.
-        let tmp = tempdir().unwrap();
-        let base = tmp.path();
-        write_manifest(&base.join("local"), "registry.ollama.ai", "library", "stale", "1", 10, &[20]);
-        let mut reg = reg_at(base, vec![]);
-        reg.reconcile();
-        assert_eq!(reg.get("stale:1").unwrap().tier, StorageTier::Warm);
-
-        // Force the record stale (simulating drift): mark it Cold with no local_path,
-        // as if an external process/crash left the registry out of sync with disk.
-        {
-            let rec = reg.records.get_mut("stale:1").unwrap();
-            rec.tier = StorageTier::Cold;
-            rec.local_path = None;
-        }
-        assert_eq!(reg.get("stale:1").unwrap().tier, StorageTier::Cold);
-
-        // Local manifest still exists on disk → the next reconcile self-heals it.
-        reg.reconcile();
-        let rec = reg.get("stale:1").unwrap();
-        assert_eq!(rec.tier, StorageTier::Warm, "reconcile re-warms a stale-cold record whose local manifest exists");
-        assert!(rec.local_path.is_some());
-    }
-
-    #[test]
-    fn reconcile_reapplies_env_protected_set_authoritatively() {
-        // MSM-05: MODEL_PROTECTED must be re-applied on every reconcile, not just
-        // unioned in for records the local/archive scans happen to touch — a
-        // persisted `protected: false` (e.g. after a registry loss/rebuild) must not
-        // leave a configured-protected model unprotected.
-        let tmp = tempdir().unwrap();
-        let base = tmp.path();
-        write_manifest(&base.join("local"), "registry.ollama.ai", "library", "pinned", "1", 1, &[1]);
-        let mut reg = reg_at(base, vec!["pinned:1".to_string()]);
-        reg.reconcile();
-        assert!(reg.get("pinned:1").unwrap().protected);
-
-        // Simulate a registry rebuild that lost the persisted flag.
-        reg.records.get_mut("pinned:1").unwrap().protected = false;
-        assert!(!reg.get("pinned:1").unwrap().protected, "flag forced false for the test");
-
-        // A second reconcile must re-mark it protected purely from the env list,
-        // even though the model was already known (not newly discovered).
-        reg.reconcile();
-        assert!(
-            reg.get("pinned:1").unwrap().protected,
-            "MODEL_PROTECTED must be re-applied authoritatively on every reconcile"
-        );
     }
 
     #[test]

@@ -436,11 +436,8 @@ fn planned_local_paths(plan: &PullPlan) -> Vec<PathBuf> {
     paths
 }
 
-/// Remove partial files left by a failed/timed-out pull (best-effort). Shared
-/// (via `pub(crate)`) with MSM-02's eviction copy (`models::eviction`), which
-/// reuses this exact cleanup for the opposite (warm→cold) direction so both
-/// copy paths get identical crash-safety behaviour.
-pub(crate) fn cleanup_partial(paths: &[PathBuf]) {
+/// Remove partial files left by a failed/timed-out pull (best-effort).
+fn cleanup_partial(paths: &[PathBuf]) {
     for p in paths {
         if p.exists() {
             if let Err(e) = std::fs::remove_file(p) {
@@ -493,10 +490,6 @@ pub struct PullCoordinator {
     /// Shared disk-operation lock so a pre-pull eviction and a background sweep
     /// never interleave destructive filesystem ops. Set alongside `evictor`.
     disk_op_lock: Option<super::eviction::DiskOpLock>,
-    /// MSM-02: max duration for a single warm→cold copy during pre-pull
-    /// eviction (`MODEL_ARCHIVE_COPY_TIMEOUT_SECS`). Set alongside `evictor`;
-    /// unused when pre-pull eviction is disabled.
-    archive_copy_timeout: Duration,
 }
 
 impl PullCoordinator {
@@ -519,7 +512,6 @@ impl PullCoordinator {
             disk_probe,
             evictor: None,
             disk_op_lock: None,
-            archive_copy_timeout: Duration::from_secs(1800),
         }
     }
 
@@ -534,14 +526,6 @@ impl PullCoordinator {
     ) -> Self {
         self.evictor = Some(evictor);
         self.disk_op_lock = Some(disk_op_lock);
-        self
-    }
-
-    /// MSM-02: override the warm→cold copy timeout used by pre-pull eviction
-    /// (default 1800s if never called). Reads `MODEL_ARCHIVE_COPY_TIMEOUT_SECS`
-    /// via `Config` in `main.rs`.
-    pub fn with_archive_copy_timeout(mut self, timeout: Duration) -> Self {
-        self.archive_copy_timeout = timeout;
         self
     }
 
@@ -629,29 +613,11 @@ impl PullCoordinator {
                                 self.disk_probe.as_ref(),
                                 evictor.as_ref(),
                                 lock,
-                                self.archive_copy_timeout,
                             )
                             .await;
                         }
                     }
                 }
-
-                // ── B1 fix: hold the shared disk-op lock across the copy ──
-                // `copy_model_files` writes each blob to its FINAL
-                // `local/blobs/sha256-<d>` path and the referencing manifest
-                // LAST, so mid-pull a just-copied blob is briefly on disk with
-                // no local manifest referencing it — exactly what the orphan-GC
-                // (and eviction) treat as a deletable orphan. Acquire
-                // `disk_op_lock` here so the pull-copy phase is serialised with
-                // GC/eviction (the lock's own contract), preventing GC from
-                // deleting a blob that is being pulled for a live on-demand load.
-                // Acquired AFTER the pre-pull `evict_for_space` above (which
-                // takes the same lock internally) so we never self-deadlock the
-                // non-reentrant async mutex.
-                let _disk_guard = match &self.disk_op_lock {
-                    Some(l) => Some(l.lock().await),
-                    None => None,
-                };
 
                 archive_pull(
                     model,
@@ -664,8 +630,7 @@ impl PullCoordinator {
                 .await?;
 
                 // Promote cold → warm (the warm → hot VRAM load is handled by
-                // the existing lifecycle, which calls set_tier(Hot)). Still under
-                // `_disk_guard` so the promote+persist can't race a GC either.
+                // the existing lifecycle, which calls set_tier(Hot)).
                 let local_str = local_root.to_string_lossy().to_string();
                 let mut reg = self.registry.lock().await;
                 reg.promote_to_warm(model, &local_str);

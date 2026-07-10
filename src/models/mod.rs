@@ -10,7 +10,6 @@ pub mod backends;
 pub mod batch_suitability;
 pub mod coding_selector;
 pub mod eviction;
-pub mod gc;
 pub mod registry;
 pub mod rope_ingest;
 pub mod routing;
