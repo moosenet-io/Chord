@@ -132,6 +132,57 @@ it via the model registry. See
 [docs/serving.md](docs/serving.md#serving-backends) for details and the validated
 `llama3.3:70b` numbers.
 
+### SLM router (DOCGEN-03)
+
+Beyond serving/proxying chat traffic, Chord owns a standalone **SLM router**
+([`src/router`](src/router)) — a small-model routing capability for in-process
+callers that need a generation without picking a model themselves. This is the
+mechanism behind "all documentation-engine inference routes through Chord, and
+Chord decides the destination": the `moosenet/Terminus` documentation engine
+(a separate spec item) only *asks* the router to generate; the router *owns*
+the destination decision.
+
+- **Policy** ([`src/router/policy.rs`](src/router/policy.rs)) is pure decision
+  logic, no network I/O: an explicit, env-configured `RoutingPolicy` maps a
+  request's estimated token count to one of three destinations — a local
+  cheap/fast model for simple requests, a local high-context model once a
+  request exceeds `SLM_ROUTER_CONTEXT_THRESHOLD_TOKENS`, or OpenRouter's
+  frontier-free tier once a request exceeds even the local high-context
+  ceiling (`SLM_ROUTER_LOCAL_HIGH_CTX_MAX_TOKENS`) — so a request is never
+  silently truncated, only escalated.
+- **Router** ([`src/router/slm_router.rs`](src/router/slm_router.rs)) resolves
+  a decision to a real backend and executes the generation, reusing the
+  existing backend catalogue (`models::backends::seed_from_env`) rather than
+  a second one — the local destinations are just different model names sent
+  to the primary Ollama-compatible backend (the same shape
+  `AgenticModelRouter`'s fast/deep models already use), and the cloud
+  destination reuses the existing `"openrouter"` backend's bearer-key
+  indirection (`Backend::api_key_env`) unchanged.
+- **Egress isolation**: every hop that would reach the cloud destination is
+  checked against `SLM_ROUTER_CLOUD_EGRESS_ALLOWLIST` (comma-separated
+  hostnames) *before* any network call — fail-closed, same posture as
+  `supervisor::egress_policy`. `SLM_ROUTER_CLOUD_ALLOWED=false` disables cloud
+  routing outright, independent of the allow-list.
+- **Graceful fallback, never a silent failure**: a destination that is
+  egress-denied, unconfigured, or fails at execution time falls back per
+  policy (cloud → local high-context → local cheap). If every destination in
+  the chain fails, `route_and_execute` returns a hard `SlmRouterError` — it
+  never fabricates or silently drops a generation.
+- **Logged for evaluation**: every routing decision the router acts on
+  (including failed/fallback hops) is logged via `tracing` and retained
+  in-memory (`SlmRouter::decisions()`) — the feed a future SLM-router
+  evaluation sweep (DOCGEN-04) consumes to judge routing quality.
+- The router assumes its input is already PII-swept by the caller (the doc
+  engine's own PII gate) — it is not itself a PII gate, only a destination
+  decision + execution layer.
+
+Env vars: `SLM_ROUTER_CONTEXT_THRESHOLD_TOKENS` (default 6000),
+`SLM_ROUTER_LOCAL_HIGH_CTX_MAX_TOKENS` (default 32000),
+`SLM_ROUTER_LOCAL_HIGH_CTX_MODEL` / `SLM_ROUTER_LOCAL_CHEAP_MODEL` /
+`SLM_ROUTER_CLOUD_MODEL` (model names/tags), `SLM_ROUTER_CLOUD_ALLOWED`
+(default true), `SLM_ROUTER_CLOUD_EGRESS_ALLOWLIST` (default
+`openrouter.ai`).
+
 ## MCP tool dispatch
 
 Beyond model serving, Chord is the constellation's authenticated MCP tool
