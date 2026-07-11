@@ -45,10 +45,11 @@
 //! [`LockRecord::is_expired`]) is separated from the `RwLock`/clock/HTTP so it is
 //! exhaustively unit-testable with no global state, no sleeping, and no network.
 
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 /// Default TTL (seconds) after which a lock with no fresh heartbeat is treated
@@ -89,7 +90,7 @@ pub fn iso_utc(epoch_secs: u64) -> String {
 /// acquirer (e.g. `intake_coder_sweep`); `acquired_at` is the first-grant time
 /// (stable across heartbeats, for "since" reporting); `last_heartbeat` is the
 /// most recent (re)acquire, which drives TTL expiry.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LockRecord {
     pub holder: String,
     pub acquired_at: u64,
@@ -180,10 +181,79 @@ pub enum ReleaseOutcome {
     Mismatch { record: LockRecord },
 }
 
+// ── RESIL-01: durable lease persistence across a Chord restart ────────────────
+//
+// The lock above is otherwise IN-MEMORY only, so a Chord process restart mid-sweep
+// dropped the lease — the sweep that legitimately owns the GPU appeared un-held
+// ("CHORD LOCK GAP DETECTED" on the harness side) and a competing job could slip
+// in. When a state path is configured (`CHORD_STATE_DIR`), every mutation writes
+// the current `Option<LockRecord>` and startup reloads it (respecting TTL), so a
+// restarted Chord keeps honoring a live lease. Persistence is best-effort: a
+// missing/corrupt/unwritable file NEVER panics Chord — it degrades to the prior
+// in-memory-only behavior and logs at warn. Path unset ⇒ persistence is disabled
+// entirely (no file writes), preserving the exact current behavior.
+
+/// Load a persisted lease from `path`. Returns the stored `Option<LockRecord>`
+/// (which may itself be `None` when the last write was a release). A missing,
+/// unreadable, or malformed file yields `None` with a warn — never a panic.
+fn load_persisted(path: &Path) -> Option<LockRecord> {
+    let data = match std::fs::read_to_string(path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            warn!(path = %path.display(), error = %e,
+                "gpu-exclusive: could not read persisted lease (starting unheld)");
+            return None;
+        }
+    };
+    match serde_json::from_str::<Option<LockRecord>>(&data) {
+        Ok(rec) => rec,
+        Err(e) => {
+            warn!(path = %path.display(), error = %e,
+                "gpu-exclusive: persisted lease is corrupt/unrecognized (starting unheld)");
+            None
+        }
+    }
+}
+
+/// Atomically persist the current lock state to `path` (tempfile + rename), so a
+/// crash mid-write can never leave a torn file. Best-effort: any IO/serde error
+/// is logged at warn and swallowed — persistence must never break acquire/release.
+fn persist_state(path: &Path, rec: &Option<LockRecord>) {
+    let json = match serde_json::to_string(rec) {
+        Ok(j) => j,
+        Err(e) => {
+            warn!(error = %e, "gpu-exclusive: failed to serialize lease (state not persisted)");
+            return;
+        }
+    };
+    if let Some(dir) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            warn!(dir = %dir.display(), error = %e,
+                "gpu-exclusive: could not create state dir (lease not persisted)");
+            return;
+        }
+    }
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
+        warn!(path = %tmp.display(), error = %e,
+            "gpu-exclusive: could not write temp lease file (lease not persisted)");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        warn!(path = %path.display(), error = %e,
+            "gpu-exclusive: could not atomically install lease file (lease not persisted)");
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 /// The process-global GPU-exclusive lock. One physical GPU ⇒ one lock.
 pub struct GpuExclusive {
     inner: RwLock<Option<LockRecord>>,
     ttl: u64,
+    /// Where the lease is persisted across restarts. `None` ⇒ persistence
+    /// disabled (in-memory only) — the original behavior.
+    state_path: Option<PathBuf>,
 }
 
 impl GpuExclusive {
@@ -191,11 +261,52 @@ impl GpuExclusive {
         Self {
             inner: RwLock::new(None),
             ttl,
+            state_path: None,
+        }
+    }
+
+    /// Construct with durable persistence at `state_path`. On construction the
+    /// persisted lease (if any) is reloaded and seeded into the in-memory lock,
+    /// UNLESS it is already expired at `now` (an abandoned lease from before the
+    /// restart must not relock the GPU). A missing/corrupt file seeds nothing.
+    pub fn with_state(ttl: u64, state_path: Option<PathBuf>, now: u64) -> Self {
+        let seed = match state_path.as_deref() {
+            Some(p) => match load_persisted(p) {
+                Some(rec) if rec.is_expired(now, ttl) => {
+                    info!(holder = %rec.holder,
+                        "gpu-exclusive: persisted lease is expired — starting unheld");
+                    None
+                }
+                Some(rec) => {
+                    info!(holder = %rec.holder, acquired_at = rec.acquired_at,
+                        "gpu-exclusive: reloaded live lease across restart");
+                    Some(rec)
+                }
+                None => None,
+            },
+            None => None,
+        };
+        Self {
+            inner: RwLock::new(seed),
+            ttl,
+            state_path,
         }
     }
 
     pub fn from_env() -> Self {
-        Self::new(ttl_secs_from_env())
+        Self::with_state(
+            ttl_secs_from_env(),
+            crate::config::gpu_exclusive_state_path(),
+            now_epoch(),
+        )
+    }
+
+    /// Persist the current in-memory state (called while holding the write lock,
+    /// after every mutation). No-op when persistence is disabled.
+    fn persist_locked(&self, current: &Option<LockRecord>) {
+        if let Some(path) = self.state_path.as_deref() {
+            persist_state(path, current);
+        }
     }
 
     pub fn ttl(&self) -> u64 {
@@ -225,6 +336,7 @@ impl GpuExclusive {
                     last_heartbeat: now,
                 };
                 *guard = Some(record.clone());
+                self.persist_locked(&guard);
                 AcquireOutcome::Granted {
                     record,
                     new_grant: true,
@@ -237,6 +349,7 @@ impl GpuExclusive {
                     r.last_heartbeat = now;
                     r.clone()
                 };
+                self.persist_locked(&guard);
                 AcquireOutcome::Granted {
                     record,
                     new_grant: false,
@@ -255,6 +368,7 @@ impl GpuExclusive {
         match decide_release(guard.as_ref(), holder) {
             ReleaseDecision::Release | ReleaseDecision::NotHeld => {
                 *guard = None;
+                self.persist_locked(&guard);
                 ReleaseOutcome::Released
             }
             ReleaseDecision::Mismatch { .. } => {
@@ -534,5 +648,115 @@ mod tests {
     fn iso_utc_is_rfc3339() {
         // 2021-01-01T00:00:00Z
         assert!(iso_utc(1609459200).starts_with("2021-01-01T00:00:00"));
+    }
+
+    // ── RESIL-01: durable lease persistence ──────────────────────────────────
+
+    #[test]
+    fn with_state_reloads_live_lease_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gpu_exclusive_lease.json");
+
+        // First instance acquires and persists.
+        let gpu = GpuExclusive::with_state(600, Some(path.clone()), 0);
+        assert!(matches!(
+            gpu.acquire("sweep", 10),
+            AcquireOutcome::Granted { new_grant: true, .. }
+        ));
+        assert!(path.exists(), "lease file should be written on acquire");
+
+        // Simulate a Chord restart: a brand-new instance loads the same file.
+        let restarted = GpuExclusive::with_state(600, Some(path.clone()), 20);
+        let held = restarted
+            .active_holder(20)
+            .expect("live lease should survive the restart");
+        assert_eq!(held.holder, "sweep");
+        assert_eq!(held.acquired_at, 10);
+    }
+
+    #[test]
+    fn with_state_drops_expired_lease_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gpu_exclusive_lease.json");
+
+        let gpu = GpuExclusive::with_state(600, Some(path.clone()), 0);
+        gpu.acquire("sweep", 0);
+
+        // Reload far past the TTL: the abandoned lease must NOT relock the GPU.
+        let restarted = GpuExclusive::with_state(600, Some(path.clone()), 700);
+        assert!(restarted.active_holder(700).is_none());
+        // And a fresh holder can take over cleanly.
+        assert!(matches!(
+            restarted.acquire("other", 700),
+            AcquireOutcome::Granted { new_grant: true, .. }
+        ));
+    }
+
+    #[test]
+    fn with_state_corrupt_file_starts_unheld_no_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gpu_exclusive_lease.json");
+        std::fs::write(&path, b"{ this is not valid json ").unwrap();
+
+        let gpu = GpuExclusive::with_state(600, Some(path.clone()), 0);
+        assert!(gpu.active_holder(0).is_none());
+        // Still fully functional after ignoring the corrupt file.
+        assert!(matches!(
+            gpu.acquire("sweep", 0),
+            AcquireOutcome::Granted { new_grant: true, .. }
+        ));
+    }
+
+    #[test]
+    fn with_state_missing_file_starts_unheld() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.json");
+        let gpu = GpuExclusive::with_state(600, Some(path), 0);
+        assert!(gpu.active_holder(0).is_none());
+    }
+
+    #[test]
+    fn release_clears_persisted_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gpu_exclusive_lease.json");
+
+        let gpu = GpuExclusive::with_state(600, Some(path.clone()), 0);
+        gpu.acquire("sweep", 0);
+        assert_eq!(gpu.release("sweep"), ReleaseOutcome::Released);
+
+        // A restart after release must see no lease.
+        let restarted = GpuExclusive::with_state(600, Some(path.clone()), 1);
+        assert!(restarted.active_holder(1).is_none());
+    }
+
+    #[test]
+    fn heartbeat_refresh_is_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gpu_exclusive_lease.json");
+
+        let gpu = GpuExclusive::with_state(600, Some(path.clone()), 0);
+        gpu.acquire("sweep", 0);
+        // Heartbeat well after the first acquire; the persisted last_heartbeat
+        // must advance so a restart sees a still-live (not stale) lease.
+        gpu.acquire("sweep", 500);
+
+        let restarted = GpuExclusive::with_state(600, Some(path.clone()), 1000);
+        let held = restarted
+            .active_holder(1000)
+            .expect("refreshed lease should still be live 500s after the heartbeat");
+        assert_eq!(held.last_heartbeat, 500);
+        assert_eq!(held.acquired_at, 0);
+    }
+
+    #[test]
+    fn no_state_path_writes_nothing_and_still_works() {
+        // The original in-memory-only path: new(ttl) sets no state_path.
+        let gpu = GpuExclusive::new(600);
+        assert!(matches!(
+            gpu.acquire("sweep", 0),
+            AcquireOutcome::Granted { new_grant: true, .. }
+        ));
+        assert_eq!(gpu.active_holder(1).unwrap().holder, "sweep");
+        assert_eq!(gpu.release("sweep"), ReleaseOutcome::Released);
     }
 }

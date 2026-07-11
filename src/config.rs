@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use crate::error::ProxyError;
 
@@ -525,6 +526,30 @@ pub fn nft_bin() -> Option<String> {
         Ok(v) => Some(v.trim().to_string()),
         Err(_) => Some("nft".to_string()),
     }
+}
+
+// ── RESIL-01: durable runtime-state directory ─────────────────────────────────
+//
+// A small directory for Chord's durable runtime state files that must survive a
+// Chord process restart — currently just the persisted GPU-exclusive lease
+// (`gpu_exclusive.rs`). Resolved from `CHORD_STATE_DIR`; `None` when unset or
+// blank, so callers degrade to in-memory-only behavior rather than inventing a
+// path (S1 — never a hardcoded/guessed absolute path).
+
+/// The durable runtime-state directory, from `CHORD_STATE_DIR`. `None` when
+/// unset or blank — callers must treat that as "no persistence", never a guess.
+pub fn chord_state_dir() -> Option<PathBuf> {
+    std::env::var("CHORD_STATE_DIR")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Path to the persisted GPU-exclusive lease file within [`chord_state_dir`].
+/// `None` when `CHORD_STATE_DIR` is unset/blank (persistence disabled).
+pub fn gpu_exclusive_state_path() -> Option<PathBuf> {
+    chord_state_dir().map(|d| d.join("gpu_exclusive_lease.json"))
 }
 
 // ── S85 SRV-05: residency / VRAM-admission config helpers ─────────────────────
