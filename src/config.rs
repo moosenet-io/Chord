@@ -552,6 +552,13 @@ pub fn gpu_exclusive_state_path() -> Option<PathBuf> {
     chord_state_dir().map(|d| d.join("gpu_exclusive_lease.json"))
 }
 
+/// Path to the persisted sweep-session store (RESIL-02) within
+/// [`chord_state_dir`]. `None` when `CHORD_STATE_DIR` is unset/blank (the
+/// session store is then in-memory only, lost on restart).
+pub fn sweep_session_state_path() -> Option<PathBuf> {
+    chord_state_dir().map(|d| d.join("sweep_sessions.json"))
+}
+
 // ── S85 SRV-05: residency / VRAM-admission config helpers ─────────────────────
 //
 // The residency manager must read the host's FREE VRAM counter and persist a

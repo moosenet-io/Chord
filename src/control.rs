@@ -18,6 +18,9 @@
 //! | POST   | `/api/models/sweep`           | yes  | trigger a disk-pressure eviction sweep |
 //! | POST   | `/api/models/reconcile`       | yes  | MSM-04: reconcile + persist the registry, return before/after tier counts |
 //! | POST   | `/api/storage/gc`             | yes  | MSM-04: run the MSM-03 orphan-blob GC pass, return freed bytes |
+//! | POST   | `/api/sweep/session`          | yes  | RESIL-02: register/upsert a sweep's action queue (idempotent) |
+//! | GET    | `/api/sweep/session/:id`      | yes  | RESIL-02: remaining keys (queue order) + counts (404 unknown) |
+//! | POST   | `/api/sweep/session/:id/advance` | yes | RESIL-02: mark keys done (append-only, idempotent) |
 //!
 //! ## Auth choice
 //! **All** endpoints — including the GETs — require the same JWT auth as the
@@ -573,6 +576,83 @@ pub async fn control_health() -> impl IntoResponse {
     }))
 }
 
+// ── Sweep session cache (RESIL-02) ───────────────────────────────────────────
+//
+// A durable, session-keyed cache of a sweep's planned action queue + progress
+// cursor, so a restarted sweep can resume from Chord. Chord only RECORDS and
+// SERVES the queue; the Terminus sweep executes it. Backed by the process-global
+// [`crate::sweep_session::SWEEP_SESSIONS`] store (host-singleton, like the GPU
+// lock), persisted under `CHORD_STATE_DIR` when configured. Same JWT auth as the
+// other control routes.
+
+/// Body for `POST /api/sweep/session` — register/upsert a queue.
+#[derive(Deserialize)]
+pub struct SweepSessionRegisterBody {
+    pub session_id: String,
+    #[serde(default)]
+    pub queue: Vec<String>,
+}
+
+/// Body for `POST /api/sweep/session/:id/advance` — mark keys done.
+#[derive(Deserialize)]
+pub struct SweepSessionAdvanceBody {
+    #[serde(default)]
+    pub keys: Vec<String>,
+}
+
+/// `POST /api/sweep/session` — idempotent register/upsert of a sweep's action
+/// queue. Same queue ⇒ no-op (preserves progress); different queue ⇒ replaces it
+/// and resets progress (a replanned sweep).
+pub async fn sweep_session_register(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<SweepSessionRegisterBody>,
+) -> Response {
+    if let Err(e) = auth_check(&headers, &state.jwt_secret) {
+        return auth_error_response(e);
+    }
+    if body.session_id.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "session_id is required");
+    }
+    let now = crate::gpu_exclusive::now_epoch();
+    let summary =
+        crate::sweep_session::SWEEP_SESSIONS.register(&body.session_id, body.queue, now);
+    Json(summary).into_response()
+}
+
+/// `GET /api/sweep/session/:id` — the remaining keys (in queue order) + counts.
+/// 404 for an unknown session.
+pub async fn sweep_session_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(e) = auth_check(&headers, &state.jwt_secret) {
+        return auth_error_response(e);
+    }
+    match crate::sweep_session::SWEEP_SESSIONS.get(&id) {
+        Some(summary) => Json(summary).into_response(),
+        None => error_response(StatusCode::NOT_FOUND, format!("unknown sweep session: {id}")),
+    }
+}
+
+/// `POST /api/sweep/session/:id/advance` — mark `keys` done (append-only,
+/// idempotent; keys not in the queue are ignored). 404 for an unknown session.
+pub async fn sweep_session_advance(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<SweepSessionAdvanceBody>,
+) -> Response {
+    if let Err(e) = auth_check(&headers, &state.jwt_secret) {
+        return auth_error_response(e);
+    }
+    match crate::sweep_session::SWEEP_SESSIONS.advance(&id, &body.keys) {
+        Some(summary) => Json(summary).into_response(),
+        None => error_response(StatusCode::NOT_FOUND, format!("unknown sweep session: {id}")),
+    }
+}
+
 // ── Router ───────────────────────────────────────────────────────────────────
 
 /// Build the TIER-05 control router over the shared [`AppState`].
@@ -589,6 +669,10 @@ pub fn build_control_router(state: Arc<AppState>) -> axum::Router {
         .route("/api/models/:name/protect", post(protect_model))
         .route("/api/storage", get(storage_summary))
         .route("/api/storage/gc", post(trigger_gc))
+        // RESIL-02: sweep action-queue cache (durable resume).
+        .route("/api/sweep/session", post(sweep_session_register))
+        .route("/api/sweep/session/:id", get(sweep_session_get))
+        .route("/api/sweep/session/:id/advance", post(sweep_session_advance))
         // SNAP observability routes (additive; distinct paths, same JWT auth):
         // /api/vram, /api/activity, /api/inventory, /api/analytics/*.
         .merge(crate::snap::api::snap_routes())
@@ -796,6 +880,92 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["alpha:1", "beta:1"]);
         assert_eq!(json["models"][0]["tier"], "warm");
+    }
+
+    // RESIL-02: sweep-session cache routes end-to-end. Uses a UNIQUE session id
+    // so it never collides with the process-global SWEEP_SESSIONS store.
+    #[tokio::test]
+    async fn sweep_session_register_get_advance_and_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let registry = Arc::new(Mutex::new(reg_at(base, vec![])));
+        let state = control_state(registry, base.join("local"), Arc::new(StatvfsProbe));
+        let app = build_control_router(state);
+
+        let sid = "resil02-ctrl-test-unique-abc123";
+
+        // Register a 3-item queue.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/sweep/session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "session_id": sid, "queue": ["a|1", "b|2", "c|3"] })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["total"], 3);
+        assert_eq!(json["done_count"], 0);
+
+        // Advance one key.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/sweep/session/{sid}/advance"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({ "keys": ["b|2"] }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["done_count"], 1);
+        let remaining: Vec<&str> = json["remaining"].as_array().unwrap().iter()
+            .map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(remaining, vec!["a|1", "c|3"]);
+
+        // GET reflects the smaller remaining set.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/sweep/session/{sid}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["remaining"].as_array().unwrap().len(), 2);
+
+        // Unknown session ⇒ 404.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/sweep/session/resil02-does-not-exist-xyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     /// YARN-06: build a one-row [`crate::serving::profile::RoutingMap`] for

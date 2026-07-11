@@ -302,6 +302,19 @@ Component explainers (written from the source in [`src/`](src)) live in
 - **[docs/snap-persistence.md](docs/snap-persistence.md)** — the optional,
   default-off SNAP → Postgres persistence layer (`CHORD_SNAP_PERSIST`).
 
+**Sweep action-queue cache (RESIL-02, `CHORD_STATE_DIR`).** Chord caches a
+sweep's planned action queue + progress cursor so a restarted sweep can resume
+from Chord rather than replanning. Three JWT-gated control endpoints:
+`POST /api/sweep/session` (register/upsert a queue — idempotent; same queue is a
+no-op preserving progress, a different queue replaces it and resets progress),
+`GET /api/sweep/session/:id` (remaining keys in queue order + counts; 404
+unknown), and `POST /api/sweep/session/:id/advance` (mark keys done — append-only,
+idempotent, keys not in the queue ignored). Chord only RECORDS and SERVES the
+queue — it never executes it; the Terminus sweep is the executor. Backed by
+[`src/sweep_session.rs`](src/sweep_session.rs), persisted to
+`<CHORD_STATE_DIR>/sweep_sessions.json` (atomic tempfile+rename) when configured;
+unset ⇒ in-memory only (lost on restart). Best-effort, corrupt-tolerant.
+
 **GPU-exclusive lease durability (`CHORD_STATE_DIR`).** The GPU-exclusive lock
 ([`src/gpu_exclusive.rs`](src/gpu_exclusive.rs)) that hands the single host GPU to
 the intake sweep is otherwise in-memory only — a Chord restart mid-sweep would drop

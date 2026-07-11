@@ -22,6 +22,7 @@ pub mod serving;
 pub mod session;
 pub mod snap;
 pub mod supervisor;
+pub mod sweep_session;
 pub mod sweep_status;
 pub mod tool_allowlist;
 pub mod validation;
