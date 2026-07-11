@@ -301,6 +301,18 @@ Component explainers (written from the source in [`src/`](src)) live in
   the fail-closed posture, and the honest scope boundaries.
 - **[docs/snap-persistence.md](docs/snap-persistence.md)** — the optional,
   default-off SNAP → Postgres persistence layer (`CHORD_SNAP_PERSIST`).
+
+**GPU-exclusive lease durability (`CHORD_STATE_DIR`).** The GPU-exclusive lock
+([`src/gpu_exclusive.rs`](src/gpu_exclusive.rs)) that hands the single host GPU to
+the intake sweep is otherwise in-memory only — a Chord restart mid-sweep would drop
+the lease and let a competing job slip in ("CHORD LOCK GAP DETECTED" on the harness
+side). When `CHORD_STATE_DIR` is set, Chord persists the lease
+(`<CHORD_STATE_DIR>/gpu_exclusive_lease.json`, atomic tempfile+rename) on every
+acquire/heartbeat/release and reloads it on startup, honoring the TTL
+(`CHORD_GPU_EXCLUSIVE_TTL_SECS`) so an already-abandoned lease never relocks the GPU.
+Persistence is best-effort: a missing/corrupt/unwritable file never panics Chord —
+it degrades to in-memory-only and logs at warn. Unset ⇒ persistence disabled (the
+prior behavior). See also the sweep's Chord-backed resume in `moosenet/Terminus`.
 - **[docs/test-results.md](docs/test-results.md)** — the S86 coder-fleet sweep
   results: themed BLITZ vs MULTI-FILE pass-rate charts, leaderboard, table, and
   takeaways.
