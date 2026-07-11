@@ -10,8 +10,8 @@
 //! [`CandidateEvalSummary`] per candidate.
 //!
 //! ## Mocked integration (per the spec's APPROACH)
-//! The GPU host is held by a permanent production serve (see project memory:
-//! lemonade-coder on <host>), so this module NEVER makes a live inference call.
+//! The GPU host is held by a permanent production coder-model serve (see
+//! project memory), so this module NEVER makes a live inference call.
 //! Everything above the [`super::slm_router::Executor`] trait (already mockable —
 //! DOCGEN-03 built it that way) is exercised end-to-end against a
 //! [`super::slm_router::Executor`] test double and a [`Grader`] test double. The
@@ -515,6 +515,11 @@ mod tests {
             "openrouter".to_string(),
             Backend {
                 kind: BackendKind::OpenRouter,
+                // Host must match the policy's cloud_egress_allowlist below
+                // ("openrouter.ai") — the mocked executor never actually
+                // dials this URL, but the egress gate checks the hostname
+                // before the mock is ever invoked.
+                url: "https://openrouter.ai".into(),
                 ..backend("openrouter")
             },
         );
