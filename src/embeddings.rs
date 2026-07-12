@@ -242,6 +242,24 @@ fn parse_embedding_vectors(body: &Value, expected_count: usize) -> Result<Vec<Ve
             items.push((idx, vec));
         }
         items.sort_by_key(|(i, _)| *i);
+        // Index-alignment guard: sorting by `index` only yields correctly
+        // input-aligned output if the reported indexes are exactly the
+        // contiguous set 0..data.len() — no duplicates, no gaps, none out of
+        // range. A malformed set (e.g. two items both `index:0`, or `index:5`
+        // in a 2-item response) can otherwise pass the later count+dim checks
+        // while silently misaligning every embedding to the wrong input, which
+        // breaks the ordered-output guarantee. Reject it here so the caller
+        // treats it as that backend's failure (local → fall back; fallback →
+        // structured 5xx) rather than returning misaligned vectors.
+        for (expected_idx, (reported_idx, _)) in items.iter().enumerate() {
+            if *reported_idx != expected_idx {
+                return Err(format!(
+                    "response 'data' indexes are not the contiguous set 0..{} \
+                     (duplicate, missing, or out-of-range index near {reported_idx})",
+                    data.len()
+                ));
+            }
+        }
         return Ok(items.into_iter().map(|(_, v)| v).collect());
     }
 
@@ -603,6 +621,56 @@ mod tests {
         assert!(parse_embedding_vectors(&body, 1).is_err());
     }
 
+    // ── index-alignment guard (OpenAI data[] shape) ────────────────────
+
+    #[test]
+    fn parse_rejects_duplicate_indexes() {
+        // Two items both claim index 0 (count + dim would still pass later).
+        let body = serde_json::json!({
+            "data": [
+                {"embedding": [1.0, 2.0], "index": 0},
+                {"embedding": [3.0, 4.0], "index": 0}
+            ]
+        });
+        assert!(parse_embedding_vectors(&body, 2).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_gapped_indexes() {
+        // Indexes {0, 2} for a 2-item response — index 1 is missing.
+        let body = serde_json::json!({
+            "data": [
+                {"embedding": [1.0, 2.0], "index": 0},
+                {"embedding": [3.0, 4.0], "index": 2}
+            ]
+        });
+        assert!(parse_embedding_vectors(&body, 2).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_out_of_range_index() {
+        // Single item with index 5 (out of range for a 1-item response).
+        let body = serde_json::json!({
+            "data": [
+                {"embedding": [1.0, 2.0], "index": 5}
+            ]
+        });
+        assert!(parse_embedding_vectors(&body, 1).is_err());
+    }
+
+    #[test]
+    fn parse_accepts_contiguous_indexes_out_of_order() {
+        // Correct set {0,1} delivered out of order — must still sort + accept.
+        let body = serde_json::json!({
+            "data": [
+                {"embedding": [3.0, 4.0], "index": 1},
+                {"embedding": [1.0, 2.0], "index": 0}
+            ]
+        });
+        let v = parse_embedding_vectors(&body, 2).unwrap();
+        assert_eq!(v, vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
+    }
+
     // ── dimension guard ──────────────────────────────────────────────────
 
     #[test]
@@ -875,6 +943,88 @@ mod tests {
             EmbeddingsError::BothBackendsFailed { local, fallback } => {
                 assert!(local.contains("count mismatch"));
                 assert!(fallback.contains("count mismatch"));
+            }
+            other => panic!("expected BothBackendsFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn local_misaligned_indexes_fall_back_to_openrouter() {
+        let local = MockServer::start_async().await;
+        let fallback = MockServer::start_async().await;
+
+        // Local returns the right COUNT and DIM, but duplicate indexes {0,0} —
+        // right count, right dims, but the embeddings are misaligned to inputs.
+        local.mock(|when, then| {
+            when.method(POST);
+            then.status(200).json_body(serde_json::json!({
+                "data": [
+                    {"embedding": vecf(1.0, 1024), "index": 0},
+                    {"embedding": vecf(2.0, 1024), "index": 0}
+                ]
+            }));
+        });
+        let fallback_mock = fallback.mock(|when, then| {
+            when.method(POST).path("/embeddings");
+            then.status(200).json_body(serde_json::json!({
+                "data": [
+                    {"embedding": vecf(3.0, 1024), "index": 0},
+                    {"embedding": vecf(4.0, 1024), "index": 1}
+                ]
+            }));
+        });
+
+        let cfg = EmbeddingsConfig::test_default(
+            Some(format!("{}/embed", local.base_url())),
+            fallback.base_url(),
+        );
+        let client = reqwest::Client::new();
+        let outcome = route_embeddings(&client, &cfg, &inputs(&["a", "b"]), Some("sk-test"))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.source, EmbedSource::Fallback);
+        assert_eq!(outcome.vectors.len(), 2);
+        fallback_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn both_misaligned_indexes_yield_structured_5xx() {
+        let local = MockServer::start_async().await;
+        let fallback = MockServer::start_async().await;
+
+        // Local: gapped indexes {0,2}. Fallback: out-of-range index {5}.
+        local.mock(|when, then| {
+            when.method(POST);
+            then.status(200).json_body(serde_json::json!({
+                "data": [
+                    {"embedding": vecf(1.0, 1024), "index": 0},
+                    {"embedding": vecf(2.0, 1024), "index": 2}
+                ]
+            }));
+        });
+        fallback.mock(|when, then| {
+            when.method(POST).path("/embeddings");
+            then.status(200).json_body(serde_json::json!({
+                "data": [
+                    {"embedding": vecf(3.0, 1024), "index": 5},
+                    {"embedding": vecf(4.0, 1024), "index": 6}
+                ]
+            }));
+        });
+
+        let cfg = EmbeddingsConfig::test_default(
+            Some(format!("{}/embed", local.base_url())),
+            fallback.base_url(),
+        );
+        let client = reqwest::Client::new();
+        let err = route_embeddings(&client, &cfg, &inputs(&["a", "b"]), Some("sk-test"))
+            .await
+            .unwrap_err();
+        match err {
+            EmbeddingsError::BothBackendsFailed { local, fallback } => {
+                assert!(local.contains("contiguous set"));
+                assert!(fallback.contains("contiguous set"));
             }
             other => panic!("expected BothBackendsFailed, got {other:?}"),
         }
