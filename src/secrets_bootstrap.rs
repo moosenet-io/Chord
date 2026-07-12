@@ -44,7 +44,13 @@ use chord_secrets::{fetch_secrets_batch, InfisicalConfig};
 /// allowlist (not "set every key found at this path") so a shared <secret-manager>
 /// path containing secrets for other services never leaks into this process's
 /// environment.
-const DOWNSTREAM_SECRET_KEYS: &[&str] = &["CHORD_JWT_SECRET", "CHORD_API_KEY"];
+/// EMBED-01: `OPENROUTER_API_KEY` — the bearer key `src/embeddings.rs`'s
+/// OpenRouter fallback path sends as `Authorization: Bearer <key>`. Fetched
+/// here (never a literal, never logged) exactly like `CHORD_JWT_SECRET`/
+/// `CHORD_API_KEY`; `embeddings::openrouter_api_key()` reads it back from the
+/// process environment fresh on every request.
+const DOWNSTREAM_SECRET_KEYS: &[&str] =
+    &["CHORD_JWT_SECRET", "CHORD_API_KEY", "OPENROUTER_API_KEY"];
 
 /// Outcome of the startup <secret-manager> fetch attempt, for the caller (`main()`)
 /// to log and for tests to assert on directly rather than scraping log text.
@@ -158,6 +164,7 @@ mod tests {
         "CHORD_INFISICAL_SECRET_PATH",
         "CHORD_JWT_SECRET",
         "CHORD_API_KEY",
+        "OPENROUTER_API_KEY",
     ];
 
     fn clear_all() {
@@ -202,7 +209,8 @@ mod tests {
             then.status(200).json_body(serde_json::json!({
                 "secrets": [
                     { "secretKey": "CHORD_JWT_SECRET", "secretValue": "fetched-jwt" }, // pii-test-fixture
-                    { "secretKey": "CHORD_API_KEY", "secretValue": "fetched-key" } // pii-test-fixture
+                    { "secretKey": "CHORD_API_KEY", "secretValue": "fetched-key" }, // pii-test-fixture
+                    { "secretKey": "OPENROUTER_API_KEY", "secretValue": "fetched-openrouter-key" } // pii-test-fixture
                 ]
             }));
         });
@@ -215,12 +223,16 @@ mod tests {
         let outcome = fetch_and_apply_downstream_secrets().await;
         assert_eq!(
             outcome,
-            SecretFetchOutcome::Fetched { count: 2, missing: vec![] }
+            SecretFetchOutcome::Fetched { count: 3, missing: vec![] }
         );
 
         // Simulate the downstream `from_env()` reads that happen later in main().
         assert_eq!(std::env::var("CHORD_JWT_SECRET").unwrap(), "fetched-jwt");
         assert_eq!(std::env::var("CHORD_API_KEY").unwrap(), "fetched-key");
+        assert_eq!(
+            std::env::var("OPENROUTER_API_KEY").unwrap(),
+            "fetched-openrouter-key"
+        );
         clear_all();
     }
 
@@ -253,6 +265,7 @@ mod tests {
                 assert_eq!(*count, 0);
                 assert!(missing.contains(&"CHORD_JWT_SECRET".to_string()));
                 assert!(missing.contains(&"CHORD_API_KEY".to_string()));
+                assert!(missing.contains(&"OPENROUTER_API_KEY".to_string()));
             }
             other => panic!("expected Fetched outcome, got {other:?}"),
         }

@@ -791,6 +791,10 @@ mod tests {
             routing_map,
             coding_profile_source: Arc::new(Mutex::new(None)),
             personal_proxy: None,
+            embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
+                None,
+                "http://127.0.0.1:1".to_string(),
+            ),
         })
     }
 

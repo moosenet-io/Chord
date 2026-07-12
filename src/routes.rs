@@ -112,6 +112,9 @@ pub struct AppState {
     /// into `proxy` / `/v1/tools/list` — reachable only via
     /// `/v1/personal/tools/list` and `/v1/personal/tools/call`.
     pub personal_proxy: Option<Arc<McpProxy>>,
+    /// EMBED-01: config for the local-first/OpenRouter-fallback `POST
+    /// /v1/embeddings` proxy. See `crate::embeddings`.
+    pub embeddings_config: crate::embeddings::EmbeddingsConfig,
 }
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -1104,6 +1107,96 @@ fn apply_request_rewrites(
     serde_json::to_vec(&v).ok()
 }
 
+// ── /v1/embeddings ────────────────────────────────────────────────────────────
+
+/// POST /v1/embeddings — OpenAI-compatible embeddings proxy (EMBED-01).
+///
+/// Serves LOCAL-FIRST from the fleet Ollama (`EMBED_LOCAL_URL`/
+/// `EMBED_LOCAL_MODEL`) and falls back to OpenRouter
+/// (`EMBED_FALLBACK_MODEL`, `OPENROUTER_API_KEY`) when local is unreachable,
+/// errors, times out, or returns a vector whose dimensionality doesn't match
+/// `EMBED_DIM`. Never returns a wrong-dimension vector — a mismatch on both
+/// paths is a structured 502, never a partial/garbage response.
+///
+/// Same JWT auth as every other endpoint; counted against the caller's LLM
+/// rate-limit budget (an embedding call is model inference, same as chat).
+pub async fn embeddings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<crate::embeddings::EmbeddingsRequest>,
+) -> Response {
+    let claims = match auth_check(&headers, &state.jwt_secret) {
+        Ok(c) => c,
+        Err(e) => {
+            let raw = headers
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|h| extract_bearer(h).ok());
+            state
+                .audit_logger
+                .log_auth_failure(raw, 0);
+            return auth_error_response(e);
+        }
+    };
+
+    // ── GPU-exclusive gate ────────────────────────────────────────────────
+    // The local path may dispatch to a GPU-resident Ollama, same as
+    // `chat_completions`/`agent_execute` — don't contend with the intake
+    // harness's exclusive hold.
+    if let Some(record) =
+        crate::gpu_exclusive::GPU_EXCLUSIVE.active_holder(crate::gpu_exclusive::now_epoch())
+    {
+        return gpu_exclusively_held_response(&record);
+    }
+
+    let inputs = match crate::embeddings::validate_inputs(req, state.embeddings_config.max_batch) {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            let status = e.status();
+            return (status, Json(e.to_json())).into_response();
+        }
+    };
+
+    let role = UserRole::from_claim(claims.role.as_deref());
+    let rl_result = {
+        let mut rl = state.rate_limiter.lock().await;
+        rl.check_and_record(&claims.sub, role, CallType::Llm)
+    };
+    if !rl_result.allowed {
+        return rate_limit_exceeded_response(&rl_result, CallType::Llm);
+    }
+    let rl_headers = rate_limit_headers(&rl_result);
+
+    let openrouter_key = crate::embeddings::openrouter_api_key();
+    match crate::embeddings::route_embeddings(
+        &state.http_client,
+        &state.embeddings_config,
+        &inputs,
+        openrouter_key.as_deref(),
+    )
+    .await
+    {
+        Ok(outcome) => {
+            // Never logs input text — only the count and which path served it.
+            tracing::info!(
+                source = outcome.source.as_str(),
+                count = inputs.len(),
+                "embeddings: served"
+            );
+            let resp = crate::embeddings::build_response(&inputs, outcome);
+            let mut response = Json(resp).into_response();
+            response.headers_mut().extend(rl_headers);
+            response
+        }
+        Err(e) => {
+            warn!("embeddings: both backends failed: {e:?}");
+            let mut response = (e.status(), Json(e.to_json())).into_response();
+            response.headers_mut().extend(rl_headers);
+            response
+        }
+    }
+}
+
 // ── /health ───────────────────────────────────────────────────────────────────
 
 pub async fn health() -> impl IntoResponse {
@@ -1142,6 +1235,7 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
         .route("/v1/personal/tools/call", axum::routing::post(personal_tools_call))
         .route("/v1/agent/execute", axum::routing::post(agent_execute))
         .route("/v1/chat/completions", axum::routing::post(chat_completions))
+        .route("/v1/embeddings", axum::routing::post(embeddings))
         .route("/v1/infer", axum::routing::post(infer))
         // GPU-exclusive coordination: the intake harness ACQUIREs the GPU here
         // instead of `systemctl stop chord.service` — Chord stays up, only its
@@ -1499,7 +1593,7 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(default_rate_config())));
         let audit_logger = Arc::new(AuditLogger::new(std::path::PathBuf::from("/dev/null")));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None })
+        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None, embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(None, "http://127.0.0.1:1".to_string()) })
     }
 
     /// Task 2: like `test_state`, but with `personal_proxy` set to an
@@ -1582,6 +1676,7 @@ mod tests {
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
             personal_proxy,
+            embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(None, "http://127.0.0.1:1".to_string()),
         })
     }
 
@@ -1652,7 +1747,7 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(default_rate_config())));
         let audit_logger = Arc::new(AuditLogger::new(audit_path));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None })
+        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None, embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(None, "http://127.0.0.1:1".to_string()) })
     }
 
     /// Like `test_state_with_audit_path`, but registers `FailingTool` instead of
@@ -1727,7 +1822,7 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(default_rate_config())));
         let audit_logger = Arc::new(AuditLogger::new(audit_path));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None })
+        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None, embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(None, "http://127.0.0.1:1".to_string()) })
     }
 
     /// State with auth disabled and an explicit upstream LLM URL for chat/completions tests.
@@ -1800,6 +1895,7 @@ mod tests {
             routing_map,
             coding_profile_source: empty_coding_profile_source(),
             personal_proxy: None,
+            embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(None, "http://127.0.0.1:1".to_string()),
         })
     }
 
@@ -1866,7 +1962,7 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(default_rate_config())));
         let audit_logger = Arc::new(AuditLogger::new(std::path::PathBuf::from("/dev/null")));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: secret, audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None })
+        Arc::new(AppState { proxy, jwt_secret: secret, audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None, embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(None, "http://127.0.0.1:1".to_string()) })
     }
 
     /// Build a state with a very tight user tool limit for rate limit tests.
@@ -1944,7 +2040,7 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(tight)));
         let audit_logger = Arc::new(AuditLogger::new(std::path::PathBuf::from("/dev/null")));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None })
+        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None, embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(None, "http://127.0.0.1:1".to_string()) })
     }
 
     /// Like `test_state_tight_limits`, but the audit logger writes to a real
@@ -2025,7 +2121,7 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(tight)));
         let audit_logger = Arc::new(AuditLogger::new(audit_path));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None })
+        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None, embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(None, "http://127.0.0.1:1".to_string()) })
     }
 
     #[tokio::test]
@@ -3133,6 +3229,7 @@ mod tests {
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
             personal_proxy: None,
+            embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(None, "http://127.0.0.1:1".to_string()),
         })
     }
 
@@ -3594,6 +3691,7 @@ mod tests {
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
             personal_proxy,
+            embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(None, "http://127.0.0.1:1".to_string()),
         });
         let app = build_router(state);
 
