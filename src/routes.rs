@@ -650,6 +650,11 @@ pub async fn agent_execute(
         Err(e) => return auth_error_response(e),
     };
 
+    // ── BLD-09 idle-mode: count in-flight + lazily restore if idle (see
+    // `chat_completions`). This route dispatches LLM calls, so it must drain too. ─
+    let _idle_inflight = crate::admin::idle::InflightGuard::enter();
+    crate::admin::idle::lazy_activate(&state).await;
+
     // ── GPU-exclusive gate ────────────────────────────────────────────────────
     // Same gate as `chat_completions`/`infer`: this route makes LLM calls too
     // (via `agentic_executor.execute`, which dispatches to CHORD_LLM_URL), so it
@@ -769,6 +774,11 @@ pub async fn chat_completions(
             return auth_error_response(e);
         }
     };
+
+    // ── BLD-09 idle-mode: count this request in-flight (so `POST /admin/idle` can
+    // drain before releasing resources) and lazily restore service if idle. ──────
+    let _idle_inflight = crate::admin::idle::InflightGuard::enter();
+    crate::admin::idle::lazy_activate(&state).await;
 
     // ── GPU-exclusive gate ────────────────────────────────────────────────────
     // While the GPU is exclusively held (by the intake harness), do NOT load a
@@ -1422,6 +1432,10 @@ pub async fn infer(
     if let Err(e) = auth_check(&headers, &state.jwt_secret) {
         return auth_error_response(e);
     }
+    // BLD-09 idle-mode: count in-flight + lazily restore if idle (see `chat_completions`).
+    let _idle_inflight = crate::admin::idle::InflightGuard::enter();
+    crate::admin::idle::lazy_activate(&state).await;
+
     // GPU-exclusive gate (see `chat_completions`): never run inference while the
     // GPU is exclusively held — return the same structured 503 instead.
     if let Some(record) =

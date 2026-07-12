@@ -277,6 +277,61 @@ time — never a literal, never logged.
 | `EMBED_TIMEOUT_SECS` | Per-backend request timeout. | `30` |
 | `OPENROUTER_API_KEY` | Bearer key for the OpenRouter fallback. <secret-manager>-sourced (see below), never a literal. | *(unset → fallback disabled)* |
 
+## Idle mode — free the host for the compiler (BLD-09)
+
+The constellation CI/CD compiler (S117) builds on the heavy GPU/big-RAM host. To
+hand that host to a build **without taking Chord down**, the compiler asks Chord to
+go *idle*: Chord drains in-flight inference, stops its on-demand backends, unloads
+every resident model from VRAM (demoting them back to warm on-disk storage so the
+system RAM/VRAM they held is freed), records a resume manifest, and enters a
+low-footprint wait — then restores full service on request. The admin surface lives
+on the **control port** (`CHORD_CONTROL_PORT`, default `8090`) and is JWT-gated with
+the same auth as every other endpoint. Implemented in
+[`src/admin/idle.rs`](src/admin/idle.rs).
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/admin/idle` | Enter idle: drain, stop providers, release GPU/VRAM, demote resident models, free RAM. Reports freed RAM. Idempotent. |
+| `POST` | `/admin/activate` | Restore full service. Idempotent. |
+| `GET` | `/admin/idle` | Current `idle`/`active` status + resume manifest + in-flight count. |
+
+**Contract**
+
+- **`POST /admin/idle`** (optional body `{"reason":"compiler"}`) drains in-flight
+  requests (bounded by `CHORD_IDLE_DRAIN_SECS`, default 30s — an overrunning request
+  is left to finish and flagged in the response), stops every on-demand inference
+  backend, evicts all Ollama-resident models from VRAM, demotes any `Hot` registry
+  records to `Warm`, and reports freed RAM measured as the `MemAvailable` delta from
+  `/proc/meminfo`. Response: `{"status":"idle","changed":true,"freed":{"mem_available_before_gb":…,"mem_available_after_gb":…,"freed_gb":…,"backends_stopped":…,"models_unloaded":…,"models_demoted":…,"inflight_remaining":0,"foreign_gpu_lock_holder":null},…}`.
+- **`POST /admin/activate`** clears idle and resumes serving. Models reload **lazily**
+  on their next request (Ollama/llama-server cold-load on demand), so activation is
+  cheap and non-blocking. Activation also happens **automatically on the first real
+  inference request** after idle (lazy-on-request) — the compiler never needs to call
+  `/admin/activate` explicitly if traffic resumes on its own.
+- **Idempotency**: idle-while-idle and activate-while-active are `200` no-ops
+  (`changed:false`); a repeat `/admin/idle` never re-runs release or clobbers the
+  original manifest.
+- **Watchdog / fail-safe**: a background loop re-activates an idle proxy once the
+  watchdog deadline passes (`CHORD_IDLE_WATCHDOG_SECS`, default 3600s) **unless** a
+  compiler GPU-exclusive lease is still held — so a legitimately long build keeps
+  Chord idle as long as it holds the GPU, but a crashed/forgotten compiler (or a stale
+  idle state reloaded after a Chord restart) never leaves the proxy silently dead.
+- **Durability**: when `CHORD_STATE_DIR` is set, the resume manifest is persisted
+  (atomic tempfile+rename) so a crash mid-idle leaves a record the watchdog acts on
+  after restart. Unset ⇒ in-memory only (the watchdog still bounds it).
+- **GPU lock held by another job**: reported in `foreign_gpu_lock_holder`, **never**
+  force-released or killed — that lease may be a legitimate external GPU job.
+
+| Env var | Purpose | Default |
+|---|---|---|
+| `CHORD_IDLE_DRAIN_SECS` | Max seconds to wait for in-flight inference to drain before releasing. | `30` |
+| `CHORD_IDLE_WATCHDOG_SECS` | Hard timeout after which the watchdog auto-activates (unless a GPU lease is held). | `3600` |
+| `CHORD_STATE_DIR` | Durable state dir; the idle manifest persists to `<dir>/admin_idle_state.json`. | *(unset → in-memory)* |
+| `OLLAMA_URL` | Ollama base used to enumerate/unload resident models on idle. | *(unset → VRAM eviction skipped)* |
+
+No infrastructure hosts/ports are hardcoded — every value above is env-sourced, and
+no secret is read or logged on the idle/activate path.
+
 ## Secrets (own <secret-manager> client)
 
 Chord fetches its own runtime secrets rather than having them written into a

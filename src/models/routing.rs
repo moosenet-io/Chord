@@ -142,6 +142,36 @@ pub async fn idle_stop_sweep(registry: Arc<Mutex<ModelRegistry>>, interval: Dura
     }
 }
 
+/// BLD-09 idle-mode provider-stop hook: UNCONDITIONALLY stop every on-demand
+/// backend (regardless of its per-backend `idle_stop_secs`) so the heavy host's
+/// GPU/RAM is freed for the compiler. This is the "stop/park a provider" primitive
+/// the idle-mode admin API drives — the same `to_resolved` + `lifecycle::stop`
+/// path as [`idle_stop_sweep`], but immediate and total rather than idle-gated.
+///
+/// Always-on / Ollama / daemon backends are NOT process-managed here (same as
+/// `idle_stop_sweep`); the resident MODELS those hold are unloaded separately by
+/// the idle handler (VRAM eviction via `gpu_exclusive::evict_resident_models`).
+/// Returns the number of on-demand backends stopped (for the freed-RAM report).
+/// Best-effort: a `lifecycle::stop` that no-ops (backend already down) still
+/// counts as "stopped" from the caller's contract — the goal state is "not running".
+pub async fn stop_all_on_demand_backends(registry: &Arc<Mutex<ModelRegistry>>) -> usize {
+    let candidates: Vec<ResolvedBackend> = {
+        let reg = registry.lock().await;
+        reg.backends()
+            .values()
+            .filter(|b| b.on_demand())
+            .map(|b| to_resolved(b, None, None))
+            .collect()
+    };
+    let mut stopped = 0usize;
+    for backend in candidates {
+        tracing::info!(backend = %backend.name, "idle-mode: stopping on-demand backend");
+        lifecycle::stop(&backend);
+        stopped += 1;
+    }
+    stopped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
