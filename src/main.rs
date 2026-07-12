@@ -354,6 +354,7 @@ async fn main() {
         routing_map,
         coding_profile_source,
         personal_proxy,
+        embeddings_config: chord_proxy::embeddings::EmbeddingsConfig::from_env(),
     });
     // TIER-05: the model-tier control API runs on a SECOND listener (control port,
     // default 8090), sharing the same AppState. Build it before `state` is moved

@@ -245,6 +245,38 @@ is unresolved — only an explicit `ROUTER_MODE=active` lets the Supra decision
 lead. A user `/deep` prefix forces the deep model outright, and escalation is
 capped at one per execution so a single request never thrashes VRAM.
 
+### Embeddings — `/v1/embeddings` (EMBED-01)
+
+`POST /v1/embeddings` is an OpenAI-compatible embeddings endpoint
+([`src/embeddings.rs`](src/embeddings.rs)): `input` may be a single string or
+an array of strings, and the response is the standard
+`{"object":"list","data":[{"object":"embedding","embedding":[...],"index":n}],"model":...,"usage":{...}}`
+shape, order-preserved. Same JWT auth as every other endpoint, and counted
+against the caller's LLM rate-limit budget.
+
+Embeddings are served **local-first** from the fleet Ollama
+(`EMBED_LOCAL_URL` / `EMBED_LOCAL_MODEL`, e.g. Qwen3-Embedding) and **fall
+back to OpenRouter** (`EMBED_FALLBACK_MODEL`, same Qwen3-Embedding family so
+vectors from either path are compatible) whenever the local backend is
+unreachable, errors, times out, or returns a vector of the wrong
+dimensionality. Chord never hands back a vector whose length doesn't match
+`EMBED_DIM` (default 1024) — a dimension mismatch is treated exactly like a
+backend failure, and a mismatch (or any other failure) on *both* paths is a
+structured `502`, never a partial or garbage response. `OPENROUTER_API_KEY`
+is fetched from <secret-manager> at startup (see below) and read fresh at dispatch
+time — never a literal, never logged.
+
+| Env var | Purpose | Default |
+|---|---|---|
+| `EMBED_LOCAL_URL` | Full URL of the local embeddings endpoint. Unset → local disabled, every request goes straight to the fallback. | *(unset)* |
+| `EMBED_LOCAL_MODEL` | Model name requested from the local backend. | `qwen3-embedding` |
+| `EMBED_FALLBACK_MODEL` | Model name requested from OpenRouter. Must stay the same model family as `EMBED_LOCAL_MODEL`. | `qwen/qwen3-embedding` |
+| `EMBED_FALLBACK_BASE_URL` | OpenRouter API base (no `/embeddings` suffix). | `https://openrouter.ai/api/v1` |
+| `EMBED_DIM` | Expected embedding dimensionality; enforced on every vector from either backend. | `1024` |
+| `EMBED_MAX_BATCH_SIZE` | Maximum number of inputs accepted per request (a `400` above this). | `256` |
+| `EMBED_TIMEOUT_SECS` | Per-backend request timeout. | `30` |
+| `OPENROUTER_API_KEY` | Bearer key for the OpenRouter fallback. <secret-manager>-sourced (see below), never a literal. | *(unset → fallback disabled)* |
+
 ## Secrets (own <secret-manager> client)
 
 Chord fetches its own runtime secrets rather than having them written into a
@@ -256,7 +288,8 @@ Chord's own machine identity (`INFISICAL_URL` / `INFISICAL_CLIENT_ID` /
 `CHORD_INFISICAL_ENVIRONMENT` / `CHORD_INFISICAL_SECRET_PATH`). The client
 itself is intentionally stateless — it authenticates fresh per call and keeps no
 token cache or background refresh thread. `chord-proxy` uses it for a one-shot
-startup fetch of values such as `CHORD_JWT_SECRET` / `CHORD_API_KEY`; the
+startup fetch of values such as `CHORD_JWT_SECRET` / `CHORD_API_KEY` /
+`OPENROUTER_API_KEY` (EMBED-01's OpenRouter fallback key); the
 `chord-tui` control client wraps it in an `InfisicalSecretManager` whose TTL
 cache coalesces concurrent cold-cache misses so its poll tasks never stampede
 <secret-manager> with a re-auth storm. When <secret-manager> config is absent the sanctioned

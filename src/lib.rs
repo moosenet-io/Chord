@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod coding_proxy;
 pub mod config;
 pub mod control;
+pub mod embeddings;
 pub mod error;
 pub mod fallback;
 pub mod gpu_exclusive;
