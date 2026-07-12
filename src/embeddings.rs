@@ -281,6 +281,23 @@ fn assert_dims(vectors: &[Vec<f32>], dim: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// Full output validation for a backend's parsed vectors: the response must
+/// contain **exactly one embedding per input** (OpenAI contract + the
+/// ordered-output guarantee — a truncated or padded `data` array silently
+/// misaligns every downstream vector-to-input mapping), and every vector must
+/// match `dim`. A violation of EITHER is treated as that backend's failure by
+/// [`route_embeddings`] (local → fall back; fallback → structured 5xx), so a
+/// wrong-count response is never surfaced to the caller.
+fn validate_output(vectors: &[Vec<f32>], expected_count: usize, dim: usize) -> Result<(), String> {
+    if vectors.len() != expected_count {
+        return Err(format!(
+            "backend returned {} embeddings for {expected_count} inputs (count mismatch)",
+            vectors.len()
+        ));
+    }
+    assert_dims(vectors, dim)
+}
+
 // ── Backend calls ────────────────────────────────────────────────────────────
 
 async fn call_local(
@@ -399,7 +416,7 @@ pub async fn route_embeddings(
     openrouter_key: Option<&str>,
 ) -> Result<EmbedOutcome, EmbeddingsError> {
     let local_err: String = match call_local(client, cfg, inputs).await {
-        Ok(vectors) => match assert_dims(&vectors, cfg.dim) {
+        Ok(vectors) => match validate_output(&vectors, inputs.len(), cfg.dim) {
             Ok(()) => {
                 return Ok(EmbedOutcome {
                     vectors,
@@ -408,8 +425,8 @@ pub async fn route_embeddings(
                 });
             }
             Err(e) => {
-                tracing::warn!("embeddings: local backend returned wrong-dim vector, falling back: {e}");
-                format!("wrong-dim vector: {e}")
+                tracing::warn!("embeddings: local backend returned invalid output, falling back: {e}");
+                format!("invalid output: {e}")
             }
         },
         Err(e) => {
@@ -419,7 +436,7 @@ pub async fn route_embeddings(
     };
 
     match call_openrouter(client, cfg, inputs, openrouter_key).await {
-        Ok(vectors) => match assert_dims(&vectors, cfg.dim) {
+        Ok(vectors) => match validate_output(&vectors, inputs.len(), cfg.dim) {
             Ok(()) => Ok(EmbedOutcome {
                 vectors,
                 source: EmbedSource::Fallback,
@@ -427,7 +444,7 @@ pub async fn route_embeddings(
             }),
             Err(e) => Err(EmbeddingsError::BothBackendsFailed {
                 local: local_err,
-                fallback: format!("wrong-dim vector: {e}"),
+                fallback: format!("invalid output: {e}"),
             }),
         },
         Err(e) => Err(EmbeddingsError::BothBackendsFailed {
@@ -767,7 +784,97 @@ mod tests {
             .unwrap_err();
         match err {
             EmbeddingsError::BothBackendsFailed { fallback, .. } => {
-                assert!(fallback.contains("wrong-dim"));
+                assert!(fallback.contains("invalid output"));
+                assert!(fallback.contains("dimension"));
+            }
+            other => panic!("expected BothBackendsFailed, got {other:?}"),
+        }
+    }
+
+    // ── output cardinality (one embedding per input, ordered) ──────────
+
+    #[test]
+    fn validate_output_rejects_too_few_embeddings() {
+        let vecs = vec![vec![0.0; 1024]];
+        assert!(validate_output(&vecs, 2, 1024).is_err());
+    }
+
+    #[test]
+    fn validate_output_rejects_too_many_embeddings() {
+        let vecs = vec![vec![0.0; 1024], vec![0.0; 1024], vec![0.0; 1024]];
+        assert!(validate_output(&vecs, 2, 1024).is_err());
+    }
+
+    #[test]
+    fn validate_output_accepts_exact_count_and_dim() {
+        let vecs = vec![vec![0.0; 1024], vec![0.0; 1024]];
+        assert!(validate_output(&vecs, 2, 1024).is_ok());
+    }
+
+    #[tokio::test]
+    async fn local_wrong_count_falls_back_to_openrouter() {
+        let local = MockServer::start_async().await;
+        let fallback = MockServer::start_async().await;
+
+        // Local returns ONE embedding for a TWO-input request → count mismatch.
+        local.mock(|when, then| {
+            when.method(POST);
+            then.status(200)
+                .json_body(serde_json::json!({ "embeddings": [vecf(1.0, 1024)] }));
+        });
+        let fallback_mock = fallback.mock(|when, then| {
+            when.method(POST).path("/embeddings");
+            then.status(200).json_body(serde_json::json!({
+                "data": [
+                    {"embedding": vecf(2.0, 1024), "index": 0},
+                    {"embedding": vecf(3.0, 1024), "index": 1}
+                ]
+            }));
+        });
+
+        let cfg = EmbeddingsConfig::test_default(
+            Some(format!("{}/embed", local.base_url())),
+            fallback.base_url(),
+        );
+        let client = reqwest::Client::new();
+        let outcome = route_embeddings(&client, &cfg, &inputs(&["a", "b"]), Some("sk-test"))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.source, EmbedSource::Fallback);
+        assert_eq!(outcome.vectors.len(), 2);
+        fallback_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn both_wrong_count_yields_structured_5xx() {
+        let local = MockServer::start_async().await;
+        let fallback = MockServer::start_async().await;
+
+        // Both backends return one embedding for a two-input request.
+        local.mock(|when, then| {
+            when.method(POST);
+            then.status(200)
+                .json_body(serde_json::json!({ "embeddings": [vecf(1.0, 1024)] }));
+        });
+        fallback.mock(|when, then| {
+            when.method(POST).path("/embeddings");
+            then.status(200)
+                .json_body(serde_json::json!({ "embeddings": [vecf(2.0, 1024)] }));
+        });
+
+        let cfg = EmbeddingsConfig::test_default(
+            Some(format!("{}/embed", local.base_url())),
+            fallback.base_url(),
+        );
+        let client = reqwest::Client::new();
+        let err = route_embeddings(&client, &cfg, &inputs(&["a", "b"]), Some("sk-test"))
+            .await
+            .unwrap_err();
+        match err {
+            EmbeddingsError::BothBackendsFailed { local, fallback } => {
+                assert!(local.contains("count mismatch"));
+                assert!(fallback.contains("count mismatch"));
             }
             other => panic!("expected BothBackendsFailed, got {other:?}"),
         }

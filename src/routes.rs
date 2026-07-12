@@ -1120,6 +1120,17 @@ fn apply_request_rewrites(
 ///
 /// Same JWT auth as every other endpoint; counted against the caller's LLM
 /// rate-limit budget (an embedding call is model inference, same as chat).
+///
+/// ## No GPU-exclusive gate (deliberate)
+/// Unlike `chat_completions`/`agent_execute`, this route is NOT gated on the
+/// GPU-exclusive lock, on unanimous reviewer consensus: (a) the OpenRouter
+/// fallback path uses zero local GPU, so gating would defeat the whole
+/// local-first→fallback resilience story while a sweep holds the GPU; (b) an
+/// agent driving `/v1/agent/execute` can hold the GPU-exclusive lock and then
+/// need `/v1/embeddings` for RAG/semantic search — a hard gate there would
+/// deadlock it against its own lock; (c) embeddings are lightweight. The
+/// local backend contending for a briefly-held GPU is acceptable; a hard deny
+/// is not.
 pub async fn embeddings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1138,16 +1149,6 @@ pub async fn embeddings(
             return auth_error_response(e);
         }
     };
-
-    // ── GPU-exclusive gate ────────────────────────────────────────────────
-    // The local path may dispatch to a GPU-resident Ollama, same as
-    // `chat_completions`/`agent_execute` — don't contend with the intake
-    // harness's exclusive hold.
-    if let Some(record) =
-        crate::gpu_exclusive::GPU_EXCLUSIVE.active_holder(crate::gpu_exclusive::now_epoch())
-    {
-        return gpu_exclusively_held_response(&record);
-    }
 
     let inputs = match crate::embeddings::validate_inputs(req, state.embeddings_config.max_batch) {
         Ok(inputs) => inputs,
@@ -1594,6 +1595,42 @@ mod tests {
         let audit_logger = Arc::new(AuditLogger::new(std::path::PathBuf::from("/dev/null")));
         let (model_registry, pull_coordinator) = empty_model_state();
         Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None, embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(None, "http://127.0.0.1:1".to_string()) })
+    }
+
+    /// Like `test_state` but with the embeddings fallback pointed at
+    /// `fallback_base` (local disabled) — used by the GPU-exclusive gate test
+    /// to prove `/v1/embeddings` reaches its fallback path while the GPU lock
+    /// is held.
+    fn test_state_with_embeddings_fallback(fallback_base: String) -> Arc<AppState> {
+        let base = test_state("http://mcp.invalid:3200".into());
+        // AppState is behind an Arc and not Clone; rebuild the one field we need
+        // to change by constructing a fresh state that shares the base's config.
+        Arc::new(AppState {
+            proxy: McpProxy::new(&Config::test_default(), Arc::new(FallbackRegistry::new())),
+            jwt_secret: String::new(),
+            audit_logger: base.audit_logger.clone(),
+            rate_limiter: base.rate_limiter.clone(),
+            agentic_executor: base.agentic_executor.clone(),
+            llm_backend_url: None,
+            model_aliases: std::collections::HashMap::new(),
+            http_client: reqwest::Client::new(),
+            model_registry: base.model_registry.clone(),
+            pull_coordinator: base.pull_coordinator.clone(),
+            local_evictor: base.local_evictor.clone(),
+            disk_op_lock: crate::models::eviction::new_disk_op_lock(),
+            disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe),
+            disk_pressure_percent: 80,
+            model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
+            routing_map: empty_routing_map(),
+            coding_profile_source: empty_coding_profile_source(),
+            personal_proxy: None,
+            embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
+                None,
+                fallback_base,
+            ),
+        })
     }
 
     /// Task 2: like `test_state`, but with `personal_proxy` set to an
@@ -2965,6 +3002,58 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(json["error"].as_str().unwrap().contains("not configured"));
+    }
+
+    /// EMBED-01 (reviewer fix 1): `/v1/embeddings` must NOT be gated on the
+    /// GPU-exclusive lock. Acquire the lock as some holder, then confirm an
+    /// embeddings request still reaches its (mocked OpenRouter) fallback and
+    /// returns 200 — never the `gpu_exclusively_held` 503 that
+    /// `chat_completions`/`agent_execute` return. Guards against a deadlock
+    /// where an agent holding the GPU lock needs embeddings for RAG.
+    #[tokio::test]
+    async fn test_embeddings_not_gpu_exclusive_gated() {
+        let fallback = httpmock::MockServer::start_async().await;
+        fallback.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/embeddings");
+            then.status(200).json_body(serde_json::json!({
+                "data": [{ "embedding": vec![0.1_f64; 1024], "index": 0 }]
+            }));
+        });
+
+        let state = test_state_with_embeddings_fallback(fallback.base_url());
+        // The fallback path needs a key present (read fresh from env at dispatch).
+        std::env::set_var("OPENROUTER_API_KEY", "<REDACTED-SECRET>"); // pii-test-fixture
+
+        // Take the process-global GPU-exclusive lock as an unrelated holder,
+        // exactly as the intake sweep (or a GPU-holding agent) would.
+        let holder = "embed01-gpu-gate-test";
+        let now = crate::gpu_exclusive::now_epoch();
+        let _ = crate::gpu_exclusive::GPU_EXCLUSIVE.acquire(holder, now);
+        assert!(
+            crate::gpu_exclusive::GPU_EXCLUSIVE.active_holder(now).is_some(),
+            "precondition: GPU-exclusive lock must be held for this test"
+        );
+
+        let app = build_router(state);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/embeddings")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"input":"hello"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+
+        // Release the global lock + env BEFORE asserting, so a failure never
+        // leaks process-global state into other tests.
+        let _ = crate::gpu_exclusive::GPU_EXCLUSIVE.release(holder);
+        std::env::remove_var("OPENROUTER_API_KEY");
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "embeddings must succeed via fallback while the GPU is exclusively held (no GPU gate)"
+        );
     }
 
     #[tokio::test]
