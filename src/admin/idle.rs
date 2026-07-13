@@ -10,28 +10,50 @@
 //! request afterwards — Chord *activates* and resumes normal serving (models
 //! reload on demand, exactly as they do from a cold start).
 //!
-//! This mirrors the [`crate::gpu_exclusive`] subsystem's shape almost exactly
-//! (process-global state + durable persistence + a decision core separated from
-//! IO), but where GPU-exclusive *gates* inference with a 503, idle-mode instead
-//! *lazily restores* on the next request — the compiler never wants a hard 503,
-//! it wants Chord to quietly get out of the way and quietly come back.
+//! ## Transition state machine (closed-world drain)
+//! Idle-mode is a real state machine, not a snapshot-then-act flag, so it is
+//! correct under CONCURRENT control calls and concurrent inference:
+//!
+//! ```text
+//!   Active ──begin_enter (CAS)──▶ EnteringIdle ──finish_enter──▶ Idle
+//!     ▲                                                            │
+//!     └──────────── finish_activate ◀── Activating ◀──begin_activate (CAS)┘
+//! ```
+//!
+//! - The `EnteringIdle`/`Activating` markers are installed ATOMICALLY (compare-and-swap
+//!   under the state lock) *before* any side-effect work, so a second concurrent
+//!   `enter`/`activate` sees the in-flight transition and returns a `changed:false`
+//!   no-op instead of re-running drain/stop/evict/demote.
+//! - New inference is admitted ([`IdleController::try_admit`]) only while the state is
+//!   `Active`, and the admission increment happens *under the same lock* that flips the
+//!   state. Once we flip to `EnteringIdle`, no further request can join the in-flight
+//!   set, so the subsequent drain is a genuine CLOSED-WORLD drain — nothing slips in
+//!   after the drain window opens.
+//!
+//! ## Compiler-lease awareness
+//! Lazy activation and the watchdog distinguish a *compiler build lease* (see
+//! [`is_compiler_lease`]) from any other GPU-exclusive holder (e.g. the intake sweep
+//! harness). While a compiler build lease is held, a stray request does NOT tear down
+//! the idle manifest, and the watchdog does NOT auto-activate — the build window stays
+//! protected. A non-compiler GPU holder does not extend the idle window.
 //!
 //! ## Contract (see `README.md`)
 //! - `POST /admin/idle`      → enter idle; reports freed RAM. Idempotent.
 //! - `POST /admin/activate`  → restore service. Idempotent. Also happens lazily
-//!                             on the next inference request ([`lazy_activate`]).
-//! - `GET  /admin/idle`      → current idle/active status + resume manifest.
+//!                             on the next inference request ([`admit_inference`]).
+//! - `GET  /admin/idle`      → current phase + resume manifest.
 //! - A watchdog ([`watchdog_loop`]) re-activates on timeout so the proxy is never
-//!   left silently dead; it holds off only while a compiler GPU-exclusive lease is
+//!   left silently dead; it holds off only while a COMPILER GPU-exclusive lease is
 //!   actively held.
 //!
 //! ## Testability
-//! The pure decision logic ([`decide_enter`], [`decide_activate`],
-//! [`ResumeManifest::watchdog_expired`], and the in-memory [`IdleController`]
-//! transitions) is separated from the clock, the filesystem, and the network so it
-//! is exhaustively unit-testable offline with no global state and no sleeping. The
-//! release/restore *side effects* (stopping backends, evicting VRAM, reading
-//! `/proc/meminfo`) live in the async orchestration functions and are best-effort.
+//! The pure decision logic ([`decide_enter`], [`decide_activate`], [`is_compiler_lease`],
+//! [`lazy_action`], [`watchdog_should_activate`], [`ResumeManifest::watchdog_expired`],
+//! and the in-memory [`IdleController`] transitions) is separated from the clock, the
+//! filesystem, and the network so it is exhaustively unit-testable offline with no
+//! global state and no sleeping. The release/restore *side effects* (stopping backends,
+//! evicting VRAM, reading `/proc/meminfo`) live in the async orchestration functions and
+//! are best-effort.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -55,6 +77,13 @@ pub const DEFAULT_WATCHDOG_SECS: u64 = 3600;
 /// (the report flags `inflight_remaining > 0`). Override `CHORD_IDLE_DRAIN_SECS`.
 pub const DEFAULT_DRAIN_SECS: u64 = 30;
 
+/// Default substrings (case-insensitive) that identify a GPU-exclusive holder as a
+/// *compiler build* lease, as opposed to some other GPU job (e.g. the intake sweep
+/// harness `intake_coder_sweep`). These are role/label conventions, NOT infra
+/// identifiers — override with `CHORD_IDLE_COMPILER_LEASE_HOLDERS` (comma-separated)
+/// if the compiler adopts a different holder label.
+pub const DEFAULT_COMPILER_LEASE_HOLDERS: &str = "compiler,build,bld";
+
 /// Resolve the watchdog timeout from `CHORD_IDLE_WATCHDOG_SECS` (seconds); a
 /// missing/blank/zero/unparseable value falls back to [`DEFAULT_WATCHDOG_SECS`].
 pub fn watchdog_secs_from_env() -> u64 {
@@ -73,6 +102,40 @@ fn parse_positive_env(key: &str, default: u64) -> u64 {
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(default)
+}
+
+/// The configured set of compiler-lease holder substrings (lowercased), from
+/// `CHORD_IDLE_COMPILER_LEASE_HOLDERS` or [`DEFAULT_COMPILER_LEASE_HOLDERS`]. Not a
+/// secret and not an infra identifier — a list of role labels.
+pub fn compiler_lease_holders_from_env() -> Vec<String> {
+    let raw = std::env::var("CHORD_IDLE_COMPILER_LEASE_HOLDERS")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_COMPILER_LEASE_HOLDERS.to_string());
+    raw.split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Does `holder` name a COMPILER build lease (per `patterns`)? Case-insensitive
+/// substring match. Pure — the caller supplies the patterns and the holder label,
+/// so this is fully unit-testable without the global lock.
+pub fn is_compiler_lease(holder: &str, patterns: &[String]) -> bool {
+    let h = holder.to_ascii_lowercase();
+    patterns
+        .iter()
+        .any(|p| !p.is_empty() && h.contains(p.as_str()))
+}
+
+/// Is a COMPILER build lease currently held on the shared GPU? Reads the global
+/// GPU-exclusive gate and applies [`is_compiler_lease`] to the live holder. A
+/// non-compiler holder (or no holder) ⇒ `false` — only a build lease protects idle.
+pub fn compiler_lease_held(now: u64) -> bool {
+    match crate::gpu_exclusive::GPU_EXCLUSIVE.active_holder(now) {
+        Some(rec) => is_compiler_lease(&rec.holder, &compiler_lease_holders_from_env()),
+        None => false,
+    }
 }
 
 // ── Resume manifest ───────────────────────────────────────────────────────────
@@ -140,30 +203,143 @@ pub fn decide_activate(current: Option<&ResumeManifest>) -> ActivateDecision {
     }
 }
 
+/// Pure decision for the lazy-restore hook: when a real request arrives while idle,
+/// should we restore, or preserve idle because a compiler build is still running?
+#[derive(Debug, PartialEq, Eq)]
+pub enum LazyAction {
+    /// No compiler lease ⇒ restore service, then serve the request.
+    Restore,
+    /// A compiler build lease is still held ⇒ keep the idle manifest + watchdog
+    /// protection intact; the request is shed (retryable 503) rather than allowed
+    /// to tear the build window down.
+    PreserveIdle,
+}
+
+pub fn lazy_action(compiler_lease_held: bool) -> LazyAction {
+    if compiler_lease_held {
+        LazyAction::PreserveIdle
+    } else {
+        LazyAction::Restore
+    }
+}
+
+/// Pure decision for the watchdog: given whether the deadline has passed and the
+/// current GPU holder (if any), should the watchdog auto-activate now? Defers ONLY
+/// for a live compiler build lease; a non-compiler holder does not extend idle.
+pub fn watchdog_should_activate(expired: bool, holder: Option<&str>, patterns: &[String]) -> bool {
+    if !expired {
+        return false;
+    }
+    match holder {
+        Some(h) if is_compiler_lease(h, patterns) => false, // compiler build in progress → defer
+        _ => true,                                          // no/other holder → auto-activate
+    }
+}
+
 // ── In-memory controller + durable persistence ───────────────────────────────
 
-/// Outcome of applying an enter against the live state.
+/// The lifecycle phase of idle-mode. `EnteringIdle`/`Activating` are transient
+/// transition markers held only for the duration of the (short) release/restore
+/// work; they are never persisted (a crash mid-transition reloads as `Active`, and
+/// the GPU-exclusive gate + watchdog keep things safe).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Phase {
+    Active,
+    EnteringIdle,
+    Idle,
+    Activating,
+}
+
+/// Internal state cell. Owns the manifest only in the idle/activating phases.
+enum IdleState {
+    Active,
+    EnteringIdle,
+    Idle(ResumeManifest),
+    Activating(ResumeManifest),
+}
+
+impl IdleState {
+    fn phase(&self) -> Phase {
+        match self {
+            IdleState::Active => Phase::Active,
+            IdleState::EnteringIdle => Phase::EnteringIdle,
+            IdleState::Idle(_) => Phase::Idle,
+            IdleState::Activating(_) => Phase::Activating,
+        }
+    }
+    /// The manifest to persist for this phase: only a fully-`Idle` proxy persists a
+    /// manifest; every other phase (including the transients) persists "not idle".
+    fn to_persisted(&self) -> Option<&ResumeManifest> {
+        match self {
+            IdleState::Idle(m) => Some(m),
+            _ => None,
+        }
+    }
+}
+
+/// Result of trying to BEGIN entering idle (CAS `Active → EnteringIdle`).
+#[derive(Debug, PartialEq)]
+pub enum BeginEnter {
+    /// Won the CAS: caller MUST run release work then call [`IdleController::finish_enter`].
+    Begin,
+    /// Already fully idle ⇒ idempotent no-op (carries the existing manifest).
+    AlreadyIdle(ResumeManifest),
+    /// Another enter/activate transition is in flight ⇒ no-op, do NOT run release.
+    InTransition,
+}
+
+/// Result of trying to BEGIN activating (CAS `Idle → Activating`).
+#[derive(Debug, PartialEq)]
+pub enum BeginActivate {
+    /// Won the CAS: caller finishes with [`IdleController::finish_activate`].
+    Begin(ResumeManifest),
+    /// Already active ⇒ idempotent no-op.
+    AlreadyActive,
+    /// An enter/activate transition is in flight ⇒ no-op.
+    InTransition,
+}
+
+/// Outcome of a full enter (begin+release+finish) against the live state.
 #[derive(Debug, PartialEq)]
 pub enum EnterOutcome {
     /// Transitioned active → idle; carries the stored manifest.
     Entered(ResumeManifest),
     /// Already idle; carries the existing manifest (idempotent).
     AlreadyIdle(ResumeManifest),
+    /// A concurrent transition was already in flight; nothing was re-run.
+    InTransition,
 }
 
-/// Outcome of applying an activate against the live state.
+/// Outcome of a full activate against the live state.
 #[derive(Debug, PartialEq)]
 pub enum ActivateOutcome {
     /// Transitioned idle → active; carries the manifest that was cleared.
     Activated(ResumeManifest),
     /// Already active (idempotent no-op).
     AlreadyActive,
+    /// A concurrent transition was in flight; nothing was re-run.
+    InTransition,
 }
 
-/// Process-global idle-mode state. `Some(manifest)` ⇒ idle; `None` ⇒ active. One
-/// Chord process serves one host, so this is a singleton, like `GPU_EXCLUSIVE`.
+/// Outcome of an admission attempt for a new inference request.
+pub enum AdmitOutcome {
+    /// Admitted while `Active`; holds the in-flight guard (already counted).
+    Admitted(InflightGuard),
+    /// Steady `Idle`: caller decides restore-vs-preserve (see [`lazy_action`]).
+    Idle,
+    /// Mid-transition (`EnteringIdle`/`Activating`): brief, retryable — do NOT admit.
+    Transitioning,
+}
+
+/// Process-global idle-mode state machine. One Chord process serves one host, so
+/// this is a singleton, like `GPU_EXCLUSIVE`.
 pub struct IdleController {
-    inner: RwLock<Option<ResumeManifest>>,
+    inner: RwLock<IdleState>,
+    /// Count of admitted in-flight inference requests. Owned per-controller (not a
+    /// module global) so unit tests are fully isolated. Shared with each
+    /// [`InflightGuard`] via an `Arc` so the guard decrements the RIGHT counter on
+    /// drop, no matter how long the request outlives the admission call.
+    inflight: Arc<AtomicUsize>,
     /// Where the manifest is persisted across restarts. `None` ⇒ persistence
     /// disabled (in-memory only) — behaviourally fine, the watchdog still bounds it.
     state_path: Option<PathBuf>,
@@ -179,24 +355,29 @@ impl IdleController {
     /// In-memory-only controller (no persistence). Used by unit tests.
     pub fn new() -> Self {
         Self {
-            inner: RwLock::new(None),
+            inner: RwLock::new(IdleState::Active),
+            inflight: Arc::new(AtomicUsize::new(0)),
             state_path: None,
         }
     }
 
     /// Construct with durable persistence at `state_path`, seeding any persisted
-    /// manifest. A missing/corrupt file seeds `None` (active) and never panics.
+    /// manifest. A missing/corrupt file seeds `Active` and never panics.
     pub fn with_state(state_path: Option<PathBuf>) -> Self {
-        let seed = state_path.as_deref().and_then(load_persisted);
-        if let Some(m) = &seed {
-            info!(
-                reason = %m.reason,
-                entered_at = m.entered_at,
-                "idle-mode: reloaded persisted idle state across restart (watchdog will bound it)"
-            );
-        }
+        let seed = match state_path.as_deref().and_then(load_persisted) {
+            Some(m) => {
+                info!(
+                    reason = %m.reason,
+                    entered_at = m.entered_at,
+                    "idle-mode: reloaded persisted idle state across restart (watchdog will bound it)"
+                );
+                IdleState::Idle(m)
+            }
+            None => IdleState::Active,
+        };
         Self {
             inner: RwLock::new(seed),
+            inflight: Arc::new(AtomicUsize::new(0)),
             state_path,
         }
     }
@@ -206,54 +387,148 @@ impl IdleController {
         Self::with_state(crate::config::admin_idle_state_path())
     }
 
-    fn persist_locked(&self, current: &Option<ResumeManifest>) {
+    fn persist_locked(&self, current: &IdleState) {
         if let Some(path) = self.state_path.as_deref() {
-            persist_state(path, current);
+            persist_state(path, &current.to_persisted().cloned());
         }
     }
 
-    /// Is Chord currently idle?
+    /// Current lifecycle phase (cheap snapshot).
+    pub fn phase(&self) -> Phase {
+        self.inner.read().expect("idle lock poisoned").phase()
+    }
+
+    /// Is Chord fully idle right now? (Transitions do NOT count as idle.)
     pub fn is_idle(&self) -> bool {
-        self.inner.read().expect("idle lock poisoned").is_some()
+        matches!(
+            &*self.inner.read().expect("idle lock poisoned"),
+            IdleState::Idle(_)
+        )
     }
 
-    /// A snapshot of the current manifest (if idle) for the status endpoint.
+    /// A snapshot of the current manifest (present while idle or activating) for the
+    /// status endpoint.
     pub fn snapshot(&self) -> Option<ResumeManifest> {
-        self.inner.read().expect("idle lock poisoned").clone()
-    }
-
-    /// Enter idle with `manifest`. Idempotent: if already idle the existing
-    /// manifest is preserved (no clobber) and returned as `AlreadyIdle`.
-    pub fn enter(&self, manifest: ResumeManifest) -> EnterOutcome {
-        let mut guard = self.inner.write().expect("idle lock poisoned");
-        match decide_enter(guard.as_ref()) {
-            EnterDecision::Enter => {
-                *guard = Some(manifest.clone());
-                self.persist_locked(&guard);
-                EnterOutcome::Entered(manifest)
-            }
-            EnterDecision::AlreadyIdle => {
-                EnterOutcome::AlreadyIdle(guard.clone().expect("already-idle implies Some"))
-            }
+        match &*self.inner.read().expect("idle lock poisoned") {
+            IdleState::Idle(m) | IdleState::Activating(m) => Some(m.clone()),
+            _ => None,
         }
     }
 
-    /// Leave idle. Idempotent: if already active, `AlreadyActive`.
-    pub fn exit(&self) -> ActivateOutcome {
-        let mut guard = self.inner.write().expect("idle lock poisoned");
-        match decide_activate(guard.as_ref()) {
-            ActivateDecision::Restore => {
-                let manifest = guard.take().expect("restore implies Some");
-                self.persist_locked(&guard);
-                ActivateOutcome::Activated(manifest)
+    /// Try to admit ONE new inference request. The in-flight increment happens under
+    /// the SAME write lock that flips the phase, so once a concurrent
+    /// [`begin_enter`](Self::begin_enter) has installed `EnteringIdle`, this can
+    /// never return `Admitted` — the drain that follows is closed-world.
+    pub fn try_admit(&self) -> AdmitOutcome {
+        let guard = self.inner.write().expect("idle lock poisoned");
+        match &*guard {
+            IdleState::Active => {
+                AdmitOutcome::Admitted(InflightGuard::admit(self.inflight.clone()))
             }
-            ActivateDecision::AlreadyActive => ActivateOutcome::AlreadyActive,
+            IdleState::Idle(_) => AdmitOutcome::Idle,
+            IdleState::EnteringIdle | IdleState::Activating(_) => AdmitOutcome::Transitioning,
+        }
+    }
+
+    /// Current number of admitted in-flight inference requests.
+    pub fn inflight_count(&self) -> usize {
+        self.inflight.load(Ordering::SeqCst)
+    }
+
+    /// Wait (bounded by `timeout`) for in-flight inference to drain to zero. Returns
+    /// the number still in flight when it returned (0 = fully drained; >0 = the bound
+    /// was hit and release proceeds anyway). Polls at 100ms. Because admission is
+    /// closed once the phase left `Active`, the count is monotonically non-increasing
+    /// here — a genuine closed-world drain.
+    pub async fn drain_inflight(&self, timeout: Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let n = self.inflight_count();
+            if n == 0 {
+                return 0;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return n;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// CAS `Active → EnteringIdle`. Installs the transition marker atomically BEFORE
+    /// any release work, so exactly one caller ever runs the release side effects.
+    pub fn begin_enter(&self) -> BeginEnter {
+        let mut guard = self.inner.write().expect("idle lock poisoned");
+        match &*guard {
+            IdleState::Active => {
+                *guard = IdleState::EnteringIdle; // transient — not persisted
+                BeginEnter::Begin
+            }
+            IdleState::Idle(m) => BeginEnter::AlreadyIdle(m.clone()),
+            IdleState::EnteringIdle | IdleState::Activating(_) => BeginEnter::InTransition,
+        }
+    }
+
+    /// Complete an enter: `EnteringIdle → Idle(manifest)`, persisting the manifest.
+    /// Returns the stored manifest. Defensive: if the phase is not `EnteringIdle`
+    /// (should never happen — only the `Begin` winner calls this), it still installs
+    /// the idle manifest rather than losing the transition.
+    pub fn finish_enter(&self, manifest: ResumeManifest) -> ResumeManifest {
+        let mut guard = self.inner.write().expect("idle lock poisoned");
+        *guard = IdleState::Idle(manifest.clone());
+        self.persist_locked(&guard);
+        manifest
+    }
+
+    /// CAS `Idle → Activating`, returning the manifest to clear. Concurrent
+    /// activates: exactly one wins `Begin`; the rest see `InTransition`/`AlreadyActive`.
+    pub fn begin_activate(&self) -> BeginActivate {
+        let mut guard = self.inner.write().expect("idle lock poisoned");
+        match &*guard {
+            IdleState::Idle(_) => {
+                let m = match std::mem::replace(&mut *guard, IdleState::Active) {
+                    IdleState::Idle(m) => m,
+                    _ => unreachable!("matched Idle above"),
+                };
+                *guard = IdleState::Activating(m.clone()); // transient — not persisted
+                BeginActivate::Begin(m)
+            }
+            IdleState::Active => BeginActivate::AlreadyActive,
+            IdleState::EnteringIdle | IdleState::Activating(_) => BeginActivate::InTransition,
+        }
+    }
+
+    /// Complete an activate: `Activating → Active`, persisting the cleared state.
+    pub fn finish_activate(&self) {
+        let mut guard = self.inner.write().expect("idle lock poisoned");
+        *guard = IdleState::Active;
+        self.persist_locked(&guard);
+    }
+
+    /// Convenience full enter used by unit tests: atomically `Active → Idle` (begin +
+    /// finish with no release work in between). Idempotent, like the real path.
+    pub fn enter(&self, manifest: ResumeManifest) -> EnterOutcome {
+        match self.begin_enter() {
+            BeginEnter::Begin => EnterOutcome::Entered(self.finish_enter(manifest)),
+            BeginEnter::AlreadyIdle(m) => EnterOutcome::AlreadyIdle(m),
+            BeginEnter::InTransition => EnterOutcome::InTransition,
+        }
+    }
+
+    /// Full leave idle (begin + finish). Idempotent: already active ⇒ `AlreadyActive`.
+    pub fn exit(&self) -> ActivateOutcome {
+        match self.begin_activate() {
+            BeginActivate::Begin(m) => {
+                self.finish_activate();
+                ActivateOutcome::Activated(m)
+            }
+            BeginActivate::AlreadyActive => ActivateOutcome::AlreadyActive,
+            BeginActivate::InTransition => ActivateOutcome::InTransition,
         }
     }
 }
 
-/// The process-global idle-mode controller. Handlers, the lazy-activate hook, and
-/// the watchdog reference this; unit tests use isolated [`IdleController::new`]
+/// The process-global idle-mode controller. Handlers, the admission hook, and the
+/// watchdog reference this; unit tests use isolated [`IdleController::new`]
 /// instances so they never touch global state.
 pub static IDLE_MODE: once_cell::sync::Lazy<IdleController> =
     once_cell::sync::Lazy::new(IdleController::from_env);
@@ -312,51 +587,30 @@ fn persist_state(path: &Path, state: &Option<ResumeManifest>) {
     }
 }
 
-// ── In-flight gauge + drain ───────────────────────────────────────────────────
+// ── In-flight gauge ───────────────────────────────────────────────────────────
 
-/// Process-global count of inference requests currently executing. Incremented on
-/// entry to the inference handlers (via [`InflightGuard`]) and decremented on drop,
-/// so idle-mode can drain before releasing resources.
-static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
-
-/// RAII guard: `InflightGuard::enter()` at the top of an inference handler counts
-/// one in-flight request; it is decremented when the guard drops (even on panic /
-/// early return / `?`), so the gauge can never leak.
+/// RAII guard for one admitted in-flight request. Constructed only via
+/// [`IdleController::try_admit`] (which increments under the state lock, and only
+/// while `Active`); the decrement on drop is lock-free and can never leak (fires on
+/// panic / `?` / early return alike). Holds an `Arc` to its owning controller's
+/// counter so it always decrements the counter it incremented.
 #[must_use = "hold the guard for the duration of the request"]
-pub struct InflightGuard(());
+pub struct InflightGuard {
+    counter: Arc<AtomicUsize>,
+}
 
 impl InflightGuard {
-    pub fn enter() -> Self {
-        INFLIGHT.fetch_add(1, Ordering::SeqCst);
-        InflightGuard(())
+    /// Increment `counter` and hand back the guard. Private: callers must go through
+    /// [`IdleController::try_admit`] so the increment stays under the state lock.
+    fn admit(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        InflightGuard { counter }
     }
 }
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        INFLIGHT.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-/// Current number of in-flight inference requests.
-pub fn inflight_count() -> usize {
-    INFLIGHT.load(Ordering::SeqCst)
-}
-
-/// Wait (bounded by `timeout`) for in-flight inference to drain to zero. Returns
-/// the number still in flight when it returned (0 = fully drained; >0 = the bound
-/// was hit and release proceeds anyway). Polls at 100ms.
-pub async fn drain_inflight(timeout: Duration) -> usize {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let n = inflight_count();
-        if n == 0 {
-            return 0;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return n;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        self.counter.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -398,22 +652,34 @@ fn freed_gb(before: Option<f64>, after: Option<f64>) -> Option<f64> {
 // ── Orchestration (async, best-effort side effects) ──────────────────────────
 
 /// Enter idle: drain, stop providers, unload VRAM, demote resident models, free
-/// RAM, record the resume manifest. Idempotent — a second call while already idle
-/// returns the existing state with no side effects. Returns the controller outcome
-/// plus (only on a real transition) the freed-RAM report.
+/// RAM, record the resume manifest. The transition marker is installed atomically
+/// FIRST, so concurrent callers never double-run release and no new inference is
+/// admitted once release begins. Returns the controller outcome plus (only on a
+/// real transition) the freed-RAM report.
 pub async fn enter_idle(
     state: &Arc<crate::routes::AppState>,
     reason: &str,
 ) -> (EnterOutcome, Option<IdleReport>) {
-    // Idempotency FIRST, so we never re-run release on an already-idle proxy.
-    if let Some(existing) = IDLE_MODE.snapshot() {
-        return (EnterOutcome::AlreadyIdle(existing), None);
+    // Atomically CLAIM the transition FIRST (fixes the TOCTOU: two concurrent enters
+    // can no longer both observe "active" and both run release). Only the `Begin`
+    // winner proceeds; everyone else returns a no-op with no side effects.
+    match IDLE_MODE.begin_enter() {
+        BeginEnter::Begin => {}
+        BeginEnter::AlreadyIdle(m) => return (EnterOutcome::AlreadyIdle(m), None),
+        BeginEnter::InTransition => return (EnterOutcome::InTransition, None),
     }
+    // Phase is now `EnteringIdle`: `try_admit` rejects all new inference, so the
+    // drain below is a genuine closed-world drain.
 
-    info!(reason, "idle-mode: entering — draining and releasing host resources");
+    info!(
+        reason,
+        "idle-mode: entering — draining and releasing host resources"
+    );
 
-    // 1. Drain in-flight inference (bounded).
-    let inflight_remaining = drain_inflight(Duration::from_secs(drain_secs_from_env())).await;
+    // 1. Drain in-flight inference (bounded, closed-world).
+    let inflight_remaining = IDLE_MODE
+        .drain_inflight(Duration::from_secs(drain_secs_from_env()))
+        .await;
     if inflight_remaining > 0 {
         warn!(
             inflight_remaining,
@@ -469,7 +735,8 @@ pub async fn enter_idle(
         resident_models,
         mem_available_before_gb: mem_before.unwrap_or(0.0),
     };
-    let outcome = IDLE_MODE.enter(manifest);
+    // Complete the transition: `EnteringIdle → Idle`.
+    let stored = IDLE_MODE.finish_enter(manifest);
 
     let report = IdleReport {
         mem_available_before_gb: mem_before,
@@ -489,16 +756,19 @@ pub async fn enter_idle(
         freed_gb = report.freed_gb.unwrap_or(0.0),
         "idle-mode: entered — host resources released for the compiler"
     );
-    (outcome, Some(report))
+    (EnterOutcome::Entered(stored), Some(report))
 }
 
-/// Leave idle and resume normal serving. Idempotent. Models reload LAZILY on their
-/// next request (Ollama/llama-server cold-load on demand), so there is nothing to
-/// force-start here — activate simply clears the gate and logs.
+/// Leave idle and resume normal serving. Idempotent, CAS-guarded. Models reload
+/// LAZILY on their next request (Ollama/llama-server cold-load on demand), so there
+/// is no async release work on this path — hence `Activating` is a nanosecond
+/// window and activate is effectively a single atomic transition.
 pub async fn activate(state: &Arc<crate::routes::AppState>, reason: &str) -> ActivateOutcome {
     let _ = state; // reserved: a future eager pre-warm could use the registry/client.
-    match IDLE_MODE.exit() {
-        ActivateOutcome::Activated(m) => {
+    match IDLE_MODE.begin_activate() {
+        BeginActivate::Begin(m) => {
+            // (restore side effects would go here; lazy reload means none today.)
+            IDLE_MODE.finish_activate();
             info!(
                 reason,
                 resident_models = m.resident_models.len(),
@@ -506,19 +776,48 @@ pub async fn activate(state: &Arc<crate::routes::AppState>, reason: &str) -> Act
             );
             ActivateOutcome::Activated(m)
         }
-        ActivateOutcome::AlreadyActive => ActivateOutcome::AlreadyActive,
+        BeginActivate::AlreadyActive => ActivateOutcome::AlreadyActive,
+        BeginActivate::InTransition => ActivateOutcome::InTransition,
     }
 }
 
-/// Lazy-activate hook for the inference handlers: if Chord is idle, restore before
-/// serving so the request succeeds (rather than hitting a stopped backend). A cheap
-/// atomic read in the common (active) case — no lock, no await — so it is safe to
-/// call at the top of every inference request.
-pub async fn lazy_activate(state: &Arc<crate::routes::AppState>) {
-    if IDLE_MODE.is_idle() {
-        info!("idle-mode: lazy activate — a real request arrived while idle");
-        let _ = activate(state, "lazy-on-request").await;
+/// Result of [`admit_inference`]: either a held guard or a ready-to-return response.
+pub enum Admission {
+    Admitted(InflightGuard),
+    Rejected(Response),
+}
+
+/// Admission hook for the inference handlers. Returns the in-flight guard to hold
+/// for the request, or a `Response` to short-circuit with:
+/// - `Active`        ⇒ admitted (guard already counted under the state lock).
+/// - `EnteringIdle`/`Activating` ⇒ retryable 503 (a brief, bounded transition window).
+/// - `Idle` + no compiler lease ⇒ lazily restore, then admit.
+/// - `Idle` + compiler build lease held ⇒ retryable 503 that PRESERVES idle +
+///   watchdog protection (the build window is not torn down by stray traffic).
+pub async fn admit_inference(state: &Arc<crate::routes::AppState>) -> Admission {
+    // Bounded attempts: at most one lazy restore, then a re-admit. A pathological
+    // re-idle between the two just yields a retryable 503 rather than spinning.
+    for _ in 0..3 {
+        match IDLE_MODE.try_admit() {
+            AdmitOutcome::Admitted(guard) => return Admission::Admitted(guard),
+            AdmitOutcome::Transitioning => return Admission::Rejected(idle_transition_response()),
+            AdmitOutcome::Idle => match lazy_action(compiler_lease_held(now_epoch())) {
+                LazyAction::PreserveIdle => {
+                    info!(
+                        "idle-mode: request arrived while idle but a compiler build lease is held — \
+                         preserving idle (503, watchdog still protecting the build window)"
+                    );
+                    return Admission::Rejected(idle_compiler_busy_response());
+                }
+                LazyAction::Restore => {
+                    info!("idle-mode: lazy activate — a real request arrived while idle");
+                    let _ = activate(state, "lazy-on-request").await;
+                    // loop: re-admit now that we should be Active
+                }
+            },
+        }
     }
+    Admission::Rejected(idle_transition_response())
 }
 
 /// Best-effort list of the models Ollama currently has resident (`/api/ps`), for
@@ -575,12 +874,39 @@ use std::sync::Arc as StdArc;
 
 use axum::{
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 
 use crate::routes::{auth_check, auth_error_response, AppState};
+
+/// Retryable 503 while a short idle/activate transition is in progress.
+fn idle_transition_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, HeaderValue::from_static("2"))],
+        Json(serde_json::json!({
+            "error": "idle_transition_in_progress",
+            "status": "transitioning",
+        })),
+    )
+        .into_response()
+}
+
+/// Retryable 503 shed while idle because a compiler build lease is still held; idle
+/// state + watchdog protection are deliberately PRESERVED.
+fn idle_compiler_busy_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, HeaderValue::from_static("5"))],
+        Json(serde_json::json!({
+            "error": "idle_compiler_build_active",
+            "status": "idle",
+        })),
+    )
+        .into_response()
+}
 
 /// Optional body for `POST /admin/idle` and `POST /admin/activate`.
 #[derive(Deserialize, Default)]
@@ -635,6 +961,15 @@ pub async fn admin_idle_enter(
             })),
         )
             .into_response(),
+        EnterOutcome::InTransition => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "entering_idle",
+                "changed": false,
+                "note": "another idle/activate transition is in progress",
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -669,10 +1004,19 @@ pub async fn admin_activate(
             Json(serde_json::json!({ "status": "active", "changed": false })),
         )
             .into_response(),
+        ActivateOutcome::InTransition => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "activating",
+                "changed": false,
+                "note": "another idle/activate transition is in progress",
+            })),
+        )
+            .into_response(),
     }
 }
 
-/// `GET /admin/idle` — current idle/active status + resume manifest for observability.
+/// `GET /admin/idle` — current phase + resume manifest for observability.
 pub async fn admin_idle_status(
     State(state): State<StdArc<AppState>>,
     headers: HeaderMap,
@@ -680,17 +1024,29 @@ pub async fn admin_idle_status(
     if let Err(e) = auth_check(&headers, &state.jwt_secret) {
         return auth_error_response(e);
     }
+    let phase = IDLE_MODE.phase();
+    let phase_str = match &phase {
+        Phase::Active => "active",
+        Phase::EnteringIdle => "entering_idle",
+        Phase::Idle => "idle",
+        Phase::Activating => "activating",
+    };
     let body = match IDLE_MODE.snapshot() {
         Some(m) => serde_json::json!({
-            "status": "idle",
+            "status": if phase == Phase::Idle { "idle" } else { phase_str },
+            "phase": phase_str,
             "reason": m.reason,
             "entered_at": crate::gpu_exclusive::iso_utc(m.entered_at),
             "watchdog_deadline": crate::gpu_exclusive::iso_utc(m.watchdog_deadline),
             "watchdog_expired": m.watchdog_expired(now_epoch()),
             "resident_models": m.resident_models,
-            "inflight": inflight_count(),
+            "inflight": IDLE_MODE.inflight_count(),
         }),
-        None => serde_json::json!({ "status": "active", "inflight": inflight_count() }),
+        None => serde_json::json!({
+            "status": "active",
+            "phase": phase_str,
+            "inflight": IDLE_MODE.inflight_count(),
+        }),
     };
     (StatusCode::OK, Json(body)).into_response()
 }
@@ -698,32 +1054,32 @@ pub async fn admin_idle_status(
 // ── Watchdog ──────────────────────────────────────────────────────────────────
 
 /// Background fail-safe: every `interval`, if idle and the watchdog deadline has
-/// passed AND no compiler GPU-exclusive lease is currently held, auto-activate so
-/// the proxy is never left silently dead (a crashed/forgotten compiler, or a stale
-/// idle state reloaded after a Chord restart). While a lease IS held the deadline
+/// passed AND no COMPILER build lease is currently held, auto-activate so the proxy
+/// is never left silently dead (a crashed/forgotten compiler, or a stale idle state
+/// reloaded after a Chord restart). While a compiler build lease IS held the deadline
 /// is deferred — a legitimately long build keeps Chord idle as long as it holds the
-/// GPU. Follows the `idle_stop_sweep` spawn pattern in `main.rs`.
+/// GPU. A NON-compiler GPU holder (e.g. the intake sweep harness) does NOT extend the
+/// idle window. Follows the `idle_stop_sweep` spawn pattern in `main.rs`.
 pub async fn watchdog_loop(state: Arc<crate::routes::AppState>, interval: Duration) {
     info!(
         interval_secs = interval.as_secs(),
         "idle-mode watchdog started"
     );
+    let patterns = compiler_lease_holders_from_env();
     loop {
         tokio::time::sleep(interval).await;
         let Some(m) = IDLE_MODE.snapshot() else {
             continue;
         };
         let now = now_epoch();
-        if !m.watchdog_expired(now) {
-            continue;
-        }
-        if crate::gpu_exclusive::GPU_EXCLUSIVE.active_holder(now).is_some() {
-            // A compiler lease is still held — a long build; defer.
+        let holder = crate::gpu_exclusive::GPU_EXCLUSIVE.active_holder(now);
+        let holder_label = holder.as_ref().map(|r| r.holder.as_str());
+        if !watchdog_should_activate(m.watchdog_expired(now), holder_label, &patterns) {
             continue;
         }
         warn!(
             reason = %m.reason,
-            "idle-mode watchdog: deadline passed with no active GPU lease — auto-activating (fail-safe)"
+            "idle-mode watchdog: deadline passed with no active compiler lease — auto-activating (fail-safe)"
         );
         let _ = activate(&state, "watchdog-timeout").await;
     }
@@ -741,6 +1097,10 @@ mod tests {
             resident_models: vec!["qwen3-coder:30b".into()],
             mem_available_before_gb: 12.0,
         }
+    }
+
+    fn holders() -> Vec<String> {
+        vec!["compiler".into(), "build".into(), "bld".into()]
     }
 
     // ── pure decisions ───────────────────────────────────────────────────────
@@ -767,11 +1127,52 @@ mod tests {
         assert!(m.watchdog_expired(9999));
     }
 
+    // ── compiler-lease matching (findings #3/#4) ──────────────────────────────
+
+    #[test]
+    fn compiler_lease_matches_only_build_holders() {
+        let p = holders();
+        assert!(is_compiler_lease("compiler", &p));
+        assert!(is_compiler_lease("bld-05-compiler", &p));
+        assert!(is_compiler_lease("constellation-build", &p));
+        assert!(is_compiler_lease("COMPILER", &p)); // case-insensitive
+                                                    // a DIFFERENT GPU job must NOT read as a compiler lease:
+        assert!(!is_compiler_lease("intake_coder_sweep", &p));
+        assert!(!is_compiler_lease("intake_assistant_sweep", &p));
+        assert!(!is_compiler_lease("", &p));
+    }
+
+    #[test]
+    fn lazy_action_preserves_idle_only_under_compiler_lease() {
+        // finding #3: a held compiler lease must NOT clear idle.
+        assert_eq!(lazy_action(true), LazyAction::PreserveIdle);
+        assert_eq!(lazy_action(false), LazyAction::Restore);
+    }
+
+    #[test]
+    fn watchdog_defers_only_for_compiler_lease() {
+        let p = holders();
+        // Not expired ⇒ never activate, regardless of holder.
+        assert!(!watchdog_should_activate(false, Some("compiler"), &p));
+        assert!(!watchdog_should_activate(false, None, &p));
+        // Expired + compiler lease held ⇒ defer (finding #4).
+        assert!(!watchdog_should_activate(true, Some("bld-05-compiler"), &p));
+        // Expired + a NON-compiler GPU holder ⇒ auto-activate anyway.
+        assert!(watchdog_should_activate(
+            true,
+            Some("intake_coder_sweep"),
+            &p
+        ));
+        // Expired + no holder ⇒ auto-activate.
+        assert!(watchdog_should_activate(true, None, &p));
+    }
+
     // ── controller transitions (isolated instance, no globals) ───────────────
 
     #[test]
     fn enter_then_exit_cycle() {
         let ctl = IdleController::new();
+        assert_eq!(ctl.phase(), Phase::Active);
         assert!(!ctl.is_idle());
         assert!(ctl.snapshot().is_none());
 
@@ -781,6 +1182,7 @@ mod tests {
             other => panic!("expected Entered, got {other:?}"),
         }
         assert!(ctl.is_idle());
+        assert_eq!(ctl.phase(), Phase::Idle);
         assert_eq!(ctl.snapshot().unwrap(), m);
 
         match ctl.exit() {
@@ -788,6 +1190,7 @@ mod tests {
             other => panic!("expected Activated, got {other:?}"),
         }
         assert!(!ctl.is_idle());
+        assert_eq!(ctl.phase(), Phase::Active);
     }
 
     #[test]
@@ -814,6 +1217,83 @@ mod tests {
         assert!(matches!(ctl.exit(), ActivateOutcome::AlreadyActive));
     }
 
+    // ── concurrency-safety: CAS + closed-world drain (findings #1/#2) ─────────
+
+    #[test]
+    fn begin_enter_is_exclusive_cas_release_runs_once() {
+        // finding #1: only ONE caller may run release. The first begin_enter wins;
+        // a second while EnteringIdle must NOT also get Begin.
+        let ctl = IdleController::new();
+        assert_eq!(ctl.begin_enter(), BeginEnter::Begin);
+        assert_eq!(ctl.begin_enter(), BeginEnter::InTransition);
+        // finish and confirm a later begin sees AlreadyIdle, never a second Begin.
+        let m = manifest("compiler", 1, 2);
+        let _ = ctl.finish_enter(m.clone());
+        match ctl.begin_enter() {
+            BeginEnter::AlreadyIdle(got) => assert_eq!(got, m),
+            other => panic!("expected AlreadyIdle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn begin_activate_is_exclusive_cas() {
+        let ctl = IdleController::new();
+        ctl.enter(manifest("compiler", 1, 2));
+        assert!(matches!(ctl.begin_activate(), BeginActivate::Begin(_)));
+        // While Activating, a second begin must not also win.
+        assert_eq!(ctl.begin_activate(), BeginActivate::InTransition);
+        ctl.finish_activate();
+        assert_eq!(ctl.begin_activate(), BeginActivate::AlreadyActive);
+    }
+
+    #[test]
+    fn no_inflight_admitted_after_entering_idle() {
+        // finding #2: once we flip to EnteringIdle, try_admit must reject — no new
+        // request can join the in-flight set, so the drain is closed-world.
+        // The counter is per-controller, so this test is fully isolated from any
+        // other test touching in-flight state (no shared global gauge).
+        let ctl = IdleController::new();
+        // Active ⇒ admits and increments.
+        assert_eq!(ctl.inflight_count(), 0);
+        let guard = match ctl.try_admit() {
+            AdmitOutcome::Admitted(g) => {
+                assert_eq!(ctl.inflight_count(), 1);
+                g
+            }
+            _ => panic!("Active must admit"),
+        };
+        drop(guard);
+        assert_eq!(ctl.inflight_count(), 0);
+
+        // Enter the transition; now admission must be refused with NO increment.
+        assert_eq!(ctl.begin_enter(), BeginEnter::Begin);
+        assert!(matches!(ctl.try_admit(), AdmitOutcome::Transitioning));
+        assert_eq!(
+            ctl.inflight_count(),
+            0,
+            "no request admitted after EnteringIdle"
+        );
+
+        // Fully idle also refuses admission (caller lazy-activates instead).
+        let _ = ctl.finish_enter(manifest("compiler", 1, 2));
+        assert!(matches!(ctl.try_admit(), AdmitOutcome::Idle));
+        assert_eq!(ctl.inflight_count(), 0);
+    }
+
+    #[test]
+    fn admit_guard_increments_and_decrements() {
+        let ctl = IdleController::new();
+        assert_eq!(ctl.inflight_count(), 0);
+        match ctl.try_admit() {
+            AdmitOutcome::Admitted(g) => {
+                assert_eq!(ctl.inflight_count(), 1);
+                drop(g);
+                assert_eq!(ctl.inflight_count(), 0);
+            }
+            _ => panic!("Active must admit"),
+        }
+    }
+
     // ── freed-RAM arithmetic ─────────────────────────────────────────────────
 
     #[test]
@@ -823,23 +1303,6 @@ mod tests {
         assert_eq!(freed_gb(Some(25.0), Some(24.0)), Some(0.0));
         assert_eq!(freed_gb(None, Some(25.0)), None);
         assert_eq!(freed_gb(Some(10.0), None), None);
-    }
-
-    // ── in-flight gauge ──────────────────────────────────────────────────────
-
-    #[test]
-    fn inflight_guard_increments_and_decrements() {
-        let base = inflight_count();
-        {
-            let _g1 = InflightGuard::enter();
-            assert_eq!(inflight_count(), base + 1);
-            {
-                let _g2 = InflightGuard::enter();
-                assert_eq!(inflight_count(), base + 2);
-            }
-            assert_eq!(inflight_count(), base + 1);
-        }
-        assert_eq!(inflight_count(), base);
     }
 
     // ── durable persistence (mirrors gpu_exclusive) ──────────────────────────
@@ -872,6 +1335,20 @@ mod tests {
         // A restart after activate must see no idle state.
         let restarted = IdleController::with_state(Some(path.clone()));
         assert!(!restarted.is_idle());
+    }
+
+    #[test]
+    fn entering_idle_is_not_persisted() {
+        // The transient marker must not persist: a crash mid-enter reloads Active.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admin_idle_state.json");
+        let ctl = IdleController::with_state(Some(path.clone()));
+        assert_eq!(ctl.begin_enter(), BeginEnter::Begin); // EnteringIdle, no finish
+        let restarted = IdleController::with_state(Some(path));
+        assert!(
+            !restarted.is_idle(),
+            "EnteringIdle must not persist as idle"
+        );
     }
 
     #[test]
@@ -919,5 +1396,13 @@ mod tests {
         std::env::set_var("CHORD_IDLE_TEST_KEY", "900");
         assert_eq!(parse_positive_env("CHORD_IDLE_TEST_KEY", 42), 900);
         std::env::remove_var("CHORD_IDLE_TEST_KEY");
+    }
+
+    #[test]
+    fn compiler_lease_holders_default_when_unset() {
+        std::env::remove_var("CHORD_IDLE_COMPILER_LEASE_HOLDERS");
+        let p = compiler_lease_holders_from_env();
+        assert!(p.contains(&"compiler".to_string()));
+        assert!(is_compiler_lease("compiler", &p));
     }
 }

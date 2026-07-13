@@ -289,6 +289,15 @@ on the **control port** (`CHORD_CONTROL_PORT`, default `8090`) and is JWT-gated 
 the same auth as every other endpoint. Implemented in
 [`src/admin/idle.rs`](src/admin/idle.rs).
 
+Internally this is a **closed-world transition state machine**
+(`Active → EnteringIdle → Idle → Activating → Active`), not a snapshot-then-act flag,
+so it is correct under concurrent control calls and concurrent inference. The
+`EnteringIdle`/`Activating` markers are installed atomically (compare-and-swap) **before**
+any release/restore work, and new inference is admitted only while `Active` — with the
+admission counter incremented under the same lock that flips the state. Once idle-mode
+flips to `EnteringIdle`, no further request can join the in-flight set, so the drain
+that follows is a genuine closed-world drain.
+
 | Method | Path | Purpose |
 |--------|------|---------|
 | `POST` | `/admin/idle` | Enter idle: drain, stop providers, release GPU/VRAM, demote resident models, free RAM. Reports freed RAM. Idempotent. |
@@ -307,25 +316,44 @@ the same auth as every other endpoint. Implemented in
   on their next request (Ollama/llama-server cold-load on demand), so activation is
   cheap and non-blocking. Activation also happens **automatically on the first real
   inference request** after idle (lazy-on-request) — the compiler never needs to call
-  `/admin/activate` explicitly if traffic resumes on its own.
+  `/admin/activate` explicitly if traffic resumes on its own — **except** while a
+  compiler build lease is still held (see below).
 - **Idempotency**: idle-while-idle and activate-while-active are `200` no-ops
   (`changed:false`); a repeat `/admin/idle` never re-runs release or clobbers the
-  original manifest.
+  original manifest. Concurrent `/admin/idle` calls are safe — exactly one runs the
+  release side effects; the rest return `changed:false`.
+- **Requests during a transition**: an inference request that arrives while idle-mode
+  is mid-transition (`EnteringIdle`/`Activating`) gets a short, retryable `503`
+  (`{"error":"idle_transition_in_progress"}`, `Retry-After: 2`) rather than being
+  admitted into the draining set.
+- **Compiler-lease-aware lazy restore**: a real request that arrives while idle
+  restores service **only if no compiler build lease is currently held**. If a compiler
+  build lease *is* held, the request is shed with a retryable `503`
+  (`{"error":"idle_compiler_build_active"}`, `Retry-After: 5`) and the idle manifest +
+  watchdog protection are **preserved** — stray traffic can never tear down an active
+  build window. A compiler lease is any GPU-exclusive holder whose label matches
+  `CHORD_IDLE_COMPILER_LEASE_HOLDERS` (default substrings `compiler,build,bld`); other
+  GPU jobs (e.g. the intake sweep harness) are **not** treated as build leases.
 - **Watchdog / fail-safe**: a background loop re-activates an idle proxy once the
   watchdog deadline passes (`CHORD_IDLE_WATCHDOG_SECS`, default 3600s) **unless** a
-  compiler GPU-exclusive lease is still held — so a legitimately long build keeps
-  Chord idle as long as it holds the GPU, but a crashed/forgotten compiler (or a stale
-  idle state reloaded after a Chord restart) never leaves the proxy silently dead.
+  *compiler build lease* (per `CHORD_IDLE_COMPILER_LEASE_HOLDERS`) is still held — so a
+  legitimately long build keeps Chord idle as long as it holds the GPU, but a
+  crashed/forgotten compiler (or a stale idle state reloaded after a Chord restart)
+  never leaves the proxy silently dead. A non-compiler GPU holder does not extend the
+  idle window.
 - **Durability**: when `CHORD_STATE_DIR` is set, the resume manifest is persisted
   (atomic tempfile+rename) so a crash mid-idle leaves a record the watchdog acts on
-  after restart. Unset ⇒ in-memory only (the watchdog still bounds it).
+  after restart. Transient transition markers (`EnteringIdle`/`Activating`) are never
+  persisted — a crash mid-transition reloads as `Active` (the GPU-exclusive gate and
+  watchdog keep that safe). Unset ⇒ in-memory only (the watchdog still bounds it).
 - **GPU lock held by another job**: reported in `foreign_gpu_lock_holder`, **never**
   force-released or killed — that lease may be a legitimate external GPU job.
 
 | Env var | Purpose | Default |
 |---|---|---|
 | `CHORD_IDLE_DRAIN_SECS` | Max seconds to wait for in-flight inference to drain before releasing. | `30` |
-| `CHORD_IDLE_WATCHDOG_SECS` | Hard timeout after which the watchdog auto-activates (unless a GPU lease is held). | `3600` |
+| `CHORD_IDLE_WATCHDOG_SECS` | Hard timeout after which the watchdog auto-activates (unless a compiler build lease is held). | `3600` |
+| `CHORD_IDLE_COMPILER_LEASE_HOLDERS` | Comma-separated, case-insensitive substrings that mark a GPU-exclusive holder as a *compiler build* lease (protects the idle window from lazy teardown + watchdog). Role labels, not infra identifiers. | `compiler,build,bld` |
 | `CHORD_STATE_DIR` | Durable state dir; the idle manifest persists to `<dir>/admin_idle_state.json`. | *(unset → in-memory)* |
 | `OLLAMA_URL` | Ollama base used to enumerate/unload resident models on idle. | *(unset → VRAM eviction skipped)* |
 

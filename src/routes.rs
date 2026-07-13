@@ -227,10 +227,7 @@ pub struct ToolListResponse {
     pub count: usize,
 }
 
-pub async fn tools_list(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn tools_list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let start = Instant::now();
 
     let claims = match auth_check(&headers, &state.jwt_secret) {
@@ -362,7 +359,8 @@ pub async fn tools_call(
             let mut response = Json(ToolCallResponse {
                 result,
                 source: Some(source.to_string()),
-            }).into_response();
+            })
+            .into_response();
             response.headers_mut().extend(rl_headers);
             response
         }
@@ -403,7 +401,10 @@ fn personal_backend_unconfigured_response() -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
 }
 
-pub async fn personal_tools_list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+pub async fn personal_tools_list(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
     let start = Instant::now();
 
     let Some(proxy) = state.personal_proxy.as_ref() else {
@@ -551,7 +552,9 @@ pub struct ToolDiscoverRequest {
     pub max_results: usize,
 }
 
-fn default_max_results() -> usize { 10 }
+fn default_max_results() -> usize {
+    10
+}
 
 #[derive(Serialize)]
 pub struct ToolDiscoverResponse {
@@ -613,7 +616,12 @@ pub async fn tools_discover(
                 None,
             );
             let query = req.query.clone();
-            let mut response = Json(ToolDiscoverResponse { tools, query, count }).into_response();
+            let mut response = Json(ToolDiscoverResponse {
+                tools,
+                query,
+                count,
+            })
+            .into_response();
             response.headers_mut().extend(rl_headers);
             response
         }
@@ -650,10 +658,12 @@ pub async fn agent_execute(
         Err(e) => return auth_error_response(e),
     };
 
-    // ── BLD-09 idle-mode: count in-flight + lazily restore if idle (see
-    // `chat_completions`). This route dispatches LLM calls, so it must drain too. ─
-    let _idle_inflight = crate::admin::idle::InflightGuard::enter();
-    crate::admin::idle::lazy_activate(&state).await;
+    // ── BLD-09 idle-mode admission (see `chat_completions`). This route dispatches
+    // LLM calls, so it must join the closed-world drain / lazy-restore path too. ──
+    let _idle_inflight = match crate::admin::idle::admit_inference(&state).await {
+        crate::admin::idle::Admission::Admitted(g) => g,
+        crate::admin::idle::Admission::Rejected(resp) => return resp,
+    };
 
     // ── GPU-exclusive gate ────────────────────────────────────────────────────
     // Same gate as `chat_completions`/`infer`: this route makes LLM calls too
@@ -775,10 +785,14 @@ pub async fn chat_completions(
         }
     };
 
-    // ── BLD-09 idle-mode: count this request in-flight (so `POST /admin/idle` can
-    // drain before releasing resources) and lazily restore service if idle. ──────
-    let _idle_inflight = crate::admin::idle::InflightGuard::enter();
-    crate::admin::idle::lazy_activate(&state).await;
+    // ── BLD-09 idle-mode admission: join the closed-world drain (so `POST /admin/idle`
+    // can drain before releasing) and lazily restore if idle. Once idle-mode has begun
+    // entering (EnteringIdle), admission is refused with a retryable 503 so no new
+    // request slips into the in-flight set after the drain window opens. ────────────
+    let _idle_inflight = match crate::admin::idle::admit_inference(&state).await {
+        crate::admin::idle::Admission::Admitted(g) => g,
+        crate::admin::idle::Admission::Rejected(resp) => return resp,
+    };
 
     // ── GPU-exclusive gate ────────────────────────────────────────────────────
     // While the GPU is exclusively held (by the intake harness), do NOT load a
@@ -860,9 +874,7 @@ pub async fn chat_completions(
             .ensure_local(&registry_key, None)
             .await
         {
-            warn!(
-                "chat/completions: cold model {resolved_model} could not be retrieved: {e}"
-            );
+            warn!("chat/completions: cold model {resolved_model} could not be retrieved: {e}");
             state.audit_logger.log_llm_call(
                 &claims.sub,
                 &resolved_model,
@@ -986,8 +998,7 @@ pub async fn chat_completions(
             let resp_body = serde_json::json!({
                 "error": format!("LLM backend unreachable: {e}")
             });
-            let mut response =
-                (StatusCode::BAD_GATEWAY, Json(resp_body)).into_response();
+            let mut response = (StatusCode::BAD_GATEWAY, Json(resp_body)).into_response();
             response.headers_mut().extend(rl_headers);
             return response;
         }
@@ -1153,9 +1164,7 @@ pub async fn embeddings(
                 .get("Authorization")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|h| extract_bearer(h).ok());
-            state
-                .audit_logger
-                .log_auth_failure(raw, 0);
+            state.audit_logger.log_auth_failure(raw, 0);
             return auth_error_response(e);
         }
     };
@@ -1224,9 +1233,7 @@ pub async fn health() -> impl IntoResponse {
 
 /// GET /v1/audit/summary — aggregate counts for the last 24h.
 /// No auth required (returns aggregate counts only, no user identities).
-pub async fn audit_summary(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+pub async fn audit_summary(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let mut summary: AuditSummary = state.audit_logger.daily_summary();
     summary.window_hours = 24;
     Json(summary)
@@ -1242,10 +1249,19 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
         .route("/v1/tools/discover", axum::routing::post(tools_discover))
         // Task 2 (federation): terminus_personal's ~147-tool catalog,
         // reachable ONLY here — never merged into /v1/tools/list above.
-        .route("/v1/personal/tools/list", axum::routing::post(personal_tools_list))
-        .route("/v1/personal/tools/call", axum::routing::post(personal_tools_call))
+        .route(
+            "/v1/personal/tools/list",
+            axum::routing::post(personal_tools_list),
+        )
+        .route(
+            "/v1/personal/tools/call",
+            axum::routing::post(personal_tools_call),
+        )
         .route("/v1/agent/execute", axum::routing::post(agent_execute))
-        .route("/v1/chat/completions", axum::routing::post(chat_completions))
+        .route(
+            "/v1/chat/completions",
+            axum::routing::post(chat_completions),
+        )
         .route("/v1/embeddings", axum::routing::post(embeddings))
         .route("/v1/infer", axum::routing::post(infer))
         // GPU-exclusive coordination: the intake harness ACQUIREs the GPU here
@@ -1266,7 +1282,10 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
         // Sweep-status observability (no auth, same bar as /health and
         // /v1/audit/summary — aggregate health, no identities/secrets).
         .merge(crate::sweep_status::api::sweep_status_routes())
-        .route("/v1/coding/select", axum::routing::post(crate::coding_proxy::coding_select))
+        .route(
+            "/v1/coding/select",
+            axum::routing::post(crate::coding_proxy::coding_select),
+        )
         .with_state(state)
 }
 
@@ -1321,7 +1340,8 @@ pub async fn gpu_exclusive_acquire(
                 tracing::info!(holder = %record.holder, "gpu-exclusive: granted — evicting resident models");
                 if let Some(base) = crate::gpu_exclusive::ollama_base_from_env() {
                     let unloaded =
-                        crate::gpu_exclusive::evict_resident_models(&state.http_client, &base).await;
+                        crate::gpu_exclusive::evict_resident_models(&state.http_client, &base)
+                            .await;
                     tracing::info!(holder = %record.holder, unloaded, "gpu-exclusive: acquire eviction complete");
                 }
             }
@@ -1338,11 +1358,14 @@ pub async fn gpu_exclusive_acquire(
                 requested_by = %holder, current_holder = %record.holder,
                 "gpu-exclusive: acquire refused — held by another"
             );
-            (StatusCode::CONFLICT, Json(serde_json::json!({
-                "error": "gpu_exclusively_held",
-                "holder": record.holder,
-                "since": crate::gpu_exclusive::iso_utc(record.acquired_at),
-            })))
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "gpu_exclusively_held",
+                    "holder": record.holder,
+                    "since": crate::gpu_exclusive::iso_utc(record.acquired_at),
+                })),
+            )
                 .into_response()
         }
     }
@@ -1369,18 +1392,25 @@ pub async fn gpu_exclusive_release(
     match crate::gpu_exclusive::GPU_EXCLUSIVE.release(&holder) {
         crate::gpu_exclusive::ReleaseOutcome::Released => {
             tracing::info!(holder = %holder, "gpu-exclusive: released — normal serving resumed");
-            (StatusCode::OK, Json(serde_json::json!({ "status": "released" }))).into_response()
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "status": "released" })),
+            )
+                .into_response()
         }
         crate::gpu_exclusive::ReleaseOutcome::Mismatch { record } => {
             tracing::warn!(
                 requested_by = %holder, current_holder = %record.holder,
                 "gpu-exclusive: release refused — held by another"
             );
-            (StatusCode::CONFLICT, Json(serde_json::json!({
-                "error": "lock_held_by_other",
-                "holder": record.holder,
-                "since": crate::gpu_exclusive::iso_utc(record.acquired_at),
-            })))
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "lock_held_by_other",
+                    "holder": record.holder,
+                    "since": crate::gpu_exclusive::iso_utc(record.acquired_at),
+                })),
+            )
                 .into_response()
         }
     }
@@ -1432,9 +1462,12 @@ pub async fn infer(
     if let Err(e) = auth_check(&headers, &state.jwt_secret) {
         return auth_error_response(e);
     }
-    // BLD-09 idle-mode: count in-flight + lazily restore if idle (see `chat_completions`).
-    let _idle_inflight = crate::admin::idle::InflightGuard::enter();
-    crate::admin::idle::lazy_activate(&state).await;
+    // BLD-09 idle-mode admission (see `chat_completions`): join the closed-world drain
+    // / lazy-restore path, or short-circuit with a retryable 503 during a transition.
+    let _idle_inflight = match crate::admin::idle::admit_inference(&state).await {
+        crate::admin::idle::Admission::Admitted(g) => g,
+        crate::admin::idle::Admission::Rejected(resp) => return resp,
+    };
 
     // GPU-exclusive gate (see `chat_completions`): never run inference while the
     // GPU is exclusively held — return the same structured 503 instead.
@@ -1469,10 +1502,18 @@ mod tests {
     struct PingTool;
     #[async_trait::async_trait]
     impl FallbackTool for PingTool {
-        fn name(&self) -> &str { "gitea_ping" }
-        fn description(&self) -> &str { "Ping" }
-        fn parameters(&self) -> Value { serde_json::json!({}) }
-        async fn execute(&self, _: Value) -> Result<String, ProxyError> { Ok("pong".into()) }
+        fn name(&self) -> &str {
+            "gitea_ping"
+        }
+        fn description(&self) -> &str {
+            "Ping"
+        }
+        fn parameters(&self) -> Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _: Value) -> Result<String, ProxyError> {
+            Ok("pong".into())
+        }
     }
 
     /// A tool whose backend failure message embeds content that could plausibly
@@ -1482,9 +1523,15 @@ mod tests {
     struct FailingTool;
     #[async_trait::async_trait]
     impl FallbackTool for FailingTool {
-        fn name(&self) -> &str { "gitea_fail_test" }
-        fn description(&self) -> &str { "Always fails with backend-echoed content" }
-        fn parameters(&self) -> Value { serde_json::json!({}) }
+        fn name(&self) -> &str {
+            "gitea_fail_test"
+        }
+        fn description(&self) -> &str {
+            "Always fails with backend-echoed content"
+        }
+        fn parameters(&self) -> Value {
+            serde_json::json!({})
+        }
         async fn execute(&self, _: Value) -> Result<String, ProxyError> {
             Err(ProxyError::ToolExecution(
                 "backend rejected field api_key=<REDACTED-SECRET>".into(),
@@ -1592,15 +1639,15 @@ mod tests {
                 model_registry_path: "<path>/model-registry.json".into(),
                 model_disk_pressure_percent: 80,
                 model_sweep_interval_secs: 1800,
-            model_warm_cooldown_hours: 168,
-            model_archive_copy_timeout_secs: 1800,
-            model_gc_min_age_secs: 300,
-            model_source_allowlist: Vec::new(),
-            outbound_proxy: None,
-            runtime_telemetry_off: true,
-            mcp_backend_token: None,
-            personal_backend_url: None,
-            personal_backend_token: None,
+                model_warm_cooldown_hours: 168,
+                model_archive_copy_timeout_secs: 1800,
+                model_gc_min_age_secs: 300,
+                model_source_allowlist: Vec::new(),
+                outbound_proxy: None,
+                runtime_telemetry_off: true,
+                mcp_backend_token: None,
+                personal_backend_url: None,
+                personal_backend_token: None,
             },
             Arc::new(FallbackRegistry::new()),
         ));
@@ -1608,7 +1655,34 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(default_rate_config())));
         let audit_logger = Arc::new(AuditLogger::new(std::path::PathBuf::from("/dev/null")));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None, embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(None, "http://127.0.0.1:1".to_string()) })
+        Arc::new(AppState {
+            proxy,
+            jwt_secret: String::new(),
+            audit_logger,
+            rate_limiter,
+            agentic_executor,
+            llm_backend_url: None,
+            model_aliases: std::collections::HashMap::new(),
+            http_client: reqwest::Client::new(),
+            model_registry,
+            pull_coordinator,
+            local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(
+                std::path::PathBuf::from("/tmp"),
+            )),
+            disk_op_lock: crate::models::eviction::new_disk_op_lock(),
+            disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe),
+            disk_pressure_percent: 80,
+            model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
+            routing_map: empty_routing_map(),
+            coding_profile_source: empty_coding_profile_source(),
+            personal_proxy: None,
+            embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
+                None,
+                "http://127.0.0.1:1".to_string(),
+            ),
+        })
     }
 
     /// Like `test_state` but with the embeddings fallback pointed at
@@ -1727,13 +1801,19 @@ mod tests {
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
             personal_proxy,
-            embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(None, "http://127.0.0.1:1".to_string()),
+            embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
+                None,
+                "http://127.0.0.1:1".to_string(),
+            ),
         })
     }
 
     /// Like `test_state`, but the audit logger writes to a real file (instead of
     /// `/dev/null`) so tests can assert on the JSONL entries it produces.
-    fn test_state_with_audit_path(mcp_url: String, audit_path: std::path::PathBuf) -> Arc<AppState> {
+    fn test_state_with_audit_path(
+        mcp_url: String,
+        audit_path: std::path::PathBuf,
+    ) -> Arc<AppState> {
         let mut reg = FallbackRegistry::new();
         reg.register(Box::new(PingTool));
         let config = Config {
@@ -1798,7 +1878,34 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(default_rate_config())));
         let audit_logger = Arc::new(AuditLogger::new(audit_path));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None, embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(None, "http://127.0.0.1:1".to_string()) })
+        Arc::new(AppState {
+            proxy,
+            jwt_secret: String::new(),
+            audit_logger,
+            rate_limiter,
+            agentic_executor,
+            llm_backend_url: None,
+            model_aliases: std::collections::HashMap::new(),
+            http_client: reqwest::Client::new(),
+            model_registry,
+            pull_coordinator,
+            local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(
+                std::path::PathBuf::from("/tmp"),
+            )),
+            disk_op_lock: crate::models::eviction::new_disk_op_lock(),
+            disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe),
+            disk_pressure_percent: 80,
+            model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
+            routing_map: empty_routing_map(),
+            coding_profile_source: empty_coding_profile_source(),
+            personal_proxy: None,
+            embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
+                None,
+                "http://127.0.0.1:1".to_string(),
+            ),
+        })
     }
 
     /// Like `test_state_with_audit_path`, but registers `FailingTool` instead of
@@ -1873,7 +1980,34 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(default_rate_config())));
         let audit_logger = Arc::new(AuditLogger::new(audit_path));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None, embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(None, "http://127.0.0.1:1".to_string()) })
+        Arc::new(AppState {
+            proxy,
+            jwt_secret: String::new(),
+            audit_logger,
+            rate_limiter,
+            agentic_executor,
+            llm_backend_url: None,
+            model_aliases: std::collections::HashMap::new(),
+            http_client: reqwest::Client::new(),
+            model_registry,
+            pull_coordinator,
+            local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(
+                std::path::PathBuf::from("/tmp"),
+            )),
+            disk_op_lock: crate::models::eviction::new_disk_op_lock(),
+            disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe),
+            disk_pressure_percent: 80,
+            model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
+            routing_map: empty_routing_map(),
+            coding_profile_source: empty_coding_profile_source(),
+            personal_proxy: None,
+            embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
+                None,
+                "http://127.0.0.1:1".to_string(),
+            ),
+        })
     }
 
     /// State with auth disabled and an explicit upstream LLM URL for chat/completions tests.
@@ -1942,11 +2076,22 @@ mod tests {
             http_client: reqwest::Client::new(),
             model_registry,
             pull_coordinator,
-            local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300,
+            local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(
+                std::path::PathBuf::from("/tmp"),
+            )),
+            disk_op_lock: crate::models::eviction::new_disk_op_lock(),
+            disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe),
+            disk_pressure_percent: 80,
+            model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
             routing_map,
             coding_profile_source: empty_coding_profile_source(),
             personal_proxy: None,
-            embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(None, "http://127.0.0.1:1".to_string()),
+            embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
+                None,
+                "http://127.0.0.1:1".to_string(),
+            ),
         })
     }
 
@@ -1997,15 +2142,15 @@ mod tests {
                 model_registry_path: "<path>/model-registry.json".into(),
                 model_disk_pressure_percent: 80,
                 model_sweep_interval_secs: 1800,
-            model_warm_cooldown_hours: 168,
-            model_archive_copy_timeout_secs: 1800,
-            model_gc_min_age_secs: 300,
-            model_source_allowlist: Vec::new(),
-            outbound_proxy: None,
-            runtime_telemetry_off: true,
-            mcp_backend_token: None,
-            personal_backend_url: None,
-            personal_backend_token: None,
+                model_warm_cooldown_hours: 168,
+                model_archive_copy_timeout_secs: 1800,
+                model_gc_min_age_secs: 300,
+                model_source_allowlist: Vec::new(),
+                outbound_proxy: None,
+                runtime_telemetry_off: true,
+                mcp_backend_token: None,
+                personal_backend_url: None,
+                personal_backend_token: None,
             },
             Arc::new(FallbackRegistry::new()),
         ));
@@ -2013,7 +2158,34 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(default_rate_config())));
         let audit_logger = Arc::new(AuditLogger::new(std::path::PathBuf::from("/dev/null")));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: secret, audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None, embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(None, "http://127.0.0.1:1".to_string()) })
+        Arc::new(AppState {
+            proxy,
+            jwt_secret: secret,
+            audit_logger,
+            rate_limiter,
+            agentic_executor,
+            llm_backend_url: None,
+            model_aliases: std::collections::HashMap::new(),
+            http_client: reqwest::Client::new(),
+            model_registry,
+            pull_coordinator,
+            local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(
+                std::path::PathBuf::from("/tmp"),
+            )),
+            disk_op_lock: crate::models::eviction::new_disk_op_lock(),
+            disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe),
+            disk_pressure_percent: 80,
+            model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
+            routing_map: empty_routing_map(),
+            coding_profile_source: empty_coding_profile_source(),
+            personal_proxy: None,
+            embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
+                None,
+                "http://127.0.0.1:1".to_string(),
+            ),
+        })
     }
 
     /// Build a state with a very tight user tool limit for rate limit tests.
@@ -2075,15 +2247,15 @@ mod tests {
                 model_registry_path: "<path>/model-registry.json".into(),
                 model_disk_pressure_percent: 80,
                 model_sweep_interval_secs: 1800,
-            model_warm_cooldown_hours: 168,
-            model_archive_copy_timeout_secs: 1800,
-            model_gc_min_age_secs: 300,
-            model_source_allowlist: Vec::new(),
-            outbound_proxy: None,
-            runtime_telemetry_off: true,
-            mcp_backend_token: None,
-            personal_backend_url: None,
-            personal_backend_token: None,
+                model_warm_cooldown_hours: 168,
+                model_archive_copy_timeout_secs: 1800,
+                model_gc_min_age_secs: 300,
+                model_source_allowlist: Vec::new(),
+                outbound_proxy: None,
+                runtime_telemetry_off: true,
+                mcp_backend_token: None,
+                personal_backend_url: None,
+                personal_backend_token: None,
             },
             Arc::new(FallbackRegistry::new()),
         ));
@@ -2091,7 +2263,34 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(tight)));
         let audit_logger = Arc::new(AuditLogger::new(std::path::PathBuf::from("/dev/null")));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None, embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(None, "http://127.0.0.1:1".to_string()) })
+        Arc::new(AppState {
+            proxy,
+            jwt_secret: String::new(),
+            audit_logger,
+            rate_limiter,
+            agentic_executor,
+            llm_backend_url: None,
+            model_aliases: std::collections::HashMap::new(),
+            http_client: reqwest::Client::new(),
+            model_registry,
+            pull_coordinator,
+            local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(
+                std::path::PathBuf::from("/tmp"),
+            )),
+            disk_op_lock: crate::models::eviction::new_disk_op_lock(),
+            disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe),
+            disk_pressure_percent: 80,
+            model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
+            routing_map: empty_routing_map(),
+            coding_profile_source: empty_coding_profile_source(),
+            personal_proxy: None,
+            embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
+                None,
+                "http://127.0.0.1:1".to_string(),
+            ),
+        })
     }
 
     /// Like `test_state_tight_limits`, but the audit logger writes to a real
@@ -2172,7 +2371,34 @@ mod tests {
         let rate_limiter = Arc::new(Mutex::new(ProxyRateLimiter::new(tight)));
         let audit_logger = Arc::new(AuditLogger::new(audit_path));
         let (model_registry, pull_coordinator) = empty_model_state();
-        Arc::new(AppState { proxy, jwt_secret: String::new(), audit_logger, rate_limiter, agentic_executor, llm_backend_url: None, model_aliases: std::collections::HashMap::new(), http_client: reqwest::Client::new(), model_registry, pull_coordinator, local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300, routing_map: empty_routing_map(), coding_profile_source: empty_coding_profile_source(), personal_proxy: None, embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(None, "http://127.0.0.1:1".to_string()) })
+        Arc::new(AppState {
+            proxy,
+            jwt_secret: String::new(),
+            audit_logger,
+            rate_limiter,
+            agentic_executor,
+            llm_backend_url: None,
+            model_aliases: std::collections::HashMap::new(),
+            http_client: reqwest::Client::new(),
+            model_registry,
+            pull_coordinator,
+            local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(
+                std::path::PathBuf::from("/tmp"),
+            )),
+            disk_op_lock: crate::models::eviction::new_disk_op_lock(),
+            disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe),
+            disk_pressure_percent: 80,
+            model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
+            routing_map: empty_routing_map(),
+            coding_profile_source: empty_coding_profile_source(),
+            personal_proxy: None,
+            embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
+                None,
+                "http://127.0.0.1:1".to_string(),
+            ),
+        })
     }
 
     #[tokio::test]
@@ -2219,10 +2445,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_tools_list_requires_auth() {
-        let state = test_state_with_secret(
-            "http://does-not-exist:9999".into(),
-            "test-secret".into(),
-        );
+        let state =
+            test_state_with_secret("http://does-not-exist:9999".into(), "test-secret".into());
         let app = build_router(state);
 
         let req = Request::builder()
@@ -2238,10 +2462,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_tools_call_requires_auth() {
-        let state = test_state_with_secret(
-            "http://does-not-exist:9999".into(),
-            "test-secret".into(),
-        );
+        let state =
+            test_state_with_secret("http://does-not-exist:9999".into(), "test-secret".into());
         let app = build_router(state);
 
         let req = Request::builder()
@@ -2257,10 +2479,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_tools_discover_requires_auth() {
-        let state = test_state_with_secret(
-            "http://does-not-exist:9999".into(),
-            "test-secret".into(),
-        );
+        let state =
+            test_state_with_secret("http://does-not-exist:9999".into(), "test-secret".into());
         let app = build_router(state);
 
         let req = Request::builder()
@@ -2299,7 +2519,8 @@ mod tests {
         let body = serde_json::to_string(&serde_json::json!({
             "name": "gitea_ping",
             "arguments": {}
-        })).unwrap();
+        }))
+        .unwrap();
 
         let req = Request::builder()
             .method(Method::POST)
@@ -2311,7 +2532,9 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["result"], "pong");
     }
@@ -2324,7 +2547,8 @@ mod tests {
         let body = serde_json::to_string(&serde_json::json!({
             "name": "nonexistent_tool",
             "arguments": {}
-        })).unwrap();
+        }))
+        .unwrap();
 
         let req = Request::builder()
             .method(Method::POST)
@@ -2345,7 +2569,8 @@ mod tests {
         let body = serde_json::to_string(&serde_json::json!({
             "query": "ping",
             "max_results": 5
-        })).unwrap();
+        }))
+        .unwrap();
 
         let req = Request::builder()
             .method(Method::POST)
@@ -2357,7 +2582,9 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(json["tools"].is_array());
         assert_eq!(json["query"], "ping");
@@ -2378,7 +2605,8 @@ mod tests {
     async fn test_tool_call_success_produces_audit_entry_with_tool_name() {
         let dir = tempfile::tempdir().unwrap();
         let audit_path = dir.path().join("chord-audit.jsonl");
-        let state = test_state_with_audit_path("http://does-not-exist:9999".into(), audit_path.clone());
+        let state =
+            test_state_with_audit_path("http://does-not-exist:9999".into(), audit_path.clone());
         let app = build_router(state);
 
         // Arguments deliberately contain secret-shaped content — it must never
@@ -2386,7 +2614,8 @@ mod tests {
         let body = serde_json::to_string(&serde_json::json!({
             "name": "gitea_ping",
             "arguments": {"token": "<REDACTED-SECRET>", "note": "hunter2"}
-        })).unwrap();
+        }))
+        .unwrap();
 
         let req = Request::builder()
             .method(Method::POST)
@@ -2415,13 +2644,15 @@ mod tests {
     async fn test_tool_call_error_produces_audit_entry_no_leak() {
         let dir = tempfile::tempdir().unwrap();
         let audit_path = dir.path().join("chord-audit.jsonl");
-        let state = test_state_with_audit_path("http://does-not-exist:9999".into(), audit_path.clone());
+        let state =
+            test_state_with_audit_path("http://does-not-exist:9999".into(), audit_path.clone());
         let app = build_router(state);
 
         let body = serde_json::to_string(&serde_json::json!({
             "name": "nonexistent_tool",
             "arguments": {"api_key": "<REDACTED-SECRET>"}
-        })).unwrap();
+        }))
+        .unwrap();
 
         let req = Request::builder()
             .method(Method::POST)
@@ -2449,7 +2680,8 @@ mod tests {
     async fn test_tools_list_produces_audit_entry() {
         let dir = tempfile::tempdir().unwrap();
         let audit_path = dir.path().join("chord-audit.jsonl");
-        let state = test_state_with_audit_path("http://does-not-exist:9999".into(), audit_path.clone());
+        let state =
+            test_state_with_audit_path("http://does-not-exist:9999".into(), audit_path.clone());
         let app = build_router(state);
 
         let req = Request::builder()
@@ -2472,14 +2704,16 @@ mod tests {
     async fn test_tools_discover_produces_audit_entry_without_query_text() {
         let dir = tempfile::tempdir().unwrap();
         let audit_path = dir.path().join("chord-audit.jsonl");
-        let state = test_state_with_audit_path("http://does-not-exist:9999".into(), audit_path.clone());
+        let state =
+            test_state_with_audit_path("http://does-not-exist:9999".into(), audit_path.clone());
         let app = build_router(state);
 
         let sensitive_query = "find the tool that stores api_key <REDACTED-SECRET>";
         let body = serde_json::to_string(&serde_json::json!({
             "query": sensitive_query,
             "max_results": 5
-        })).unwrap();
+        }))
+        .unwrap();
 
         let req = Request::builder()
             .method(Method::POST)
@@ -2493,7 +2727,10 @@ mod tests {
 
         let entries = read_audit_entries(&audit_path);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].request_type, crate::audit::RequestType::ToolDiscover);
+        assert_eq!(
+            entries[0].request_type,
+            crate::audit::RequestType::ToolDiscover
+        );
         assert_eq!(entries[0].status, crate::audit::Status::Success);
 
         // The raw query text must never appear in the audit log.
@@ -2519,7 +2756,8 @@ mod tests {
         let body = serde_json::to_string(&serde_json::json!({
             "name": "gitea_fail_test",
             "arguments": {}
-        })).unwrap();
+        }))
+        .unwrap();
 
         let req = Request::builder()
             .method(Method::POST)
@@ -2536,7 +2774,10 @@ mod tests {
         assert_eq!(entries[0].request_type, crate::audit::RequestType::ToolCall);
         assert_eq!(entries[0].target, "gitea_fail_test");
         assert_eq!(entries[0].status, crate::audit::Status::Error);
-        assert_eq!(entries[0].error_message.as_deref(), Some("tool_execution_error"));
+        assert_eq!(
+            entries[0].error_message.as_deref(),
+            Some("tool_execution_error")
+        );
 
         // The backend's echoed "secret" must never appear in the audit log,
         // even though FailingTool's ProxyError::ToolExecution Display text
@@ -2561,7 +2802,8 @@ mod tests {
             let body = serde_json::to_string(&serde_json::json!({
                 "name": "gitea_ping",
                 "arguments": {}
-            })).unwrap();
+            }))
+            .unwrap();
             let req = Request::builder()
                 .method(Method::POST)
                 .uri("/v1/tools/call")
@@ -2575,7 +2817,8 @@ mod tests {
         let body = serde_json::to_string(&serde_json::json!({
             "name": "gitea_ping",
             "arguments": {"secret_arg": "<REDACTED-SECRET>"}
-        })).unwrap();
+        }))
+        .unwrap();
         let req = Request::builder()
             .method(Method::POST)
             .uri("/v1/tools/call")
@@ -2615,9 +2858,18 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         let headers = resp.headers();
-        assert!(headers.contains_key("X-RateLimit-Limit"), "X-RateLimit-Limit must be present");
-        assert!(headers.contains_key("X-RateLimit-Remaining"), "X-RateLimit-Remaining must be present");
-        assert!(headers.contains_key("X-RateLimit-Reset"), "X-RateLimit-Reset must be present");
+        assert!(
+            headers.contains_key("X-RateLimit-Limit"),
+            "X-RateLimit-Limit must be present"
+        );
+        assert!(
+            headers.contains_key("X-RateLimit-Remaining"),
+            "X-RateLimit-Remaining must be present"
+        );
+        assert!(
+            headers.contains_key("X-RateLimit-Reset"),
+            "X-RateLimit-Reset must be present"
+        );
     }
 
     #[tokio::test]
@@ -2647,13 +2899,27 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
 
         let headers = resp.headers();
-        assert!(headers.contains_key("Retry-After"), "Retry-After must be present on 429");
-        assert!(headers.contains_key("X-RateLimit-Limit"), "X-RateLimit-Limit must be present on 429");
-        assert!(headers.contains_key("X-RateLimit-Remaining"), "X-RateLimit-Remaining must be present on 429");
-        assert!(headers.contains_key("X-RateLimit-Reset"), "X-RateLimit-Reset must be present on 429");
+        assert!(
+            headers.contains_key("Retry-After"),
+            "Retry-After must be present on 429"
+        );
+        assert!(
+            headers.contains_key("X-RateLimit-Limit"),
+            "X-RateLimit-Limit must be present on 429"
+        );
+        assert!(
+            headers.contains_key("X-RateLimit-Remaining"),
+            "X-RateLimit-Remaining must be present on 429"
+        );
+        assert!(
+            headers.contains_key("X-RateLimit-Reset"),
+            "X-RateLimit-Reset must be present on 429"
+        );
 
         // Body should contain error message.
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(json["error"].as_str().unwrap().contains("limit reached"));
     }
@@ -2809,10 +3075,12 @@ mod tests {
             when.method(httpmock::Method::POST)
                 .path("/v1/chat/completions")
                 .body_contains("chat_template_kwargs");
-            then.status(200).json_body(serde_json::json!({"choices": []}));
+            then.status(200)
+                .json_body(serde_json::json!({"choices": []}));
         });
         let real = server.mock(|when, then| {
-            when.method(httpmock::Method::POST).path("/v1/chat/completions");
+            when.method(httpmock::Method::POST)
+                .path("/v1/chat/completions");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(serde_json::json!({"choices": []}));
@@ -2832,10 +3100,16 @@ mod tests {
             .method(Method::POST)
             .uri("/v1/chat/completions")
             .header("Content-Type", "application/json")
-            .body(Body::from(chat_request_body_with_thinking("plain:7b", "on")))
+            .body(Body::from(chat_request_body_with_thinking(
+                "plain:7b", "on",
+            )))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "ignored hint must never error");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "ignored hint must never error"
+        );
         trap.assert_hits_async(0).await;
         real.assert_hits_async(1).await;
     }
@@ -2850,10 +3124,12 @@ mod tests {
             when.method(httpmock::Method::POST)
                 .path("/v1/chat/completions")
                 .body_contains("chat_template_kwargs");
-            then.status(200).json_body(serde_json::json!({"choices": []}));
+            then.status(200)
+                .json_body(serde_json::json!({"choices": []}));
         });
         let real = server.mock(|when, then| {
-            when.method(httpmock::Method::POST).path("/v1/chat/completions");
+            when.method(httpmock::Method::POST)
+                .path("/v1/chat/completions");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(serde_json::json!({"choices": []}));
@@ -2897,10 +3173,12 @@ mod tests {
             when.method(httpmock::Method::POST)
                 .path("/v1/chat/completions")
                 .body_contains("chat_template_kwargs");
-            then.status(200).json_body(serde_json::json!({"choices": []}));
+            then.status(200)
+                .json_body(serde_json::json!({"choices": []}));
         });
         let real = server.mock(|when, then| {
-            when.method(httpmock::Method::POST).path("/v1/chat/completions");
+            when.method(httpmock::Method::POST)
+                .path("/v1/chat/completions");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(serde_json::json!({"choices": []}));
@@ -2942,10 +3220,12 @@ mod tests {
             when.method(httpmock::Method::POST)
                 .path("/v1/chat/completions")
                 .body_contains("chat_template_kwargs");
-            then.status(200).json_body(serde_json::json!({"choices": []}));
+            then.status(200)
+                .json_body(serde_json::json!({"choices": []}));
         });
         let real = server.mock(|when, then| {
-            when.method(httpmock::Method::POST).path("/v1/chat/completions");
+            when.method(httpmock::Method::POST)
+                .path("/v1/chat/completions");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(serde_json::json!({"choices": []}));
@@ -2973,7 +3253,11 @@ mod tests {
             )))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "malformed value must never crash/error");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "malformed value must never crash/error"
+        );
         trap.assert_hits_async(0).await;
         real.assert_hits_async(1).await;
     }
@@ -3013,7 +3297,9 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(json["error"].as_str().unwrap().contains("not configured"));
     }
@@ -3044,7 +3330,9 @@ mod tests {
         let now = crate::gpu_exclusive::now_epoch();
         let _ = crate::gpu_exclusive::GPU_EXCLUSIVE.acquire(holder, now);
         assert!(
-            crate::gpu_exclusive::GPU_EXCLUSIVE.active_holder(now).is_some(),
+            crate::gpu_exclusive::GPU_EXCLUSIVE
+                .active_holder(now)
+                .is_some(),
             "precondition: GPU-exclusive lock must be held for this test"
         );
 
@@ -3084,7 +3372,8 @@ mod tests {
             "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
         });
         let mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST).path("/v1/chat/completions");
+            when.method(httpmock::Method::POST)
+                .path("/v1/chat/completions");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(upstream_body.clone());
@@ -3110,7 +3399,9 @@ mod tests {
             "application/json"
         );
 
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["choices"][0]["message"]["content"], "Hi there!");
 
@@ -3172,7 +3463,8 @@ mod tests {
                    data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\n\
                    data: [DONE]\n\n";
         let mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST).path("/v1/chat/completions");
+            when.method(httpmock::Method::POST)
+                .path("/v1/chat/completions");
             then.status(200)
                 .header("content-type", "text/event-stream")
                 .body(sse);
@@ -3197,7 +3489,9 @@ mod tests {
             "text/event-stream"
         );
 
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(text.contains("data: "));
         assert!(text.contains("[DONE]"));
@@ -3209,7 +3503,8 @@ mod tests {
     async fn test_chat_completions_passes_through_upstream_error_status() {
         let server = httpmock::MockServer::start_async().await;
         let mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST).path("/v1/chat/completions");
+            when.method(httpmock::Method::POST)
+                .path("/v1/chat/completions");
             then.status(404)
                 .header("content-type", "application/json")
                 .json_body(serde_json::json!({
@@ -3232,7 +3527,9 @@ mod tests {
         // The upstream 404 must be surfaced verbatim, not masked as 502.
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(json["error"]["message"]
             .as_str()
@@ -3245,9 +3542,7 @@ mod tests {
     #[tokio::test]
     async fn test_chat_completions_502_when_backend_unreachable() {
         // Point at an unroutable address so the upstream send() fails.
-        let state = test_state_with_llm(Some(
-            "http://127.0.0.1:1/v1/chat/completions".into(),
-        ));
+        let state = test_state_with_llm(Some("http://127.0.0.1:1/v1/chat/completions".into()));
         let app = build_router(state);
 
         let req = Request::builder()
@@ -3260,7 +3555,9 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(json["error"].as_str().unwrap().contains("unreachable"));
     }
@@ -3328,17 +3625,33 @@ mod tests {
             http_client: reqwest::Client::new(),
             model_registry: registry,
             pull_coordinator: coordinator,
-            local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(std::path::PathBuf::from("/tmp"))), disk_op_lock: crate::models::eviction::new_disk_op_lock(), disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe), disk_pressure_percent: 80, model_warm_cooldown_hours: 168, model_archive_copy_timeout_secs: 1800, model_gc_min_age_secs: 300,
+            local_evictor: std::sync::Arc::new(crate::models::eviction::FsLocalEvictor::new(
+                std::path::PathBuf::from("/tmp"),
+            )),
+            disk_op_lock: crate::models::eviction::new_disk_op_lock(),
+            disk_probe: std::sync::Arc::new(crate::models::transfer::StatvfsProbe),
+            disk_pressure_percent: 80,
+            model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
             personal_proxy: None,
-            embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(None, "http://127.0.0.1:1".to_string()),
+            embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
+                None,
+                "http://127.0.0.1:1".to_string(),
+            ),
         })
     }
 
     /// Write a minimal Ollama manifest + its blobs under `<root>` for `<model>:<tag>`,
     /// returning the model name. Mirrors the transfer-test layout.
-    fn write_archive_model(root: &std::path::Path, model: &str, tag: &str, sizes: &[u64]) -> String {
+    fn write_archive_model(
+        root: &std::path::Path,
+        model: &str,
+        tag: &str,
+        sizes: &[u64],
+    ) -> String {
         use std::fs;
         let manifests = root
             .join("manifests")
@@ -3351,7 +3664,11 @@ mod tests {
         let mut layers = Vec::new();
         for (i, size) in sizes.iter().enumerate() {
             let digest = format!("sha256:{model}{i}");
-            fs::write(blobs.join(digest.replacen(':', "-", 1)), vec![b'x'; *size as usize]).unwrap();
+            fs::write(
+                blobs.join(digest.replacen(':', "-", 1)),
+                vec![b'x'; *size as usize],
+            )
+            .unwrap();
             layers.push(serde_json::json!({ "size": size, "digest": digest }));
         }
         let cfg = format!("sha256:{model}cfg");
@@ -3393,7 +3710,8 @@ mod tests {
 
         let server = httpmock::MockServer::start_async().await;
         let mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST).path("/v1/chat/completions");
+            when.method(httpmock::Method::POST)
+                .path("/v1/chat/completions");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(serde_json::json!({"choices": []}));
@@ -3451,7 +3769,8 @@ mod tests {
 
         let server = httpmock::MockServer::start_async().await;
         let mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST).path("/v1/chat/completions");
+            when.method(httpmock::Method::POST)
+                .path("/v1/chat/completions");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(serde_json::json!({"choices": []}));
@@ -3485,7 +3804,8 @@ mod tests {
     async fn test_chat_completions_unknown_model_passes_through() {
         let server = httpmock::MockServer::start_async().await;
         let mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST).path("/v1/chat/completions");
+            when.method(httpmock::Method::POST)
+                .path("/v1/chat/completions");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(serde_json::json!({"choices": []}));
@@ -3500,7 +3820,10 @@ mod tests {
             .method(Method::POST)
             .uri("/v1/chat/completions")
             .header("Content-Type", "application/json")
-            .body(Body::from(chat_request_body("some-unknown-model:42", false)))
+            .body(Body::from(chat_request_body(
+                "some-unknown-model:42",
+                false,
+            )))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -3794,7 +4117,10 @@ mod tests {
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
             personal_proxy,
-            embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(None, "http://127.0.0.1:1".to_string()),
+            embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
+                None,
+                "http://127.0.0.1:1".to_string(),
+            ),
         });
         let app = build_router(state);
 
