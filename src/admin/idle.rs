@@ -84,13 +84,24 @@ pub const DEFAULT_DRAIN_SECS: u64 = 30;
 /// if the compiler adopts a different holder label.
 pub const DEFAULT_COMPILER_LEASE_HOLDERS: &str = "compiler,build,bld";
 
-/// Default bound (seconds) after which the watchdog force-resolves a controller
-/// stuck in a TRANSIENT phase (`EnteringIdle`/`Activating`) back to `Active`. This
-/// is a backstop only: the RAII [`EnterTransition`] guard already rolls a dropped /
-/// panicked enter back to `Active` immediately, so this timeout only matters for a
-/// pathological wedge. Comfortably longer than any drain+release, short enough to
-/// self-heal quickly. Override with `CHORD_IDLE_STALE_TRANSITION_SECS`.
-pub const DEFAULT_STALE_TRANSITION_SECS: u64 = 120;
+/// Default hard budget (seconds) for the ENTIRE `enter_idle` release sequence
+/// (drain + stop backends + evict VRAM + demote). Bounding release under an explicit
+/// timeout — kept STRICTLY BELOW the stale-recovery threshold — makes it structurally
+/// impossible for the watchdog to reopen admission while release is still running: the
+/// release either completes (→ `Idle`) or self-aborts via this budget (→ `Active`
+/// through the guard, with admission having been closed the whole `EnteringIdle`
+/// window). Comfortably above the drain deadline. Override `CHORD_IDLE_RELEASE_BUDGET_SECS`.
+pub const DEFAULT_RELEASE_BUDGET_SECS: u64 = 90;
+
+/// Default bound (seconds) after which the watchdog force-resolves a controller stuck
+/// in a TRANSIENT phase (`EnteringIdle`/`Activating`) back to `Active`. MUST be
+/// strictly greater than [`DEFAULT_RELEASE_BUDGET_SECS`] so the watchdog can only ever
+/// recover a transition whose release future has ALREADY self-aborted or vanished —
+/// never one still doing live release work (see [`stale_transition_secs_from_env`],
+/// which clamps this ordering at runtime). Backstop only: the RAII [`EnterTransition`]
+/// guard already rolls a dropped/panicked enter back to `Active` immediately.
+/// Override with `CHORD_IDLE_STALE_TRANSITION_SECS`.
+pub const DEFAULT_STALE_TRANSITION_SECS: u64 = 300;
 
 /// Resolve the watchdog timeout from `CHORD_IDLE_WATCHDOG_SECS` (seconds); a
 /// missing/blank/zero/unparseable value falls back to [`DEFAULT_WATCHDOG_SECS`].
@@ -104,14 +115,43 @@ pub fn drain_secs_from_env() -> u64 {
     parse_positive_env("CHORD_IDLE_DRAIN_SECS", DEFAULT_DRAIN_SECS)
 }
 
-/// Resolve the stale-transition backstop bound from `CHORD_IDLE_STALE_TRANSITION_SECS`
-/// (seconds); a missing/blank/zero/unparseable value falls back to
-/// [`DEFAULT_STALE_TRANSITION_SECS`].
-pub fn stale_transition_secs_from_env() -> u64 {
+/// Resolve the whole-release budget from `CHORD_IDLE_RELEASE_BUDGET_SECS` (seconds); a
+/// missing/blank/zero/unparseable value falls back to [`DEFAULT_RELEASE_BUDGET_SECS`].
+pub fn release_budget_secs_from_env() -> u64 {
     parse_positive_env(
+        "CHORD_IDLE_RELEASE_BUDGET_SECS",
+        DEFAULT_RELEASE_BUDGET_SECS,
+    )
+}
+
+/// Resolve the stale-transition backstop bound from `CHORD_IDLE_STALE_TRANSITION_SECS`
+/// (seconds), CLAMPED so it is always strictly greater than the release budget. This
+/// preserves the core invariant: the release future self-aborts (via its budget) BEFORE
+/// the watchdog is ever allowed to force-recover the transition, so stale-recovery can
+/// only fire once release is already gone — never concurrently with live release. A
+/// misconfiguration (stale ≤ budget) is logged and clamped up to a safe value.
+pub fn stale_transition_secs_from_env() -> u64 {
+    let stale = parse_positive_env(
         "CHORD_IDLE_STALE_TRANSITION_SECS",
         DEFAULT_STALE_TRANSITION_SECS,
-    )
+    );
+    let budget = release_budget_secs_from_env();
+    if stale > budget {
+        return stale;
+    }
+    // Misconfigured: clamp strictly above the budget (≥ 1.5× budget, and never below
+    // the safe default), so the ordering invariant always holds.
+    let safe = budget
+        .saturating_add(budget / 2)
+        .max(DEFAULT_STALE_TRANSITION_SECS);
+    warn!(
+        stale,
+        budget,
+        clamped_to = safe,
+        "CHORD_IDLE_STALE_TRANSITION_SECS ≤ release budget — clamping up to preserve the \
+         no-mid-release-admission invariant"
+    );
+    safe
 }
 
 fn parse_positive_env(key: &str, default: u64) -> u64 {
@@ -338,6 +378,11 @@ pub enum BeginActivate {
     AlreadyActive,
     /// An enter/activate transition is in flight ⇒ no-op.
     InTransition,
+    /// A state path is configured but clearing the persisted manifest to `Active`
+    /// FAILED, so the activate was ABORTED before touching memory — the controller
+    /// stays `Idle` (recoverable; a crash would reload `Idle`, consistent with memory).
+    /// The caller should surface a retryable error and try again.
+    PersistFailed,
 }
 
 /// Outcome of a full enter (begin+release+finish) against the live state.
@@ -360,9 +405,11 @@ pub enum ActivateOutcome {
     AlreadyActive,
     /// A concurrent transition was in flight; nothing was re-run.
     InTransition,
+    /// Activate aborted because the persist-Active-before-restore hard gate failed;
+    /// the controller stays `Idle` and the caller should retry (see
+    /// [`BeginActivate::PersistFailed`]).
+    PersistFailed,
 }
-
-/// Outcome of an admission attempt for a new inference request.
 pub enum AdmitOutcome {
     /// Admitted while `Active`; holds the in-flight guard (already counted).
     Admitted(InflightGuard),
@@ -437,9 +484,17 @@ impl IdleController {
         Self::with_state(crate::config::admin_idle_state_path())
     }
 
+    /// Best-effort persist for the non-critical transitions (finish/abort/recover):
+    /// a failure here is logged and swallowed because those all move TOWARD a resting
+    /// phase and a stale on-disk state is bounded by the watchdog. The one persist that
+    /// is NOT best-effort — clearing to `Active` before the activate restore — is
+    /// hard-gated directly in [`begin_activate_inner`](Self::begin_activate_inner).
     fn persist_locked(&self, current: &IdleState) {
         if let Some(path) = self.state_path.as_deref() {
-            persist_state(path, &current.to_persisted().cloned());
+            if let Err(e) = persist_state(path, &current.to_persisted().cloned()) {
+                warn!(path = %path.display(), error = %e,
+                    "idle-mode: state persist failed (best-effort — watchdog still bounds it)");
+            }
         }
     }
 
@@ -597,14 +652,29 @@ impl IdleController {
     }
 
     /// Internal CAS `Idle → Activating{generation}`, returning the manifest to clear
-    /// plus the transition's generation. FINDING #2: the persisted state is cleared to
-    /// the RESTING `Active`/none form HERE (before the async restore work) — memory
-    /// says `Activating` but disk says `Active`, so a crash mid-`Activating` reloads as
-    /// `Active` (worst case: lost idle), never wedged idle.
+    /// plus the transition's generation. FINDING #2: clearing the persisted manifest to
+    /// the RESTING `Active`/none form is a HARD PREREQUISITE done BEFORE mutating memory
+    /// — while the controller is still `Idle`. When a state path is configured and that
+    /// persist FAILS, the activate is ABORTED (`Err(PersistFailed)`) with memory left
+    /// `Idle`, so on-disk and memory stay consistent (a crash reloads `Idle`,
+    /// recoverable) — we never proceed into restore with the disk still saying `Idle`
+    /// while memory says `Activating`. When no state path is configured, persistence is
+    /// a no-op and this gate is skipped (best-effort, as before). Only after the disk
+    /// reads `Active` do we flip memory to `Activating`.
     fn begin_activate_inner(&self) -> Result<(ResumeManifest, u64), BeginActivate> {
         let mut guard = self.inner.write().expect("idle lock poisoned");
         match &*guard {
             IdleState::Idle(_) => {
+                // HARD GATE: clear disk → Active BEFORE touching memory (still `Idle`).
+                if let Some(path) = self.state_path.as_deref() {
+                    if let Err(e) = persist_state(path, &None) {
+                        warn!(path = %path.display(), error = %e,
+                            "idle-mode: could not clear persisted idle state before activate — \
+                             aborting activate (staying Idle, retryable)");
+                        return Err(BeginActivate::PersistFailed);
+                    }
+                }
+                // Disk now reads `Active`; safe to flip memory to `Activating`.
                 let m = match std::mem::replace(&mut *guard, IdleState::Active) {
                     IdleState::Idle(m) => m,
                     _ => unreachable!("matched Idle above"),
@@ -615,9 +685,6 @@ impl IdleController {
                     generation,
                     manifest: m.clone(),
                 };
-                // Persist NOW: `to_persisted(Activating)` is `None`, so disk becomes
-                // "not idle" (Active) immediately, ahead of any restore work.
-                self.persist_locked(&guard);
                 Ok((m, generation))
             }
             IdleState::Active => Err(BeginActivate::AlreadyActive),
@@ -701,6 +768,7 @@ impl IdleController {
                 ActivateOutcome::Activated(m)
             }
             Err(BeginActivate::AlreadyActive) => ActivateOutcome::AlreadyActive,
+            Err(BeginActivate::PersistFailed) => ActivateOutcome::PersistFailed,
             Err(_) => ActivateOutcome::InTransition,
         }
     }
@@ -787,35 +855,23 @@ fn load_persisted(path: &Path) -> Option<ResumeManifest> {
     }
 }
 
-/// Atomically persist the current state (tempfile + rename). Best-effort: any
-/// IO/serde error is logged at warn and swallowed — persistence must never break
-/// the idle/activate transition itself.
-fn persist_state(path: &Path, state: &Option<ResumeManifest>) {
-    let json = match serde_json::to_string(state) {
-        Ok(j) => j,
-        Err(e) => {
-            warn!(error = %e, "idle-mode: failed to serialize state (not persisted)");
-            return;
-        }
-    };
+/// Atomically persist the current state (tempfile + rename). Returns the IO error on
+/// failure so the CALLER can decide whether it is fatal: most callers treat it as
+/// best-effort (see [`IdleController::persist_locked`]), but the activate path
+/// hard-gates on it (see [`IdleController::begin_activate_inner`]).
+fn persist_state(path: &Path, state: &Option<ResumeManifest>) -> std::io::Result<()> {
+    let json = serde_json::to_string(state)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     if let Some(dir) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            warn!(dir = %dir.display(), error = %e,
-                "idle-mode: could not create state dir (state not persisted)");
-            return;
-        }
+        std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("json.tmp");
-    if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
-        warn!(path = %tmp.display(), error = %e,
-            "idle-mode: could not write temp state file (state not persisted)");
-        return;
-    }
+    std::fs::write(&tmp, json.as_bytes())?;
     if let Err(e) = std::fs::rename(&tmp, path) {
-        warn!(path = %path.display(), error = %e,
-            "idle-mode: could not atomically install state file (state not persisted)");
         let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
+    Ok(())
 }
 
 // ── In-flight gauge ───────────────────────────────────────────────────────────
@@ -910,56 +966,96 @@ pub async fn enter_idle(
         "idle-mode: entering — draining and releasing host resources"
     );
 
-    // 1. Drain in-flight inference (bounded, closed-world).
-    let inflight_remaining = IDLE_MODE
-        .drain_inflight(Duration::from_secs(drain_secs_from_env()))
-        .await;
-    if inflight_remaining > 0 {
-        warn!(
+    // FINDING #1: bound the ENTIRE release sequence with an explicit budget kept
+    // STRICTLY BELOW the stale-recovery threshold. If release overruns, the timeout
+    // fires, we do NOT commit, and the RAII `transition` guard drops → clean rollback
+    // to `Active`. Admission was CLOSED for the whole `EnteringIdle` window and only
+    // reopens AFTER that consistent rollback — never with half-stopped backends still
+    // admitting, and never concurrently with the watchdog's stale-recovery (which, by
+    // the config ordering invariant, cannot fire before this budget elapses).
+    let release_budget = Duration::from_secs(release_budget_secs_from_env());
+    let release = tokio::time::timeout(release_budget, async {
+        // 1. Drain in-flight inference (bounded, closed-world).
+        let inflight_remaining = IDLE_MODE
+            .drain_inflight(Duration::from_secs(drain_secs_from_env()))
+            .await;
+        if inflight_remaining > 0 {
+            warn!(
+                inflight_remaining,
+                "idle-mode: drain bound hit — releasing anyway (overrunning requests finish on their own)"
+            );
+        }
+
+        // 2. Snapshot resident models (for the manifest) BEFORE we unload them.
+        let resident_models = list_resident_models(state).await;
+
+        // 3. Sample RAM before release.
+        let mem_before = crate::config::read_cpu_free_gb();
+
+        // 4. Stop on-demand inference backends (llama-server processes).
+        let backends_stopped =
+            crate::models::routing::stop_all_on_demand_backends(&state.model_registry).await;
+
+        // 5. Unload every resident model from VRAM (best-effort; skipped if OLLAMA_URL
+        //    unset). This is the real "release the GPU + the RAM the models held".
+        let models_unloaded = match crate::gpu_exclusive::ollama_base_from_env() {
+            Some(base) => {
+                crate::gpu_exclusive::evict_resident_models(&state.http_client, &base).await
+            }
+            None => {
+                info!("idle-mode: OLLAMA_URL unset — skipping VRAM eviction (best-effort)");
+                0
+            }
+        };
+
+        // 6. Demote Hot (VRAM-resident) registry records to Warm (on disk). The blobs
+        //    stay local; only the tier bookkeeping changes so a later reconcile/status
+        //    reflects that nothing is loaded. Best-effort; a save error is logged.
+        let models_demoted = demote_hot_to_warm(&state.model_registry).await;
+
+        // 7. Report (but never force-clear) any foreign GPU-exclusive lease.
+        let foreign_gpu_lock_holder =
+            crate::gpu_exclusive::GPU_EXCLUSIVE
+                .active_holder(now_epoch())
+                .map(|r| {
+                    warn!(
+                        holder = %r.holder,
+                        "idle-mode: a GPU-exclusive lease is held by another job — reporting, not force-releasing"
+                    );
+                    r.holder
+                });
+
+        // 8. Sample RAM after release.
+        let mem_after = crate::config::read_cpu_free_gb();
+
+        let report = IdleReport {
+            mem_available_before_gb: mem_before,
+            mem_available_after_gb: mem_after,
+            freed_gb: freed_gb(mem_before, mem_after),
+            backends_stopped,
+            models_unloaded,
+            models_demoted,
             inflight_remaining,
-            "idle-mode: drain bound hit — releasing anyway (overrunning requests finish on their own)"
-        );
-    }
+            foreign_gpu_lock_holder,
+        };
+        // `resident_models` goes into the manifest (not the report); hand both back.
+        (report, resident_models)
+    })
+    .await;
 
-    // 2. Snapshot resident models (for the manifest) BEFORE we unload them.
-    let resident_models = list_resident_models(state).await;
-
-    // 3. Sample RAM before release.
-    let mem_before = crate::config::read_cpu_free_gb();
-
-    // 4. Stop on-demand inference backends (llama-server processes).
-    let backends_stopped =
-        crate::models::routing::stop_all_on_demand_backends(&state.model_registry).await;
-
-    // 5. Unload every resident model from VRAM (best-effort; skipped if OLLAMA_URL
-    //    unset). This is the real "release the GPU + the RAM the models held".
-    let models_unloaded = match crate::gpu_exclusive::ollama_base_from_env() {
-        Some(base) => crate::gpu_exclusive::evict_resident_models(&state.http_client, &base).await,
-        None => {
-            info!("idle-mode: OLLAMA_URL unset — skipping VRAM eviction (best-effort)");
-            0
+    let (report, resident_models) = match release {
+        Ok(pair) => pair,
+        Err(_elapsed) => {
+            warn!(
+                reason,
+                budget_secs = release_budget.as_secs(),
+                "idle-mode: release exceeded its budget — aborting enter; guard rolls EnteringIdle back to Active (admission was closed throughout)"
+            );
+            // `transition` drops here → clean rollback to Active; admission reopens
+            // only now, after a consistent rollback.
+            return (EnterOutcome::InTransition, None);
         }
     };
-
-    // 6. Demote Hot (VRAM-resident) registry records to Warm (on disk). The blobs
-    //    stay local; only the tier bookkeeping changes so a later reconcile/status
-    //    reflects that nothing is loaded. Best-effort; a save error is logged.
-    let models_demoted = demote_hot_to_warm(&state.model_registry).await;
-
-    // 7. Report (but never force-clear) any foreign GPU-exclusive lease.
-    let foreign_gpu_lock_holder =
-        crate::gpu_exclusive::GPU_EXCLUSIVE
-            .active_holder(now_epoch())
-            .map(|r| {
-                warn!(
-                    holder = %r.holder,
-                    "idle-mode: a GPU-exclusive lease is held by another job — reporting, not force-releasing"
-                );
-                r.holder
-            });
-
-    // 8. Sample RAM after release.
-    let mem_after = crate::config::read_cpu_free_gb();
 
     let now = now_epoch();
     let manifest = ResumeManifest {
@@ -967,7 +1063,7 @@ pub async fn enter_idle(
         entered_at: now,
         watchdog_deadline: now.saturating_add(watchdog_secs_from_env()),
         resident_models,
-        mem_available_before_gb: mem_before.unwrap_or(0.0),
+        mem_available_before_gb: report.mem_available_before_gb.unwrap_or(0.0),
     };
     // Complete the transition: `EnteringIdle{gen} → Idle` (consumes the guard so its
     // Drop rollback becomes a no-op). Generation-guarded: if our transition was
@@ -982,21 +1078,11 @@ pub async fn enter_idle(
         return (EnterOutcome::InTransition, None);
     };
 
-    let report = IdleReport {
-        mem_available_before_gb: mem_before,
-        mem_available_after_gb: mem_after,
-        freed_gb: freed_gb(mem_before, mem_after),
-        backends_stopped,
-        models_unloaded,
-        models_demoted,
-        inflight_remaining,
-        foreign_gpu_lock_holder,
-    };
     info!(
         reason,
-        backends_stopped,
-        models_unloaded,
-        models_demoted,
+        backends_stopped = report.backends_stopped,
+        models_unloaded = report.models_unloaded,
+        models_demoted = report.models_demoted,
         freed_gb = report.freed_gb.unwrap_or(0.0),
         "idle-mode: entered — host resources released for the compiler"
     );
@@ -1024,6 +1110,7 @@ pub async fn activate(state: &Arc<crate::routes::AppState>, reason: &str) -> Act
             ActivateOutcome::Activated(m)
         }
         Err(BeginActivate::AlreadyActive) => ActivateOutcome::AlreadyActive,
+        Err(BeginActivate::PersistFailed) => ActivateOutcome::PersistFailed,
         Err(_) => ActivateOutcome::InTransition,
     }
 }
@@ -1058,7 +1145,11 @@ pub async fn admit_inference(state: &Arc<crate::routes::AppState>) -> Admission 
                 }
                 LazyAction::Restore => {
                     info!("idle-mode: lazy activate — a real request arrived while idle");
-                    let _ = activate(state, "lazy-on-request").await;
+                    if activate(state, "lazy-on-request").await == ActivateOutcome::PersistFailed {
+                        // Couldn't clear persisted idle safely → stay Idle; shed with a
+                        // retryable 503 rather than looping on a persist that keeps failing.
+                        return Admission::Rejected(idle_transition_response());
+                    }
                     // loop: re-admit now that we should be Active
                 }
             },
@@ -1257,6 +1348,18 @@ pub async fn admin_activate(
                 "status": "activating",
                 "changed": false,
                 "note": "another idle/activate transition is in progress",
+            })),
+        )
+            .into_response(),
+        // Persist-Active-before-restore hard gate failed: the proxy stayed Idle
+        // (recoverable). Signal a retryable error so the caller retries.
+        ActivateOutcome::PersistFailed => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, HeaderValue::from_static("2"))],
+            Json(serde_json::json!({
+                "error": "idle_activate_persist_failed",
+                "status": "idle",
+                "changed": false,
             })),
         )
             .into_response(),
@@ -1795,6 +1898,73 @@ mod tests {
         assert!(matches!(ctl.exit(), ActivateOutcome::Activated(_)));
     }
 
+    #[test]
+    fn begin_activate_persist_failure_stays_recoverable() {
+        // finding #2: when a state path is configured and clearing the manifest to
+        // Active FAILS, begin_activate must ABORT (PersistFailed) and leave the
+        // controller Idle — so on-disk and memory stay consistent (a crash reloads
+        // Idle, recoverable), never Activating-with-disk-still-Idle.
+        let dir = tempfile::tempdir().unwrap();
+        // Make the state file's PARENT a regular file, so create_dir_all/write fails.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let path = blocker.join("admin_idle_state.json"); // parent `blocker` is a file
+
+        let ctl = IdleController::with_state(Some(path));
+        // Reach Idle in memory (finish_enter's persist is best-effort and just fails
+        // silently against the unwritable path — memory still becomes Idle).
+        assert!(matches!(
+            ctl.enter(manifest("compiler", 1, 2)),
+            EnterOutcome::Entered(_)
+        ));
+        assert!(ctl.is_idle());
+
+        // The hard-gated persist(None) MUST fail → PersistFailed, memory stays Idle.
+        match ctl.begin_activate_inner() {
+            Err(BeginActivate::PersistFailed) => {}
+            other => panic!("expected PersistFailed, got {other:?}"),
+        }
+        assert!(
+            ctl.is_idle(),
+            "activate must abort and remain Idle when the persist gate fails"
+        );
+        assert_eq!(ctl.phase(), Phase::Idle);
+        // The full exit() path surfaces it as a retryable ActivateOutcome too.
+        assert_eq!(ctl.exit(), ActivateOutcome::PersistFailed);
+        assert!(ctl.is_idle());
+    }
+
+    #[tokio::test]
+    async fn release_exceeding_budget_rolls_back_with_admission_closed() {
+        // finding #1: while EnteringIdle, admission is CLOSED; a release that overruns
+        // its budget self-aborts (timeout) and the guard rollback reopens admission
+        // ONLY after a consistent return to Active — never mid-release. This mirrors
+        // enter_idle's structure using the controller primitives.
+        let ctl = IdleController::new();
+        let transition = ctl.try_begin_enter().expect("Active ⇒ transition begins");
+
+        // Admission is closed for the whole EnteringIdle window.
+        assert!(matches!(ctl.try_admit(), AdmitOutcome::Transitioning));
+
+        // Simulate release work that exceeds a tiny budget.
+        let budget = Duration::from_millis(20);
+        let release = tokio::time::timeout(budget, async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        })
+        .await;
+        assert!(release.is_err(), "release must exceed its budget");
+
+        // STILL EnteringIdle and STILL closed — we have not committed or rolled back.
+        assert_eq!(ctl.phase(), Phase::EnteringIdle);
+        assert!(matches!(ctl.try_admit(), AdmitOutcome::Transitioning));
+
+        // On timeout we drop the guard → clean rollback to Active.
+        drop(transition);
+        assert_eq!(ctl.phase(), Phase::Active);
+        // Admission reopens ONLY now, after the consistent rollback.
+        assert!(matches!(ctl.try_admit(), AdmitOutcome::Admitted(_)));
+    }
+
     // ── env parsing ──────────────────────────────────────────────────────────
 
     #[test]
@@ -1814,5 +1984,26 @@ mod tests {
         let p = compiler_lease_holders_from_env();
         assert!(p.contains(&"compiler".to_string()));
         assert!(is_compiler_lease("compiler", &p));
+    }
+
+    #[test]
+    fn stale_threshold_always_exceeds_release_budget() {
+        // finding #1 invariant: the watchdog stale bound must be strictly greater than
+        // the release budget, so stale-recovery can never fire during live release.
+        // Default config:
+        std::env::remove_var("CHORD_IDLE_STALE_TRANSITION_SECS");
+        std::env::remove_var("CHORD_IDLE_RELEASE_BUDGET_SECS");
+        assert!(stale_transition_secs_from_env() > release_budget_secs_from_env());
+
+        // Misconfigured so stale ≤ budget ⇒ clamped strictly above the budget.
+        std::env::set_var("CHORD_IDLE_RELEASE_BUDGET_SECS", "90");
+        std::env::set_var("CHORD_IDLE_STALE_TRANSITION_SECS", "30"); // below budget
+        assert!(
+            stale_transition_secs_from_env() > release_budget_secs_from_env(),
+            "misconfigured stale ≤ budget must be clamped above the budget"
+        );
+
+        std::env::remove_var("CHORD_IDLE_STALE_TRANSITION_SECS");
+        std::env::remove_var("CHORD_IDLE_RELEASE_BUDGET_SECS");
     }
 }

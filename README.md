@@ -341,14 +341,27 @@ that follows is a genuine closed-world drain.
   crashed/forgotten compiler (or a stale idle state reloaded after a Chord restart)
   never leaves the proxy silently dead. A non-compiler GPU holder does not extend the
   idle window.
-- **Cancellation-safe transition**: entering idle spans several `.await` points
-  (drain, VRAM eviction, tier demote). The `EnteringIdle` phase is held by an RAII
-  guard, so if the enter request is cancelled (client disconnect), panics, or returns
-  early before completion, the phase deterministically rolls back to `Active` — a
-  cancelled enter can never wedge the proxy in `EnteringIdle` (which would 503 all
-  inference and block admin enter/activate). As a backstop, the watchdog force-resolves
-  any transient phase stuck longer than `CHORD_IDLE_STALE_TRANSITION_SECS` back to
-  `Active`.
+- **Cancellation-safe, budget-bounded transition**: entering idle spans several
+  `.await` points (drain, VRAM eviction, tier demote). The `EnteringIdle` phase is held
+  by an RAII guard, so if the enter request is cancelled (client disconnect), panics, or
+  returns early before completion, the phase deterministically rolls back to `Active` —
+  a cancelled enter can never wedge the proxy in `EnteringIdle` (which would 503 all
+  inference and block admin enter/activate). The **entire release sequence is bounded by
+  `CHORD_IDLE_RELEASE_BUDGET_SECS`** (default 90s): if it overruns, the enter self-aborts
+  and the guard rolls back to `Active`. Admission is **closed for the whole
+  `EnteringIdle` window** and reopens only after that consistent rollback — never with
+  half-stopped backends still admitting. As a defense-in-depth backstop, the watchdog
+  force-resolves any transient phase stuck longer than `CHORD_IDLE_STALE_TRANSITION_SECS`
+  (default 300s) back to `Active`. **Invariant (clamped at runtime): the stale-recovery
+  threshold is always strictly greater than the release budget**, so stale-recovery can
+  only ever fire after the release future is already gone — never concurrently with live
+  release.
+- **Activate persist is hard-gated**: when a state path is configured, `POST /admin/activate`
+  (and lazy restore) clears the on-disk idle manifest to `Active` **before** any restore
+  work; if that persist fails, the activate is aborted (the proxy stays `Idle`,
+  recoverable) and a retryable `503 idle_activate_persist_failed` is returned — it never
+  proceeds into restore while the disk still says `Idle`. With no state path configured,
+  persistence is a no-op as before.
 - **Streaming in-flight accounting**: for streaming inference (chat/completions SSE or
   JSON pass-through, agent SSE), the in-flight guard lives until the streamed body is
   fully consumed / the executor task finishes — not merely until the handler returns
@@ -369,8 +382,9 @@ dispatches to a GPU-resident embedding model), exactly like `/v1/chat/completion
 | Env var | Purpose | Default |
 |---|---|---|
 | `CHORD_IDLE_DRAIN_SECS` | Max seconds to wait for in-flight inference to drain before releasing. | `30` |
+| `CHORD_IDLE_RELEASE_BUDGET_SECS` | Hard budget for the entire `enter_idle` release sequence; on overrun the enter self-aborts and rolls back to `Active` (admission closed throughout). Must be, and is clamped to be, strictly less than the stale threshold. | `90` |
 | `CHORD_IDLE_WATCHDOG_SECS` | Hard timeout after which the watchdog auto-activates (unless a compiler build lease is held). | `3600` |
-| `CHORD_IDLE_STALE_TRANSITION_SECS` | Backstop: force-resolve a controller stuck in a transient `EnteringIdle`/`Activating` phase back to `Active` after this many seconds (behind the RAII rollback guard). | `120` |
+| `CHORD_IDLE_STALE_TRANSITION_SECS` | Backstop: force-resolve a controller stuck in a transient `EnteringIdle`/`Activating` phase back to `Active` after this many seconds (behind the RAII rollback guard). Clamped up if set ≤ the release budget. | `300` |
 | `CHORD_IDLE_COMPILER_LEASE_HOLDERS` | Comma-separated, case-insensitive substrings that mark a GPU-exclusive holder as a *compiler build* lease (protects the idle window from lazy teardown + watchdog). Role labels, not infra identifiers. | `compiler,build,bld` |
 | `CHORD_STATE_DIR` | Durable state dir; the idle manifest persists to `<dir>/admin_idle_state.json`. | *(unset → in-memory)* |
 | `OLLAMA_URL` | Ollama base used to enumerate/unload resident models on idle. | *(unset → VRAM eviction skipped)* |
