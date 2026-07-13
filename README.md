@@ -341,6 +341,19 @@ that follows is a genuine closed-world drain.
   crashed/forgotten compiler (or a stale idle state reloaded after a Chord restart)
   never leaves the proxy silently dead. A non-compiler GPU holder does not extend the
   idle window.
+- **Cancellation-safe transition**: entering idle spans several `.await` points
+  (drain, VRAM eviction, tier demote). The `EnteringIdle` phase is held by an RAII
+  guard, so if the enter request is cancelled (client disconnect), panics, or returns
+  early before completion, the phase deterministically rolls back to `Active` — a
+  cancelled enter can never wedge the proxy in `EnteringIdle` (which would 503 all
+  inference and block admin enter/activate). As a backstop, the watchdog force-resolves
+  any transient phase stuck longer than `CHORD_IDLE_STALE_TRANSITION_SECS` back to
+  `Active`.
+- **Streaming in-flight accounting**: for streaming inference (chat/completions SSE or
+  JSON pass-through, agent SSE), the in-flight guard lives until the streamed body is
+  fully consumed / the executor task finishes — not merely until the handler returns
+  the `Response` — so `POST /admin/idle` never observes a false "drained" state while a
+  response is still streaming.
 - **Durability**: when `CHORD_STATE_DIR` is set, the resume manifest is persisted
   (atomic tempfile+rename) so a crash mid-idle leaves a record the watchdog acts on
   after restart. Transient transition markers (`EnteringIdle`/`Activating`) are never
@@ -349,10 +362,15 @@ that follows is a genuine closed-world drain.
 - **GPU lock held by another job**: reported in `foreign_gpu_lock_holder`, **never**
   force-released or killed — that lease may be a legitimate external GPU job.
 
+`/v1/embeddings` also participates in this admission/drain path (its local-first path
+dispatches to a GPU-resident embedding model), exactly like `/v1/chat/completions`,
+`/v1/agent/execute`, and `/v1/infer`.
+
 | Env var | Purpose | Default |
 |---|---|---|
 | `CHORD_IDLE_DRAIN_SECS` | Max seconds to wait for in-flight inference to drain before releasing. | `30` |
 | `CHORD_IDLE_WATCHDOG_SECS` | Hard timeout after which the watchdog auto-activates (unless a compiler build lease is held). | `3600` |
+| `CHORD_IDLE_STALE_TRANSITION_SECS` | Backstop: force-resolve a controller stuck in a transient `EnteringIdle`/`Activating` phase back to `Active` after this many seconds (behind the RAII rollback guard). | `120` |
 | `CHORD_IDLE_COMPILER_LEASE_HOLDERS` | Comma-separated, case-insensitive substrings that mark a GPU-exclusive holder as a *compiler build* lease (protects the idle window from lazy teardown + watchdog). Role labels, not infra identifiers. | `compiler,build,bld` |
 | `CHORD_STATE_DIR` | Durable state dir; the idle manifest persists to `<dir>/admin_idle_state.json`. | *(unset → in-memory)* |
 | `OLLAMA_URL` | Ollama base used to enumerate/unload resident models on idle. | *(unset → VRAM eviction skipped)* |

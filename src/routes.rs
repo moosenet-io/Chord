@@ -660,7 +660,12 @@ pub async fn agent_execute(
 
     // ── BLD-09 idle-mode admission (see `chat_completions`). This route dispatches
     // LLM calls, so it must join the closed-world drain / lazy-restore path too. ──
-    let _idle_inflight = match crate::admin::idle::admit_inference(&state).await {
+    // Held for the whole request; for the STREAMING branch it is moved into the
+    // spawned executor task so the in-flight count stays incremented until the actual
+    // inference completes — NOT merely until this handler returns the SSE Response
+    // (cycle-2 fix #3). For the non-streaming branch it is held across the awaited
+    // `execute(...)` below.
+    let idle_inflight = match crate::admin::idle::admit_inference(&state).await {
         crate::admin::idle::Admission::Admitted(g) => g,
         crate::admin::idle::Admission::Rejected(resp) => return resp,
     };
@@ -699,7 +704,11 @@ pub async fn agent_execute(
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ProgressEvent>();
         let exec = state.agentic_executor.clone();
+        // Move the in-flight guard INTO the detached executor task: the guard (and so
+        // the in-flight count) lives until the real inference finishes, regardless of
+        // when the SSE Response is returned or whether the client disconnects early.
         tokio::spawn(async move {
+            let _idle_inflight = idle_inflight;
             let _ = exec.execute(req, Some(tx)).await;
         });
 
@@ -789,7 +798,11 @@ pub async fn chat_completions(
     // can drain before releasing) and lazily restore if idle. Once idle-mode has begun
     // entering (EnteringIdle), admission is refused with a retryable 503 so no new
     // request slips into the in-flight set after the drain window opens. ────────────
-    let _idle_inflight = match crate::admin::idle::admit_inference(&state).await {
+    // On every EARLY return below (GPU-exclusive 503, rate-limit, upstream error) the
+    // guard simply drops. On the SUCCESS path it is moved INTO the streamed response
+    // body so the in-flight count stays incremented until the stream is fully consumed
+    // — not merely until this handler returns the Response (cycle-2 fix #3).
+    let idle_inflight = match crate::admin::idle::admit_inference(&state).await {
         crate::admin::idle::Admission::Admitted(g) => g,
         crate::admin::idle::Admission::Rejected(resp) => return resp,
     };
@@ -1031,10 +1044,18 @@ pub async fn chat_completions(
 
     // Stream the upstream body straight back to the caller. This passes through
     // both non-streaming JSON and streaming SSE (text/event-stream) untouched.
-    use futures_util::TryStreamExt;
+    use futures_util::{StreamExt, TryStreamExt};
+    // Move the idle-mode in-flight guard INTO the body stream so it is dropped only
+    // when the streamed body is fully consumed (or dropped on client disconnect),
+    // never when this handler returns the Response (cycle-2 fix #3). The `move`
+    // inspect closure OWNS the guard, tying its lifetime to the stream's.
+    let idle_guard = idle_inflight;
     let stream = upstream
         .bytes_stream()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        .inspect(move |_chunk| {
+            let _ = &idle_guard; // keepalive: forces the closure to own the guard
+        });
     let body = Body::from_stream(stream);
 
     let mut response = Response::builder()
@@ -1167,6 +1188,17 @@ pub async fn embeddings(
             state.audit_logger.log_auth_failure(raw, 0);
             return auth_error_response(e);
         }
+    };
+
+    // ── BLD-09 idle-mode admission ──────────────────────────────────────────────
+    // /v1/embeddings is an inference entry point: the local-first path dispatches to
+    // a GPU-resident embedding model and contends for VRAM, so it MUST join the
+    // closed-world drain / lazy-restore transition exactly like the other inference
+    // routes (cycle-2 fix #2 — previously this route bypassed admission entirely).
+    // Non-streaming (buffered JSON), so the guard held to handler return is correct.
+    let _idle_inflight = match crate::admin::idle::admit_inference(&state).await {
+        crate::admin::idle::Admission::Admitted(g) => g,
+        crate::admin::idle::Admission::Rejected(resp) => return resp,
     };
 
     let inputs = match crate::embeddings::validate_inputs(req, state.embeddings_config.max_batch) {

@@ -84,6 +84,14 @@ pub const DEFAULT_DRAIN_SECS: u64 = 30;
 /// if the compiler adopts a different holder label.
 pub const DEFAULT_COMPILER_LEASE_HOLDERS: &str = "compiler,build,bld";
 
+/// Default bound (seconds) after which the watchdog force-resolves a controller
+/// stuck in a TRANSIENT phase (`EnteringIdle`/`Activating`) back to `Active`. This
+/// is a backstop only: the RAII [`EnterTransition`] guard already rolls a dropped /
+/// panicked enter back to `Active` immediately, so this timeout only matters for a
+/// pathological wedge. Comfortably longer than any drain+release, short enough to
+/// self-heal quickly. Override with `CHORD_IDLE_STALE_TRANSITION_SECS`.
+pub const DEFAULT_STALE_TRANSITION_SECS: u64 = 120;
+
 /// Resolve the watchdog timeout from `CHORD_IDLE_WATCHDOG_SECS` (seconds); a
 /// missing/blank/zero/unparseable value falls back to [`DEFAULT_WATCHDOG_SECS`].
 pub fn watchdog_secs_from_env() -> u64 {
@@ -94,6 +102,16 @@ pub fn watchdog_secs_from_env() -> u64 {
 /// missing/blank/zero/unparseable value falls back to [`DEFAULT_DRAIN_SECS`].
 pub fn drain_secs_from_env() -> u64 {
     parse_positive_env("CHORD_IDLE_DRAIN_SECS", DEFAULT_DRAIN_SECS)
+}
+
+/// Resolve the stale-transition backstop bound from `CHORD_IDLE_STALE_TRANSITION_SECS`
+/// (seconds); a missing/blank/zero/unparseable value falls back to
+/// [`DEFAULT_STALE_TRANSITION_SECS`].
+pub fn stale_transition_secs_from_env() -> u64 {
+    parse_positive_env(
+        "CHORD_IDLE_STALE_TRANSITION_SECS",
+        DEFAULT_STALE_TRANSITION_SECS,
+    )
 }
 
 fn parse_positive_env(key: &str, default: u64) -> u64 {
@@ -250,21 +268,28 @@ pub enum Phase {
     Activating,
 }
 
-/// Internal state cell. Owns the manifest only in the idle/activating phases.
+/// Internal state cell. Owns the manifest only in the idle/activating phases. The
+/// transient phases carry the epoch second they began (`since`) so the watchdog can
+/// detect and force-resolve a wedged transition (a backstop behind the RAII guard).
 enum IdleState {
     Active,
-    EnteringIdle,
+    EnteringIdle {
+        since: u64,
+    },
     Idle(ResumeManifest),
-    Activating(ResumeManifest),
+    Activating {
+        since: u64,
+        manifest: ResumeManifest,
+    },
 }
 
 impl IdleState {
     fn phase(&self) -> Phase {
         match self {
             IdleState::Active => Phase::Active,
-            IdleState::EnteringIdle => Phase::EnteringIdle,
+            IdleState::EnteringIdle { .. } => Phase::EnteringIdle,
             IdleState::Idle(_) => Phase::Idle,
-            IdleState::Activating(_) => Phase::Activating,
+            IdleState::Activating { .. } => Phase::Activating,
         }
     }
     /// The manifest to persist for this phase: only a fully-`Idle` proxy persists a
@@ -272,6 +297,13 @@ impl IdleState {
     fn to_persisted(&self) -> Option<&ResumeManifest> {
         match self {
             IdleState::Idle(m) => Some(m),
+            _ => None,
+        }
+    }
+    /// The epoch second a TRANSIENT phase began, or `None` for a steady phase.
+    fn transition_since(&self) -> Option<u64> {
+        match self {
+            IdleState::EnteringIdle { since } | IdleState::Activating { since, .. } => Some(*since),
             _ => None,
         }
     }
@@ -410,7 +442,7 @@ impl IdleController {
     /// status endpoint.
     pub fn snapshot(&self) -> Option<ResumeManifest> {
         match &*self.inner.read().expect("idle lock poisoned") {
-            IdleState::Idle(m) | IdleState::Activating(m) => Some(m.clone()),
+            IdleState::Idle(m) | IdleState::Activating { manifest: m, .. } => Some(m.clone()),
             _ => None,
         }
     }
@@ -426,7 +458,9 @@ impl IdleController {
                 AdmitOutcome::Admitted(InflightGuard::admit(self.inflight.clone()))
             }
             IdleState::Idle(_) => AdmitOutcome::Idle,
-            IdleState::EnteringIdle | IdleState::Activating(_) => AdmitOutcome::Transitioning,
+            IdleState::EnteringIdle { .. } | IdleState::Activating { .. } => {
+                AdmitOutcome::Transitioning
+            }
         }
     }
 
@@ -456,15 +490,34 @@ impl IdleController {
 
     /// CAS `Active → EnteringIdle`. Installs the transition marker atomically BEFORE
     /// any release work, so exactly one caller ever runs the release side effects.
+    /// Prefer [`try_begin_enter`](Self::try_begin_enter), whose RAII guard guarantees
+    /// the phase is finalized even if the enter future is dropped mid-transition.
     pub fn begin_enter(&self) -> BeginEnter {
         let mut guard = self.inner.write().expect("idle lock poisoned");
         match &*guard {
             IdleState::Active => {
-                *guard = IdleState::EnteringIdle; // transient — not persisted
+                *guard = IdleState::EnteringIdle { since: now_epoch() }; // transient — not persisted
                 BeginEnter::Begin
             }
             IdleState::Idle(m) => BeginEnter::AlreadyIdle(m.clone()),
-            IdleState::EnteringIdle | IdleState::Activating(_) => BeginEnter::InTransition,
+            IdleState::EnteringIdle { .. } | IdleState::Activating { .. } => {
+                BeginEnter::InTransition
+            }
+        }
+    }
+
+    /// CAS into `EnteringIdle` and return an RAII [`EnterTransition`] guard. The guard
+    /// MUST be finalized with [`EnterTransition::commit`]; if it is instead dropped
+    /// (the enter future is cancelled on client disconnect, panics, or returns early),
+    /// its `Drop` deterministically rolls `EnteringIdle → Active` so the controller can
+    /// never wedge in the transient phase. `Err` carries the non-`Begin` CAS result.
+    pub fn try_begin_enter(&self) -> Result<EnterTransition<'_>, BeginEnter> {
+        match self.begin_enter() {
+            BeginEnter::Begin => Ok(EnterTransition {
+                ctl: self,
+                committed: false,
+            }),
+            other => Err(other),
         }
     }
 
@@ -479,6 +532,19 @@ impl IdleController {
         manifest
     }
 
+    /// Roll an in-progress `EnteringIdle` back to `Active` (the safe resting phase).
+    /// Used by the [`EnterTransition`] guard when an enter is dropped before commit.
+    /// Only acts while still `EnteringIdle`; if the phase already advanced (finished,
+    /// or was recovered by the watchdog) it is left untouched, so a late drop can't
+    /// clobber a subsequently-installed state.
+    pub fn abort_enter(&self) {
+        let mut guard = self.inner.write().expect("idle lock poisoned");
+        if matches!(&*guard, IdleState::EnteringIdle { .. }) {
+            *guard = IdleState::Active;
+            self.persist_locked(&guard);
+        }
+    }
+
     /// CAS `Idle → Activating`, returning the manifest to clear. Concurrent
     /// activates: exactly one wins `Begin`; the rest see `InTransition`/`AlreadyActive`.
     pub fn begin_activate(&self) -> BeginActivate {
@@ -489,11 +555,16 @@ impl IdleController {
                     IdleState::Idle(m) => m,
                     _ => unreachable!("matched Idle above"),
                 };
-                *guard = IdleState::Activating(m.clone()); // transient — not persisted
+                *guard = IdleState::Activating {
+                    since: now_epoch(),
+                    manifest: m.clone(),
+                }; // transient — not persisted
                 BeginActivate::Begin(m)
             }
             IdleState::Active => BeginActivate::AlreadyActive,
-            IdleState::EnteringIdle | IdleState::Activating(_) => BeginActivate::InTransition,
+            IdleState::EnteringIdle { .. } | IdleState::Activating { .. } => {
+                BeginActivate::InTransition
+            }
         }
     }
 
@@ -502,6 +573,25 @@ impl IdleController {
         let mut guard = self.inner.write().expect("idle lock poisoned");
         *guard = IdleState::Active;
         self.persist_locked(&guard);
+    }
+
+    /// Backstop: if the controller has been stuck in a TRANSIENT phase
+    /// (`EnteringIdle`/`Activating`) since before `now - max_age`, force-resolve it to
+    /// `Active` and return `true`. Never touches a steady `Active`/`Idle` phase. This
+    /// is insurance behind the RAII guard for the (should-be-impossible) case of a
+    /// genuinely wedged transition; the watchdog calls it each tick.
+    pub fn recover_stale_transition(&self, now: u64, max_age: u64) -> bool {
+        let mut guard = self.inner.write().expect("idle lock poisoned");
+        let Some(since) = guard.transition_since() else {
+            return false;
+        };
+        if now.saturating_sub(since) >= max_age {
+            *guard = IdleState::Active;
+            self.persist_locked(&guard);
+            true
+        } else {
+            false
+        }
     }
 
     /// Convenience full enter used by unit tests: atomically `Active → Idle` (begin +
@@ -523,6 +613,40 @@ impl IdleController {
             }
             BeginActivate::AlreadyActive => ActivateOutcome::AlreadyActive,
             BeginActivate::InTransition => ActivateOutcome::InTransition,
+        }
+    }
+}
+
+/// RAII guard for an in-progress `EnteringIdle` transition (BLD-09 cycle-2 fix #1).
+/// Obtained from [`IdleController::try_begin_enter`]. The transition spans several
+/// `.await` points (drain, VRAM eviction, demote); if the enclosing future is
+/// dropped/cancelled/panics before [`commit`](Self::commit), this guard's `Drop`
+/// deterministically rolls the phase back to `Active`, so a cancelled enter can never
+/// leave the controller wedged in `EnteringIdle` (which would 503 all inference and
+/// block admin enter/activate indefinitely).
+#[must_use = "commit the transition, or it will roll back to Active on drop"]
+pub struct EnterTransition<'a> {
+    ctl: &'a IdleController,
+    committed: bool,
+}
+
+impl EnterTransition<'_> {
+    /// Complete the transition: `EnteringIdle → Idle(manifest)`. Consumes the guard so
+    /// its `Drop` becomes a no-op (nothing to roll back).
+    pub fn commit(mut self, manifest: ResumeManifest) -> ResumeManifest {
+        self.committed = true;
+        self.ctl.finish_enter(manifest)
+    }
+}
+
+impl Drop for EnterTransition<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.ctl.abort_enter();
+            warn!(
+                "idle-mode: enter transition dropped before commit (future cancelled/panicked) \
+                 — rolled EnteringIdle back to Active"
+            );
         }
     }
 }
@@ -662,12 +786,15 @@ pub async fn enter_idle(
 ) -> (EnterOutcome, Option<IdleReport>) {
     // Atomically CLAIM the transition FIRST (fixes the TOCTOU: two concurrent enters
     // can no longer both observe "active" and both run release). Only the `Begin`
-    // winner proceeds; everyone else returns a no-op with no side effects.
-    match IDLE_MODE.begin_enter() {
-        BeginEnter::Begin => {}
-        BeginEnter::AlreadyIdle(m) => return (EnterOutcome::AlreadyIdle(m), None),
-        BeginEnter::InTransition => return (EnterOutcome::InTransition, None),
-    }
+    // winner proceeds; everyone else returns a no-op with no side effects. The RAII
+    // `transition` guard makes this cancellation-safe: if this future is dropped
+    // (client disconnect), panics, or returns early before `transition.commit(...)`,
+    // the guard's Drop rolls `EnteringIdle → Active` so the controller never wedges.
+    let transition = match IDLE_MODE.try_begin_enter() {
+        Ok(t) => t,
+        Err(BeginEnter::AlreadyIdle(m)) => return (EnterOutcome::AlreadyIdle(m), None),
+        Err(_) => return (EnterOutcome::InTransition, None),
+    };
     // Phase is now `EnteringIdle`: `try_admit` rejects all new inference, so the
     // drain below is a genuine closed-world drain.
 
@@ -735,8 +862,9 @@ pub async fn enter_idle(
         resident_models,
         mem_available_before_gb: mem_before.unwrap_or(0.0),
     };
-    // Complete the transition: `EnteringIdle → Idle`.
-    let stored = IDLE_MODE.finish_enter(manifest);
+    // Complete the transition: `EnteringIdle → Idle` (consumes the guard so its Drop
+    // rollback becomes a no-op). Past this point the enter is durably finalized.
+    let stored = transition.commit(manifest);
 
     let report = IdleReport {
         mem_available_before_gb: mem_before,
@@ -1066,12 +1194,24 @@ pub async fn watchdog_loop(state: Arc<crate::routes::AppState>, interval: Durati
         "idle-mode watchdog started"
     );
     let patterns = compiler_lease_holders_from_env();
+    let stale_secs = stale_transition_secs_from_env();
     loop {
         tokio::time::sleep(interval).await;
+        let now = now_epoch();
+        // Backstop (BLD-09 cycle-2 fix #1): force-resolve a controller wedged in a
+        // transient phase (EnteringIdle/Activating) past the stale bound back to
+        // Active. The RAII EnterTransition guard normally prevents this; this only
+        // fires for a pathological wedge that escaped the guard.
+        if IDLE_MODE.recover_stale_transition(now, stale_secs) {
+            warn!(
+                stale_secs,
+                "idle-mode watchdog: force-resolved a stale idle transition back to Active"
+            );
+            continue;
+        }
         let Some(m) = IDLE_MODE.snapshot() else {
             continue;
         };
-        let now = now_epoch();
         let holder = crate::gpu_exclusive::GPU_EXCLUSIVE.active_holder(now);
         let holder_label = holder.as_ref().map(|r| r.holder.as_str());
         if !watchdog_should_activate(m.watchdog_expired(now), holder_label, &patterns) {
@@ -1244,6 +1384,73 @@ mod tests {
         assert_eq!(ctl.begin_activate(), BeginActivate::InTransition);
         ctl.finish_activate();
         assert_eq!(ctl.begin_activate(), BeginActivate::AlreadyActive);
+    }
+
+    // ── cancellation-safety of the EnteringIdle transition (finding #1) ───────
+
+    #[test]
+    fn dropped_enter_transition_rolls_back_to_active() {
+        // A transition guard dropped WITHOUT commit (future cancelled/panicked) must
+        // leave the controller recoverable (Active), never wedged in EnteringIdle.
+        let ctl = IdleController::new();
+        {
+            let _t = ctl.try_begin_enter().expect("Active ⇒ transition begins");
+            assert_eq!(ctl.phase(), Phase::EnteringIdle);
+            // fall out of scope WITHOUT calling commit → Drop rolls back
+        }
+        assert_eq!(
+            ctl.phase(),
+            Phase::Active,
+            "dropped transition must roll back to Active"
+        );
+        assert!(!ctl.is_idle());
+        // Controller is fully usable afterwards.
+        assert!(matches!(
+            ctl.enter(manifest("compiler", 1, 2)),
+            EnterOutcome::Entered(_)
+        ));
+    }
+
+    #[test]
+    fn committed_enter_transition_reaches_idle() {
+        let ctl = IdleController::new();
+        let t = ctl.try_begin_enter().expect("Active ⇒ transition begins");
+        let m = manifest("compiler", 5, 10);
+        assert_eq!(t.commit(m.clone()), m);
+        assert!(ctl.is_idle());
+        assert_eq!(ctl.snapshot().unwrap(), m);
+    }
+
+    #[test]
+    fn try_begin_enter_errors_when_not_active() {
+        let ctl = IdleController::new();
+        ctl.enter(manifest("compiler", 1, 2));
+        // Already idle ⇒ Err(AlreadyIdle), and NO transition guard handed out (so no
+        // spurious rollback of the live idle state when that Err is dropped).
+        match ctl.try_begin_enter() {
+            Err(BeginEnter::AlreadyIdle(_)) => {}
+            other => panic!("expected Err(AlreadyIdle), got {other:?}"),
+        }
+        assert!(
+            ctl.is_idle(),
+            "a rejected try_begin_enter must not disturb idle"
+        );
+    }
+
+    #[test]
+    fn recover_stale_transition_only_when_stale() {
+        let ctl = IdleController::new();
+        // Put it in EnteringIdle (records `since = now_epoch()`).
+        assert_eq!(ctl.begin_enter(), BeginEnter::Begin);
+        let now = crate::gpu_exclusive::now_epoch();
+        // Fresh transition ⇒ NOT recovered.
+        assert!(!ctl.recover_stale_transition(now, 120));
+        assert_eq!(ctl.phase(), Phase::EnteringIdle);
+        // Well past the bound ⇒ force-resolved to Active.
+        assert!(ctl.recover_stale_transition(now + 1_000, 120));
+        assert_eq!(ctl.phase(), Phase::Active);
+        // A steady phase is never touched.
+        assert!(!ctl.recover_stale_transition(now + 1_000, 120));
     }
 
     #[test]
