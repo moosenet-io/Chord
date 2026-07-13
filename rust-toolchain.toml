@@ -1,0 +1,8 @@
+# BLD-02 (S117): one pinned rustc fleet-wide — eliminates the 1.95/1.96/1.97 drift
+# that broke cross-host caching and a mid-session build. The compiler tool (BLD-05)
+# installs this exact version idempotently before building; humans/agents must NEVER
+# run `rustup update` on a shared build host (that is what broke a host mid-build).
+[toolchain]
+channel = "1.97.0"
+targets = ["x86_64-unknown-linux-musl"]
+components = ["rust-src"]
