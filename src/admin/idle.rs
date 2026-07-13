@@ -651,6 +651,16 @@ impl Drop for EnterTransition<'_> {
     }
 }
 
+// Manual `Debug` (the held `&IdleController` isn't `Debug`, so we can't derive):
+// prints just the completion marker, which is all a test diagnostic needs.
+impl std::fmt::Debug for EnterTransition<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnterTransition")
+            .field("committed", &self.committed)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The process-global idle-mode controller. Handlers, the admission hook, and the
 /// watchdog reference this; unit tests use isolated [`IdleController::new`]
 /// instances so they never touch global state.
