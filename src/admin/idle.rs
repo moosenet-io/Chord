@@ -56,7 +56,7 @@
 //! are best-effort.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -270,15 +270,20 @@ pub enum Phase {
 
 /// Internal state cell. Owns the manifest only in the idle/activating phases. The
 /// transient phases carry the epoch second they began (`since`) so the watchdog can
-/// detect and force-resolve a wedged transition (a backstop behind the RAII guard).
+/// detect and force-resolve a wedged transition, plus a unique `generation` token so
+/// a stale transition guard can prove it still owns the CURRENT transition before
+/// finalizing it — preventing a dropped/committed stale guard from clobbering a newer
+/// transition (the ABA hazard).
 enum IdleState {
     Active,
     EnteringIdle {
         since: u64,
+        generation: u64,
     },
     Idle(ResumeManifest),
     Activating {
         since: u64,
+        generation: u64,
         manifest: ResumeManifest,
     },
 }
@@ -303,7 +308,9 @@ impl IdleState {
     /// The epoch second a TRANSIENT phase began, or `None` for a steady phase.
     fn transition_since(&self) -> Option<u64> {
         match self {
-            IdleState::EnteringIdle { since } | IdleState::Activating { since, .. } => Some(*since),
+            IdleState::EnteringIdle { since, .. } | IdleState::Activating { since, .. } => {
+                Some(*since)
+            }
             _ => None,
         }
     }
@@ -312,7 +319,8 @@ impl IdleState {
 /// Result of trying to BEGIN entering idle (CAS `Active → EnteringIdle`).
 #[derive(Debug, PartialEq)]
 pub enum BeginEnter {
-    /// Won the CAS: caller MUST run release work then call [`IdleController::finish_enter`].
+    /// Won the CAS: caller MUST run release work then commit the transition (via the
+    /// RAII [`EnterTransition`] guard's `commit`).
     Begin,
     /// Already fully idle ⇒ idempotent no-op (carries the existing manifest).
     AlreadyIdle(ResumeManifest),
@@ -323,7 +331,8 @@ pub enum BeginEnter {
 /// Result of trying to BEGIN activating (CAS `Idle → Activating`).
 #[derive(Debug, PartialEq)]
 pub enum BeginActivate {
-    /// Won the CAS: caller finishes with [`IdleController::finish_activate`].
+    /// Won the CAS: caller finishes the activate transition (see [`IdleController::exit`]
+    /// / [`activate`]).
     Begin(ResumeManifest),
     /// Already active ⇒ idempotent no-op.
     AlreadyActive,
@@ -372,6 +381,13 @@ pub struct IdleController {
     /// [`InflightGuard`] via an `Arc` so the guard decrements the RIGHT counter on
     /// drop, no matter how long the request outlives the admission call.
     inflight: Arc<AtomicUsize>,
+    /// Monotonic generation counter. Each `begin_enter`/`begin_activate` mints a fresh
+    /// generation (under the `inner` write lock) that is stamped into the transient
+    /// phase and captured by the transition's guard. `finish`/`abort` only act while
+    /// that same generation is still the live one, so a stale guard (whose transition
+    /// was force-recovered by the watchdog and superseded by a newer one) becomes a
+    /// no-op instead of clobbering the newer transition (the ABA hazard).
+    next_gen: AtomicU64,
     /// Where the manifest is persisted across restarts. `None` ⇒ persistence
     /// disabled (in-memory only) — behaviourally fine, the watchdog still bounds it.
     state_path: Option<PathBuf>,
@@ -389,6 +405,7 @@ impl IdleController {
         Self {
             inner: RwLock::new(IdleState::Active),
             inflight: Arc::new(AtomicUsize::new(0)),
+            next_gen: AtomicU64::new(0),
             state_path: None,
         }
     }
@@ -410,6 +427,7 @@ impl IdleController {
         Self {
             inner: RwLock::new(seed),
             inflight: Arc::new(AtomicUsize::new(0)),
+            next_gen: AtomicU64::new(0),
             state_path,
         }
     }
@@ -488,66 +506,102 @@ impl IdleController {
         }
     }
 
+    /// Internal CAS `Active → EnteringIdle{generation}`. Mints a fresh generation
+    /// under the write lock and stamps it into the transient phase. `Ok(gen)` on a
+    /// real transition (caller must eventually finish/abort with that `gen`); `Err`
+    /// carries the non-transition outcome. Shared by [`begin_enter`](Self::begin_enter)
+    /// and [`try_begin_enter`](Self::try_begin_enter) so both mint a generation.
+    fn begin_enter_inner(&self) -> Result<u64, BeginEnter> {
+        let mut guard = self.inner.write().expect("idle lock poisoned");
+        match &*guard {
+            IdleState::Active => {
+                let generation = self.next_gen.fetch_add(1, Ordering::SeqCst);
+                *guard = IdleState::EnteringIdle {
+                    since: now_epoch(),
+                    generation,
+                }; // transient — persists as "not idle" (Active) if persisted at all
+                Ok(generation)
+            }
+            IdleState::Idle(m) => Err(BeginEnter::AlreadyIdle(m.clone())),
+            IdleState::EnteringIdle { .. } | IdleState::Activating { .. } => {
+                Err(BeginEnter::InTransition)
+            }
+        }
+    }
+
     /// CAS `Active → EnteringIdle`. Installs the transition marker atomically BEFORE
     /// any release work, so exactly one caller ever runs the release side effects.
     /// Prefer [`try_begin_enter`](Self::try_begin_enter), whose RAII guard guarantees
     /// the phase is finalized even if the enter future is dropped mid-transition.
     pub fn begin_enter(&self) -> BeginEnter {
-        let mut guard = self.inner.write().expect("idle lock poisoned");
-        match &*guard {
-            IdleState::Active => {
-                *guard = IdleState::EnteringIdle { since: now_epoch() }; // transient — not persisted
-                BeginEnter::Begin
-            }
-            IdleState::Idle(m) => BeginEnter::AlreadyIdle(m.clone()),
-            IdleState::EnteringIdle { .. } | IdleState::Activating { .. } => {
-                BeginEnter::InTransition
-            }
+        match self.begin_enter_inner() {
+            Ok(_gen) => BeginEnter::Begin,
+            Err(e) => e,
         }
     }
 
-    /// CAS into `EnteringIdle` and return an RAII [`EnterTransition`] guard. The guard
-    /// MUST be finalized with [`EnterTransition::commit`]; if it is instead dropped
-    /// (the enter future is cancelled on client disconnect, panics, or returns early),
-    /// its `Drop` deterministically rolls `EnteringIdle → Active` so the controller can
-    /// never wedge in the transient phase. `Err` carries the non-`Begin` CAS result.
+    /// CAS into `EnteringIdle` and return an RAII [`EnterTransition`] guard carrying
+    /// this transition's generation. The guard MUST be finalized with
+    /// [`EnterTransition::commit`]; if it is instead dropped (the enter future is
+    /// cancelled on client disconnect, panics, or returns early), its `Drop`
+    /// deterministically rolls `EnteringIdle → Active` — BUT only if its generation is
+    /// still the live one, so a stale guard can never roll back a newer transition.
+    /// `Err` carries the non-`Begin` CAS result.
     pub fn try_begin_enter(&self) -> Result<EnterTransition<'_>, BeginEnter> {
-        match self.begin_enter() {
-            BeginEnter::Begin => Ok(EnterTransition {
+        match self.begin_enter_inner() {
+            Ok(generation) => Ok(EnterTransition {
                 ctl: self,
+                generation,
                 committed: false,
             }),
-            other => Err(other),
+            Err(e) => Err(e),
         }
     }
 
-    /// Complete an enter: `EnteringIdle → Idle(manifest)`, persisting the manifest.
-    /// Returns the stored manifest. Defensive: if the phase is not `EnteringIdle`
-    /// (should never happen — only the `Begin` winner calls this), it still installs
-    /// the idle manifest rather than losing the transition.
-    pub fn finish_enter(&self, manifest: ResumeManifest) -> ResumeManifest {
+    /// Complete an enter: `EnteringIdle{gen} → Idle(manifest)`, persisting the manifest.
+    /// GENERATION-GUARDED: only installs the manifest if the controller is STILL in the
+    /// same-generation `EnteringIdle` this transition began — otherwise (watchdog
+    /// recovered it, or a newer transition superseded it) it is a NO-OP returning
+    /// `None`, so a stale commit can never clobber a newer phase.
+    fn finish_enter(&self, generation: u64, manifest: ResumeManifest) -> Option<ResumeManifest> {
         let mut guard = self.inner.write().expect("idle lock poisoned");
-        *guard = IdleState::Idle(manifest.clone());
-        self.persist_locked(&guard);
-        manifest
+        match &*guard {
+            IdleState::EnteringIdle {
+                generation: cur, ..
+            } if *cur == generation => {
+                *guard = IdleState::Idle(manifest.clone());
+                self.persist_locked(&guard);
+                Some(manifest)
+            }
+            _ => None,
+        }
     }
 
     /// Roll an in-progress `EnteringIdle` back to `Active` (the safe resting phase).
     /// Used by the [`EnterTransition`] guard when an enter is dropped before commit.
-    /// Only acts while still `EnteringIdle`; if the phase already advanced (finished,
-    /// or was recovered by the watchdog) it is left untouched, so a late drop can't
-    /// clobber a subsequently-installed state.
-    pub fn abort_enter(&self) {
+    /// GENERATION-GUARDED: only acts while the controller is STILL in the same-generation
+    /// `EnteringIdle` this transition installed. If the phase advanced (committed), was
+    /// recovered by the watchdog, or was superseded by a newer transition, it is a
+    /// NO-OP — so a stale/late drop can never clobber a newer transition's state.
+    fn abort_enter(&self, generation: u64) {
         let mut guard = self.inner.write().expect("idle lock poisoned");
-        if matches!(&*guard, IdleState::EnteringIdle { .. }) {
-            *guard = IdleState::Active;
-            self.persist_locked(&guard);
+        if let IdleState::EnteringIdle {
+            generation: cur, ..
+        } = &*guard
+        {
+            if *cur == generation {
+                *guard = IdleState::Active;
+                self.persist_locked(&guard);
+            }
         }
     }
 
-    /// CAS `Idle → Activating`, returning the manifest to clear. Concurrent
-    /// activates: exactly one wins `Begin`; the rest see `InTransition`/`AlreadyActive`.
-    pub fn begin_activate(&self) -> BeginActivate {
+    /// Internal CAS `Idle → Activating{generation}`, returning the manifest to clear
+    /// plus the transition's generation. FINDING #2: the persisted state is cleared to
+    /// the RESTING `Active`/none form HERE (before the async restore work) — memory
+    /// says `Activating` but disk says `Active`, so a crash mid-`Activating` reloads as
+    /// `Active` (worst case: lost idle), never wedged idle.
+    fn begin_activate_inner(&self) -> Result<(ResumeManifest, u64), BeginActivate> {
         let mut guard = self.inner.write().expect("idle lock poisoned");
         match &*guard {
             IdleState::Idle(_) => {
@@ -555,37 +609,68 @@ impl IdleController {
                     IdleState::Idle(m) => m,
                     _ => unreachable!("matched Idle above"),
                 };
+                let generation = self.next_gen.fetch_add(1, Ordering::SeqCst);
                 *guard = IdleState::Activating {
                     since: now_epoch(),
+                    generation,
                     manifest: m.clone(),
-                }; // transient — not persisted
-                BeginActivate::Begin(m)
+                };
+                // Persist NOW: `to_persisted(Activating)` is `None`, so disk becomes
+                // "not idle" (Active) immediately, ahead of any restore work.
+                self.persist_locked(&guard);
+                Ok((m, generation))
             }
-            IdleState::Active => BeginActivate::AlreadyActive,
+            IdleState::Active => Err(BeginActivate::AlreadyActive),
             IdleState::EnteringIdle { .. } | IdleState::Activating { .. } => {
-                BeginActivate::InTransition
+                Err(BeginActivate::InTransition)
             }
         }
     }
 
-    /// Complete an activate: `Activating → Active`, persisting the cleared state.
-    pub fn finish_activate(&self) {
+    /// CAS `Idle → Activating`, returning the manifest to clear. Concurrent
+    /// activates: exactly one wins `Begin`; the rest see `InTransition`/`AlreadyActive`.
+    pub fn begin_activate(&self) -> BeginActivate {
+        match self.begin_activate_inner() {
+            Ok((m, _gen)) => BeginActivate::Begin(m),
+            Err(e) => e,
+        }
+    }
+
+    /// Complete an activate: `Activating{gen} → Active`. GENERATION-GUARDED: only acts
+    /// while the controller is STILL in the same-generation `Activating` this transition
+    /// began; otherwise a NO-OP. Returns whether it finalized. (Disk already reads
+    /// `Active` from [`begin_activate_inner`], so this is a memory-only resolution.)
+    fn finish_activate(&self, generation: u64) -> bool {
         let mut guard = self.inner.write().expect("idle lock poisoned");
-        *guard = IdleState::Active;
-        self.persist_locked(&guard);
+        if let IdleState::Activating {
+            generation: cur, ..
+        } = &*guard
+        {
+            if *cur == generation {
+                *guard = IdleState::Active;
+                self.persist_locked(&guard);
+                return true;
+            }
+        }
+        false
     }
 
     /// Backstop: if the controller has been stuck in a TRANSIENT phase
     /// (`EnteringIdle`/`Activating`) since before `now - max_age`, force-resolve it to
-    /// `Active` and return `true`. Never touches a steady `Active`/`Idle` phase. This
-    /// is insurance behind the RAII guard for the (should-be-impossible) case of a
-    /// genuinely wedged transition; the watchdog calls it each tick.
+    /// `Active` and return `true`. Never touches a steady `Active`/`Idle` phase. Bumps
+    /// the generation so any outstanding guard for the recovered transition is
+    /// invalidated (its finish/abort become no-ops). Insurance behind the RAII guard
+    /// for the (should-be-impossible) case of a genuinely wedged transition; the
+    /// watchdog calls it each tick.
     pub fn recover_stale_transition(&self, now: u64, max_age: u64) -> bool {
         let mut guard = self.inner.write().expect("idle lock poisoned");
         let Some(since) = guard.transition_since() else {
             return false;
         };
         if now.saturating_sub(since) >= max_age {
+            // Bump the generation: the abandoned transition's guard now holds a stale
+            // generation, so its Drop/commit can't clobber whatever comes next.
+            self.next_gen.fetch_add(1, Ordering::SeqCst);
             *guard = IdleState::Active;
             self.persist_locked(&guard);
             true
@@ -595,24 +680,28 @@ impl IdleController {
     }
 
     /// Convenience full enter used by unit tests: atomically `Active → Idle` (begin +
-    /// finish with no release work in between). Idempotent, like the real path.
+    /// finish with no release work in between, via the RAII guard). Idempotent, like
+    /// the real path.
     pub fn enter(&self, manifest: ResumeManifest) -> EnterOutcome {
-        match self.begin_enter() {
-            BeginEnter::Begin => EnterOutcome::Entered(self.finish_enter(manifest)),
-            BeginEnter::AlreadyIdle(m) => EnterOutcome::AlreadyIdle(m),
-            BeginEnter::InTransition => EnterOutcome::InTransition,
+        match self.try_begin_enter() {
+            Ok(t) => match t.commit(manifest) {
+                Some(m) => EnterOutcome::Entered(m),
+                None => EnterOutcome::InTransition,
+            },
+            Err(BeginEnter::AlreadyIdle(m)) => EnterOutcome::AlreadyIdle(m),
+            Err(_) => EnterOutcome::InTransition,
         }
     }
 
     /// Full leave idle (begin + finish). Idempotent: already active ⇒ `AlreadyActive`.
     pub fn exit(&self) -> ActivateOutcome {
-        match self.begin_activate() {
-            BeginActivate::Begin(m) => {
-                self.finish_activate();
+        match self.begin_activate_inner() {
+            Ok((m, generation)) => {
+                self.finish_activate(generation);
                 ActivateOutcome::Activated(m)
             }
-            BeginActivate::AlreadyActive => ActivateOutcome::AlreadyActive,
-            BeginActivate::InTransition => ActivateOutcome::InTransition,
+            Err(BeginActivate::AlreadyActive) => ActivateOutcome::AlreadyActive,
+            Err(_) => ActivateOutcome::InTransition,
         }
     }
 }
@@ -627,25 +716,32 @@ impl IdleController {
 #[must_use = "commit the transition, or it will roll back to Active on drop"]
 pub struct EnterTransition<'a> {
     ctl: &'a IdleController,
+    /// The generation minted for THIS transition. `commit`/`Drop` only act while this
+    /// is still the controller's live `EnteringIdle` generation (ABA guard).
+    generation: u64,
     committed: bool,
 }
 
 impl EnterTransition<'_> {
-    /// Complete the transition: `EnteringIdle → Idle(manifest)`. Consumes the guard so
-    /// its `Drop` becomes a no-op (nothing to roll back).
-    pub fn commit(mut self, manifest: ResumeManifest) -> ResumeManifest {
+    /// Complete the transition: `EnteringIdle{gen} → Idle(manifest)`. Consumes the
+    /// guard so its `Drop` becomes a no-op. Returns `Some(manifest)` if this transition
+    /// still owned the live generation, or `None` if it had been superseded/recovered
+    /// (in which case nothing was installed — the caller must not report success).
+    pub fn commit(mut self, manifest: ResumeManifest) -> Option<ResumeManifest> {
         self.committed = true;
-        self.ctl.finish_enter(manifest)
+        self.ctl.finish_enter(self.generation, manifest)
     }
 }
 
 impl Drop for EnterTransition<'_> {
     fn drop(&mut self) {
         if !self.committed {
-            self.ctl.abort_enter();
+            // Generation-guarded inside `abort_enter`: a stale guard (its transition
+            // recovered by the watchdog and superseded by a newer one) is a no-op here.
+            self.ctl.abort_enter(self.generation);
             warn!(
                 "idle-mode: enter transition dropped before commit (future cancelled/panicked) \
-                 — rolled EnteringIdle back to Active"
+                 — rolled EnteringIdle back to Active (if still the live transition)"
             );
         }
     }
@@ -656,6 +752,7 @@ impl Drop for EnterTransition<'_> {
 impl std::fmt::Debug for EnterTransition<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EnterTransition")
+            .field("generation", &self.generation)
             .field("committed", &self.committed)
             .finish_non_exhaustive()
     }
@@ -872,9 +969,18 @@ pub async fn enter_idle(
         resident_models,
         mem_available_before_gb: mem_before.unwrap_or(0.0),
     };
-    // Complete the transition: `EnteringIdle → Idle` (consumes the guard so its Drop
-    // rollback becomes a no-op). Past this point the enter is durably finalized.
-    let stored = transition.commit(manifest);
+    // Complete the transition: `EnteringIdle{gen} → Idle` (consumes the guard so its
+    // Drop rollback becomes a no-op). Generation-guarded: if our transition was
+    // force-recovered by the watchdog while we were releasing (took longer than the
+    // stale bound), `commit` returns `None` — our enter did NOT take effect and we
+    // must not claim success, so report `InTransition` with no freed-RAM report.
+    let Some(stored) = transition.commit(manifest) else {
+        warn!(
+            reason,
+            "idle-mode: enter superseded (watchdog recovered a stale transition mid-release) — not reporting Entered"
+        );
+        return (EnterOutcome::InTransition, None);
+    };
 
     let report = IdleReport {
         mem_available_before_gb: mem_before,
@@ -903,10 +1009,13 @@ pub async fn enter_idle(
 /// window and activate is effectively a single atomic transition.
 pub async fn activate(state: &Arc<crate::routes::AppState>, reason: &str) -> ActivateOutcome {
     let _ = state; // reserved: a future eager pre-warm could use the registry/client.
-    match IDLE_MODE.begin_activate() {
-        BeginActivate::Begin(m) => {
-            // (restore side effects would go here; lazy reload means none today.)
-            IDLE_MODE.finish_activate();
+    match IDLE_MODE.begin_activate_inner() {
+        Ok((m, generation)) => {
+            // (restore side effects would go here; lazy reload means none today.) Disk
+            // already reads `Active` from begin_activate_inner; finish_activate resolves
+            // memory `Activating{gen} → Active`. Generation-guarded, so a concurrent
+            // recovery can't be clobbered.
+            IDLE_MODE.finish_activate(generation);
             info!(
                 reason,
                 resident_models = m.resident_models.len(),
@@ -914,8 +1023,8 @@ pub async fn activate(state: &Arc<crate::routes::AppState>, reason: &str) -> Act
             );
             ActivateOutcome::Activated(m)
         }
-        BeginActivate::AlreadyActive => ActivateOutcome::AlreadyActive,
-        BeginActivate::InTransition => ActivateOutcome::InTransition,
+        Err(BeginActivate::AlreadyActive) => ActivateOutcome::AlreadyActive,
+        Err(_) => ActivateOutcome::InTransition,
     }
 }
 
@@ -1371,14 +1480,18 @@ mod tests {
 
     #[test]
     fn begin_enter_is_exclusive_cas_release_runs_once() {
-        // finding #1: only ONE caller may run release. The first begin_enter wins;
-        // a second while EnteringIdle must NOT also get Begin.
+        // finding #1: only ONE caller may run release. The first begin wins; a second
+        // while EnteringIdle must NOT also get a transition.
         let ctl = IdleController::new();
-        assert_eq!(ctl.begin_enter(), BeginEnter::Begin);
+        let t = ctl.try_begin_enter().expect("first begins");
+        assert!(matches!(
+            ctl.try_begin_enter(),
+            Err(BeginEnter::InTransition)
+        ));
         assert_eq!(ctl.begin_enter(), BeginEnter::InTransition);
-        // finish and confirm a later begin sees AlreadyIdle, never a second Begin.
+        // commit and confirm a later begin sees AlreadyIdle, never a second Begin.
         let m = manifest("compiler", 1, 2);
-        let _ = ctl.finish_enter(m.clone());
+        assert_eq!(t.commit(m.clone()), Some(m.clone()));
         match ctl.begin_enter() {
             BeginEnter::AlreadyIdle(got) => assert_eq!(got, m),
             other => panic!("expected AlreadyIdle, got {other:?}"),
@@ -1389,10 +1502,10 @@ mod tests {
     fn begin_activate_is_exclusive_cas() {
         let ctl = IdleController::new();
         ctl.enter(manifest("compiler", 1, 2));
-        assert!(matches!(ctl.begin_activate(), BeginActivate::Begin(_)));
+        let (_m, generation) = ctl.begin_activate_inner().expect("Idle ⇒ activate begins");
         // While Activating, a second begin must not also win.
         assert_eq!(ctl.begin_activate(), BeginActivate::InTransition);
-        ctl.finish_activate();
+        assert!(ctl.finish_activate(generation));
         assert_eq!(ctl.begin_activate(), BeginActivate::AlreadyActive);
     }
 
@@ -1426,7 +1539,7 @@ mod tests {
         let ctl = IdleController::new();
         let t = ctl.try_begin_enter().expect("Active ⇒ transition begins");
         let m = manifest("compiler", 5, 10);
-        assert_eq!(t.commit(m.clone()), m);
+        assert_eq!(t.commit(m.clone()), Some(m.clone()));
         assert!(ctl.is_idle());
         assert_eq!(ctl.snapshot().unwrap(), m);
     }
@@ -1464,6 +1577,61 @@ mod tests {
     }
 
     #[test]
+    fn stale_guard_drop_does_not_clobber_newer_transition() {
+        // finding #1 (ABA): begin (gen N) → watchdog recovers to Active (gen bumped) →
+        // begin again (gen N+2) → drop the FIRST guard. The stale guard's rollback must
+        // be a NO-OP: it must NOT roll the SECOND (newer) transition back to Active.
+        let ctl = IdleController::new();
+        let first = ctl.try_begin_enter().expect("first transition begins");
+        assert_eq!(ctl.phase(), Phase::EnteringIdle);
+
+        // Watchdog force-recovers the (now stale) first transition to Active.
+        let now = crate::gpu_exclusive::now_epoch();
+        assert!(ctl.recover_stale_transition(now + 10_000, 120));
+        assert_eq!(ctl.phase(), Phase::Active);
+
+        // A SECOND enter begins — a brand-new, distinct generation.
+        let second = ctl.try_begin_enter().expect("second transition begins");
+        assert_eq!(ctl.phase(), Phase::EnteringIdle);
+
+        // Drop the FIRST (stale) guard: its Drop→abort_enter must NOT touch the second
+        // transition (generation mismatch), so we stay in EnteringIdle.
+        drop(first);
+        assert_eq!(
+            ctl.phase(),
+            Phase::EnteringIdle,
+            "stale guard drop must not roll back the newer transition"
+        );
+
+        // The second transition can still commit normally.
+        let m = manifest("compiler", 7, 9);
+        assert_eq!(second.commit(m.clone()), Some(m.clone()));
+        assert!(ctl.is_idle());
+        assert_eq!(ctl.snapshot().unwrap(), m);
+    }
+
+    #[test]
+    fn stale_guard_commit_does_not_clobber_newer_phase() {
+        // Companion to the ABA test: a stale guard's COMMIT must also no-op (return
+        // None) rather than install its manifest over whatever phase now exists.
+        let ctl = IdleController::new();
+        let stale = ctl.try_begin_enter().expect("first transition begins");
+        let now = crate::gpu_exclusive::now_epoch();
+        assert!(ctl.recover_stale_transition(now + 10_000, 120)); // → Active, gen bumped
+                                                                  // A newer enter takes over and reaches Idle.
+        let fresh = manifest("compiler", 1, 2);
+        assert!(matches!(ctl.enter(fresh.clone()), EnterOutcome::Entered(_)));
+        // The stale guard commits LATE: must be a no-op (None), not clobber fresh idle.
+        let stale_m = manifest("stale", 99, 100);
+        assert_eq!(stale.commit(stale_m), None);
+        assert_eq!(
+            ctl.snapshot().unwrap(),
+            fresh,
+            "stale commit must not overwrite the newer manifest"
+        );
+    }
+
+    #[test]
     fn no_inflight_admitted_after_entering_idle() {
         // finding #2: once we flip to EnteringIdle, try_admit must reject — no new
         // request can join the in-flight set, so the drain is closed-world.
@@ -1483,7 +1651,7 @@ mod tests {
         assert_eq!(ctl.inflight_count(), 0);
 
         // Enter the transition; now admission must be refused with NO increment.
-        assert_eq!(ctl.begin_enter(), BeginEnter::Begin);
+        let t = ctl.try_begin_enter().expect("Active ⇒ transition begins");
         assert!(matches!(ctl.try_admit(), AdmitOutcome::Transitioning));
         assert_eq!(
             ctl.inflight_count(),
@@ -1492,7 +1660,7 @@ mod tests {
         );
 
         // Fully idle also refuses admission (caller lazy-activates instead).
-        let _ = ctl.finish_enter(manifest("compiler", 1, 2));
+        let _ = t.commit(manifest("compiler", 1, 2));
         assert!(matches!(ctl.try_admit(), AdmitOutcome::Idle));
         assert_eq!(ctl.inflight_count(), 0);
     }
@@ -1566,6 +1734,31 @@ mod tests {
             !restarted.is_idle(),
             "EnteringIdle must not persist as idle"
         );
+    }
+
+    #[test]
+    fn crash_during_activating_reloads_active_not_idle() {
+        // finding #2: begin_activate clears the persisted manifest to Active BEFORE the
+        // (async) restore work. A crash while memory is `Activating` must therefore
+        // reload as Active, not Idle — worst case we lose idle, never wedge idle.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admin_idle_state.json");
+
+        let ctl = IdleController::with_state(Some(path.clone()));
+        ctl.enter(manifest("compiler", 1, 2)); // → Idle, disk = Some(manifest)
+
+        // Begin activate: memory → Activating, but disk must be cleared to Active NOW
+        // (before finish_activate). Do NOT finish — simulate a crash here.
+        let (_m, _gen) = ctl.begin_activate_inner().expect("Idle ⇒ activate begins");
+        assert_eq!(ctl.phase(), Phase::Activating);
+
+        // Reload from disk as if the process crashed mid-Activating.
+        let reloaded = IdleController::with_state(Some(path));
+        assert!(
+            !reloaded.is_idle(),
+            "crash during Activating must reload Active, not Idle"
+        );
+        assert_eq!(reloaded.phase(), Phase::Active);
     }
 
     #[test]
