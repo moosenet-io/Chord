@@ -559,6 +559,15 @@ pub fn sweep_session_state_path() -> Option<PathBuf> {
     chord_state_dir().map(|d| d.join("sweep_sessions.json"))
 }
 
+/// BLD-09: path to the persisted idle-mode resume manifest within
+/// [`chord_state_dir`]. `None` when `CHORD_STATE_DIR` is unset/blank — idle-mode
+/// state is then in-memory only (a crash mid-idle relies on the watchdog rather
+/// than a reloaded manifest). Same "never a hardcoded/guessed path" discipline
+/// (S1) as the other state-file helpers above.
+pub fn admin_idle_state_path() -> Option<PathBuf> {
+    chord_state_dir().map(|d| d.join("admin_idle_state.json"))
+}
+
 // ── S85 SRV-05: residency / VRAM-admission config helpers ─────────────────────
 //
 // The residency manager must read the host's FREE VRAM counter and persist a

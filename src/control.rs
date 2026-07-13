@@ -673,6 +673,15 @@ pub fn build_control_router(state: Arc<AppState>) -> axum::Router {
         .route("/api/sweep/session", post(sweep_session_register))
         .route("/api/sweep/session/:id", get(sweep_session_get))
         .route("/api/sweep/session/:id/advance", post(sweep_session_advance))
+        // BLD-09: idle-mode admin surface — free the heavy host for the compiler.
+        // `POST /admin/idle` enters idle (drain + release providers/GPU/models/RAM,
+        // report freed RAM); `GET /admin/idle` reports status; `POST /admin/activate`
+        // restores. Same JWT auth as every route above (checked inside the handlers).
+        .route(
+            "/admin/idle",
+            post(crate::admin::idle::admin_idle_enter).get(crate::admin::idle::admin_idle_status),
+        )
+        .route("/admin/activate", post(crate::admin::idle::admin_activate))
         // SNAP observability routes (additive; distinct paths, same JWT auth):
         // /api/vram, /api/activity, /api/inventory, /api/analytics/*.
         .merge(crate::snap::api::snap_routes())
@@ -1302,6 +1311,43 @@ mod tests {
     }
 
     // ── MSM-04: /api/models/reconcile, /api/storage/gc ─────────────────────────
+
+    // ── BLD-09: /admin/idle, /admin/activate ────────────────────────────────────
+
+    // Auth-wiring only: a non-empty secret with no token ⇒ 401 on every idle-mode
+    // route, so the request never reaches `enter_idle`/`activate` and the
+    // process-global IDLE_MODE is never touched (keeping this test parallel-safe).
+    #[tokio::test]
+    async fn idle_mode_routes_require_auth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let registry = Arc::new(Mutex::new(reg_at(base, vec![])));
+        let state = control_state_with_secret(registry, base.join("local"), "s");
+        let app = build_control_router(state);
+
+        for (method, uri) in [
+            (Method::POST, "/admin/idle"),
+            (Method::GET, "/admin/idle"),
+            (Method::POST, "/admin/activate"),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} must require auth"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn reconcile_requires_auth() {

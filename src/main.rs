@@ -378,6 +378,22 @@ async fn main() {
     chord_proxy::sweep_status::poll::spawn(sweep_status_cfg);
     info!("sweep-status monitor started (GET /v1/sweep/status, /v1/sweep/status/history)");
 
+    // ── BLD-09 idle-mode watchdog ──
+    // Fail-safe: if the proxy is left idle past the watchdog deadline with no
+    // active compiler GPU-exclusive lease (a crashed/forgotten compiler, or a
+    // stale idle state reloaded after a Chord restart), auto-activate so Chord is
+    // never left silently dead. Cheap (a snapshot every 60s); no-op while active.
+    {
+        let watchdog_state = state.clone();
+        tokio::spawn(async move {
+            chord_proxy::admin::idle::watchdog_loop(
+                watchdog_state,
+                std::time::Duration::from_secs(60),
+            )
+            .await;
+        });
+    }
+
     let control_port = config.control_port;
     let control_router = chord_proxy::control::build_control_router(state.clone());
 
