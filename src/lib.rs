@@ -12,6 +12,7 @@ pub mod error;
 pub mod fallback;
 pub mod gpu_exclusive;
 pub mod harness;
+pub mod metrics;
 pub mod middleware;
 pub mod mcp_proxy;
 pub mod models;
