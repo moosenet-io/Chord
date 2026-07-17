@@ -42,6 +42,13 @@
 //! - `POST /admin/activate`  → restore service. Idempotent. Also happens lazily
 //!                             on the next inference request ([`admit_inference`]).
 //! - `GET  /admin/idle`      → current phase + resume manifest.
+//! - `GET  /admin/activity`  → live *serving* activity (CHORD-ACT-01): whether any
+//!                             inference is in flight and, if not, how long Chord has
+//!                             been quiet. This is a DIFFERENT signal from `/admin/idle`
+//!                             (which reports the idle-MODE phase) — the compiler
+//!                             scheduler reads it to dispatch heavy builds only while
+//!                             Chord is genuinely idle, without being blocked forever by
+//!                             a continuously-serving proxy.
 //! - A watchdog ([`watchdog_loop`]) re-activates on timeout so the proxy is never
 //!   left silently dead; it holds off only while a COMPILER GPU-exclusive lease is
 //!   actively held.
@@ -56,7 +63,7 @@
 //! are best-effort.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -294,6 +301,21 @@ pub fn watchdog_should_activate(expired: bool, holder: Option<&str>, patterns: &
     }
 }
 
+/// CHORD-ACT-01 pure view: given the in-flight count, the last-activity epoch, and
+/// `now`, derive `(serving, idle_secs)` for `GET /admin/activity`. `serving` is simply
+/// "something is in flight"; `idle_secs` is `0` while serving, else `now - last_activity`
+/// clamped at `0` (a clock that went backwards, or a future stamp, never yields a
+/// negative age). Pure and clock-free so it is exhaustively unit-testable.
+pub fn activity_summary(inflight: usize, last_activity_unix: i64, now: i64) -> (bool, u64) {
+    let serving = inflight > 0;
+    let idle_secs = if serving {
+        0
+    } else {
+        now.saturating_sub(last_activity_unix).max(0) as u64
+    };
+    (serving, idle_secs)
+}
+
 // ── In-memory controller + durable persistence ───────────────────────────────
 
 /// The lifecycle phase of idle-mode. `EnteringIdle`/`Activating` are transient
@@ -428,6 +450,12 @@ pub struct IdleController {
     /// [`InflightGuard`] via an `Arc` so the guard decrements the RIGHT counter on
     /// drop, no matter how long the request outlives the admission call.
     inflight: Arc<AtomicUsize>,
+    /// CHORD-ACT-01: epoch-seconds of the most recent inference ADMISSION (the moment
+    /// `try_admit` last increments `inflight`). Seeded to construction time so
+    /// "idle for N seconds" is meaningful from boot even before the first request.
+    /// Read by `GET /admin/activity`; a single relaxed-cost `SeqCst` store on the hot
+    /// admission path, no lock of its own (it piggybacks the admission write lock).
+    last_activity: AtomicI64,
     /// Monotonic generation counter. Each `begin_enter`/`begin_activate` mints a fresh
     /// generation (under the `inner` write lock) that is stamped into the transient
     /// phase and captured by the transition's guard. `finish`/`abort` only act while
@@ -452,6 +480,7 @@ impl IdleController {
         Self {
             inner: RwLock::new(IdleState::Active),
             inflight: Arc::new(AtomicUsize::new(0)),
+            last_activity: AtomicI64::new(now_epoch() as i64),
             next_gen: AtomicU64::new(0),
             state_path: None,
         }
@@ -474,6 +503,7 @@ impl IdleController {
         Self {
             inner: RwLock::new(seed),
             inflight: Arc::new(AtomicUsize::new(0)),
+            last_activity: AtomicI64::new(now_epoch() as i64),
             next_gen: AtomicU64::new(0),
             state_path,
         }
@@ -528,6 +558,13 @@ impl IdleController {
         let guard = self.inner.write().expect("idle lock poisoned");
         match &*guard {
             IdleState::Active => {
+                // CHORD-ACT-01: stamp last-activity at the instant admission increments
+                // the in-flight count — one cheap atomic store under the lock we already
+                // hold. This is THE inference-request start for every admitted call
+                // (chat/completions, embeddings, agentic), so `/admin/activity` reflects
+                // real serving without a second counter or a second call site.
+                self.last_activity
+                    .store(now_epoch() as i64, Ordering::SeqCst);
                 AdmitOutcome::Admitted(InflightGuard::admit(self.inflight.clone()))
             }
             IdleState::Idle(_) => AdmitOutcome::Idle,
@@ -540,6 +577,20 @@ impl IdleController {
     /// Current number of admitted in-flight inference requests.
     pub fn inflight_count(&self) -> usize {
         self.inflight.load(Ordering::SeqCst)
+    }
+
+    /// CHORD-ACT-01: epoch-seconds of the most recent inference admission (or the
+    /// controller's construction time if it has never served). Read by
+    /// `GET /admin/activity`; see [`activity_summary`] for the derived serving/idle view.
+    pub fn last_activity_unix(&self) -> i64 {
+        self.last_activity.load(Ordering::SeqCst)
+    }
+
+    /// Test-only override of the last-activity stamp so the activity view can be
+    /// exercised deterministically without sleeping or touching the wall clock.
+    #[cfg(test)]
+    fn set_last_activity_for_test(&self, unix: i64) {
+        self.last_activity.store(unix, Ordering::SeqCst);
     }
 
     /// Wait (bounded by `timeout`) for in-flight inference to drain to zero. Returns
@@ -1401,6 +1452,42 @@ pub async fn admin_idle_status(
     (StatusCode::OK, Json(body)).into_response()
 }
 
+/// CHORD-ACT-01 response body, factored out of the handler so its exact shape is unit
+/// tested without an HTTP round-trip. Reuses [`activity_summary`] so the wire contract
+/// and the pure logic can never drift.
+fn activity_json(inflight: usize, last_activity_unix: i64, now: i64) -> serde_json::Value {
+    let (serving, idle_secs) = activity_summary(inflight, last_activity_unix, now);
+    serde_json::json!({
+        "serving": serving,
+        "inflight": inflight,
+        "idle_secs": idle_secs,
+        "last_request_unix": last_activity_unix,
+    })
+}
+
+/// `GET /admin/activity` — live serving-activity signal (CHORD-ACT-01). Auth-gated with
+/// the SAME posture as `/admin/idle`. Distinct from the idle-MODE phase reported there:
+/// this answers "is Chord actually serving inference right now, and if not, for how long
+/// has it been quiet?" so the constellation compiler scheduler can dispatch heavy builds
+/// only into genuine quiet windows without being permanently blocked by a busy proxy.
+/// Reuses the one in-flight counter the idle machinery owns — no second source of truth.
+pub async fn admin_activity_status(
+    State(state): State<StdArc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = auth_check(&headers, &state.jwt_secret) {
+        return auth_error_response(e);
+    }
+    let inflight = IDLE_MODE.inflight_count();
+    let last_activity_unix = IDLE_MODE.last_activity_unix();
+    let now = now_epoch() as i64;
+    (
+        StatusCode::OK,
+        Json(activity_json(inflight, last_activity_unix, now)),
+    )
+        .into_response()
+}
+
 // ── Watchdog ──────────────────────────────────────────────────────────────────
 
 /// Background fail-safe: every `interval`, if idle and the watchdog deadline has
@@ -2005,5 +2092,85 @@ mod tests {
 
         std::env::remove_var("CHORD_IDLE_STALE_TRANSITION_SECS");
         std::env::remove_var("CHORD_IDLE_RELEASE_BUDGET_SECS");
+    }
+
+    // ── CHORD-ACT-01: activity view ──────────────────────────────────────────
+
+    #[test]
+    fn activity_summary_serving_when_inflight_positive() {
+        // Any in-flight request ⇒ serving, and idle_secs is pinned to 0 regardless of
+        // how stale the last-activity stamp looks.
+        let (serving, idle_secs) = activity_summary(1, 1_000, 9_999);
+        assert!(serving);
+        assert_eq!(idle_secs, 0);
+        let (serving, idle_secs) = activity_summary(5, 0, 9_999);
+        assert!(serving);
+        assert_eq!(idle_secs, 0);
+    }
+
+    #[test]
+    fn activity_summary_idle_secs_grows_from_last_activity() {
+        // Not serving ⇒ idle_secs is now - last_activity, growing as `now` advances.
+        let (serving, idle_secs) = activity_summary(0, 1_000, 1_000);
+        assert!(!serving);
+        assert_eq!(idle_secs, 0);
+        assert_eq!(activity_summary(0, 1_000, 1_042).1, 42);
+        assert_eq!(activity_summary(0, 1_000, 4_600).1, 3_600);
+    }
+
+    #[test]
+    fn activity_summary_never_negative_on_backward_clock() {
+        // A last-activity stamp in the "future" (clock skew / step-back) clamps to 0,
+        // never a wrapped/negative age.
+        let (serving, idle_secs) = activity_summary(0, 5_000, 1_000);
+        assert!(!serving);
+        assert_eq!(idle_secs, 0);
+    }
+
+    #[test]
+    fn activity_json_shape_serving_and_idle() {
+        // Serving shape.
+        let v = activity_json(2, 1_000, 5_000);
+        assert_eq!(v["serving"], serde_json::json!(true));
+        assert_eq!(v["inflight"], serde_json::json!(2));
+        assert_eq!(v["idle_secs"], serde_json::json!(0));
+        assert_eq!(v["last_request_unix"], serde_json::json!(1_000));
+
+        // Idle shape.
+        let v = activity_json(0, 1_000, 1_075);
+        assert_eq!(v["serving"], serde_json::json!(false));
+        assert_eq!(v["inflight"], serde_json::json!(0));
+        assert_eq!(v["idle_secs"], serde_json::json!(75));
+        assert_eq!(v["last_request_unix"], serde_json::json!(1_000));
+    }
+
+    #[test]
+    fn controller_records_activity_on_admission() {
+        // A fresh isolated controller starts Active with a seeded (non-zero) stamp;
+        // admitting a request refreshes it and bumps the in-flight count. This reuses
+        // the SAME counter the drain/idle machinery reads — no second gauge.
+        let ctl = IdleController::new();
+        assert_eq!(ctl.inflight_count(), 0);
+        ctl.set_last_activity_for_test(1_000);
+        assert_eq!(ctl.last_activity_unix(), 1_000);
+
+        let guard = match ctl.try_admit() {
+            AdmitOutcome::Admitted(g) => g,
+            _ => panic!("expected admission while Active"),
+        };
+        assert_eq!(ctl.inflight_count(), 1);
+        // Admission stamped a real wall-clock time (>> the 1_000 test seed).
+        assert!(
+            ctl.last_activity_unix() > 1_000,
+            "admission must refresh last_activity from the seed"
+        );
+        // While admitted the derived view is `serving`.
+        assert!(activity_summary(ctl.inflight_count(), ctl.last_activity_unix(), now_epoch() as i64).0);
+        drop(guard);
+        assert_eq!(ctl.inflight_count(), 0);
+        // Once drained, the view reports not-serving with a non-negative age.
+        let (serving, _idle) =
+            activity_summary(ctl.inflight_count(), ctl.last_activity_unix(), now_epoch() as i64);
+        assert!(!serving);
     }
 }
