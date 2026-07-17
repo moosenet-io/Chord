@@ -701,6 +701,14 @@ pub fn build_control_router(state: Arc<AppState>) -> axum::Router {
             post(crate::admin::idle::admin_idle_enter).get(crate::admin::idle::admin_idle_status),
         )
         .route("/admin/activate", post(crate::admin::idle::admin_activate))
+        // CHORD-ACT-01: live serving-activity signal. Distinct from the idle-MODE phase
+        // above — `GET /admin/activity` reports whether inference is actually in flight
+        // and, if not, how long Chord has been quiet, so the compiler scheduler can
+        // dispatch heavy builds into genuine idle windows. Same JWT auth (in-handler).
+        .route(
+            "/admin/activity",
+            get(crate::admin::idle::admin_activity_status),
+        )
         // SNAP observability routes (additive; distinct paths, same JWT auth):
         // /api/vram, /api/activity, /api/inventory, /api/analytics/*.
         .merge(crate::snap::api::snap_routes())
@@ -1348,6 +1356,7 @@ mod tests {
             (Method::POST, "/admin/idle"),
             (Method::GET, "/admin/idle"),
             (Method::POST, "/admin/activate"),
+            (Method::GET, "/admin/activity"),
         ] {
             let resp = app
                 .clone()
