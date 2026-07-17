@@ -9,6 +9,7 @@
 //! ## Endpoints
 //! | Method | Path                          | Auth | Purpose |
 //! |--------|-------------------------------|------|---------|
+//! | GET    | `/metrics`                    | no   | PROMEX-02: Prometheus text-exposition application metrics |
 //! | GET    | `/api/models`                 | yes  | list all registry records |
 //! | GET    | `/api/models/:name`          | yes  | single model detail (404 unknown) |
 //! | POST   | `/api/models/:name/archive`  | yes  | archive a warm model (warm → cold) |
@@ -576,6 +577,22 @@ pub async fn control_health() -> impl IntoResponse {
     }))
 }
 
+/// PROMEX-02: `GET /metrics` — encodes the process-global `crate::metrics`
+/// registry (inference request counts + latency histogram) in the standard
+/// Prometheus text exposition format. Takes no `State` — the registry is
+/// process-global, not per-server-instance. Unauthenticated, same as
+/// `/health` above (see this module's doc, "Auth choice" section — JWT auth
+/// is checked INSIDE the `/api/*`/`/admin/*` handlers, not a router-wide
+/// layer, and metrics are equally non-sensitive: bounded model names, counts,
+/// and timings only).
+pub async fn handle_metrics() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4")],
+        crate::metrics::gather_text(),
+    )
+}
+
 // ── Sweep session cache (RESIL-02) ───────────────────────────────────────────
 //
 // A durable, session-keyed cache of a sweep's planned action queue + progress
@@ -660,6 +677,8 @@ pub fn build_control_router(state: Arc<AppState>) -> axum::Router {
     use axum::routing::{get, post};
     axum::Router::new()
         .route("/health", get(control_health))
+        // PROMEX-02: application metrics, unauthenticated like /health above.
+        .route("/metrics", get(handle_metrics))
         .route("/api/models", get(list_models))
         .route("/api/models/sweep", post(trigger_sweep))
         .route("/api/models/reconcile", post(trigger_reconcile))

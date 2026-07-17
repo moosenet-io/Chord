@@ -828,6 +828,13 @@ pub async fn chat_completions(
             AuditStatus::Error,
             Some("CHORD_LLM_URL not configured".into()),
         );
+        // PROMEX-02: no registry lookup has happened yet at this point, so
+        // there's no known-served evidence for `model` — bound to <unknown>.
+        crate::metrics::record_inference(
+            &crate::metrics::bounded_model_label(&model, false),
+            false,
+            start.elapsed(),
+        );
         let resp_body = serde_json::json!({
             "error": "LLM backend not configured (CHORD_LLM_URL unset)"
         });
@@ -872,14 +879,19 @@ pub async fn chat_completions(
     // the upstream below (no regression for models the registry doesn't track).
     // The lock is released before the (potentially long) pull and the upstream
     // HTTP call.
-    let needs_pull = {
+    // PROMEX-02: `is_known_served` is Chord's own validated known-model
+    // evidence for the `chord_inference_*` metrics' bounded `model` label —
+    // the registry actually tracking `registry_key` (regardless of tier),
+    // never a parse of the raw client-supplied model string. See
+    // `crate::metrics::bounded_model_label`.
+    let (needs_pull, is_known_served) = {
         use crate::models::registry::StorageTier;
         let mut reg = state.model_registry.lock().await;
         reg.update_last_requested(&registry_key);
-        matches!(
-            reg.get(&registry_key).map(|r| r.tier.clone()),
-            Some(StorageTier::Cold)
-        )
+        let record = reg.get(&registry_key);
+        let is_known_served = record.is_some();
+        let needs_pull = matches!(record.map(|r| r.tier.clone()), Some(StorageTier::Cold));
+        (needs_pull, is_known_served)
     };
     if needs_pull {
         if let Err(e) = state
@@ -894,6 +906,11 @@ pub async fn chat_completions(
                 start.elapsed().as_millis() as u64,
                 AuditStatus::Error,
                 Some(format!("archive pull failed: {e}")),
+            );
+            crate::metrics::record_inference(
+                &crate::metrics::bounded_model_label(&resolved_model, is_known_served),
+                false,
+                start.elapsed(),
             );
             let resp_body = serde_json::json!({
                 "error": format!("model could not be retrieved from archive: {e}")
@@ -1008,6 +1025,11 @@ pub async fn chat_completions(
                 AuditStatus::Error,
                 Some(format!("upstream request failed: {e}")),
             );
+            crate::metrics::record_inference(
+                &crate::metrics::bounded_model_label(&model, is_known_served),
+                false,
+                start.elapsed(),
+            );
             let resp_body = serde_json::json!({
                 "error": format!("LLM backend unreachable: {e}")
             });
@@ -1040,6 +1062,11 @@ pub async fn chat_completions(
         } else {
             Some(format!("upstream returned HTTP {status}"))
         },
+    );
+    crate::metrics::record_inference(
+        &crate::metrics::bounded_model_label(&model, is_known_served),
+        status.is_success(),
+        start.elapsed(),
     );
 
     // Stream the upstream body straight back to the caller. This passes through
