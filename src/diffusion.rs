@@ -59,6 +59,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use once_cell::sync::Lazy;
+use serde::Deserialize;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -85,6 +86,11 @@ pub struct DiffusionConfig {
     pub idle_secs: u64,
     pub start_timeout_secs: u64,
     pub extra_args: Vec<String>,
+    /// CHRD-DIFF-503: HTTP client timeout for `POST /generate` calls,
+    /// distinct from the short `:health`-poll client — a cold model load +
+    /// first-ever Vulkan shader compile can take minutes (matches
+    /// terminus-rs's `DGEM_CLIENT_TIMEOUT_SECS` default of 600s).
+    pub generate_timeout_secs: u64,
 }
 
 impl Default for DiffusionConfig {
@@ -115,6 +121,7 @@ impl Default for DiffusionConfig {
                 "-b".into(),
                 "8192".into(),
             ],
+            generate_timeout_secs: 600,
         }
     }
 }
@@ -180,6 +187,11 @@ impl DiffusionConfig {
                 cfg.extra_args = parsed;
             }
         }
+        if let Some(v) = get("DIFFUSION_GENERATE_TIMEOUT_SECS") {
+            if let Ok(n) = v.trim().parse() {
+                cfg.generate_timeout_secs = n;
+            }
+        }
         cfg
     }
 
@@ -187,19 +199,50 @@ impl DiffusionConfig {
         format!("http://{}:{}", self.bind, self.port)
     }
 
-    /// The FULL OpenAI-compatible chat-completions endpoint the router forwards
-    /// to. Returned by [`DiffusionManager::ensure_running`] so its contract is
-    /// IDENTICAL to `models::routing::resolve_and_ensure` (which likewise
-    /// returns a full `.../v1/chat/completions` URL) — the caller in
-    /// `chat_completions` POSTs this verbatim and MUST NOT append a path, so no
-    /// call site can ever produce a doubled `/v1/chat/completions/v1/chat/completions`.
+    /// A full `.../v1/chat/completions` URL shape. **No longer used to serve
+    /// requests** (see [`Self::generate_url`]) — the real
+    /// `llama-diffusion-daemon` never implements this OpenAI route (verified:
+    /// POST → 404, `/v1/models` → 404). Kept only because its
+    /// exactly-one-path-segment contract is still exercised by
+    /// `chat_completions_url_has_exactly_one_path_segment` below; do not wire
+    /// this back into the serving path (CHRD-DIFF-503).
     pub fn chat_completions_url(&self) -> String {
         format!("{}/v1/chat/completions", self.base_url())
+    }
+
+    /// CHRD-DIFF-503: the FULL `/generate` endpoint the router serves
+    /// diffusion requests through. This is the daemon's REAL API (verified
+    /// live: `/health`=200, `/generate`=the dgem contract used by
+    /// terminus-rs's `dgem::DgemConfig::generate` — `{system, prompt,
+    /// max_tokens}` → `{text, time_ms, model_load_ms, input_tokens, tokens,
+    /// blocks}`). Returned by [`DiffusionManager::ensure_running`] with the
+    /// same "full URL, POST verbatim, never append a path" contract
+    /// `chat_completions_url` used to have, so no call site can ever produce
+    /// a doubled `/generate/generate`.
+    pub fn generate_url(&self) -> String {
+        format!("{}/generate", self.base_url())
     }
 
     fn health_url(&self) -> String {
         format!("{}/health", self.base_url())
     }
+}
+
+/// CHRD-DIFF-503: the daemon's `POST /generate` response shape — identical to
+/// terminus-rs's `dgem::GenerateResponse` (same daemon, same contract).
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiffusionGenerateResponse {
+    pub text: String,
+    #[serde(default)]
+    pub time_ms: i64,
+    #[serde(default)]
+    pub model_load_ms: i64,
+    #[serde(default)]
+    pub input_tokens: i64,
+    #[serde(default)]
+    pub tokens: i64,
+    #[serde(default)]
+    pub blocks: i64,
 }
 
 /// Is `model` (the client-supplied / alias-resolved chat-completions model
@@ -264,13 +307,23 @@ pub struct DiffusionManager {
     cfg: DiffusionConfig,
     inner: Mutex<Inner>,
     last_activity_epoch: AtomicU64,
+    /// Short-timeout client for lifecycle checks (`/health` polling, ambient
+    /// port-serving probe). NOT used for `/generate` — a cold model load can
+    /// take minutes, far past this client's 10s budget.
     client: reqwest::Client,
+    /// CHRD-DIFF-503: long-timeout client dedicated to `POST /generate`
+    /// requests (see [`DiffusionConfig::generate_timeout_secs`]).
+    generate_client: reqwest::Client,
 }
 
 impl DiffusionManager {
     pub fn new(cfg: DiffusionConfig) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
+            .build()
+            .expect("reqwest client");
+        let generate_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(cfg.generate_timeout_secs))
             .build()
             .expect("reqwest client");
         Self {
@@ -281,6 +334,7 @@ impl DiffusionManager {
             }),
             last_activity_epoch: AtomicU64::new(0),
             client,
+            generate_client,
         }
     }
 
@@ -354,10 +408,9 @@ impl DiffusionManager {
     }
 
     /// Lazily start the daemon if it isn't already running, gated on the
-    /// process-global `gpu_exclusive` lock. Returns the FULL
-    /// `.../v1/chat/completions` endpoint to forward to — identical in shape to
-    /// `models::routing::resolve_and_ensure`, so the `chat_completions` caller
-    /// POSTs it verbatim and never appends a second path segment.
+    /// process-global `gpu_exclusive` lock. Returns the FULL `/generate`
+    /// endpoint to serve through (CHRD-DIFF-503) — the caller passes this to
+    /// [`Self::generate`] verbatim and never appends a second path segment.
     ///
     /// Thin wrapper over [`Self::ensure_running_gated`]: it reads the current
     /// GPU-exclusive holder state from the process-global lock and delegates.
@@ -375,7 +428,7 @@ impl DiffusionManager {
 
     /// The gate + lazy-spawn logic, with the GPU-exclusive-held decision passed
     /// in rather than read from global state (so it is race-free to unit-test).
-    /// Returns the FULL chat-completions endpoint URL on success.
+    /// Returns the FULL `/generate` endpoint URL on success.
     pub async fn ensure_running_gated(&self, gpu_held: bool) -> Result<String, String> {
         let mut guard = self.inner.lock().await;
 
@@ -389,7 +442,7 @@ impl DiffusionManager {
             StartDecision::AlreadyRunning => {
                 drop(guard);
                 self.touch_activity();
-                return Ok(self.cfg.chat_completions_url());
+                return Ok(self.cfg.generate_url());
             }
             StartDecision::Blocked => {
                 return Err(
@@ -422,7 +475,7 @@ impl DiffusionManager {
             }
             drop(guard);
             self.touch_activity();
-            return Ok(self.cfg.chat_completions_url());
+            return Ok(self.cfg.generate_url());
         }
 
         info!(
@@ -467,7 +520,51 @@ impl DiffusionManager {
         }
 
         self.touch_activity();
-        Ok(self.cfg.chat_completions_url())
+        Ok(self.cfg.generate_url())
+    }
+
+    /// CHRD-DIFF-503: serve a prompt via the daemon's REAL `POST /generate`
+    /// API — the only endpoint it actually implements besides `/health`.
+    /// Mirrors terminus-rs's `dgem::DgemConfig::generate` client exactly
+    /// (same daemon, same contract): request `{system, prompt, max_tokens}`,
+    /// response `{text, time_ms, model_load_ms, input_tokens, tokens,
+    /// blocks}`. `url` must be the value [`Self::ensure_running`] returned
+    /// (POSTed verbatim, never re-derived here, for the same
+    /// never-double-a-path reason `ensure_running`'s own docs describe).
+    pub async fn generate(
+        &self,
+        url: &str,
+        system: &str,
+        prompt: &str,
+        max_tokens: u32,
+    ) -> Result<DiffusionGenerateResponse, String> {
+        let resp = self
+            .generate_client
+            .post(url)
+            .json(&serde_json::json!({
+                "system": system,
+                "prompt": prompt,
+                "max_tokens": max_tokens,
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("diffusion: /generate request failed: {e}"))?;
+
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("diffusion: /generate response read failed: {e}"))?;
+        if !status.is_success() {
+            // The daemon returns {"error": "..."} for 4xx/5xx.
+            let msg = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
+                .unwrap_or_else(|| format!("daemon HTTP {status}"));
+            return Err(format!("diffusion daemon: {msg}"));
+        }
+        serde_json::from_str::<DiffusionGenerateResponse>(&body)
+            .map_err(|e| format!("diffusion: malformed /generate response: {e}"))
     }
 
     /// Poll `GET /health` every 2s up to `timeout_secs`, mirroring
@@ -605,6 +702,25 @@ mod tests {
             url.matches("/v1/chat/completions").count(),
             1,
             "URL must carry exactly one chat-completions path, got: {url}"
+        );
+    }
+
+    // CHRD-DIFF-503: the daemon has NO `/v1/chat/completions` route (verified
+    // 404) — only `/health` + `/generate` exist. `ensure_running`/`generate`
+    // must use `/generate`, never the OpenAI-shaped path above.
+    #[test]
+    fn generate_url_has_exactly_one_path_segment() {
+        let cfg = DiffusionConfig {
+            bind: "127.0.0.1".into(),
+            port: 8877,
+            ..DiffusionConfig::default()
+        };
+        let url = cfg.generate_url();
+        assert_eq!(url, "http://127.0.0.1:8877/generate");
+        assert_eq!(
+            url.matches("/generate").count(),
+            1,
+            "URL must carry exactly one /generate path, got: {url}"
         );
     }
 
@@ -781,5 +897,66 @@ mod tests {
             !mgr.is_running().await,
             "a tracked child that has exited must not read as running"
         );
+    }
+
+    // ── CHRD-DIFF-503: DiffusionManager::generate serves via /generate ──────
+
+    #[tokio::test]
+    async fn generate_posts_to_slash_generate_and_parses_the_daemon_contract() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/generate")
+                .json_body(serde_json::json!({
+                    "system": "be terse",
+                    "prompt": "hello",
+                    "max_tokens": 128,
+                }));
+            then.status(200).json_body(serde_json::json!({
+                "text": "hi there",
+                "time_ms": 123,
+                "model_load_ms": 0,
+                "input_tokens": 5,
+                "tokens": 3,
+                "blocks": 1,
+            }));
+        });
+
+        let cfg = DiffusionConfig {
+            bind: server.address().ip().to_string(),
+            port: server.address().port(),
+            ..DiffusionConfig::default()
+        };
+        let mgr = DiffusionManager::new(cfg.clone());
+        let resp = mgr
+            .generate(&cfg.generate_url(), "be terse", "hello", 128)
+            .await
+            .expect("generate must succeed against the mock /generate route");
+
+        assert_eq!(resp.text, "hi there");
+        assert_eq!(resp.tokens, 3);
+        assert_eq!(resp.input_tokens, 5);
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn generate_surfaces_daemon_error_body() {
+        let server = httpmock::MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/generate");
+            then.status(503).json_body(serde_json::json!({"error": "VRAM occupied"}));
+        });
+
+        let cfg = DiffusionConfig {
+            bind: server.address().ip().to_string(),
+            port: server.address().port(),
+            ..DiffusionConfig::default()
+        };
+        let mgr = DiffusionManager::new(cfg.clone());
+        let err = mgr
+            .generate(&cfg.generate_url(), "", "hello", 128)
+            .await
+            .unwrap_err();
+        assert!(err.contains("VRAM occupied"), "got: {err}");
     }
 }

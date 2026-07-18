@@ -919,57 +919,47 @@ pub async fn chat_completions(
         }
     }
 
-    // ── CHRD-DIFF-01: DiffusionGemma managed-daemon routing ───────────────────
+    // ── CHRD-DIFF-01 / CHRD-DIFF-503: DiffusionGemma managed-daemon routing ──
     // Takes precedence over P5 tag-aware routing below: a request for the
     // Chord-managed diffusion model (`diffusion-gemma` by default, see
-    // `crate::diffusion`) is lazy-started on demand and forwarded straight to
-    // its `:8877` daemon — never `CHORD_LLM_URL` and never the ModelRegistry
-    // backend table (that daemon was never registered as a `Backend`; it is
-    // owned entirely by the `diffusion` module's own process manager). Unlike
-    // the P5 fallback-on-failure posture below, a start failure here returns a
-    // structured 503 rather than silently forwarding to the wrong (non-
-    // diffusion) upstream — sending a diffusion prompt to the default chat
-    // model would be a silent correctness bug, not graceful degradation.
-    let (llm_url, bearer_key) = if crate::diffusion::global().is_diffusion_model(&resolved_model) {
-        match crate::diffusion::global().ensure_running().await {
-            // `ensure_running` returns the FULL `.../v1/chat/completions`
-            // endpoint (same contract as `resolve_and_ensure`) — POST it
-            // verbatim below; do NOT append a path here, or the daemon sees a
-            // doubled `/v1/chat/completions/v1/chat/completions` → 404.
-            Ok(full_url) => (full_url, None),
-            Err(e) => {
-                warn!("diffusion: could not serve {resolved_model}: {e}");
-                state.audit_logger.log_llm_call(
-                    &claims.sub,
-                    &resolved_model,
-                    start.elapsed().as_millis() as u64,
-                    AuditStatus::Error,
-                    Some(e.clone()),
-                );
-                crate::metrics::record_inference(
-                    &crate::metrics::bounded_model_label(&resolved_model, is_known_served),
-                    false,
-                    start.elapsed(),
-                );
-                let resp_body = serde_json::json!({
-                    "error": format!("diffusion backend unavailable: {e}")
-                });
-                return (StatusCode::SERVICE_UNAVAILABLE, Json(resp_body)).into_response();
-            }
-        }
-    } else {
-        // ── P5 tag-aware routing ───────────────────────────────────────────────
-        // Forward to the model's tagged backend (GPU vs CPU), starting an
-        // on-demand backend if needed. Untagged models resolve to the default
-        // backend (whose URL matches CHORD_LLM_URL), so behavior is unchanged
-        // until models are tagged. On any failure we fall back to CHORD_LLM_URL.
-        // `bearer_key` is `Some` only for backends with `api_key_env` set (e.g.
-        // OpenRouter) — re-injected as an outbound Authorization header below,
-        // after the inbound-header copy loop strips the caller's own JWT.
+    // `crate::diffusion`) is lazy-started on demand and SERVED via the
+    // daemon's own `/generate` API — never `CHORD_LLM_URL` and never the
+    // ModelRegistry backend table (that daemon was never registered as a
+    // `Backend`; it is owned entirely by the `diffusion` module's own
+    // process manager). This is a fully separate serving path (not a raw
+    // forward): CHRD-DIFF-503 found the daemon has NO `/v1/chat/completions`
+    // route (verified live: POST → 404, `/v1/models` → 404 — only `/health`
+    // and `/generate` exist), so the old raw-forward-to-OpenAI-shape 404'd
+    // and was mapped to a 503 on every diffusion request. `ensure_running`'s
+    // adopt/gate/spawn behavior (including the gpu_exclusive `Blocked` case,
+    // which still returns a structured 503 rather than silently falling
+    // back to the wrong non-diffusion upstream) is unchanged.
+    if crate::diffusion::global().is_diffusion_model(&resolved_model) {
+        return serve_diffusion_chat_completion(
+            &state,
+            &claims,
+            &resolved_model,
+            &body,
+            start,
+            rl_headers,
+            is_known_served,
+            idle_inflight,
+        )
+        .await;
+    }
+
+    // ── P5 tag-aware routing ───────────────────────────────────────────────
+    // Forward to the model's tagged backend (GPU vs CPU), starting an
+    // on-demand backend if needed. Untagged models resolve to the default
+    // backend (whose URL matches CHORD_LLM_URL), so behavior is unchanged
+    // until models are tagged. On any failure we fall back to CHORD_LLM_URL.
+    // `bearer_key` is `Some` only for backends with `api_key_env` set (e.g.
+    // OpenRouter) — re-injected as an outbound Authorization header below,
+    // after the inbound-header copy loop strips the caller's own JWT.
+    let (llm_url, bearer_key) =
         crate::models::routing::resolve_and_ensure(&state.model_registry, &registry_key, &resolved_model)
             .await
-            .unwrap_or((llm_url, None))
-    };
+            .unwrap_or((llm_url, None));
 
     // ── YARN-06: per-request thinking honoring ──────────────────────────────
     // Harmony (THINK-01/02) may send an optional top-level `thinking: "on"|"off"`
@@ -1131,6 +1121,217 @@ pub async fn chat_completions(
         });
     response.headers_mut().extend(rl_headers);
     response
+}
+
+/// CHRD-DIFF-503: serve a `/v1/chat/completions` request whose (alias-resolved)
+/// model is the Chord-managed DiffusionGemma model. Calls
+/// [`crate::diffusion::global`]'s `ensure_running` (unchanged adopt/gate/spawn
+/// behavior, including the structured 503 on `gpu_exclusive`-Blocked), then
+/// SERVES via the daemon's real `POST /generate` API — never a raw forward to
+/// an OpenAI-shaped endpoint the daemon doesn't implement (that was the bug:
+/// the daemon 404s on `/v1/chat/completions`, which `chat_completions` mapped
+/// to a 503 on every diffusion request). The `/generate` result is translated
+/// into a standard OpenAI chat-completion JSON response.
+///
+/// DiffusionGemma generates in fixed canvas blocks, not a token stream, so
+/// (v1) this always returns a single non-streamed JSON response even when the
+/// caller set `"stream": true` — correct behavior, just not SSE yet.
+async fn serve_diffusion_chat_completion(
+    state: &Arc<AppState>,
+    claims: &Claims,
+    resolved_model: &str,
+    body: &[u8],
+    start: Instant,
+    rl_headers: HeaderMap,
+    is_known_served: bool,
+    _idle_inflight: crate::admin::idle::InflightGuard,
+) -> Response {
+    let manager = crate::diffusion::global();
+
+    let generate_url = match manager.ensure_running().await {
+        Ok(url) => url,
+        Err(e) => {
+            warn!("diffusion: could not serve {resolved_model}: {e}");
+            state.audit_logger.log_llm_call(
+                &claims.sub,
+                resolved_model,
+                start.elapsed().as_millis() as u64,
+                AuditStatus::Error,
+                Some(e.clone()),
+            );
+            crate::metrics::record_inference(
+                &crate::metrics::bounded_model_label(resolved_model, is_known_served),
+                false,
+                start.elapsed(),
+            );
+            let resp_body = serde_json::json!({
+                "error": format!("diffusion backend unavailable: {e}")
+            });
+            let mut response = (StatusCode::SERVICE_UNAVAILABLE, Json(resp_body)).into_response();
+            response.headers_mut().extend(rl_headers);
+            return response;
+        }
+    };
+
+    let (system_prompt, user_prompt) = extract_diffusion_prompt(body);
+    let max_tokens = parse_max_tokens_from_body(body).unwrap_or(1024);
+
+    let gen = match manager
+        .generate(&generate_url, &system_prompt, &user_prompt, max_tokens)
+        .await
+    {
+        Ok(g) => g,
+        Err(e) => {
+            warn!("diffusion: /generate failed for {resolved_model}: {e}");
+            state.audit_logger.log_llm_call(
+                &claims.sub,
+                resolved_model,
+                start.elapsed().as_millis() as u64,
+                AuditStatus::Error,
+                Some(e.clone()),
+            );
+            crate::metrics::record_inference(
+                &crate::metrics::bounded_model_label(resolved_model, is_known_served),
+                false,
+                start.elapsed(),
+            );
+            let resp_body = serde_json::json!({
+                "error": format!("diffusion backend unavailable: {e}")
+            });
+            let mut response = (StatusCode::SERVICE_UNAVAILABLE, Json(resp_body)).into_response();
+            response.headers_mut().extend(rl_headers);
+            return response;
+        }
+    };
+
+    state.audit_logger.log_llm_call(
+        &claims.sub,
+        resolved_model,
+        start.elapsed().as_millis() as u64,
+        AuditStatus::Success,
+        None,
+    );
+    crate::metrics::record_inference(
+        &crate::metrics::bounded_model_label(resolved_model, is_known_served),
+        true,
+        start.elapsed(),
+    );
+
+    let resp_body = diffusion_generate_to_openai_response(resolved_model, &gen);
+    let mut response = (StatusCode::OK, Json(resp_body)).into_response();
+    response.headers_mut().extend(rl_headers);
+    // `_idle_inflight` drops here (function return), releasing the in-flight
+    // count — correct for this handler because, unlike the streamed P5/
+    // fallback path, the response body above is already fully buffered JSON;
+    // there is no later point at which "fully consumed" would differ from
+    // "handler returned".
+    response
+}
+
+/// Extract a (system, user) prompt pair from an OpenAI-style chat-completions
+/// request body for the diffusion `/generate` API, which — unlike an OpenAI
+/// backend — takes a single flat `system` + `prompt` string rather than a
+/// `messages` array. All `system`-role messages are concatenated (in order)
+/// into the system prompt; every other message (`user`/`assistant`/tool,
+/// etc.) is rendered as `"<Role>: <content>"` lines and concatenated into the
+/// prompt, preserving conversation order — a simple, standard flattening
+/// (not a model-specific chat template) that keeps multi-turn context legible
+/// to the model. A `content` array (OpenAI's multi-part message shape) has
+/// its string `text` parts joined; non-text parts (e.g. images) are skipped,
+/// as DiffusionGemma here is text-only. Malformed/non-object JSON yields two
+/// empty strings rather than erroring — the daemon call will simply see an
+/// empty prompt.
+fn extract_diffusion_prompt(body: &[u8]) -> (String, String) {
+    let Some(messages) = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("messages").cloned())
+        .and_then(|m| m.as_array().cloned())
+    else {
+        return (String::new(), String::new());
+    };
+
+    let mut system = String::new();
+    let mut convo = String::new();
+    for msg in &messages {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+        let content = message_content_to_text(msg.get("content"));
+        if content.is_empty() {
+            continue;
+        }
+        if role == "system" {
+            if !system.is_empty() {
+                system.push_str("\n\n");
+            }
+            system.push_str(&content);
+        } else {
+            if !convo.is_empty() {
+                convo.push('\n');
+            }
+            let label = match role {
+                "assistant" => "Assistant",
+                "tool" => "Tool",
+                _ => "User",
+            };
+            convo.push_str(&format!("{label}: {content}"));
+        }
+    }
+    (system, convo)
+}
+
+/// Render an OpenAI message `content` field (either a plain string, or the
+/// multi-part `[{"type":"text","text":"..."}, ...]` shape) as flat text.
+fn message_content_to_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Extract an optional top-level `max_tokens` integer from the request body
+/// (standard OpenAI field). `None` when absent/malformed — the caller applies
+/// the daemon-side default.
+fn parse_max_tokens_from_body(body: &[u8]) -> Option<u32> {
+    serde_json::from_slice::<Value>(body)
+        .ok()?
+        .get("max_tokens")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+}
+
+/// Translate a DiffusionGemma `/generate` response into a standard OpenAI
+/// `chat.completion` response object.
+fn diffusion_generate_to_openai_response(
+    model: &str,
+    gen: &crate::diffusion::DiffusionGenerateResponse,
+) -> Value {
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    serde_json::json!({
+        "id": format!("chatcmpl-dgem-{created}"),
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": gen.text,
+            },
+            "finish_reason": "stop",
+        }],
+        "usage": {
+            "prompt_tokens": gen.input_tokens,
+            "completion_tokens": gen.tokens,
+            "total_tokens": gen.input_tokens + gen.tokens,
+        },
+    })
 }
 
 /// Extract the `model` field from an OpenAI-style request body for audit logging.
@@ -4321,5 +4522,162 @@ mod tests {
             tools.len(),
             tools.iter().map(|t| &t.name).collect::<Vec<_>>()
         );
+    }
+
+    // ── CHRD-DIFF-503: diffusion serving translation (pure helpers) ─────────
+    //
+    // `serve_diffusion_chat_completion` itself dispatches through the
+    // process-global `crate::diffusion::global()` singleton, so it can't be
+    // pointed at a per-test mock daemon the way `resolve_and_ensure`'s
+    // registry-backed path can. Instead these prove the translation logic —
+    // OpenAI request → (system, prompt) → daemon response → OpenAI
+    // chat-completion — directly against the pure helper functions, and
+    // `diffusion::tests::generate_posts_to_slash_generate_and_parses_the_daemon_contract`
+    // (in `diffusion.rs`) proves the actual `/generate` HTTP call shape
+    // against a mocked daemon.
+
+    #[test]
+    fn extract_diffusion_prompt_splits_system_and_flattens_conversation() {
+        let body = serde_json::json!({
+            "model": "diffusion-gemma",
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": "how are you"},
+            ],
+        })
+        .to_string();
+        let (system, prompt) = extract_diffusion_prompt(body.as_bytes());
+        assert_eq!(system, "be terse");
+        assert_eq!(
+            prompt,
+            "User: hi\nAssistant: hello\nUser: how are you"
+        );
+    }
+
+    #[test]
+    fn extract_diffusion_prompt_joins_multiple_system_messages() {
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "rule one"},
+                {"role": "system", "content": "rule two"},
+                {"role": "user", "content": "go"},
+            ],
+        })
+        .to_string();
+        let (system, prompt) = extract_diffusion_prompt(body.as_bytes());
+        assert_eq!(system, "rule one\n\nrule two");
+        assert_eq!(prompt, "User: go");
+    }
+
+    #[test]
+    fn extract_diffusion_prompt_handles_multipart_content_and_skips_non_text() {
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "part one"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}},
+                    {"type": "text", "text": "part two"},
+                ]},
+            ],
+        })
+        .to_string();
+        let (_, prompt) = extract_diffusion_prompt(body.as_bytes());
+        assert_eq!(prompt, "User: part one\npart two");
+    }
+
+    #[test]
+    fn extract_diffusion_prompt_malformed_body_yields_empty_strings() {
+        let (system, prompt) = extract_diffusion_prompt(b"not json");
+        assert!(system.is_empty());
+        assert!(prompt.is_empty());
+    }
+
+    #[test]
+    fn parse_max_tokens_from_body_reads_and_defaults() {
+        let body = serde_json::json!({"model": "x", "max_tokens": 256}).to_string();
+        assert_eq!(parse_max_tokens_from_body(body.as_bytes()), Some(256));
+        assert_eq!(parse_max_tokens_from_body(b"{}"), None);
+        assert_eq!(parse_max_tokens_from_body(b"not json"), None);
+    }
+
+    #[test]
+    fn diffusion_generate_wraps_as_valid_openai_chat_completion() {
+        let gen = crate::diffusion::DiffusionGenerateResponse {
+            text: "the answer is 42".to_string(),
+            time_ms: 500,
+            model_load_ms: 0,
+            input_tokens: 10,
+            tokens: 6,
+            blocks: 1,
+        };
+        let resp = diffusion_generate_to_openai_response("diffusion-gemma", &gen);
+
+        assert_eq!(resp["object"], "chat.completion");
+        assert_eq!(resp["model"], "diffusion-gemma");
+        assert_eq!(
+            resp["choices"][0]["message"]["role"],
+            "assistant"
+        );
+        assert_eq!(
+            resp["choices"][0]["message"]["content"],
+            "the answer is 42"
+        );
+        assert_eq!(resp["choices"][0]["finish_reason"], "stop");
+        assert_eq!(resp["choices"][0]["index"], 0);
+        assert_eq!(resp["usage"]["prompt_tokens"], 10);
+        assert_eq!(resp["usage"]["completion_tokens"], 6);
+        assert_eq!(resp["usage"]["total_tokens"], 16);
+        assert!(resp["id"].as_str().unwrap().starts_with("chatcmpl-"));
+    }
+
+    /// End-to-end through the real `chat_completions` handler: a diffusion
+    /// model request must NEVER reach `CHORD_LLM_URL` (proving the old
+    /// raw-forward-to-a-nonexistent-endpoint bug is gone — the diffusion
+    /// branch now returns its own structured 503 from `ensure_running`
+    /// failing in this sandbox, where no real daemon binary/process exists,
+    /// rather than falling through to any other upstream).
+    #[tokio::test]
+    #[serial(gpu_gate)]
+    async fn test_chat_completions_diffusion_model_never_forwards_to_chord_llm_url() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/chat/completions");
+            then.status(200).json_body(serde_json::json!({"choices": []}));
+        });
+        let llm_url = format!("{}/v1/chat/completions", server.base_url());
+
+        let state = test_state_with_llm(Some(llm_url));
+        let app = build_router(state);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("Content-Type", "application/json")
+            .body(Body::from(chat_request_body("diffusion-gemma", false)))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // No real llama-diffusion-daemon binary in this sandbox ⇒
+        // `ensure_running` fails to spawn ⇒ structured 503 from the
+        // diffusion branch itself.
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            json["error"].as_str().unwrap().contains("diffusion"),
+            "expected a diffusion-specific error, got: {json}"
+        );
+        // The decisive assertion: CHORD_LLM_URL was NEVER hit. This is the
+        // bug this fix closes — the old code, on a diffusion-branch failure,
+        // still couldn't reach CHORD_LLM_URL either (it returned its own
+        // 503), but a regression that fell through to the P5/CHORD_LLM_URL
+        // path for a diffusion model would silently answer with the WRONG
+        // (non-diffusion) model — this guards against ever reintroducing
+        // that.
+        mock.assert_hits_async(0).await;
     }
 }

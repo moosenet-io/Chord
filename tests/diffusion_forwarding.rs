@@ -1,8 +1,10 @@
-//! CHRD-DIFF-01 issue-1 (codex HIGH) end-to-end forwarding-URL guard.
+//! CHRD-DIFF-01 issue-1 (codex HIGH) / CHRD-DIFF-503 end-to-end URL guard.
 //!
-//! Proves the URL the `chat_completions` router forwards a diffusion request to
-//! carries EXACTLY ONE `/v1/chat/completions` — never the doubled
-//! `/v1/chat/completions/v1/chat/completions` (→ 404) codex flagged.
+//! Proves the URL `ensure_running` returns for a diffusion request carries
+//! EXACTLY ONE `/generate` — never a doubled `/generate/generate` (→ 404).
+//! CHRD-DIFF-503: the daemon has no `/v1/chat/completions` route at all
+//! (verified live: 404) — `/generate` is its real, only serving API besides
+//! `/health`, so that's what this now proves against.
 //!
 //! This lives in its own integration-test binary (separate process) rather than
 //! the `chord_proxy` lib unit tests on purpose: its httpmock + reqwest timing
@@ -19,25 +21,33 @@ use chord_proxy::diffusion::{DiffusionConfig, DiffusionManager};
             run explicitly with --ignored in a real env. The URL single-path \
             contract is ALSO covered by the non-ignored lib unit test \
             diffusion::tests::chat_completions_url_has_exactly_one_path_segment."]
-async fn ensure_running_adopts_ambient_daemon_and_forwards_single_path_url() {
+async fn ensure_running_adopts_ambient_daemon_and_serves_single_path_generate_url() {
     // Stand up a mock "ambient daemon" (as if the standalone dgem.service were
-    // still listening): it answers /health, and records exactly which path a
-    // forwarded chat request lands on. `ensure_running_gated` must adopt it (no
-    // spawn) and return a URL that, POSTed verbatim, hits `/v1/chat/completions`
-    // ONCE — never a doubled path.
+    // still listening): it answers /health and /generate — the daemon's REAL
+    // API (CHRD-DIFF-503; there is no /v1/chat/completions route on the real
+    // daemon at all). `ensure_running_gated` must adopt it (no spawn) and
+    // return a URL that, POSTed verbatim, hits `/generate` ONCE — never a
+    // doubled path.
     let server = httpmock::MockServer::start_async().await;
     let health = server.mock(|when, then| {
         when.method(httpmock::Method::GET).path("/health");
         then.status(200);
     });
-    let chat = server.mock(|when, then| {
-        when.method(httpmock::Method::POST).path("/v1/chat/completions");
-        then.status(200).json_body(serde_json::json!({"ok": true}));
+    let generate = server.mock(|when, then| {
+        when.method(httpmock::Method::POST).path("/generate");
+        then.status(200).json_body(serde_json::json!({
+            "text": "ok",
+            "time_ms": 1,
+            "model_load_ms": 0,
+            "input_tokens": 1,
+            "tokens": 1,
+            "blocks": 1,
+        }));
     });
     // A request to the DOUBLED path must NOT be what we send.
     let doubled = server.mock(|when, then| {
         when.method(httpmock::Method::POST)
-            .path("/v1/chat/completions/v1/chat/completions");
+            .path("/generate/generate");
         then.status(404);
     });
 
@@ -57,22 +67,20 @@ async fn ensure_running_adopts_ambient_daemon_and_forwards_single_path_url() {
         .await
         .expect("must adopt the ambient healthy daemon without spawning");
     assert_eq!(
-        url.matches("/v1/chat/completions").count(),
+        url.matches("/generate").count(),
         1,
-        "forwarded URL must carry exactly one chat-completions path, got: {url}"
+        "served URL must carry exactly one /generate path, got: {url}"
     );
     // Adopted, not owned: is_running stays false (no child to idle-evict).
     assert!(!mgr.is_running().await);
     health.assert();
 
-    // Forward a request to exactly that URL (what chat_completions does).
-    let resp = reqwest::Client::new()
-        .post(&url)
-        .json(&serde_json::json!({"model": "diffusion-gemma"}))
-        .send()
+    // Serve a request via exactly that URL (what chat_completions now does).
+    let resp = mgr
+        .generate(&url, "", "hello", 128)
         .await
-        .expect("forward to adopted daemon");
-    assert_eq!(resp.status(), 200);
-    chat.assert(); // the single-path endpoint was hit
+        .expect("serve via the adopted daemon's /generate");
+    assert_eq!(resp.text, "ok");
+    generate.assert(); // the single-path endpoint was hit
     doubled.assert_hits(0); // the doubled path was never requested
 }
