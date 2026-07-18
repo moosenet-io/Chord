@@ -919,21 +919,57 @@ pub async fn chat_completions(
         }
     }
 
-    // ── P5 tag-aware routing ──────────────────────────────────────────────────
-    // Forward to the model's tagged backend (GPU vs CPU), starting an on-demand
-    // backend if needed. Untagged models resolve to the default backend (whose
-    // URL matches CHORD_LLM_URL), so behavior is unchanged until models are
-    // tagged. On any failure we fall back to CHORD_LLM_URL.
-    // `bearer_key` is `Some` only for backends with `api_key_env` set (e.g.
-    // OpenRouter) — re-injected as an outbound Authorization header below,
-    // after the inbound-header copy loop strips the caller's own JWT.
-    let (llm_url, bearer_key) = crate::models::routing::resolve_and_ensure(
-        &state.model_registry,
-        &registry_key,
-        &resolved_model,
-    )
-    .await
-    .unwrap_or((llm_url, None));
+    // ── CHRD-DIFF-01: DiffusionGemma managed-daemon routing ───────────────────
+    // Takes precedence over P5 tag-aware routing below: a request for the
+    // Chord-managed diffusion model (`diffusion-gemma` by default, see
+    // `crate::diffusion`) is lazy-started on demand and forwarded straight to
+    // its `:8877` daemon — never `CHORD_LLM_URL` and never the ModelRegistry
+    // backend table (that daemon was never registered as a `Backend`; it is
+    // owned entirely by the `diffusion` module's own process manager). Unlike
+    // the P5 fallback-on-failure posture below, a start failure here returns a
+    // structured 503 rather than silently forwarding to the wrong (non-
+    // diffusion) upstream — sending a diffusion prompt to the default chat
+    // model would be a silent correctness bug, not graceful degradation.
+    let (llm_url, bearer_key) = if crate::diffusion::global().is_diffusion_model(&resolved_model) {
+        match crate::diffusion::global().ensure_running().await {
+            // `ensure_running` returns the FULL `.../v1/chat/completions`
+            // endpoint (same contract as `resolve_and_ensure`) — POST it
+            // verbatim below; do NOT append a path here, or the daemon sees a
+            // doubled `/v1/chat/completions/v1/chat/completions` → 404.
+            Ok(full_url) => (full_url, None),
+            Err(e) => {
+                warn!("diffusion: could not serve {resolved_model}: {e}");
+                state.audit_logger.log_llm_call(
+                    &claims.sub,
+                    &resolved_model,
+                    start.elapsed().as_millis() as u64,
+                    AuditStatus::Error,
+                    Some(e.clone()),
+                );
+                crate::metrics::record_inference(
+                    &crate::metrics::bounded_model_label(&resolved_model, is_known_served),
+                    false,
+                    start.elapsed(),
+                );
+                let resp_body = serde_json::json!({
+                    "error": format!("diffusion backend unavailable: {e}")
+                });
+                return (StatusCode::SERVICE_UNAVAILABLE, Json(resp_body)).into_response();
+            }
+        }
+    } else {
+        // ── P5 tag-aware routing ───────────────────────────────────────────────
+        // Forward to the model's tagged backend (GPU vs CPU), starting an
+        // on-demand backend if needed. Untagged models resolve to the default
+        // backend (whose URL matches CHORD_LLM_URL), so behavior is unchanged
+        // until models are tagged. On any failure we fall back to CHORD_LLM_URL.
+        // `bearer_key` is `Some` only for backends with `api_key_env` set (e.g.
+        // OpenRouter) — re-injected as an outbound Authorization header below,
+        // after the inbound-header copy loop strips the caller's own JWT.
+        crate::models::routing::resolve_and_ensure(&state.model_registry, &registry_key, &resolved_model)
+            .await
+            .unwrap_or((llm_url, None))
+    };
 
     // ── YARN-06: per-request thinking honoring ──────────────────────────────
     // Harmony (THINK-01/02) may send an optional top-level `thinking: "on"|"off"`
@@ -1403,6 +1439,14 @@ pub async fn gpu_exclusive_acquire(
                             .await;
                     tracing::info!(holder = %record.holder, unloaded, "gpu-exclusive: acquire eviction complete");
                 }
+                // CHRD-DIFF-01: the managed DiffusionGemma daemon is not tracked
+                // by Ollama's /api/ps (it's a bare llama-diffusion-daemon
+                // process), so evict_resident_models above never sees it — stop
+                // it explicitly so a fresh exclusive grant never contends with
+                // Chord's own managed daemon for VRAM.
+                if crate::diffusion::global().stop().await {
+                    tracing::info!(holder = %record.holder, "gpu-exclusive: stopped managed DiffusionGemma daemon");
+                }
             }
             let body = serde_json::json!({
                 "status": "acquired",
@@ -1551,6 +1595,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Method, Request};
+    use serial_test::serial;
     use tower::ServiceExt;
 
     use crate::agentic::AgenticExecutor;
@@ -3042,6 +3087,7 @@ mod tests {
     /// request, no relaunch required) and the Chord-only `thinking` field must
     /// NOT be forwarded upstream.
     #[tokio::test]
+    #[serial(gpu_gate)]
     async fn test_chat_completions_thinking_on_sets_enable_thinking_true() {
         let server = httpmock::MockServer::start_async().await;
         let mock = server.mock(|when, then| {
@@ -3086,6 +3132,7 @@ mod tests {
     /// YARN-06: `thinking:"off"` against a supporting + validated model — the
     /// forwarded body must carry `chat_template_kwargs.enable_thinking: false`.
     #[tokio::test]
+    #[serial(gpu_gate)]
     async fn test_chat_completions_thinking_off_sets_enable_thinking_false() {
         let server = httpmock::MockServer::start_async().await;
         let mock = server.mock(|when, then| {
@@ -3127,6 +3174,7 @@ mod tests {
     /// all — ignored, NOT an error (still 200), and no `chat_template_kwargs`
     /// is injected into the forwarded body.
     #[tokio::test]
+    #[serial(gpu_gate)]
     async fn test_chat_completions_thinking_ignored_for_non_supporting_model() {
         let server = httpmock::MockServer::start_async().await;
         // Trap: fails the test (unmatched → 404) if chat_template_kwargs leaks in.
@@ -3177,6 +3225,7 @@ mod tests {
     /// present but UNVALIDATED — must degrade EXACTLY like a non-supporting
     /// model (never serve an untrusted mode): ignored, no `chat_template_kwargs`.
     #[tokio::test]
+    #[serial(gpu_gate)]
     async fn test_chat_completions_thinking_ignored_for_unvalidated_model() {
         let server = httpmock::MockServer::start_async().await;
         let trap = server.mock(|when, then| {
@@ -3226,6 +3275,7 @@ mod tests {
     /// byte pass-through, same as before this item), no `chat_template_kwargs`
     /// ever appears.
     #[tokio::test]
+    #[serial(gpu_gate)]
     async fn test_chat_completions_no_thinking_param_leaves_body_unchanged() {
         let server = httpmock::MockServer::start_async().await;
         let trap = server.mock(|when, then| {
@@ -3273,6 +3323,7 @@ mod tests {
     /// degrades to model default — never a crash, never a 4xx/5xx, and no
     /// `chat_template_kwargs` is injected.
     #[tokio::test]
+    #[serial(gpu_gate)]
     async fn test_chat_completions_malformed_thinking_value_defaults_no_crash() {
         let server = httpmock::MockServer::start_async().await;
         let trap = server.mock(|when, then| {
@@ -3322,6 +3373,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(gpu_gate)]
     async fn test_chat_completions_requires_auth() {
         // Auth enabled (secret set) but no Authorization header → 401.
         let mut state = test_state_with_llm(Some("http://does-not-exist:9999".into()));
@@ -3341,6 +3393,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(gpu_gate)]
     async fn test_chat_completions_503_when_llm_url_unset() {
         // Auth disabled, llm_backend_url is None → 503.
         let state = test_state_with_llm(None);
@@ -3370,6 +3423,7 @@ mod tests {
     /// `chat_completions`/`agent_execute` return. Guards against a deadlock
     /// where an agent holding the GPU lock needs embeddings for RAG.
     #[tokio::test]
+    #[serial(gpu_gate)]
     async fn test_embeddings_not_gpu_exclusive_gated() {
         let fallback = httpmock::MockServer::start_async().await;
         fallback.mock(|when, then| {
@@ -3418,6 +3472,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(gpu_gate)]
     async fn test_chat_completions_non_streaming_proxies_json() {
         let server = httpmock::MockServer::start_async().await;
         let upstream_body = serde_json::json!({
@@ -3471,6 +3526,7 @@ mod tests {
     /// must rewrite the `model` field to the real backend model (gpt-oss:20b) before
     /// forwarding, so Ollama no longer returns 404 "model lumina-fast not found".
     #[tokio::test]
+    #[serial(gpu_gate)]
     async fn test_chat_completions_resolves_model_alias_before_forwarding() {
         let server = httpmock::MockServer::start_async().await;
         let upstream_body = serde_json::json!({
@@ -3515,6 +3571,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(gpu_gate)]
     async fn test_chat_completions_streaming_preserves_sse_content_type() {
         let server = httpmock::MockServer::start_async().await;
         // Simulate an SSE stream body the way Ollama returns it.
@@ -3559,6 +3616,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(gpu_gate)]
     async fn test_chat_completions_passes_through_upstream_error_status() {
         let server = httpmock::MockServer::start_async().await;
         let mock = server.mock(|when, then| {
@@ -3599,6 +3657,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(gpu_gate)]
     async fn test_chat_completions_502_when_backend_unreachable() {
         // Point at an unroutable address so the upstream send() fails.
         let state = test_state_with_llm(Some("http://127.0.0.1:1/v1/chat/completions".into()));
@@ -3745,6 +3804,7 @@ mod tests {
     /// copied to local disk, promoted to Warm in the registry, and the upstream
     /// mock is hit exactly once.
     #[tokio::test]
+    #[serial(gpu_gate)]
     async fn test_chat_completions_pulls_cold_model_before_forwarding() {
         use crate::models::registry::{ModelRegistry, StorageTier};
         use crate::models::transfer::PullCoordinator;
@@ -3799,6 +3859,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(gpu_gate)]
     async fn test_chat_completions_pulls_cold_model_for_untagged_request() {
         // Regression: the registry is keyed by the fully-tagged name
         // ("coldmodel:latest"), but clients often request the untagged name
@@ -3860,6 +3921,7 @@ mod tests {
     /// through to the upstream unchanged (no pull attempted, no error) — the
     /// no-regression guarantee for unknown models.
     #[tokio::test]
+    #[serial(gpu_gate)]
     async fn test_chat_completions_unknown_model_passes_through() {
         let server = httpmock::MockServer::start_async().await;
         let mock = server.mock(|when, then| {

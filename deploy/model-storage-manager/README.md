@@ -31,7 +31,7 @@ itself (the S111 incident's root cause).
 6. Exits non-zero (and prints an `ALERT:` line to stderr) on any non-2xx
    response, a `curl` failure, or an unrelieved high-water condition.
 
-## Install (on the Chord host, e.g. <host>)
+## Install (on the Chord GPU host)
 
 ```sh
 sudo mkdir -p <path>/deploy/model-storage-manager

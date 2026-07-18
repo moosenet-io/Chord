@@ -47,7 +47,7 @@ Harmony was modified by this spec.
 ## Daemon deployment precedent reused (ROUT-01)
 
 The Supra-Router-51M daemon (see `deploy/supra-router.service` in this
-branch) mirrors the `dgem.service` pattern already proven on `<host>` for
+branch) mirrors the `dgem.service` pattern already proven on the GPU host for
 DiffusionGemma this session:
 
 - `Type=simple`, loopback-bound (`Environment=...BIND=127.0.0.1`), no external

@@ -264,6 +264,14 @@ async fn main() {
         });
     }
 
+    // ── CHRD-DIFF-01: DiffusionGemma idle-eviction reaper ──
+    // Chord now owns `llama-diffusion-daemon`'s lifecycle (lazy-start on the
+    // first `diffusion-gemma` chat-completions request, in `routes.rs`); this
+    // is the other half — stop it (freeing VRAM) after DIFFUSION_IDLE_SECS of
+    // inactivity, so it never sits resident perpetually like the old
+    // standalone `dgem.service` did. Lightweight (a state check every 30s).
+    chord_proxy::diffusion::spawn_idle_reaper(std::time::Duration::from_secs(30));
+
     // ── YARN-06: SRV-04 serving-profile routing map ──
     // The source of a model's ThinkingConfig — capability advertisement
     // (`GET /api/models`) and per-request thinking honoring

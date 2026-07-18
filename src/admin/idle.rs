@@ -1047,6 +1047,15 @@ pub async fn enter_idle(
         let backends_stopped =
             crate::models::routing::stop_all_on_demand_backends(&state.model_registry).await;
 
+        // 4b. CHRD-DIFF-01: stop the Chord-managed DiffusionGemma daemon too —
+        //     it isn't a ModelRegistry `Backend` (step 4 doesn't see it) and
+        //     isn't tracked by Ollama's /api/ps (step 5 below doesn't see it
+        //     either). Idle-mode release must free its VRAM the same as every
+        //     other on-demand backend.
+        if crate::diffusion::global().stop().await {
+            info!("idle-mode: stopped managed DiffusionGemma daemon");
+        }
+
         // 5. Unload every resident model from VRAM (best-effort; skipped if OLLAMA_URL
         //    unset). This is the real "release the GPU + the RAM the models held".
         let models_unloaded = match crate::gpu_exclusive::ollama_base_from_env() {

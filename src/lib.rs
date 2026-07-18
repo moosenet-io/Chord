@@ -7,6 +7,7 @@ pub mod catalog;
 pub mod coding_proxy;
 pub mod config;
 pub mod control;
+pub mod diffusion;
 pub mod embeddings;
 pub mod error;
 pub mod fallback;
