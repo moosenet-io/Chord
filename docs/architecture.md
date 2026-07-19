@@ -27,6 +27,51 @@ which carries the MCP proxy, the agentic executor, the rate limiter, the model
 registry, the pull coordinator, the local evictor, and the disk probe/lock — so
 the proxy handlers and the control handlers operate over the same live registry.
 
+## Subsystem map (derived from the code knowledge graph)
+
+The KG for this repo has 3,182 nodes and 7,892 intra-repo edges, rolled up into
+17 subsystems with 114 cross-subsystem call edges. The picture that falls out
+(node labels carry real symbol counts):
+
+```mermaid
+flowchart LR
+    routes["routes (107)<br/>proxy port"]
+    control["control API<br/>+ admin idle"]
+    mcp["mcp_proxy (37)<br/>+ catalog (34)"]
+    agentic["agentic (539)"]
+    harness["harness (229)"]
+    models["models (374)"]
+    serving["serving (361)"]
+    supervisor["supervisor (70)"]
+    snap["snap (185)"]
+    gpu["gpu_exclusive (40)"]
+    router["router (111)"]
+    sweep["sweep_status (132)"]
+    audit["audit (59)"]
+
+    routes -->|tools list/call/discover| mcp
+    routes -->|agent/execute| agentic
+    routes -->|tier lookup + pull + backend routing| models
+    routes -->|thinking-mode resolution| serving
+    routes -->|inference gate| gpu
+    routes -->|every request outcome| audit
+    routes -->|merged /v1/sweep/*| sweep
+    agentic -->|guarded tool calls| mcp
+    agentic -->|research episodes| harness
+    serving -->|scrubbed env + netns| supervisor
+    router -->|backend catalogue| models
+    control -->|archive / pull / protect / sweep / gc| models
+    control -->|vram / inventory / analytics| snap
+```
+
+Background tasks spawned by `main.rs` tie the rest together: the eviction sweep
+(`models::eviction::run_eviction_sweep` + `models::gc::run_gc`), the backend
+idle-stop sweep (`models::routing::idle_stop_sweep`), the DiffusionGemma idle
+reaper (`diffusion::spawn_idle_reaper`), the SNAP health monitor
+(`snap::spawn_health_monitor`), the sweep-status poller
+(`sweep_status::poll::spawn`), and the idle-mode watchdog
+(`admin::idle::watchdog_loop`).
+
 ## Request flow (the proxy front door)
 
 The OpenAI-compatible entry point is
@@ -37,22 +82,26 @@ order, a request goes through:
    `CHORD_JWT_SECRET`. An empty secret disables auth cluster-wide (used in tests
    and trusted single-tenant deploys). Auth failures are recorded by the
    `AuditLogger` (token hashed, never stored).
-2. **Backend-configured check** — if `CHORD_LLM_URL` is unset the endpoint returns
+2. **GPU-exclusive gate** — if an external job holds the GPU lock
+   (`gpu_exclusive::GpuExclusive::active_holder`), the inference paths return a
+   structured `503` naming the holder rather than racing the GPU (see
+   "GPU-exclusive coordination" below).
+3. **Backend-configured check** — if `CHORD_LLM_URL` is unset the endpoint returns
    `503` immediately.
-3. **Rate limit** — `ProxyRateLimiter::check_and_record` applies the per-user
+4. **Rate limit** — `ProxyRateLimiter::check_and_record` applies the per-user
    daily LLM budget; over-budget returns `429` with `Retry-After`.
-4. **Alias resolution** — `config::resolve_model_alias` rewrites the request's
+5. **Alias resolution** — `config::resolve_model_alias` rewrites the request's
    `model` (e.g. a `lumina-fast` alias → the real `gpt-oss:20b`) so the upstream
    never sees a name it doesn't know. The model name is normalized to a tagged
    `name:tag` registry key (untagged ⇒ `:latest`).
-5. **Pull-on-miss (storage tier)** — the resolved model's tier is looked up in the
+6. **Pull-on-miss (storage tier)** — the resolved model's tier is looked up in the
    registry; **only** a `Cold` model triggers a transparent archive pull
    (`PullCoordinator::ensure_local`) before inference. Hot / Warm / registry-unknown
    models pass straight through. Any known model has its `last_requested` bumped.
-6. **Backend routing** — `models::routing::resolve_and_ensure` picks the model's
+7. **Backend routing** — `models::routing::resolve_and_ensure` picks the model's
    tagged backend, starts it on demand if needed, and returns the upstream URL.
    On any failure it falls back to `CHORD_LLM_URL` ("availability over strictness").
-7. **Thinking-mode honoring (YARN-06)** — an optional top-level `"thinking":
+8. **Thinking-mode honoring (YARN-06)** — an optional top-level `"thinking":
    "on"` / `"thinking": "off"` field on the incoming request is Chord's own
    per-request contract field for a caller (e.g. Harmony) that wants to force
    reasoning-trace mode for this one call. Chord makes **no decision about
@@ -61,10 +110,8 @@ order, a request goes through:
    (`serving::profile::resolve_thinking_request`, driven by the target
    model's `serving_profile.env_json.thinking` block — `supports_thinking &&
    validated`, see [serving.md](serving.md)) and, if so, honors it. See
-   **"Per-request thinking mode"** below for the full contract (accepted
-   values, and what happens when the model doesn't support it, the value is
-   absent, or it's malformed).
-8. **Forward** — hop-by-hop headers are stripped, the (possibly model- and/or
+   **"Per-request thinking mode"** below for the full contract.
+9. **Forward** — hop-by-hop headers are stripped, the (possibly model- and/or
    thinking-rewritten) body is forwarded, and the upstream response — JSON or
    `text/event-stream` — is streamed straight back to the caller.
 
@@ -80,8 +127,7 @@ about *when* a step should think:
 
 Behavior:
 
-- **Absent** — the model's own default mode is used, unchanged. This is the
-  legacy behavior (no regression) and applies whenever the field is omitted.
+- **Absent** — the model's own default mode is used, unchanged (no regression).
 - **`"on"` / `"off"` on a model that supports thinking AND whose thinking
   config is validated** — honored. Chord sets/merges
   `chat_template_kwargs.enable_thinking` (`true`/`false`) into the body
@@ -91,25 +137,24 @@ Behavior:
   already-warm/resident model honors it per-call, no relaunch required.
 - **`"on"` / `"off"` on a model that does NOT support thinking, or whose
   thinking config is present but not yet validated** — ignored, **not** an
-  error. The model's default mode is served (HTTP 200 as normal); Chord logs
-  a debug-level note naming the reason. An unvalidated config is treated
-  identically to a wholly non-supporting model — Chord never serves an
-  unvalidated/untrusted thinking mode.
-- **Any other value** (anything besides `"on"`/`"off"`, case-insensitively) —
-  treated as malformed: degrades to the model's default mode with a logged
-  warning, never a 4xx/5xx and never a crash.
+  error; the model's default mode is served (HTTP 200) with a debug-level log.
+  An unvalidated config is treated identically to a non-supporting model.
+- **Any other value** — treated as malformed: degrades to the model's default
+  mode with a logged warning, never a 4xx/5xx and never a crash.
 - In every case, the `thinking` field itself is stripped before the request
-  is forwarded upstream — it is Chord's own contract field, not something an
-  OpenAI-compatible backend understands.
+  is forwarded upstream.
 
 Query whether a given model supports this ahead of time via `GET
-/api/models`'s `supports_thinking` field (below) — a caller can skip sending
-`thinking` at all for a model that doesn't support it.
+/api/models`'s `supports_thinking` field (below).
 
 The other proxy routes are `/v1/tools/list`, `/v1/tools/call`,
-`/v1/tools/discover` (the MCP tool surface), `/v1/agent/execute` (the agentic
-loop, below), `/v1/infer` (one prompt → normalized per-backend metrics), and
-`/health` / `/v1/audit/summary` (no auth).
+`/v1/tools/discover` (the MCP tool surface), `/v1/personal/tools/list` /
+`/v1/personal/tools/call` (the optional federated personal-tool catalog),
+`/v1/agent/execute` (the agentic loop), `/v1/embeddings` (local-first embeddings
+proxy), `/v1/infer` (one prompt → normalized per-backend metrics),
+`/v1/coding/select` (coding-model resolution), `/v1/gpu-exclusive/*`,
+`/v1/sweep/status[/history]`, and `/health` / `/v1/audit/summary` (no auth). The
+full table lives in [reference/routes.md](reference/routes.md).
 
 ## Components
 
@@ -138,10 +183,6 @@ loop, below), `/v1/infer` (one prompt → normalized per-backend metrics), and
   - `KeepDefault { reason }` — when no candidate cleared the guard, *or* the
     measured pick isn't a registry-known model, keep the operator's current alias.
 
-  This is the "chat-role pin" box on the diagram: it pins interactive traffic to
-  an intended, vetted backend and refuses to route the chat alias to a model the
-  registry can't actually serve.
-
 ### Backend tiers
 
 **What it is.** First-class, hardware-tagged inference backends —
@@ -149,28 +190,17 @@ loop, below), `/v1/infer` (one prompt → normalized per-backend metrics), and
 The data model is the `Backend` struct (`name`, `url`, `hardware: Hardware`,
 `kind: BackendKind`, `always_on`, `idle_stop_secs`, optional `LaunchSpec`).
 `Backend::on_demand()` is true for non-`always_on`, non-`Daemon` backends.
+`seed_from_env` builds the default catalogue from env: an always-on Ollama CPU
+tier (plus a second resident Ollama for embeddings / micro-jobs), a
+unit-managed llama.cpp GPU server for one fixed coder model, and a generic
+on-demand `llama-gpu` llama.cpp server that loads any requested model's blob
+(its `LaunchSpec` carries the explicit `-c` context size and `--no-mmap`). The
+CPU tier is the genuine system-RAM "last resort" for small models.
 
-`seed_from_env` builds the default catalogue from env, mirroring the three-tier
-stack in the README/diagram:
-
-| Backend | `hardware` / `kind` | Tier | Notes |
-|---------|---------------------|------|-------|
-| `ollama` | `Cpu` / `Ollama` | CPU | primary, `always_on` (ROCm doesn't engage on this APU, so it's the CPU tier) |
-| `ollama-cpu` | `Cpu` / `Ollama` | CPU | resident embeddings / micro-jobs |
-| `lemonade-coder` | `Gpu` / `LlamaServer` | GPU (llama.cpp) | one fixed model, unit-managed, idle-stops at 900 s |
-| `llama-gpu` | `Gpu` / `LlamaServer` | GPU (llama.cpp) | generic on-demand server that loads *any* requested model's blob |
-
-The generic `llama-gpu` `LaunchSpec` is where the diagram's
-"**launch w/ explicit `-c`**" and "**`--no-mmap`**" annotations physically live —
-its `args` are `-c 32768 -ngl 999 -fa 1 --no-mmap --host 0.0.0.0 --port …` with
-the model passed via `-m`. The CPU tier is the genuine system-RAM fallback "last
-resort" for small models.
-
-> Note on the diagram's `ollama-rocm` label: in this crate the Ollama backends are
-> tagged `Hardware::Cpu` because ROCm does not engage on the target APU. The
-> "ollama as a GPU fallback for architectures llama.cpp can't load" story is a
-> deployment/topology concern, not a separate code path here — both Ollama
-> backends share the same `BackendKind::Ollama` routing.
+> Note: in this crate the Ollama backends are tagged `Hardware::Cpu` because
+> ROCm does not engage on the target APU. "Ollama as a GPU fallback for
+> architectures llama.cpp can't load" is a deployment/topology concern, not a
+> separate code path here.
 
 ### Model registry & storage tiering
 
@@ -185,9 +215,10 @@ it lives at — [`models::registry`](../src/models/registry.rs), type
 The registry is a JSON file (atomic temp-file-then-rename `save()`; corrupt JSON
 rebuilds empty rather than panicking). At startup `reconcile()` walks the local
 and archive Ollama manifest trees and re-tiers records to match on-disk reality
-(including demoting a model whose local copy vanished out-of-band). `register_external`
-/ `register_diffusiongemma_from_env` track non-Ollama models (a `llama-diffusion`
-daemon model) that `reconcile()` deliberately leaves alone.
+(including demoting a model whose local copy vanished out-of-band).
+`register_external` / `register_diffusiongemma_from_env` /
+`register_openrouter_owl_alpha_from_env` track non-Ollama models that
+`reconcile()` deliberately leaves alone.
 
 `warm_eviction_candidates()` is the LRU candidate set the eviction logic consumes
 (warm, non-protected, Ollama-managed only). Protected models — by per-record flag
@@ -196,18 +227,8 @@ or the configured `MODEL_PROTECTED` set — are never demoted to `Cold`
 
 ### Memory / residency management
 
-> **Spec mapping.** The diagram labels a "**Memory Coordinator**" box
-> ("substrate-aware", "SeparateCeilings", "UnifiedPool", "admission",
-> "tier-aware eviction"), a "**Clean-Swap Launcher**" box ("teardown →",
-> "verify release →", "orphan force-kill", "false-OOM guard",
-> "launch w/ explicit `-c`"), and a "**Mode Controller**" box. As of
-> chord-proxy 1.1.0 all three ship in [`src/serving/`](../src/serving) —
-> `SeparateCeilings`, `UnifiedPool`, the `VramResidencyManager` coordinator, the
-> `clean_swap` barrier with `verify_release` (orphan kill + false-OOM guard), and
-> the persisted `ModeController` are all real types. The serving subsystem doc
-> ([serving.md](serving.md)) walks through them in detail.
-
-Residency / memory behaviour spans the VRAM serving layer and the storage layer:
+Residency / memory behaviour spans the VRAM serving layer and the storage layer
+(all in [`src/serving/`](../src/serving) and [`src/models/`](../src/models)):
 
 - **VRAM Memory Coordinator** — [`serving::residency::VramResidencyManager`](../src/serving/residency.rs)
   owns the resident set, in-flight reservations, the pinned chat model, and the
@@ -239,70 +260,58 @@ Residency / memory behaviour spans the VRAM serving layer and the storage layer:
 - **Archive pull / admission-by-space** — [`models::transfer`](../src/models/transfer.rs).
   `PullCoordinator::ensure_local` is the cold → warm copy with a disk precheck that
   fails fast, per-model dedup locking, timeout, and partial-file cleanup.
+- **Anti-drift + crash-safety (MSM-01..06, S111)** — `reconcile()` re-runs at the
+  start of every sweep tick with atomic persists; the eviction copy is wrapped in
+  `MODEL_ARCHIVE_COPY_TIMEOUT_SECS` so a stalled NFS write can't wedge the sweep;
+  `models::gc::run_gc` deletes orphaned blobs only when provably safe;
+  `MODEL_PROTECTED` is authoritative on every reconcile; and
+  [`deploy/model-storage-manager/`](../deploy/model-storage-manager/) drives
+  reconcile → sweep → gc out-of-process on a timer, with heartbeat + alerting.
 
-See [serving.md](serving.md) for the full module-by-module walkthrough.
+See [serving.md](serving.md) for the full module-by-module walkthrough and
+[reference/models.md](reference/models.md) / [reference/serving.md](reference/serving.md)
+for symbol tables.
 
-### Control API (operator / dashboard surface)
+### Runtime launch isolation (supervisor)
 
-**What it is.** The second listener — [`control`](../src/control.rs),
-`build_control_router`. All endpoints require the same JWT as the proxy. It
-exposes the registry and tiering controls:
+**What it is.** The *posture* of every runtime launch —
+[`supervisor`](../src/supervisor/mod.rs). ISO-01 is advisory: `build_runtime_env`
+([`launch_env.rs`](../src/supervisor/launch_env.rs)) spawns runtimes with a
+scrubbed environment and telemetry-off / offline opt-outs, and
+[`egress_policy`](../src/supervisor/egress_policy.rs) declares each launch's
+`EgressPosture`. ISO-02 is the kernel guarantee: [`netns`](../src/supervisor/netns.rs)
+gives a `Serve`/`Denied` runtime a network namespace with **no route** (every
+external `connect()` fails at the kernel), while a `Pull`/`AllowList` runtime gets
+a constrained, nftables-filtered path ([`egress_filter`](../src/supervisor/egress_filter.rs))
+to the configured model sources only. **Fail-closed**: without `CAP_NET_ADMIN`
+the launch is refused, not run with full host egress (`CHORD_ALLOW_UNISOLATED=1`
+is the loud, off-by-default override). The serving launcher consumes both; the
+clean swap tears namespaces down. Honest scope: this isolates the runtimes Chord
+*launches* — it does not firewall Chord's own process. See [egress.md](egress.md).
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| GET | `/api/models` | list every registry record |
-| GET | `/api/models/:name` | single model detail (404 unknown) |
-| POST | `/api/models/:name/archive` | warm → cold (`evict_to_archive`); Hot → 409, protected → 403 |
-| POST | `/api/models/:name/pull` | cold → warm (`ensure_local`); insufficient space → 507 |
-| POST | `/api/models/:name/protect` | toggle/set the protected flag |
-| GET | `/api/storage` | local + archive disk usage |
-| POST | `/api/models/sweep` | trigger an eviction sweep (202 Accepted, runs async) |
-| POST | `/api/models/reconcile` | **MSM-04**: reconcile the registry against on-disk reality and persist it; returns before/after `{hot,warm,cold}` tier counts (200, synchronous) |
-| POST | `/api/storage/gc` | **MSM-04**: run the MSM-03 orphan-blob GC pass; returns `{orphans_deleted, freed_bytes, errors}` (200, synchronous) |
-| GET | `/health` | version metadata (no auth) |
+### GPU-exclusive coordination
 
-**MSM-01..06 (S111): anti-drift + crash-safety hardening.** A 2026-07-10
-incident (`MODEL_ARCHIVE_PATH` unset after a redeploy silently disabling all
-eviction, a stalled NFS write wedging the in-process sweep, a stale on-disk
-registry, and `MODEL_PROTECTED` losing effect on a registry rebuild) motivated:
-- **MSM-01**: `reconcile()` now runs at the start of every background sweep
-  tick (not just startup), and the registry is persisted atomically
-  (`ModelRegistry::save`, temp-file + rename) after every reconcile and every
-  eviction — the on-disk `model-registry.json` never lags in-memory by more
-  than one sweep interval. Persist failures are non-fatal (warn + continue).
-- **MSM-02**: the warm→cold eviction copy (`eviction::evict_to_archive`) is now
-  wrapped in a `tokio::time::timeout` (`MODEL_ARCHIVE_COPY_TIMEOUT_SECS`,
-  default 1800s), mirroring TIER-02's pull-side timeout. On timeout or a
-  mid-copy I/O error, any archive files that specific attempt wrote are
-  cleaned up (never a pre-existing/shared archive blob), the model stays Warm
-  for retry on the next sweep, and the shared disk-op lock is always released
-  — a stalled NFS write can no longer wedge the sweep indefinitely.
-- **MSM-03**: a new orphan-blob GC pass (`models::gc::run_gc`) finds local
-  blobs referenced by no local manifest (an interrupted eviction can leave
-  these behind) and safely deletes them when a cold copy exists in the
-  archive, or when they're truly unreferenced anywhere (no local manifest, no
-  archive manifest, no archive blob file). A blob referenced by any local
-  manifest, or one an archive manifest expects but whose archive blob file is
-  missing, is never deleted. Runs as part of the background sweep, after
-  eviction, and via `POST /api/storage/gc`.
-- **MSM-05**: `MODEL_PROTECTED` is now authoritative and re-applied on every
-  reconcile (not just unioned into records the local/archive scans happen to
-  touch), so a registry rebuild/loss can never silently unprotect a
-  configured-protected model.
-- **MSM-06**: [`deploy/model-storage-manager/`](../deploy/model-storage-manager/)
-  — an external systemd service + timer that drives
-  reconcile → sweep → gc every ~15 min via the control API, entirely
-  out-of-process (so it can never be wedged by Chord's own disk-op lock),
-  with a JSON heartbeat and alerting on failure or an unrelieved high-water
-  disk condition.
+**What it is.** A process-global lock ([`gpu_exclusive`](../src/gpu_exclusive.rs),
+`GpuExclusive`) that hands the single host GPU to an external GPU-heavy job (the
+Terminus intake benchmarking harness) **without taking Chord down** — the fix for
+the era when the harness ran `systemctl stop chord.service` and left the fleet
+backbone dead for days. `acquire` grants or heartbeat-refreshes a TTL'd lock
+(different live holder ⇒ 409); `active_holder` is the gate the inference handlers
+consult (`Some` ⇒ structured 503); `release`/expiry restores normal service.
+Endpoints: `POST /v1/gpu-exclusive/acquire|release`, `GET /v1/gpu-exclusive/status`.
+Everything else — health checks, routing decisions, read-only tools — keeps serving.
 
-`GET /api/models` / `GET /api/models/:name` response fields (per model,
-`ModelView` in [`control.rs`](../src/control.rs)) include a **YARN-06**
-capability-advertisement field:
+### Idle mode + activity signal (admin)
 
-| Field | Type | Meaning |
-|---|---|---|
-| `supports_thinking` | bool | Whether this model currently supports the `thinking` request parameter on `/v1/chat/completions` (see "Per-request thinking mode" above). `true` only when the model's serving profile has a `thinking` block AND `supports_thinking` AND `validated` are all true in it — an unvalidated config is never advertised as available. Computed fresh on every request from the in-process `serving::profile::RoutingMap` (never independently cached), so the value always matches what `/v1/chat/completions` would honor from that same map right now — **but** the map itself is loaded once at process startup from the intake DB and is not hot-reloaded, so a model reprofiled (or newly validated) after Chord starts is not reflected until the next process restart (see [serving.md](serving.md)). |
+**What it is.** [`admin::idle`](../src/admin/idle.rs) (BLD-09): `POST /admin/idle`
+drains and releases providers/GPU/models/RAM so a heavy build (the fleet
+compiler) can own the host, `POST /admin/activate` restores, `GET /admin/idle`
+reports phase. A watchdog (`watchdog_loop`, spawned in `main.rs`) auto-activates
+if the proxy is left idle past a deadline with no live compiler lease — Chord is
+never left silently dead. Distinct from the mode: `GET /admin/activity`
+(CHORD-ACT-01) reports whether inference is *actually in flight* and how long
+Chord has been quiet, so a scheduler can dispatch heavy work into genuine idle
+windows.
 
 ### Agentic loop
 
@@ -314,24 +323,14 @@ iterations and returns an `AgenticResponse` whose execution log is **metadata
 only** — tool arguments and raw results never cross the wire.
 
 Five security guards run at every step (each emits a `SecurityEvent`):
-
-- `PermissionEnforcer` ([permissions.rs](../src/agentic/permissions.rs)) — per-user
-  allowed-tool sets;
-- `ArgumentGuard` ([argument_guard.rs](../src/agentic/argument_guard.rs)) — blocks
-  shell / SQL injection and credential patterns in tool arguments;
-- `ResultGuard` ([result_guard.rs](../src/agentic/result_guard.rs)) — sanitizes
-  suspicious tool results;
-- `ResponseGuard` ([response_guard.rs](../src/agentic/response_guard.rs)) — detects
-  cross-step injection chains;
-- `BehavioralMonitor` ([behavioral_monitor.rs](../src/agentic/behavioral_monitor.rs))
-  — flags internal-data → external-tool exfiltration patterns.
-
-Within the loop, `AgenticModelRouter`
-([model_router.rs](../src/agentic/model_router.rs)) escalates **once** from the
-fast model (`CHORD_FAST_MODEL`) to the deep model (`CHORD_DEEP_MODEL`) when a
-complexity heuristic fires (tool-result count, total chars, or reasoning
-keywords) — capped at one escalation per execution so VRAM isn't thrashed.
-Progress is streamed as SSE `ProgressEvent`s
+`PermissionEnforcer` (per-user allowed-tool sets), `ArgumentGuard` (shell/SQL
+injection + credential patterns in arguments), `ResultGuard` (sanitizes
+suspicious results), `ResponseGuard` (cross-step injection chains), and
+`BehavioralMonitor` (internal-data → external-tool exfiltration patterns).
+Within the loop, `AgenticModelRouter` ([model_router.rs](../src/agentic/model_router.rs))
+escalates **once** from `CHORD_FAST_MODEL` to `CHORD_DEEP_MODEL` when a
+complexity heuristic fires — capped at one escalation per execution so VRAM
+isn't thrashed. Progress streams as SSE `ProgressEvent`s
 ([streaming.rs](../src/agentic/streaming.rs)) when the caller sets `stream: true`.
 
 ### Search harness (Harness-1)
@@ -341,60 +340,134 @@ Progress is streamed as SSE `ProgressEvent`s
 (candidate pool, curated set, evidence graph, verification records). The harness
 holds the bookkeeping; the model emits one `HarnessAction` per turn and the
 harness renders a compact observation back. A `SearchBudget` caps turns.
-
 The `ResearchDetector` ([detector.rs](../src/harness/detector.rs)) decides whether
-a query warrants the full harness (explicit `/research` command, intent keywords,
-or a complexity score above `HARNESS_TRIGGER_THRESHOLD`) versus a plain search.
-When it fires, `harness_integration` rotates VRAM via `HarnessVramManager` through
-the sequence `personality → search-model → synthesis → personality`, then builds a
+a query warrants the full harness versus a plain search. When it fires,
+`harness_integration` rotates VRAM via `HarnessVramManager`
+([vram_lifecycle.rs](../src/harness/vram_lifecycle.rs)) through
+`personality → search-model → synthesis → personality`, then builds a
 citation-style `SynthesisPrompt` from the curated documents. Every VRAM-rotation
 failure degrades gracefully (`SwapOutcome::Fallback` / `Degraded`) — never a crash.
 
-## Observability (SNAP)
+### SLM router (documentation-engine inference)
 
-Chord 1.2.0 folds in the "SNAP" observability features (previously a separate
-harmony-chord codebase) as an additive subsystem under
-[`src/snap/`](../src/snap/). It contributes a read-only telemetry surface on the
-existing control port, gated by the same JWT auth as `/api/models`, with no
-change to the request path:
+**What it is.** [`router`](../src/router/mod.rs) (DOCGEN-03/04):
+`slm_router::SlmRouter::route_and_execute` takes a generation request from the
+Terminus documentation engine and decides the destination — local high-context,
+local cheap, or the frontier-free OpenRouter tier — per an explicit
+`policy::RoutingPolicy` (env-driven), then executes on the chosen destination
+with graceful, never-silent fallback. It reuses the existing substrate:
+destinations resolve to real `models::backends::Backend`s from `seed_from_env`.
+[`eval`](../src/router/eval.rs)/[`eval_storage`](../src/router/eval_storage.rs)
+score candidate routers on ROUTING quality (decision appropriateness, doc
+quality, cost, latency), persisted to Postgres for cross-run comparison.
 
-- **VRAM reader** ([`snap::vram`](../src/snap/vram.rs), SNAP-02) — the *actual*
-  GPU read from sysfs (`mem_info_vram_total`) with a `rocm-smi --json` fallback
-  and an Ollama-allocation roll-up. This complements `serving::memory_model`
-  (which is VRAM *accounting*); the reader is the missing device-truth source.
-- **Health monitor** ([`snap::health`](../src/snap/health.rs)) — a background
-  poller that fills a shared `InferenceState` (engines + per-model load) every
-  `SNAP_POLL_INTERVAL_SECS`; only env-configured endpoints are polled.
-- **Model inventory** ([`snap::inventory`](../src/snap/inventory.rs), SNAP-03) —
-  scans `SNAP_STORAGE_LOCATIONS` for GGUF files (with quant detection) and
-  Ollama manifests, reporting size, tier, and cleanup candidates.
-- **Activity tracker** ([`snap::activity`](../src/snap/activity.rs), SNAP-04) —
-  passive per-engine/per-model in-use observation derived from live state.
-- **Analytics** ([`snap::analytics`](../src/snap/analytics.rs), SNAP-05) —
-  `RequestLogger`: append-only JSONL request log with imputed cloud-cost and
-  savings summaries vs. representative cloud pricing.
-- **vLLM adapter** ([`snap::vllm`](../src/snap/vllm.rs), VLLM-01) — a vLLM
-  `EngineAdapter` backend option (gfx1151 container lifecycle), additive to the
-  existing `serving/` launch path.
+### Coding-model selection
+
+**What it is.** `POST /v1/coding/select` ([`coding_proxy.rs`](../src/coding_proxy.rs),
+CPROX-03/04): a caller sends a `WorkTypeCode` ("I need CODE work of this shape")
+instead of a hardcoded model alias; Chord ranks the real coder-sweep fleet data
+([`models::coding_selector`](../src/models/coding_selector.rs)), health-checks the
+top candidate, and falls back down the ranked list. Deliberately a **resolution**
+(`model_id`/`backend`/`confidence`), not a transparent proxy — the caller then
+dispatches against `/v1/chat/completions` itself, so inference budget is consumed
+exactly once. Fail-open: no intake DB ⇒ a clear 503, never a startup block.
+See [coding-proxy.md](coding-proxy.md).
+
+### Embeddings
+
+**What it is.** `POST /v1/embeddings` ([`embeddings.rs`](../src/embeddings.rs),
+EMBED-01): OpenAI-compatible, local-first from the fleet Ollama
+(Qwen3-Embedding), falling back to OpenRouter (same model family) on
+unreachable/error/timeout/wrong-dimension — a caller can never tell from vector
+shape which path served it, and Chord never returns a vector whose length
+doesn't match `EMBED_DIM`.
+
+### Managed DiffusionGemma daemon
+
+**What it is.** [`diffusion.rs`](../src/diffusion.rs) (CHRD-DIFF-01): Chord owns
+the `llama-diffusion-daemon` lifecycle — lazy start on the first
+diffusion-tagged chat request (`DiffusionManager::ensure_running`), idle
+eviction by a background reaper after `DIFFUSION_IDLE_SECS` — so the diffusion
+model never sits in VRAM perpetually. See
+[diffusion-gemma-managed.md](diffusion-gemma-managed.md).
+
+### MCP tool surface + federation
+
+**What it is.** [`mcp_proxy.rs`](../src/mcp_proxy.rs) routes `/v1/tools/*`
+between callers and the MCP backend (`MCP_BACKEND_URL`), falling back to the
+in-process `terminus-rs` Rust tool registry ([`fallback.rs`](../src/fallback.rs))
+when the backend is unavailable. [`catalog.rs`](../src/catalog.rs) merges both
+sources (MCP wins name conflicts; cached `CHORD_CATALOG_CACHE_SECS`), and
+[`tool_allowlist.rs`](../src/tool_allowlist.rs) scopes what Chord will surface
+or execute at all. An optional second, **unfiltered** proxy federates a personal
+tool backend (`PERSONAL_BACKEND_URL`) under `/v1/personal/tools/*` — never
+merged into the default catalog. Details:
+[reference/mcp_proxy.md](reference/mcp_proxy.md).
+
+### Secrets bootstrap
+
+**What it is.** [`secrets_bootstrap.rs`](../src/secrets_bootstrap.rs) + the
+[`chord-secrets`](../crates/chord-secrets/src/lib.rs) crate (CSEC-01/02): at
+startup, before `Config::from_env`, Chord fetches `CHORD_JWT_SECRET` /
+`CHORD_API_KEY` fresh from <secret-manager> via its own Universal Auth identity
+(deliberately **not** brokered over internal HTTP hops that aren't
+TLS-terminated) and applies them to the process env. Never a hard startup
+failure — falls back to the static environment.
+
+### Audit
+
+**What it is.** [`audit.rs`](../src/audit.rs): one JSONL metadata record per
+request under `CHORD_AUDIT_PATH` — request type, outcome, duration, hashed
+identity. Tool arguments, LLM messages, and memory content are **never** logged.
+Size-based rotation at 100 MiB, 10 files retained. `GET /v1/audit/summary`
+serves aggregates.
+
+## Observability (SNAP + sweep status)
+
+Chord folds in the "SNAP" observability features as an additive subsystem under
+[`src/snap/`](../src/snap/): a read-only telemetry surface on the control port,
+gated by the same JWT auth, with no change to the request path:
+
+- **VRAM reader** ([`snap::vram`](../src/snap/vram.rs)) — the *actual* GPU read
+  from sysfs with a `rocm-smi --json` fallback and an Ollama-allocation roll-up
+  (complements `serving::memory_model`, which is accounting).
+- **Health monitor** ([`snap::health`](../src/snap/health.rs)) — background
+  poller filling the shared `InferenceState` every `SNAP_POLL_INTERVAL_SECS`.
+- **Model inventory** ([`snap::inventory`](../src/snap/inventory.rs)) — scans
+  `SNAP_STORAGE_LOCATIONS` for GGUF files (quant detection) and Ollama
+  manifests; sizes, tiers, cleanup candidates.
+- **Activity tracker** ([`snap::activity`](../src/snap/activity.rs)) — passive
+  per-engine/per-model in-use observation.
+- **Analytics** ([`snap::analytics`](../src/snap/analytics.rs)) —
+  `RequestLogger`: append-only request log + imputed cloud-cost / savings.
+- **vLLM adapter** ([`snap::vllm`](../src/snap/vllm.rs)) — vLLM `EngineAdapter`
+  backend option (container lifecycle), additive to the `serving/` launch path.
 
 Endpoints (all `GET`, control port, JWT-gated): `/api/vram`, `/api/activity`,
 `/api/inventory`, `/api/analytics/requests`, `/api/analytics/cost`,
-`/api/analytics/savings`. Harmony-chord's mutating lifecycle/config endpoints and
-its streaming reverse proxy were intentionally **not** ported — chord already
-owns the proxy path (`routes.rs` / `mcp_proxy.rs` / `routing/`), so only the
-unique analytics/inventory/observation *value* was reconciled in.
+`/api/analytics/savings`.
 
-Env knobs: `SNAP_POLL_INTERVAL_SECS`, `SNAP_DATA_DIR` (falls back to
-`CHORD_DATA_DIR` then the system temp dir), `SNAP_STORAGE_LOCATIONS`
-(`name:tier:/path` entries separated by `;`), `LLAMA_SERVER_URL`, `OLLAMA_URL`,
-`OLLAMA_CPU_URL`, `CHORD_VLLM_URL`.
+[`sweep_status`](../src/sweep_status/mod.rs) is the sibling monitor for the
+fleet's model-benchmarking services: a background poller correlates GPU busy
+percent, fresh sweep DB rows, Ollama loaded models, and systemd unit state into
+a pure `working`/`stuck`/`idle` [`verdict`](../src/sweep_status/verdict.rs) —
+built after a real 7-hour silent GPU-wedge jam. Served (no auth, aggregate-only)
+at `GET /v1/sweep/status` and `/v1/sweep/status/history` on the proxy port, with
+a daily-rotated JSONL log behind it. Every external probe degrades to an
+`unavailable` marker — never a crashed poll loop.
 
 ## Configuration surface
 
-All operational knobs come from env (parsed in [`config.rs`](../src/config.rs)) —
-nothing infrastructure-specific is hardcoded. Key variables: `CHORD_PROXY_PORT`,
-`CHORD_CONTROL_PORT`, `CHORD_JWT_SECRET`, `CHORD_LLM_URL`, `CHORD_MODEL_ALIASES`,
+All operational knobs come from env — nothing infrastructure-specific is
+hardcoded, and secret-shaped values are materialized from the vault at runtime.
+The surface is 44 keys across [`config.rs`](../src/config.rs) and the
+feature-colocated config modules (`snap::config`, `sweep_status::config`,
+`embeddings`, `diffusion`, `supervisor::egress_policy`,
+`harness::vram_lifecycle`, `models::backends`, `secrets_bootstrap`). Key names
+are inventoried per subsystem in the [reference pages](reference/index.md); the
+headliners: `CHORD_PROXY_PORT`, `CHORD_CONTROL_PORT`, `CHORD_JWT_SECRET`,
+`CHORD_LLM_URL`, `CHORD_MODEL_ALIASES`, `MCP_BACKEND_URL`,
 `MODEL_LOCAL_PATH` / `MODEL_ARCHIVE_PATH` / `MODEL_REGISTRY_PATH`,
 `MODEL_PROTECTED`, `MODEL_DISK_PRESSURE_PERCENT`, `MODEL_WARM_COOLDOWN_HOURS`,
-`CHORD_FAST_MODEL` / `CHORD_DEEP_MODEL`, the `HARNESS_*` harness knobs, and the
-`SNAP_*` observability knobs (see Observability above).
+`CHORD_FAST_MODEL` / `CHORD_DEEP_MODEL`, the `HARNESS_*`, `SNAP_*`,
+`CHORD_SWEEP_*`, `EMBED_*`, `DIFFUSION_*`, and `INFISICAL_*` families.
