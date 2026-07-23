@@ -1607,6 +1607,11 @@ fn gpu_exclusively_held_response(record: &crate::gpu_exclusive::LockRecord) -> R
 pub struct GpuExclusiveBody {
     /// Short label identifying the acquirer (e.g. `intake_coder_sweep`).
     pub holder: Option<String>,
+    /// S125 CHRD-GPUX: force the grant even while a client request is in flight
+    /// (bypass the client-yield guard). Default false — a fresh grab is refused while
+    /// Chord is actively serving so MINT yields to the client.
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// `POST /v1/gpu-exclusive/acquire` — grant the GPU to `holder`. On a fresh
@@ -1632,6 +1637,33 @@ pub async fn gpu_exclusive_acquire(
     let now = crate::gpu_exclusive::now_epoch();
     match crate::gpu_exclusive::GPU_EXCLUSIVE.acquire(&holder, now) {
         crate::gpu_exclusive::AcquireOutcome::Granted { record, new_grant } => {
+            // S125 CHRD-GPUX client-guard: the ATOMIC, all-paths backstop to MINT's own
+            // fast-path probe. On a FRESH grant, if a client request is in flight, RELEASE
+            // and yield BEFORE any eviction — so the harmful action (evicting the client's
+            // resident model) never runs while a client is being served. This is atomic
+            // w.r.t. eviction: once we hold the lock, new clients are 503'd (they see the
+            // lock held), so `inflight` reflects only clients admitted before the lock;
+            // refusing here leaves them untouched. A heartbeat (new_grant=false) never
+            // evicts, and `force` overrides. Covers every MINT acquisition path (all route
+            // through here), closing the probe→acquire window from the fast-path check.
+            if new_grant && !body.force {
+                let client_inflight = crate::admin::idle::IDLE_MODE.inflight_count();
+                if client_inflight > 0 {
+                    let _ = crate::gpu_exclusive::GPU_EXCLUSIVE.release(&holder);
+                    tracing::info!(
+                        requested_by = %holder, client_inflight,
+                        "gpu-exclusive: yielding to in-flight client — released without evicting (S125)"
+                    );
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": "gpu_yield_client_busy",
+                            "inflight": client_inflight,
+                        })),
+                    )
+                        .into_response();
+                }
+            }
             if new_grant {
                 tracing::info!(holder = %record.holder, "gpu-exclusive: granted — evicting resident models");
                 if let Some(base) = crate::gpu_exclusive::ollama_base_from_env() {
