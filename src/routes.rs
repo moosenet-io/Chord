@@ -1607,6 +1607,11 @@ fn gpu_exclusively_held_response(record: &crate::gpu_exclusive::LockRecord) -> R
 pub struct GpuExclusiveBody {
     /// Short label identifying the acquirer (e.g. `intake_coder_sweep`).
     pub holder: Option<String>,
+    /// S125 CHRD-GPUX: force the grant even while a client request is in flight
+    /// (bypass the client-yield guard). Default false — a fresh grab is refused while
+    /// Chord is actively serving so MINT yields to the client.
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// `POST /v1/gpu-exclusive/acquire` — grant the GPU to `holder`. On a fresh
@@ -1630,6 +1635,35 @@ pub async fn gpu_exclusive_acquire(
             .into_response();
     }
     let now = crate::gpu_exclusive::now_epoch();
+    // S125 CHRD-GPUX client-guard: the ATOMIC, all-paths backstop to MINT's own fast-path
+    // probe. If a client request is in flight, refuse a FRESH exclusive grab so MINT
+    // yields to the client instead of preempting (evicting) its resident model. A
+    // heartbeat by the CURRENT holder (models already evicted, no client being served)
+    // and an explicit `force` are always allowed. This closes the probe→acquire window
+    // and covers every MINT acquisition path (all route through here).
+    if !body.force {
+        let client_inflight = crate::admin::idle::IDLE_MODE.inflight_count();
+        if client_inflight > 0 {
+            let held_by_me = crate::gpu_exclusive::GPU_EXCLUSIVE
+                .active_holder(now)
+                .map(|r| r.holder == holder)
+                .unwrap_or(false);
+            if !held_by_me {
+                tracing::info!(
+                    requested_by = %holder, client_inflight,
+                    "gpu-exclusive: acquire refused — yielding to in-flight client (S125)"
+                );
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "gpu_yield_client_busy",
+                        "inflight": client_inflight,
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
     match crate::gpu_exclusive::GPU_EXCLUSIVE.acquire(&holder, now) {
         crate::gpu_exclusive::AcquireOutcome::Granted { record, new_grant } => {
             if new_grant {
