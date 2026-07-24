@@ -1463,6 +1463,168 @@ pub struct TranscribeRequest {
     pub language: Option<String>,
 }
 
+/// S125 shared proxy for the media-serve routes: POST `fwd` JSON to `url`, return the
+/// upstream JSON on success. Upstream errors are LOGGED (never echoed — a reqwest error
+/// string can carry the configured URL) and mapped to 502. `label` names the backend in logs.
+async fn proxy_media_post(
+    client: &reqwest::Client,
+    url: &str,
+    fwd: &serde_json::Value,
+    timeout: std::time::Duration,
+    label: &str,
+) -> Response {
+    match client.post(url).json(fwd).timeout(timeout).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+            Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+            Err(e) => {
+                tracing::warn!(backend = label, error = %e, "media proxy: upstream response parse error");
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({ "error": format!("{label} upstream parse error") })),
+                )
+                    .into_response()
+            }
+        },
+        Ok(resp) => {
+            let code = resp.status().as_u16();
+            tracing::warn!(backend = label, upstream_status = code, "media proxy: upstream error");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": format!("{label} upstream error"), "upstream_status": code })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::warn!(backend = label, error = %e, "media proxy: serve unreachable");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": format!("{label} serve unreachable") })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Auth + parse the raw body into `T` (auth-FIRST, matching chat_completions' documented
+/// body-before-auth-extractor pattern). Returns `Ok(req)` or a ready error `Response`.
+fn auth_and_parse<T: serde::de::DeserializeOwned>(
+    headers: &HeaderMap,
+    jwt_secret: &str,
+    body: &[u8],
+    what: &str,
+) -> Result<T, Response> {
+    if let Err(e) = auth_check(headers, jwt_secret) {
+        return Err(auth_error_response(e));
+    }
+    serde_json::from_slice::<T>(body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("invalid {what} request body"), "detail": e.to_string() })),
+        )
+            .into_response()
+    })
+}
+
+/// S125 CH-TTS-01: `POST /v1/audio/speech` — text-to-speech. Proxies `{text, voice?}` to the
+/// sovereign piper serve (`PIPER_URL`, default `:8093/speak`) → `{audio_base64, sample_rate,
+/// model}`.
+#[derive(serde::Deserialize)]
+pub struct SpeechRequest {
+    pub text: String,
+    #[serde(default)]
+    pub voice: Option<String>,
+}
+
+pub async fn audio_speech(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let req: SpeechRequest = match auth_and_parse(&headers, &state.jwt_secret, &body, "speech") {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if req.text.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "text is required" })))
+            .into_response();
+    }
+    let url = non_empty_env_or("PIPER_URL", "http://127.0.0.1:8093/speak");
+    let fwd = serde_json::json!({ "text": req.text, "voice": req.voice });
+    proxy_media_post(&state.http_client, &url, &fwd, std::time::Duration::from_secs(120), "tts").await
+}
+
+/// S125 CH-DOC-01: `POST /v1/documents/parse` — document/OCR parsing. Proxies
+/// `{document_base64, mode?}` to the sovereign doc serve (`DOC_URL`, default `:8094/parse`) →
+/// `{text, pages?, model}`.
+#[derive(serde::Deserialize)]
+pub struct DocParseRequest {
+    pub document_base64: String,
+    #[serde(default)]
+    pub mode: Option<String>,
+}
+
+pub async fn documents_parse(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let req: DocParseRequest = match auth_and_parse(&headers, &state.jwt_secret, &body, "document parse") {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if req.document_base64.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "document_base64 is required" })))
+            .into_response();
+    }
+    let url = non_empty_env_or("DOC_URL", "http://127.0.0.1:8094/parse");
+    let fwd = serde_json::json!({ "document_base64": req.document_base64, "mode": req.mode });
+    proxy_media_post(&state.http_client, &url, &fwd, std::time::Duration::from_secs(300), "doc-parse").await
+}
+
+/// S125 CH-IMG-01: `POST /v1/images/generations` — text-to-image. Proxies `{prompt, steps?,
+/// width?, height?}` to the sovereign image-gen serve (`IMGGEN_URL`, default `:8095/generate`)
+/// → `{image_base64, model, time_ms}`.
+#[derive(serde::Deserialize)]
+pub struct ImageGenRequest {
+    pub prompt: String,
+    #[serde(default)]
+    pub steps: Option<u32>,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+}
+
+pub async fn images_generations(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let req: ImageGenRequest = match auth_and_parse(&headers, &state.jwt_secret, &body, "image generation") {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if req.prompt.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "prompt is required" })))
+            .into_response();
+    }
+    let url = non_empty_env_or("IMGGEN_URL", "http://127.0.0.1:8095/generate");
+    let fwd = serde_json::json!({
+        "prompt": req.prompt, "steps": req.steps, "width": req.width, "height": req.height,
+    });
+    // Image generation can be slow (CPU SD); generous timeout.
+    proxy_media_post(&state.http_client, &url, &fwd, std::time::Duration::from_secs(600), "image-gen").await
+}
+
+/// Read a non-empty env var or fall back to `default` (loopback default, not an infra literal).
+fn non_empty_env_or(key: &str, default: &str) -> String {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
 pub async fn audio_transcriptions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1733,6 +1895,25 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
         // S125 CH-RRK-01: cross-encoder reranking (proxied to the sovereign reranker serve).
         .route("/v1/rerank", axum::routing::post(rerank))
         // S125 CH-ASR-01: speech-to-text (proxied to the sovereign whisper serve).
+        // S125 CH-TTS-01 / CH-DOC-01 / CH-IMG-01: media capability routes (proxied to their
+        // sovereign serves). All auth-first, upstream errors logged not echoed.
+        .route(
+            "/v1/audio/speech",
+            axum::routing::post(audio_speech)
+                // Small text payload; explicit 1MB cap (below the 2MB default).
+                .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)),
+        )
+        .route(
+            "/v1/documents/parse",
+            axum::routing::post(documents_parse)
+                .layer(axum::extract::DefaultBodyLimit::max(25 * 1024 * 1024)),
+        )
+        .route(
+            "/v1/images/generations",
+            axum::routing::post(images_generations)
+                // Small prompt payload; explicit 1MB cap.
+                .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)),
+        )
         .route(
             "/v1/audio/transcriptions",
             axum::routing::post(audio_transcriptions)
