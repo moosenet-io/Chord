@@ -189,9 +189,18 @@ pub fn resolve(
         return None;
     }
 
-    // (0'/preferred) Honor an explicit preference IFF it survived the filters above.
+    let tier = desc.constraints.quality_tier.unwrap_or(QualityTier::Balanced);
+
+    // (0'/preferred) Honor an explicit preference IFF it survived the filters above. When the
+    // preferred NAME exists on multiple backends, pick the best-ranked one (deterministic —
+    // never "whichever was supplied first").
     if let Some(pref) = desc.hints.preferred_model.as_deref() {
-        if let Some(c) = pool.iter().copied().find(|c| c.name == pref) {
+        if let Some(c) = pool
+            .iter()
+            .copied()
+            .filter(|c| c.name == pref)
+            .max_by(|a, b| cmp_candidates(a, b, tier))
+        {
             return Some(Selection {
                 model: c.name.clone(),
                 backend: c.backend.clone(),
@@ -201,7 +210,6 @@ pub fn resolve(
     }
 
     // (4) Rank and pick (total, deterministic order — NaN-safe).
-    let tier = desc.constraints.quality_tier.unwrap_or(QualityTier::Balanced);
     let best = pool.iter().copied().max_by(|a, b| cmp_candidates(a, b, tier))?;
     Some(Selection {
         model: best.name.clone(),
