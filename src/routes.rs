@@ -1451,6 +1451,89 @@ pub struct RerankRequest {
     pub top_n: Option<usize>,
 }
 
+/// S125 CH-ASR-01: `POST /v1/audio/transcriptions` — speech-to-text. Proxies
+/// `{audio_base64, language?}` to the sovereign whisper serve (`WHISPER_URL`, default the
+/// local faster-whisper on `:8092`) and returns `{text, language, duration, model}`. Same
+/// JWT auth as every endpoint; auth-FIRST (raw body parsed after the check). CPU serve — no
+/// GPU-exclusive gate. A larger body cap than chat since audio is bulkier.
+#[derive(serde::Deserialize)]
+pub struct TranscribeRequest {
+    pub audio_base64: String,
+    #[serde(default)]
+    pub language: Option<String>,
+}
+
+pub async fn audio_transcriptions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Err(e) = auth_check(&headers, &state.jwt_secret) {
+        return auth_error_response(e);
+    }
+    let req: TranscribeRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "invalid transcription request body", "detail": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    if req.audio_base64.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "audio_base64 is required" })),
+        )
+            .into_response();
+    }
+    let url = std::env::var("WHISPER_URL")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:8092/transcribe".to_string());
+    let fwd = serde_json::json!({ "audio_base64": req.audio_base64, "language": req.language });
+    match state
+        .http_client
+        .post(&url)
+        .json(&fwd)
+        .timeout(std::time::Duration::from_secs(300))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+            Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+            Err(e) => {
+                // Log the detail server-side; the response stays generic (never echoes the
+                // upstream URL/error, which a reqwest error string can carry).
+                tracing::warn!(error = %e, "transcription: upstream response parse error");
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({ "error": "transcription upstream parse error" })),
+                )
+                    .into_response()
+            }
+        },
+        Ok(resp) => {
+            let code = resp.status().as_u16();
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "transcription upstream error", "upstream_status": code })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "transcription: whisper serve unreachable");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "whisper serve unreachable" })),
+            )
+                .into_response()
+        }
+    }
+}
+
 pub async fn rerank(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1649,6 +1732,15 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
         .route("/v1/embeddings", axum::routing::post(embeddings))
         // S125 CH-RRK-01: cross-encoder reranking (proxied to the sovereign reranker serve).
         .route("/v1/rerank", axum::routing::post(rerank))
+        // S125 CH-ASR-01: speech-to-text (proxied to the sovereign whisper serve).
+        .route(
+            "/v1/audio/transcriptions",
+            axum::routing::post(audio_transcriptions)
+                // Audio is bulkier than the 2MB axum default; allow up to 10MB (~5min b64). Kept
+                // modest since the body is buffered before the in-handler auth (the
+                // documented codebase pattern shared with chat_completions).
+                .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024)),
+        )
         .route("/v1/infer", axum::routing::post(infer))
         // GPU-exclusive coordination: the intake harness ACQUIREs the GPU here
         // instead of `systemctl stop chord.service` — Chord stays up, only its
