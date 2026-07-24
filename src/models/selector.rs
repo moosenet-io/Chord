@@ -292,6 +292,37 @@ pub fn backend_is_local(kind: BackendKind) -> bool {
     !matches!(kind, BackendKind::OpenRouter)
 }
 
+/// S125 CH-CAP-02 wiring: assemble the selector's candidate set from the LIVE model registry
+/// + the capability registry. Only models with ≥1 declared capability are candidates (an
+/// unclassified model can't be matched by capability). `available` = not archived-only
+/// (`Cold`). `max_context`/`score`/latency/cost start `None` (fail-open); a `ScoreSource`
+/// (MINT operational profiles) can enrich `score` before ranking — pass scores in via
+/// [`with_scores`](ModelCandidate) at the call site.
+pub fn candidates_from(
+    reg: &crate::models::registry::ModelRegistry,
+    caps: &CapabilityRegistry,
+) -> Vec<ModelCandidate> {
+    use crate::models::registry::StorageTier;
+    reg.all_records()
+        .filter(|rec| !caps.of(&rec.name).is_empty())
+        .filter_map(|rec| {
+            let backend = reg.backend_for(&rec.name)?;
+            Some(ModelCandidate {
+                name: rec.name.clone(),
+                backend: backend.name.clone(),
+                backend_kind: backend.kind,
+                // Cold = archive-only (needs a transfer before it can serve) ⇒ not available.
+                available: !matches!(rec.tier, StorageTier::Cold),
+                max_context: None,
+                score: None,
+                is_local: backend_is_local(backend.kind),
+                est_latency_ms: None,
+                est_cost: None,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

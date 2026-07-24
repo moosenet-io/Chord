@@ -1582,7 +1582,55 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
             "/v1/coding/select",
             axum::routing::post(crate::coding_proxy::coding_select),
         )
+        // S125 CH-SEL-01: capability-aware model resolution from a TaskDescriptor.
+        .route("/v1/resolve", axum::routing::post(resolve_task))
         .with_state(state)
+}
+
+/// S125 CH-SEL-01/CH-CAP-02: `POST /v1/resolve` — resolve a [`TaskDescriptor`] to a concrete
+/// `(model, backend)` using the capability registry + live model registry. Clients send *what
+/// the work needs* (task + constraints) instead of a raw model name. 400 on a self-
+/// contradictory descriptor (advisory modality check); 404 when no model can serve the task.
+pub async fn resolve_task(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(desc): Json<crate::models::selector::TaskDescriptor>,
+) -> Response {
+    if let Err(e) = auth_check(&headers, &state.jwt_secret) {
+        return auth_error_response(e);
+    }
+    if let Err(reason) = desc.modality_consistent() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "modality_inconsistent", "reason": reason })),
+        )
+            .into_response();
+    }
+    // Capabilities are config-driven (CHORD_CAPABILITIES_PATH) + MINT-refreshable. Loaded per
+    // request so config/MINT updates are picked up; this is a routing-decision endpoint, not
+    // the hot inference path.
+    let caps = crate::models::capability::CapabilityRegistry::from_env();
+    let candidates = {
+        let reg = state.model_registry.lock().await;
+        crate::models::selector::candidates_from(&reg, &caps)
+    };
+    match crate::models::selector::resolve(&desc, &caps, &candidates) {
+        Some(sel) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "model": sel.model, "backend": sel.backend, "reason": sel.reason
+            })),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "no_model_for_task",
+                "task": format!("{:?}", desc.task),
+            })),
+        )
+            .into_response(),
+    }
 }
 
 // ── GPU-exclusive coordination endpoints ─────────────────────────────────────
