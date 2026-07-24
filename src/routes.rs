@@ -1437,6 +1437,94 @@ fn apply_request_rewrites(
 /// deadlock it against its own lock; (c) embeddings are lightweight. The
 /// local backend contending for a briefly-held GPU is acceptable; a hard deny
 /// is not.
+/// S125 CH-RRK-01: `POST /v1/rerank` — cross-encoder reranking. Proxies `{query,
+/// documents[], top_n?}` to the sovereign reranker serve (`RERANK_URL`, default the local
+/// bge-reranker-v2-m3 on `:8091`) and returns `{results:[{index,score}], model}` sorted by
+/// score desc. Same JWT auth as every endpoint. No GPU-exclusive gate: the reranker runs
+/// CPU-only, so it never contends for the GPU a sweep may hold.
+#[derive(serde::Deserialize)]
+pub struct RerankRequest {
+    pub query: String,
+    #[serde(default)]
+    pub documents: Vec<String>,
+    #[serde(default)]
+    pub top_n: Option<usize>,
+}
+
+pub async fn rerank(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    // Auth FIRST — take the raw body and parse only after auth, so an unauthenticated caller
+    // can't probe the endpoint via a malformed-body 400 before the auth check runs.
+    if let Err(e) = auth_check(&headers, &state.jwt_secret) {
+        return auth_error_response(e);
+    }
+    let req: RerankRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "invalid rerank request body", "detail": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    if req.query.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "query is required" })),
+        )
+            .into_response();
+    }
+    if req.documents.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "results": [] })),
+        )
+            .into_response();
+    }
+    let url = std::env::var("RERANK_URL")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:8091/rerank".to_string());
+    let body = serde_json::json!({
+        "query": req.query, "documents": req.documents, "top_n": req.top_n,
+    });
+    match state
+        .http_client
+        .post(&url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+            Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "rerank upstream parse error", "detail": e.to_string() })),
+            )
+                .into_response(),
+        },
+        Ok(resp) => {
+            let code = resp.status().as_u16();
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "rerank upstream error", "upstream_status": code })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": "rerank serve unreachable", "detail": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 pub async fn embeddings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1559,6 +1647,8 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
             axum::routing::post(chat_completions),
         )
         .route("/v1/embeddings", axum::routing::post(embeddings))
+        // S125 CH-RRK-01: cross-encoder reranking (proxied to the sovereign reranker serve).
+        .route("/v1/rerank", axum::routing::post(rerank))
         .route("/v1/infer", axum::routing::post(infer))
         // GPU-exclusive coordination: the intake harness ACQUIREs the GPU here
         // instead of `systemctl stop chord.service` — Chord stays up, only its
