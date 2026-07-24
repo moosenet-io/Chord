@@ -1504,11 +1504,16 @@ pub async fn audio_transcriptions(
     {
         Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
             Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-            Err(e) => (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "error": "transcription upstream parse error", "detail": e.to_string() })),
-            )
-                .into_response(),
+            Err(e) => {
+                // Log the detail server-side; the response stays generic (never echoes the
+                // upstream URL/error, which a reqwest error string can carry).
+                tracing::warn!(error = %e, "transcription: upstream response parse error");
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({ "error": "transcription upstream parse error" })),
+                )
+                    .into_response()
+            }
         },
         Ok(resp) => {
             let code = resp.status().as_u16();
@@ -1518,11 +1523,14 @@ pub async fn audio_transcriptions(
             )
                 .into_response()
         }
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({ "error": "whisper serve unreachable", "detail": e.to_string() })),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::warn!(error = %e, "transcription: whisper serve unreachable");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "whisper serve unreachable" })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -1728,8 +1736,10 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
         .route(
             "/v1/audio/transcriptions",
             axum::routing::post(audio_transcriptions)
-                // Audio payloads are bulkier than the 2MB axum default; allow up to 32MB.
-                .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)),
+                // Audio is bulkier than the 2MB axum default; allow up to 10MB (~5min b64). Kept
+                // modest since the body is buffered before the in-handler auth (the
+                // documented codebase pattern shared with chat_completions).
+                .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024)),
         )
         .route("/v1/infer", axum::routing::post(infer))
         // GPU-exclusive coordination: the intake harness ACQUIREs the GPU here
