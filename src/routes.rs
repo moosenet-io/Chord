@@ -1727,7 +1727,9 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
         // S125 CH-ASR-01: speech-to-text (proxied to the sovereign whisper serve).
         .route(
             "/v1/audio/transcriptions",
-            axum::routing::post(audio_transcriptions),
+            axum::routing::post(audio_transcriptions)
+                // Audio payloads are bulkier than the 2MB axum default; allow up to 32MB.
+                .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
         .route("/v1/infer", axum::routing::post(infer))
         // GPU-exclusive coordination: the intake harness ACQUIREs the GPU here
