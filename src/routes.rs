@@ -1897,7 +1897,12 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
         // S125 CH-ASR-01: speech-to-text (proxied to the sovereign whisper serve).
         // S125 CH-TTS-01 / CH-DOC-01 / CH-IMG-01: media capability routes (proxied to their
         // sovereign serves). All auth-first, upstream errors logged not echoed.
-        .route("/v1/audio/speech", axum::routing::post(audio_speech))
+        .route(
+            "/v1/audio/speech",
+            axum::routing::post(audio_speech)
+                // Small text payload; explicit 1MB cap (below the 2MB default).
+                .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)),
+        )
         .route(
             "/v1/documents/parse",
             axum::routing::post(documents_parse)
@@ -1905,7 +1910,9 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
         )
         .route(
             "/v1/images/generations",
-            axum::routing::post(images_generations),
+            axum::routing::post(images_generations)
+                // Small prompt payload; explicit 1MB cap.
+                .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)),
         )
         .route(
             "/v1/audio/transcriptions",
