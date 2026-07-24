@@ -1454,11 +1454,23 @@ pub struct RerankRequest {
 pub async fn rerank(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(req): Json<RerankRequest>,
+    body: axum::body::Bytes,
 ) -> Response {
+    // Auth FIRST — take the raw body and parse only after auth, so an unauthenticated caller
+    // can't probe the endpoint via a malformed-body 400 before the auth check runs.
     if let Err(e) = auth_check(&headers, &state.jwt_secret) {
         return auth_error_response(e);
     }
+    let req: RerankRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "invalid rerank request body", "detail": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
     if req.query.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
