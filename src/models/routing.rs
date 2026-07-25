@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 
 use crate::models::backends::{Backend, BackendKind, Hardware};
 use crate::models::registry::ModelRegistry;
+use crate::serving::profile::RoutingMap;
 
 use terminus_rs::intake::infer::{LaunchSpec as TLaunch, ResolvedBackend};
 use terminus_rs::intake::lifecycle;
@@ -75,14 +76,38 @@ fn to_resolved(
 /// of this function).
 pub async fn resolve_and_ensure(
     registry: &Arc<Mutex<ModelRegistry>>,
+    routing_map: &Arc<Mutex<RoutingMap>>,
     registry_key: &str,
     model: &str,
 ) -> Option<(String, Option<String>)> {
+    // ARCH-AWARE resolution (CHRD arch-aware fix): consult the serving
+    // `RoutingMap` so a model whose registry-tagged backend is arch-EXCLUDED
+    // (e.g. a `gpt-oss` model still tagged `llama-gpu`, which llama-server
+    // cannot load) is steered to the map's chosen usable backend instead of
+    // being dispatched to a backend that will crash-loop.
+    //
+    // The routing_map guard is taken FIRST and dropped BEFORE the registry lock
+    // — we extract only small OWNED values (the excluded tiers + chosen tier for
+    // THIS model). `list_models`/`get_model` lock the registry THEN the
+    // routing_map; holding both here in the opposite order would be a lock-order
+    // inversion (deadlock). Extracting-then-dropping removes the nested hold
+    // entirely, so there is no ordering to invert.
+    let (excluded_tiers, chosen_tier) = {
+        let routing = routing_map.lock().await;
+        let model_id = terminus_rs::intake::serving::ModelId::from(registry_key);
+        (
+            routing.excluded_tiers(&model_id),
+            routing.chosen_backend(&model_id),
+        )
+    };
+
     // Brief lock: snapshot the backend + the model's local path, then release so
     // a (possibly long) on-demand start does not block other requests.
     let (resolved, bearer_key) = {
         let reg = registry.lock().await;
-        let b = reg.backend_for(registry_key)?.clone();
+        let b = reg
+            .backend_for_arch_aware(registry_key, &excluded_tiers, chosen_tier)?
+            .clone();
         let local = reg.get(registry_key).and_then(|r| r.local_path.clone());
         let gguf = reg.get(registry_key).and_then(|r| r.gguf_path.clone());
         let bearer_key = b
@@ -253,8 +278,15 @@ mod tests {
         });
         assert!(reg.register_remote_api_model("openrouter/owl-alpha", "openrouter-api", "openrouter"));
         let registry = Arc::new(Mutex::new(reg));
+        let routing_map = Arc::new(Mutex::new(RoutingMap::empty()));
 
-        let result = resolve_and_ensure(&registry, "openrouter/owl-alpha", "openrouter/owl-alpha").await;
+        let result = resolve_and_ensure(
+            &registry,
+            &routing_map,
+            "openrouter/owl-alpha",
+            "openrouter/owl-alpha",
+        )
+        .await;
         let (url, bearer) = result.expect("openrouter backend should resolve");
         assert_eq!(url, "http://127.0.0.1:0/v1/chat/completions");
         assert_eq!(bearer.as_deref(), Some("<REDACTED-SECRET>"));

@@ -962,10 +962,14 @@ pub async fn chat_completions(
     // `bearer_key` is `Some` only for backends with `api_key_env` set (e.g.
     // OpenRouter) — re-injected as an outbound Authorization header below,
     // after the inbound-header copy loop strips the caller's own JWT.
-    let (llm_url, bearer_key) =
-        crate::models::routing::resolve_and_ensure(&state.model_registry, &registry_key, &resolved_model)
-            .await
-            .unwrap_or((llm_url, None));
+    let (llm_url, bearer_key) = crate::models::routing::resolve_and_ensure(
+        &state.model_registry,
+        &state.routing_map,
+        &registry_key,
+        &resolved_model,
+    )
+    .await
+    .unwrap_or((llm_url, None));
 
     // ── YARN-06: per-request thinking honoring ──────────────────────────────
     // Harmony (THINK-01/02) may send an optional top-level `thinking: "on"|"off"`

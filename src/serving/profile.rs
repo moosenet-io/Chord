@@ -31,7 +31,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use terminus_rs::intake::serving::{ModelId, Runtime, ServingProfile};
+use terminus_rs::intake::serving::{ModelId, Runtime, ServingBackend, ServingProfile};
 
 /// Typed view of a serving row's `env_json` launch hints.
 ///
@@ -652,6 +652,14 @@ impl std::error::Error for ProfileLoadError {}
 #[derive(Debug, Clone, Default)]
 pub struct RoutingMap {
     by_model: HashMap<String, RouteEntry>,
+    /// Per-model set of backend tiers whose serving row is arch-EXCLUDED
+    /// (`exclusion_reason != None`). Retained ALONGSIDE the winning
+    /// [`RouteEntry`] in `by_model` (which only ever keeps the best USABLE row)
+    /// so a resolution-time guard can ask "is THIS specific tier excluded for
+    /// this model?" — the fact the winner-selection collapse would otherwise
+    /// discard. Keyed by `model_id`; a model with no excluded rows has no entry.
+    /// See [`excluded_tiers`](Self::excluded_tiers).
+    excluded: HashMap<String, Vec<ServingBackend>>,
 }
 
 impl RoutingMap {
@@ -659,6 +667,7 @@ impl RoutingMap {
     pub fn empty() -> Self {
         RoutingMap {
             by_model: HashMap::new(),
+            excluded: HashMap::new(),
         }
     }
 
@@ -677,7 +686,7 @@ impl RoutingMap {
     /// excluded for a non-`none` reason loses to any usable row. This keeps a
     /// lookup pointing at the row Chord can actually launch.
     pub fn load_from(rows: Vec<ServingProfile>) -> Self {
-        use terminus_rs::intake::serving::{ExclusionReason, ServingBackend};
+        use terminus_rs::intake::serving::ExclusionReason;
 
         // Lower rank = more preferred.
         fn tier_rank(b: ServingBackend) -> u8 {
@@ -689,8 +698,19 @@ impl RoutingMap {
         }
 
         let mut by_model: HashMap<String, RouteEntry> = HashMap::new();
+        let mut excluded: HashMap<String, Vec<ServingBackend>> = HashMap::new();
         for row in rows {
             let key = row.model_id.as_str().to_string();
+            // Record an arch-excluded tier BEFORE the winner-selection collapse
+            // (which keeps only the best usable row) discards it. This is what
+            // the resolution-time guard consults to override a stale registry
+            // tag that points at an excluded backend.
+            if row.exclusion_reason != ExclusionReason::None {
+                let set = excluded.entry(key.clone()).or_default();
+                if !set.contains(&row.backend_tag) {
+                    set.push(row.backend_tag);
+                }
+            }
             let candidate = RouteEntry::from_profile(row);
 
             match by_model.get(&key) {
@@ -717,13 +737,34 @@ impl RoutingMap {
                 }
             }
         }
-        RoutingMap { by_model }
+        RoutingMap { by_model, excluded }
     }
 
     /// Look up a model's route entry by `model_id`. `None` ⇒ unprofiled model
     /// (the launcher turns this into a clear "unprofiled" error — never a guess).
     pub fn get(&self, model_id: &ModelId) -> Option<&RouteEntry> {
         self.by_model.get(model_id.as_str())
+    }
+
+    /// The arch-EXCLUDED backend tiers for `model_id` (`exclusion_reason !=
+    /// None`), returned as an OWNED `Vec` so the caller can drop the map guard
+    /// before doing any further locking (the resolution guard extracts this,
+    /// releases the routing_map lock, THEN locks the registry — avoiding a
+    /// lock-order inversion). Empty for an unprofiled model or one with no
+    /// excluded rows.
+    pub fn excluded_tiers(&self, model_id: &ModelId) -> Vec<ServingBackend> {
+        self.excluded
+            .get(model_id.as_str())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The USABLE backend tier the map chose for `model_id` (the winning row's
+    /// `backend_tag`), if the model is profiled. This is the "usable route" the
+    /// resolution guard steers to when a tagged backend is excluded. `None` ⇒
+    /// unprofiled (caller falls back to the default backend).
+    pub fn chosen_backend(&self, model_id: &ModelId) -> Option<ServingBackend> {
+        self.get(model_id).map(|entry| entry.profile.backend_tag)
     }
 
     /// Number of distinct models routable.
