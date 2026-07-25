@@ -32,24 +32,46 @@
 //!     metric contribute.
 //!   - `r` = responsiveness (tokens/sec) from `model_operational_profiles`
 //!     (`throughput_at_2k`, falling back to the next-larger measured tier) —
-//!     higher tok/s ⇒ higher `r`.
+//!     higher tok/s ⇒ higher `r`, but SATURATED at
+//!     `CHORD_ALIAS_R_SATURATION_TOK_S` (metric-v2) so a tiny hyper-fast model
+//!     earns no runaway speed advantage over a merely "fast enough" one.
 //!
-//! ### Per-tier weights (env-configurable; defaults below)
-//! `lumina` and `lumina-fast` favor responsiveness; `lumina-deep` favors
-//! quality:
+//! ## metric-v2 (post-mortem of the qwen2.5:0.5b regression)
+//! The first live deploy crowned `qwen2.5:0.5b` (a 0.5B model!) for all three
+//! tiers at an identical 0.700 — it had a deceptively high `assistant_avg_value`
+//! and maximal responsiveness (tiny ⇒ fast), and the blend rewarded speed. The
+//! redesign:
+//!   - **PRIMARY: a hard capability/size gate** (`CHORD_ALIAS_MIN_SIZE_BYTES`,
+//!     default ~5 GB) drops any model too small to be a real assistant BEFORE
+//!     scoring. A 0.5B model can never be a candidate. Unknown/zero size ⇒
+//!     excluded (fail-safe).
+//!   - **q-heavy reweight** so responsiveness only breaks ties among CAPABLE
+//!     models (see weights below).
+//!   - **responsiveness saturation** so "fast enough" earns full `r` and being
+//!     tiny-fast earns no more.
+//!   - **`assistant_avg_value` verified** to be `avg(value)` (a genuine per-row
+//!     average, NOT a count-inflated sum — terminus-rs `schema.rs` view SQL), so
+//!     `q` is kept as-is (dividing by `assistant_score_count` would be wrong).
+//!
+//! ### Per-tier weights (env-configurable; metric-v2 defaults below)
+//! Both tiers are q-heavy; `lumina`/`lumina-fast` keep a small responsiveness
+//! tie-breaker, `lumina-deep` almost none:
 //! ```text
-//! lumina / lumina-fast : 0.40*q + 0.30*a + 0.30*r
-//! lumina-deep          : 0.60*q + 0.30*a + 0.10*r
+//! lumina / lumina-fast : 0.55*q + 0.30*a + 0.15*r
+//! lumina-deep          : 0.65*q + 0.30*a + 0.05*r
 //! ```
 //!
 //! ### Gates (a candidate is dropped BEFORE scoring if any fails)
 //!   a. Not servable/known in the registry.
-//!   b. Arch-excluded on all backends (per the RoutingMap serving exclusion —
+//!   SIZE. Registry `size_bytes` below `CHORD_ALIAS_MIN_SIZE_BYTES`, or
+//!      unknown/zero (metric-v2 PRIMARY gate — the decisive fix).
+//!   b. Arch-excluded on ALL backends (per the RoutingMap serving exclusion —
 //!      reuses [`crate::serving::profile::RoutingMap`]).
 //!   c. Fails the existing latency/degradation guard that
 //!      [`reporting::select_chat_role`] applies (we only accept models it marks
 //!      [`GuardVerdict::Eligible`]).
-//!   d. Below the assistant-quality floor `CHORD_ALIAS_MIN_QUALITY` (on `q`).
+//!   d. Below the assistant-quality floor `CHORD_ALIAS_MIN_QUALITY` (on `q`;
+//!      disabled by default — the size gate is the real filter).
 //!
 //! ### Hysteresis
 //! A tier only repoints when the new top model's blended score beats the CURRENT
@@ -182,9 +204,25 @@ pub struct AliasUpdaterConfig {
     /// DISABLED** (no quality filtering); an operator sets a real raw value (e.g.
     /// 50) from the observed distribution to exclude weak models.
     pub min_quality: f64,
+    /// `CHORD_ALIAS_MIN_SIZE_BYTES` — PRIMARY capability gate (metric-v2). A model
+    /// whose registry `size_bytes` is below this is too small to be a real
+    /// conversational assistant and is EXCLUDED before scoring (no blend can
+    /// crown it). Default `5_000_000_000` (~5 GB ≈ ~7B params at Q4) — keeps
+    /// granite4.1:30b / command-r / phi4:14b / mistral-small3.2:24b / qwen2.5:32b,
+    /// drops qwen2.5:0.5b (~0.4 GB) and other sub-~7B models. A model with
+    /// unknown/zero `size_bytes` is EXCLUDED (fail-safe — never promote an unsized
+    /// model to a primary assistant alias).
+    pub min_size_bytes: u64,
+    /// `CHORD_ALIAS_R_SATURATION_TOK_S` — responsiveness saturation target
+    /// (tok/s). Raw `r` is capped at this BEFORE normalization, so a model gets
+    /// FULL responsiveness credit once it is "fast enough" and a tiny model earns
+    /// no runaway speed advantage for being sub-second. Default 40.0 tok/s
+    /// (comfortably interactive). Set very high to effectively disable saturation.
+    pub r_saturation_tok_s: f64,
     /// `CHORD_ALIAS_SWITCH_MARGIN` — hysteresis margin (default 0.05).
     pub switch_margin: f64,
-    /// Weights for `lumina` and `lumina-fast` (responsiveness-favoring).
+    /// Weights for `lumina` and `lumina-fast` (responsiveness-favoring, but
+    /// q-heavy in metric-v2 so speed only breaks ties among CAPABLE models).
     pub fast_weights: BlendWeights,
     /// Weights for `lumina-deep` (quality-favoring).
     pub deep_weights: BlendWeights,
@@ -218,6 +256,32 @@ fn env_refresh_secs(key: &str, default: u64) -> u64 {
         .max(MIN_REFRESH_SECS)
 }
 
+/// Parse a non-negative u64 env value (e.g. a byte threshold); malformed → default.
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+/// Parse a strictly-positive, finite f64 env value; anything malformed, NaN,
+/// ±inf, or `<= 0` falls back to `default` (a zero saturation would divide-by-zero
+/// or zero-out responsiveness).
+fn env_pos_f64(key: &str, default: f64) -> f64 {
+    match std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+    {
+        Some(v) if v.is_finite() && v > 0.0 => v,
+        _ => default,
+    }
+}
+
+/// Default size gate: ~5 GB ≈ ~7B params at Q4 (see [`AliasUpdaterConfig::min_size_bytes`]).
+const DEFAULT_MIN_SIZE_BYTES: u64 = 5_000_000_000;
+/// Default responsiveness saturation target (tok/s).
+const DEFAULT_R_SATURATION_TOK_S: f64 = 40.0;
+
 impl AliasUpdaterConfig {
     /// Read the config from the environment, applying the documented defaults for
     /// any unset/malformed/invalid var (see [`env_nonneg_f64`] /
@@ -227,16 +291,23 @@ impl AliasUpdaterConfig {
         AliasUpdaterConfig {
             refresh_secs: env_refresh_secs("CHORD_ALIAS_REFRESH_SECS", 900),
             min_quality: env_nonneg_f64("CHORD_ALIAS_MIN_QUALITY", 0.0),
+            min_size_bytes: env_u64("CHORD_ALIAS_MIN_SIZE_BYTES", DEFAULT_MIN_SIZE_BYTES),
+            r_saturation_tok_s: env_pos_f64(
+                "CHORD_ALIAS_R_SATURATION_TOK_S",
+                DEFAULT_R_SATURATION_TOK_S,
+            ),
             switch_margin: env_nonneg_f64("CHORD_ALIAS_SWITCH_MARGIN", 0.05),
+            // metric-v2 reweight: q-heavy so responsiveness only breaks ties among
+            // capable (size-gated) models — it can no longer crown a weak model.
             fast_weights: BlendWeights {
-                q: env_nonneg_f64("CHORD_ALIAS_W_FAST_Q", 0.40),
+                q: env_nonneg_f64("CHORD_ALIAS_W_FAST_Q", 0.55),
                 a: env_nonneg_f64("CHORD_ALIAS_W_FAST_A", 0.30),
-                r: env_nonneg_f64("CHORD_ALIAS_W_FAST_R", 0.30),
+                r: env_nonneg_f64("CHORD_ALIAS_W_FAST_R", 0.15),
             },
             deep_weights: BlendWeights {
-                q: env_nonneg_f64("CHORD_ALIAS_W_DEEP_Q", 0.60),
+                q: env_nonneg_f64("CHORD_ALIAS_W_DEEP_Q", 0.65),
                 a: env_nonneg_f64("CHORD_ALIAS_W_DEEP_A", 0.30),
-                r: env_nonneg_f64("CHORD_ALIAS_W_DEEP_R", 0.10),
+                r: env_nonneg_f64("CHORD_ALIAS_W_DEEP_R", 0.05),
             },
         }
     }
@@ -247,16 +318,18 @@ impl Default for AliasUpdaterConfig {
         AliasUpdaterConfig {
             refresh_secs: 900,
             min_quality: 0.0,
+            min_size_bytes: DEFAULT_MIN_SIZE_BYTES,
+            r_saturation_tok_s: DEFAULT_R_SATURATION_TOK_S,
             switch_margin: 0.05,
             fast_weights: BlendWeights {
-                q: 0.40,
+                q: 0.55,
                 a: 0.30,
-                r: 0.30,
+                r: 0.15,
             },
             deep_weights: BlendWeights {
-                q: 0.60,
+                q: 0.65,
                 a: 0.30,
-                r: 0.10,
+                r: 0.05,
             },
         }
     }
@@ -273,7 +346,17 @@ pub struct RawSignal {
     pub model_id: String,
     /// Aggregated `assistant_avg_value` (mean of the model's `model_dual_profile`
     /// rows). `None` ⇒ no assistant-value data (fails the quality floor).
-    pub q: Option<f64>, // RAW `assistant_avg_value` scale (un-normalized; ~hundreds).
+    ///
+    /// metric-v2 semantics verification (FIX B): the `model_dual_profile` view
+    /// defines this column as `avg(value)` over the assistant-category
+    /// `assistant_dimension_score` rows — a genuine PER-ROW AVERAGE, **not** a
+    /// count-inflated SUM (verified against terminus-rs `schema.rs`, view SQL
+    /// `count(*) AS assistant_score_count, avg(value) AS assistant_avg_value`).
+    /// So answer-count does NOT inflate it, and dividing by `assistant_score_count`
+    /// would be WRONG. It IS a coarse signal (it averages `value` across several
+    /// assistant dimensions on different magnitudes), which is exactly why the
+    /// hard size gate — not `q` alone — is the decisive filter in metric-v2.
+    pub q: Option<f64>, // RAW `assistant_avg_value` (avg(value); un-normalized).
     /// dim-5 behavioral/prompted-adherence mean, taken from a GUARD-ELIGIBLE
     /// backend row (max across the model's eligible rows only). Sourcing `a` from
     /// an eligible row — rather than a global max that could come from an
@@ -298,12 +381,17 @@ pub struct AliasCandidate {
     pub r: f64,
 }
 
-/// A scored candidate: the blended `score` plus the normalized components (kept
-/// for logging / test introspection). Higher `score` is better.
+/// A scored candidate: the blended `score` plus BOTH the raw and normalized
+/// components, so a repoint's full rationale is auditable in the logs (FIX D).
+/// Higher `score` is better.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScoredCandidate {
     pub model_id: String,
     pub score: f64,
+    /// Raw (pre-normalization) blend inputs — `r` is post-saturation.
+    pub q_raw: f64,
+    pub a_raw: f64,
+    pub r_raw: f64,
     pub q_norm: f64,
     pub a_norm: f64,
     pub r_norm: f64,
@@ -406,14 +494,23 @@ pub fn extract_raw_signals(
 /// used on the live path). (c) the chat-role guard (`guard_eligible`); (d) the
 /// RAW-scale quality floor `min_quality` on `q` — a model with no `q` at all is
 /// dropped (can't assess quality); the floor is disabled by default (0.0).
+///
+/// NOTE: the PRIMARY capability/size gate (metric-v2 FIX A) is applied UPSTREAM,
+/// folded into the `eligible` set the live caller passes — a too-small model is
+/// never in `eligible`, so it never reaches scoring here.
+///
+/// `r_saturation_tok_s` caps each candidate's raw responsiveness (FIX C) so a
+/// tiny hyper-fast model earns no runaway speed advantage: once a model is
+/// "fast enough" it gets the same `r` as any faster one.
 pub fn gate_and_build(
     raws: &[RawSignal],
     eligible: Option<&HashSet<String>>,
     min_quality: f64,
+    r_saturation_tok_s: f64,
 ) -> Vec<AliasCandidate> {
     raws.iter()
         .filter_map(|raw| {
-            // (a+b) servable & not arch-excluded — Some(set) always filters.
+            // (a+b) servable, size-gated & not arch-excluded — Some(set) always filters.
             if let Some(set) = eligible {
                 if !set.contains(&raw.model_id) {
                     return None;
@@ -428,11 +525,13 @@ pub fn gate_and_build(
             if q < min_quality {
                 return None;
             }
+            // (FIX C) saturate responsiveness at the "fast enough" target.
+            let r = raw.r.unwrap_or(0.0).min(r_saturation_tok_s);
             Some(AliasCandidate {
                 model_id: raw.model_id.clone(),
                 q,
                 a: raw.a.unwrap_or(0.0),
-                r: raw.r.unwrap_or(0.0),
+                r,
             })
         })
         .collect()
@@ -478,6 +577,9 @@ pub fn rank(candidates: &[AliasCandidate], weights: BlendWeights) -> Vec<ScoredC
             ScoredCandidate {
                 model_id: c.model_id.clone(),
                 score,
+                q_raw: c.q,
+                a_raw: c.a,
+                r_raw: c.r,
                 q_norm,
                 a_norm,
                 r_norm,
@@ -552,23 +654,37 @@ pub struct TierPlan {
     pub current: Option<String>,
 }
 
+/// One tier's full decision: the repoint plus the ranked candidate list it was
+/// derived from (for the FIX D audit log — every candidate's q/a/r and score).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TierDecision {
+    pub key: String,
+    pub repoint: Repoint,
+    pub ranked: Vec<ScoredCandidate>,
+}
+
 /// Compute the repoint decision for every tier from one shared raw-signal set.
 /// The gates are identical across tiers (they don't depend on the weights); only
 /// the blend/ranking differs per tier's weights. Pure — the whole
-/// decision core is testable without any I/O.
+/// decision core is testable without any I/O. Returns each tier's ranked list so
+/// the caller can log the full selection rationale.
 pub fn plan_repoints(
     raws: &[RawSignal],
     eligible: Option<&HashSet<String>>,
     cfg: &AliasUpdaterConfig,
     tiers: &[TierPlan],
-) -> Vec<(String, Repoint)> {
-    let candidates = gate_and_build(raws, eligible, cfg.min_quality);
+) -> Vec<TierDecision> {
+    let candidates = gate_and_build(raws, eligible, cfg.min_quality, cfg.r_saturation_tok_s);
     tiers
         .iter()
         .map(|tier| {
             let ranked = rank(&candidates, tier.weights);
             let repoint = select_target(&ranked, tier.current.as_deref(), cfg.switch_margin);
-            (tier.key.clone(), repoint)
+            TierDecision {
+                key: tier.key.clone(),
+                repoint,
+                ranked,
+            }
         })
         .collect()
 }
@@ -687,13 +803,19 @@ impl AssistantAliasSource for DbAssistantAliasSource {
 // Live orchestration
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Compute the eligible (servable & has-a-usable-backend) model-id set, given a
-/// non-empty `servable` name set and the serving RoutingMap, restricted to the
+/// Compute the eligible model-id set, given the registry `sizes` map (name →
+/// `size_bytes`), the serving RoutingMap, and the size floor, restricted to the
 /// models we actually have signals for.
 ///
-/// Gate (a) servable: the registry must know the model (the caller guarantees a
-/// non-empty `servable` — an empty/not-ready registry is handled upstream by
-/// keeping the current targets, never by scoring unservable models).
+/// Gate (a) servable: the registry must know the model — presence in `sizes`
+/// (the caller guarantees a non-empty registry; an empty/not-ready registry is
+/// handled upstream by keeping the current targets, never by scoring unservable
+/// models).
+///
+/// Gate (SIZE — metric-v2 FIX A, the PRIMARY capability gate): the model's
+/// registry `size_bytes` must be `>= min_size_bytes`. A model with unknown/zero
+/// size is EXCLUDED (fail-safe — never promote an unsized model). This is what
+/// keeps a 0.5B model from ever being scored, let alone winning.
 ///
 /// Gate (b) arch-exclusion — evaluated across the model's FULL backend set, not a
 /// single row: a model is dropped ONLY when it is arch-excluded on ALL of its
@@ -705,7 +827,8 @@ impl AssistantAliasSource for DbAssistantAliasSource {
 /// winner is still excluded (⇒ every known backend is excluded).
 fn compute_eligible(
     raws: &[RawSignal],
-    servable: &HashSet<String>,
+    sizes: &HashMap<String, u64>,
+    min_size_bytes: u64,
     rmap: &crate::serving::profile::RoutingMap,
 ) -> HashSet<String> {
     use terminus_rs::intake::serving::{ExclusionReason, ModelId};
@@ -713,7 +836,18 @@ fn compute_eligible(
     raws.iter()
         .filter_map(|raw| {
             // (a) servable per the registry.
-            if !servable.contains(&raw.model_id) {
+            let size = match sizes.get(&raw.model_id) {
+                Some(&s) => s,
+                None => return None,
+            };
+            // (SIZE) hard capability gate — unknown/zero or too-small ⇒ excluded.
+            if size == 0 || size < min_size_bytes {
+                tracing::debug!(
+                    "lumina alias updater: '{}' excluded by size gate ({} bytes < {} min)",
+                    raw.model_id,
+                    size,
+                    min_size_bytes
+                );
                 return None;
             }
             // (b) usable on at least one backend.
@@ -770,11 +904,15 @@ pub async fn run_alias_refresh_tick(
     // servable — scoring then risks pointing a lumina alias at a model Chord
     // can't start. Fail-safe: keep the current targets, same posture as the
     // empty-candidate / DB-down paths.
-    let servable: HashSet<String> = {
+    // Registry name → size_bytes: powers BOTH servability (presence) and the
+    // metric-v2 size gate (FIX A).
+    let sizes: HashMap<String, u64> = {
         let reg = registry.lock().await;
-        reg.all_records().map(|r| r.name.clone()).collect()
+        reg.all_records()
+            .map(|r| (r.name.clone(), r.size_bytes))
+            .collect()
     };
-    if servable.is_empty() {
+    if sizes.is_empty() {
         tracing::warn!(
             "lumina alias updater: model registry not ready (no records) — keeping current \
              lumina targets"
@@ -785,8 +923,16 @@ pub async fn run_alias_refresh_tick(
     // Snapshot the routing map (drop the lock before any store writes).
     let eligible = {
         let rmap = routing.lock().await;
-        compute_eligible(&raws, &servable, &rmap)
+        compute_eligible(&raws, &sizes, cfg.min_size_bytes, &rmap)
     };
+    tracing::info!(
+        "lumina alias updater: {} raw signal(s), {} eligible after gates (min_size={} bytes, \
+         r_saturation={} tok/s)",
+        raws.len(),
+        eligible.len(),
+        cfg.min_size_bytes,
+        cfg.r_saturation_tok_s
+    );
 
     let tiers = vec![
         TierPlan {
@@ -806,7 +952,30 @@ pub async fn run_alias_refresh_tick(
         },
     ];
 
-    for (key, repoint) in plan_repoints(&raws, Some(&eligible), cfg, &tiers) {
+    for decision in plan_repoints(&raws, Some(&eligible), cfg, &tiers) {
+        let TierDecision {
+            key,
+            repoint,
+            ranked,
+        } = decision;
+
+        // FIX D: full per-candidate audit so the operator can verify the live pick
+        // is sane. Every candidate's raw + normalized q/a/r and final score.
+        for (rank_idx, sc) in ranked.iter().enumerate() {
+            tracing::debug!(
+                "lumina alias '{key}' cand #{rank_idx} {}: score={:.3} \
+                 q(raw={:.1},norm={:.3}) a(raw={:.3},norm={:.3}) r(raw={:.1},norm={:.3})",
+                sc.model_id,
+                sc.score,
+                sc.q_raw,
+                sc.q_norm,
+                sc.a_raw,
+                sc.a_norm,
+                sc.r_raw,
+                sc.r_norm,
+            );
+        }
+
         match repoint {
             Repoint::Switch {
                 from,
@@ -815,11 +984,31 @@ pub async fn run_alias_refresh_tick(
                 ..
             } => {
                 store.set(&key, to.clone());
-                tracing::info!(
-                    "lumina alias '{key}' repointed: {} -> {} (score {new_score:.3})",
-                    from.as_deref().unwrap_or("<unset>"),
-                    to
-                );
+                // INFO rationale: the winning candidate's full breakdown so a live
+                // repoint is verifiable without DEBUG logging enabled.
+                let winner = ranked.iter().find(|s| s.model_id == to);
+                match winner {
+                    Some(w) => tracing::info!(
+                        "lumina alias '{key}' repointed: {} -> {} | score={:.3} \
+                         q(raw={:.1},norm={:.3}) a(raw={:.3},norm={:.3}) r(raw={:.1},norm={:.3}) \
+                         [{} candidate(s)]",
+                        from.as_deref().unwrap_or("<unset>"),
+                        to,
+                        new_score,
+                        w.q_raw,
+                        w.q_norm,
+                        w.a_raw,
+                        w.a_norm,
+                        w.r_raw,
+                        w.r_norm,
+                        ranked.len(),
+                    ),
+                    None => tracing::info!(
+                        "lumina alias '{key}' repointed: {} -> {} (score {new_score:.3})",
+                        from.as_deref().unwrap_or("<unset>"),
+                        to
+                    ),
+                }
             }
             Repoint::Keep { reason } => {
                 tracing::debug!("lumina alias '{key}' unchanged: {reason}");
@@ -884,7 +1073,7 @@ mod tests {
             raw("winner", Some(5.0), Some(5.0), Some(100.0), true),
             raw("loser", Some(3.0), Some(3.0), Some(10.0), true),
         ];
-        let cands = gate_and_build(&raws, None, 0.0);
+        let cands = gate_and_build(&raws, None, 0.0, f64::INFINITY);
         let ranked = rank(
             &cands,
             BlendWeights {
@@ -901,11 +1090,16 @@ mod tests {
 
     #[test]
     fn fast_and_deep_weights_pick_different_winners() {
-        // `fast_model`: slightly-lower quality but MUCH faster.
-        // `deep_model`: highest quality but slow.
+        // metric-v2 is q-heavy, so divergence needs a genuine near-tie in quality
+        // that the small responsiveness weight can tip on the fast tier but not the
+        // deep tier. `fast_model` is only slightly lower quality but faster (r
+        // stays UNDER the 40 tok/s saturation so it still differentiates);
+        // `deep_model` is the quality leader but slow; `filler` spreads the
+        // normalization so q_norm isn't a degenerate 0/1.
         let raws = vec![
-            raw("fast_model", Some(4.0), Some(4.0), Some(120.0), true),
-            raw("deep_model", Some(5.0), Some(4.0), Some(10.0), true),
+            raw("fast_model", Some(85.0), Some(4.0), Some(40.0), true),
+            raw("deep_model", Some(100.0), Some(4.0), Some(10.0), true),
+            raw("filler", Some(1.0), Some(4.0), Some(10.0), true),
         ];
         let cfg = AliasUpdaterConfig::default();
         let tiers = vec![
@@ -922,8 +1116,8 @@ mod tests {
         ];
         let plans = plan_repoints(&raws, None, &cfg, &tiers);
 
-        let fast = &plans[0].1;
-        let deep = &plans[1].1;
+        let fast = &plans[0].repoint;
+        let deep = &plans[1].repoint;
         match fast {
             Repoint::Switch { to, .. } => {
                 assert_eq!(
@@ -948,10 +1142,14 @@ mod tests {
 
     #[test]
     fn hysteresis_holds_within_margin() {
-        // current = "b"; top = "a" but only marginally better than "b".
+        // current = "b"; top = "a" but only marginally better. A `filler` spreads
+        // the q normalization so "a" and "b" land at 1.0 vs ~0.98 (a genuine
+        // near-tie in score) rather than the degenerate 0/1 a 2-candidate min-max
+        // would force. Equal a/r keep the difference purely in q.
         let raws = vec![
-            raw("a", Some(4.10), Some(4.0), Some(100.0), true),
-            raw("b", Some(4.00), Some(4.0), Some(99.0), true),
+            raw("a", Some(100.0), Some(4.0), Some(30.0), true),
+            raw("b", Some(98.0), Some(4.0), Some(30.0), true),
+            raw("filler", Some(1.0), Some(4.0), Some(30.0), true),
         ];
         let cfg = AliasUpdaterConfig {
             switch_margin: 0.50, // large margin → a's tiny edge can't clear it
@@ -964,9 +1162,9 @@ mod tests {
         }];
         let plans = plan_repoints(&raws, None, &cfg, &tiers);
         assert!(
-            matches!(plans[0].1, Repoint::Keep { .. }),
+            matches!(plans[0].repoint, Repoint::Keep { .. }),
             "within-margin near-tie must NOT switch (got {:?})",
-            plans[0].1
+            plans[0].repoint
         );
     }
 
@@ -986,7 +1184,7 @@ mod tests {
             current: Some("b".into()),
         }];
         let plans = plan_repoints(&raws, None, &cfg, &tiers);
-        match &plans[0].1 {
+        match &plans[0].repoint {
             Repoint::Switch { from, to, .. } => {
                 assert_eq!(from.as_deref(), Some("b"));
                 assert_eq!(to, "a");
@@ -1005,7 +1203,7 @@ mod tests {
             current: Some("a".into()),
         }];
         let plans = plan_repoints(&raws, None, &cfg, &tiers);
-        assert!(matches!(plans[0].1, Repoint::Keep { .. }));
+        assert!(matches!(plans[0].repoint, Repoint::Keep { .. }));
     }
 
     // ── Gates ──────────────────────────────────────────────────────────────────
@@ -1016,7 +1214,7 @@ mod tests {
             raw("guarded_out", Some(5.0), Some(5.0), Some(100.0), false),
             raw("ok", Some(4.0), Some(4.0), Some(50.0), true),
         ];
-        let cands = gate_and_build(&raws, None, 0.0);
+        let cands = gate_and_build(&raws, None, 0.0, f64::INFINITY);
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].model_id, "ok");
     }
@@ -1027,7 +1225,7 @@ mod tests {
             raw("too_low", Some(2.5), Some(5.0), Some(100.0), true),
             raw("ok", Some(3.5), Some(4.0), Some(50.0), true),
         ];
-        let cands = gate_and_build(&raws, None, 3.0);
+        let cands = gate_and_build(&raws, None, 3.0, f64::INFINITY);
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].model_id, "ok");
     }
@@ -1036,7 +1234,7 @@ mod tests {
     fn gate_drops_models_without_quality_data() {
         // No q value at all → cannot clear the floor, dropped.
         let raws = vec![raw("no_q", None, Some(5.0), Some(100.0), true)];
-        let cands = gate_and_build(&raws, None, 0.0);
+        let cands = gate_and_build(&raws, None, 0.0, f64::INFINITY);
         assert!(cands.is_empty());
     }
 
@@ -1050,7 +1248,7 @@ mod tests {
         ];
         let mut eligible = HashSet::new();
         eligible.insert("servable".to_string());
-        let cands = gate_and_build(&raws, Some(&eligible), 0.0);
+        let cands = gate_and_build(&raws, Some(&eligible), 0.0, f64::INFINITY);
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].model_id, "servable");
     }
@@ -1069,7 +1267,7 @@ mod tests {
         }];
         let plans = plan_repoints(&raws, None, &cfg, &tiers);
         assert!(
-            matches!(plans[0].1, Repoint::Keep { .. }),
+            matches!(plans[0].repoint, Repoint::Keep { .. }),
             "no candidates must keep the current target, never blank it"
         );
     }
@@ -1085,7 +1283,7 @@ mod tests {
             current: Some("stale".into()),
         }];
         let plans = plan_repoints(&raws, None, &cfg, &tiers);
-        match &plans[0].1 {
+        match &plans[0].repoint {
             Repoint::Switch {
                 from,
                 to,
@@ -1273,12 +1471,14 @@ mod tests {
             raw("dead", Some(60.0), Some(4.5), Some(90.0), true),
             raw("unprofiled", Some(40.0), Some(3.5), Some(70.0), true),
         ];
-        let servable: HashSet<String> = ["mixed", "dead", "unprofiled"]
+        // All three are large enough to clear the size gate (the arch behaviour is
+        // what this test exercises).
+        let sizes: HashMap<String, u64> = ["mixed", "dead", "unprofiled"]
             .iter()
-            .map(|s| s.to_string())
+            .map(|s| (s.to_string(), 30_000_000_000u64))
             .collect();
 
-        let eligible = compute_eligible(&raws, &servable, &rmap);
+        let eligible = compute_eligible(&raws, &sizes, 5_000_000_000, &rmap);
         assert!(
             eligible.contains("mixed"),
             "a model usable on ONE backend must survive arch-exclusion"
@@ -1298,14 +1498,161 @@ mod tests {
         use crate::serving::profile::RoutingMap;
         let rmap = RoutingMap::empty();
         let raws = vec![raw("known", Some(50.0), Some(4.0), Some(80.0), true)];
-        // "known" is NOT in the servable set → dropped even with clean routing.
-        let servable: HashSet<String> = HashSet::new();
-        // (compute_eligible itself never sees an empty registry live — the tick
-        // bails first — but the servability filter must still hold here.)
-        let eligible = compute_eligible(&raws, &servable, &rmap);
+        // "known" is NOT in the registry sizes map → dropped even with clean routing.
+        let sizes: HashMap<String, u64> = HashMap::new();
+        let eligible = compute_eligible(&raws, &sizes, 5_000_000_000, &rmap);
         assert!(
             eligible.is_empty(),
             "non-servable models must be filtered out"
+        );
+    }
+
+    // ── metric-v2 FIX A: size/capability gate ──────────────────────────────────
+
+    #[test]
+    fn size_gate_excludes_tiny_and_unsized_models() {
+        use crate::serving::profile::RoutingMap;
+        let rmap = RoutingMap::empty();
+        let raws = vec![
+            raw("granite4.1:30b", Some(489.0), Some(4.0), Some(25.0), true),
+            raw("qwen2.5:0.5b", Some(344.0), Some(4.0), Some(400.0), true),
+            raw("unsized:xb", Some(999.0), Some(5.0), Some(50.0), true),
+        ];
+        let mut sizes: HashMap<String, u64> = HashMap::new();
+        sizes.insert("granite4.1:30b".into(), 18_000_000_000); // ~18 GB
+        sizes.insert("qwen2.5:0.5b".into(), 400_000_000); // ~0.4 GB
+        sizes.insert("unsized:xb".into(), 0); // unknown/zero size
+
+        let eligible = compute_eligible(&raws, &sizes, 5_000_000_000, &rmap);
+        assert!(
+            eligible.contains("granite4.1:30b"),
+            "a capable ~30B model must survive the size gate"
+        );
+        assert!(
+            !eligible.contains("qwen2.5:0.5b"),
+            "a 0.5B model must be excluded by the size gate — it must never win"
+        );
+        assert!(
+            !eligible.contains("unsized:xb"),
+            "an unknown/zero-size model must be excluded (fail-safe)"
+        );
+    }
+
+    #[test]
+    fn tiny_high_count_model_excluded_granite_wins_both_tiers() {
+        // End-to-end metric-v2 regression: a qwen2.5:0.5b-shaped input (tiny size,
+        // deceptively-high q, MAX responsiveness) must be EXCLUDED, and a
+        // granite-shaped input (large size, high per-answer q, modest speed) must
+        // WIN both the fast and deep tiers.
+        use crate::serving::profile::RoutingMap;
+        let rmap = RoutingMap::empty();
+        let raws = vec![
+            raw("granite4.1:30b", Some(489.0), Some(4.5), Some(25.0), true),
+            raw("qwen2.5:0.5b", Some(344.0), Some(4.5), Some(400.0), true),
+        ];
+        let mut sizes: HashMap<String, u64> = HashMap::new();
+        sizes.insert("granite4.1:30b".into(), 18_000_000_000);
+        sizes.insert("qwen2.5:0.5b".into(), 400_000_000);
+
+        let eligible = compute_eligible(&raws, &sizes, 5_000_000_000, &rmap);
+        assert!(
+            !eligible.contains("qwen2.5:0.5b"),
+            "0.5B excluded pre-scoring"
+        );
+
+        let cfg = AliasUpdaterConfig::default();
+        let tiers = vec![
+            TierPlan {
+                key: "lumina-fast".into(),
+                weights: cfg.fast_weights,
+                current: None,
+            },
+            TierPlan {
+                key: "lumina-deep".into(),
+                weights: cfg.deep_weights,
+                current: None,
+            },
+        ];
+        let plans = plan_repoints(&raws, Some(&eligible), &cfg, &tiers);
+        for plan in &plans {
+            match &plan.repoint {
+                Repoint::Switch { to, .. } => assert_eq!(
+                    to, "granite4.1:30b",
+                    "the capable model must win tier '{}', never the tiny one",
+                    plan.key
+                ),
+                other => panic!("expected {} to switch to granite, got {other:?}", plan.key),
+            }
+            // The tiny model must not even appear in the ranked set.
+            assert!(
+                plan.ranked.iter().all(|s| s.model_id != "qwen2.5:0.5b"),
+                "qwen2.5:0.5b must never be a scored candidate"
+            );
+        }
+    }
+
+    // ── metric-v2 FIX C: responsiveness saturation ─────────────────────────────
+
+    #[test]
+    fn responsiveness_saturates_so_tiny_fast_gets_no_runaway_bonus() {
+        // Two capable models: "solid" is high-q and fast-enough (45 tok/s);
+        // "speedy" is lower-q but blazing (400 tok/s). With saturation at 40 tok/s
+        // both hit the r ceiling, so r cannot rescue the weaker model.
+        let raws = vec![
+            raw("solid", Some(480.0), Some(4.5), Some(45.0), true),
+            raw("speedy", Some(300.0), Some(4.0), Some(400.0), true),
+        ];
+        let cfg = AliasUpdaterConfig::default(); // r_saturation 40, fast 0.55/0.30/0.15
+        let cands = gate_and_build(&raws, None, 0.0, cfg.r_saturation_tok_s);
+        // Both r's are capped at 40 → equal → r_norm degenerate (0.5 each), so the
+        // blend is decided by q/a where "solid" dominates.
+        let solid = cands.iter().find(|c| c.model_id == "solid").unwrap();
+        let speedy = cands.iter().find(|c| c.model_id == "speedy").unwrap();
+        assert_eq!(
+            solid.r, 40.0,
+            "solid's 45 tok/s saturates to the 40 ceiling"
+        );
+        assert_eq!(
+            speedy.r, 40.0,
+            "speedy's 400 tok/s saturates to the 40 ceiling"
+        );
+        let ranked = rank(&cands, cfg.fast_weights);
+        assert_eq!(
+            ranked[0].model_id, "solid",
+            "q wins once speed is saturated"
+        );
+    }
+
+    // ── metric-v2 FIX D: single-candidate must still pass all gates ─────────────
+
+    #[test]
+    fn single_candidate_selected_only_if_it_passes_gates() {
+        use crate::serving::profile::RoutingMap;
+        let rmap = RoutingMap::empty();
+        // Only a tiny model is available → size gate empties the candidate set →
+        // keep current (never promote the 0.5B model just because it's the only one).
+        let raws = vec![raw(
+            "qwen2.5:0.5b",
+            Some(344.0),
+            Some(4.5),
+            Some(400.0),
+            true,
+        )];
+        let mut sizes: HashMap<String, u64> = HashMap::new();
+        sizes.insert("qwen2.5:0.5b".into(), 400_000_000);
+        let eligible = compute_eligible(&raws, &sizes, 5_000_000_000, &rmap);
+        assert!(eligible.is_empty());
+
+        let cfg = AliasUpdaterConfig::default();
+        let tiers = vec![TierPlan {
+            key: "lumina".into(),
+            weights: cfg.fast_weights,
+            current: Some("granite4.1:30b".into()),
+        }];
+        let plans = plan_repoints(&raws, Some(&eligible), &cfg, &tiers);
+        assert!(
+            matches!(plans[0].repoint, Repoint::Keep { .. }),
+            "a lone sub-threshold candidate must NOT be adopted — keep current"
         );
     }
 
@@ -1317,6 +1664,8 @@ mod tests {
         let keys = [
             "CHORD_ALIAS_REFRESH_SECS",
             "CHORD_ALIAS_MIN_QUALITY",
+            "CHORD_ALIAS_MIN_SIZE_BYTES",
+            "CHORD_ALIAS_R_SATURATION_TOK_S",
             "CHORD_ALIAS_SWITCH_MARGIN",
             "CHORD_ALIAS_W_FAST_Q",
             "CHORD_ALIAS_W_FAST_A",
@@ -1328,12 +1677,13 @@ mod tests {
         for k in keys {
             std::env::remove_var(k);
         }
-        // Invalid values: NaN, negative, and a zero/too-small refresh interval.
+        // Invalid values: NaN, negative, zero, and a zero/too-small interval.
         std::env::set_var("CHORD_ALIAS_REFRESH_SECS", "0"); // → floored to MIN_REFRESH_SECS
         std::env::set_var("CHORD_ALIAS_W_FAST_Q", "NaN"); // → default
         std::env::set_var("CHORD_ALIAS_W_FAST_A", "-1.0"); // → default
         std::env::set_var("CHORD_ALIAS_W_DEEP_Q", "inf"); // → default
         std::env::set_var("CHORD_ALIAS_SWITCH_MARGIN", "-0.5"); // → default
+        std::env::set_var("CHORD_ALIAS_R_SATURATION_TOK_S", "0"); // → default (must be > 0)
 
         let cfg = AliasUpdaterConfig::from_env();
         let def = AliasUpdaterConfig::default();
@@ -1341,6 +1691,10 @@ mod tests {
         assert_eq!(
             cfg.refresh_secs, MIN_REFRESH_SECS,
             "0 refresh floored, never panics interval"
+        );
+        assert_eq!(
+            cfg.r_saturation_tok_s, def.r_saturation_tok_s,
+            "zero saturation → default (never zero-out responsiveness)"
         );
         assert_eq!(
             cfg.fast_weights.q, def.fast_weights.q,
