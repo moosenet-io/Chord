@@ -61,6 +61,10 @@ tokio-stream = "0.1"
 futures-util = "0.3"
 terminus-rs = { version = "1.3.1", registry = "gitea" }
 once_cell = "1"
+# CHRD-91390429: lock-free hot-swap of the dynamic lumina proxy alias targets
+# (the chat hot-path reads via ArcSwap::load, never blocking inference on the
+# background alias updater). See src/routing/lumina_alias.rs.
+arc-swap = "1"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid"], default-features = false }
 # PROMEX-02: application-level Prometheus metrics exporter (see src/metrics.rs),
 # mirroring the reference pattern merged in terminus-rs (PROMEX-01).
