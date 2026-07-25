@@ -25,9 +25,11 @@
 //!     model that is otherwise mediocre across its measured configs).
 //!   - `a` = the dim-5 behavioral / prompted-adherence mean — the exact signal
 //!     the already-built [`reporting::select_chat_role`] ranks by. Aggregated
-//!     per model by the **max** across its backend rows (a model's best measured
-//!     adherence). This is composed INTO the blend rather than discarded, so
-//!     both the operator's metric AND the built code's metric contribute.
+//!     per model by the **max across its GUARD-ELIGIBLE rows only** (never a
+//!     global max — an excluded backend's adherence must not stand in for the
+//!     eligible one that actually qualifies the model). Composed INTO the blend
+//!     rather than discarded, so both the operator's metric AND the built code's
+//!     metric contribute.
 //!   - `r` = responsiveness (tokens/sec) from `model_operational_profiles`
 //!     (`throughput_at_2k`, falling back to the next-larger measured tier) —
 //!     higher tok/s ⇒ higher `r`.
@@ -173,9 +175,12 @@ pub struct BlendWeights {
 pub struct AliasUpdaterConfig {
     /// `CHORD_ALIAS_REFRESH_SECS` — tick interval (default 900).
     pub refresh_secs: u64,
-    /// `CHORD_ALIAS_MIN_QUALITY` — minimum `assistant_avg_value` (1..5 scale) a
-    /// candidate must reach to be eligible (gate d). Default 3.0 (above the
-    /// midpoint of the 1..5 assistant-value scale).
+    /// `CHORD_ALIAS_MIN_QUALITY` — minimum RAW `assistant_avg_value` a candidate
+    /// must reach (gate d). `assistant_avg_value` is UN-normalized (observed in
+    /// the hundreds, e.g. granite4.1 ≈ 489), so a meaningful threshold depends on
+    /// the live distribution and cannot be known at build time. **Default 0.0 =
+    /// DISABLED** (no quality filtering); an operator sets a real raw value (e.g.
+    /// 50) from the observed distribution to exclude weak models.
     pub min_quality: f64,
     /// `CHORD_ALIAS_SWITCH_MARGIN` — hysteresis margin (default 0.05).
     pub switch_margin: f64,
@@ -185,37 +190,53 @@ pub struct AliasUpdaterConfig {
     pub deep_weights: BlendWeights,
 }
 
-fn env_f64(key: &str, default: f64) -> f64 {
-    std::env::var(key)
+/// Lower bound on the refresh interval. `tokio::time::interval` PANICS on a
+/// zero period, and a sub-minute alias flap makes no sense for a slow-moving
+/// assistant ranking — so any smaller/zero value is floored to this.
+const MIN_REFRESH_SECS: u64 = 60;
+
+/// Parse a non-negative, finite f64 env value; anything malformed, NaN, ±inf, or
+/// negative falls back to `default` (a NaN/inf/negative weight would corrupt or
+/// invert the blend; a negative margin would defeat hysteresis).
+fn env_nonneg_f64(key: &str, default: f64) -> f64 {
+    match std::env::var(key)
         .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(default)
+        .and_then(|v| v.trim().parse::<f64>().ok())
+    {
+        Some(v) if v.is_finite() && v >= 0.0 => v,
+        _ => default,
+    }
 }
 
-fn env_u64(key: &str, default: u64) -> u64 {
+/// Parse the refresh interval, floored to [`MIN_REFRESH_SECS`] so a `0`/tiny
+/// value can never panic `tokio::time::interval`.
+fn env_refresh_secs(key: &str, default: u64) -> u64 {
     std::env::var(key)
         .ok()
-        .and_then(|v| v.trim().parse().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(default)
+        .max(MIN_REFRESH_SECS)
 }
 
 impl AliasUpdaterConfig {
     /// Read the config from the environment, applying the documented defaults for
-    /// any unset/malformed var.
+    /// any unset/malformed/invalid var (see [`env_nonneg_f64`] /
+    /// [`env_refresh_secs`] — invalid weights/margins fall back to defaults, the
+    /// interval is floored).
     pub fn from_env() -> Self {
         AliasUpdaterConfig {
-            refresh_secs: env_u64("CHORD_ALIAS_REFRESH_SECS", 900),
-            min_quality: env_f64("CHORD_ALIAS_MIN_QUALITY", 3.0),
-            switch_margin: env_f64("CHORD_ALIAS_SWITCH_MARGIN", 0.05),
+            refresh_secs: env_refresh_secs("CHORD_ALIAS_REFRESH_SECS", 900),
+            min_quality: env_nonneg_f64("CHORD_ALIAS_MIN_QUALITY", 0.0),
+            switch_margin: env_nonneg_f64("CHORD_ALIAS_SWITCH_MARGIN", 0.05),
             fast_weights: BlendWeights {
-                q: env_f64("CHORD_ALIAS_W_FAST_Q", 0.40),
-                a: env_f64("CHORD_ALIAS_W_FAST_A", 0.30),
-                r: env_f64("CHORD_ALIAS_W_FAST_R", 0.30),
+                q: env_nonneg_f64("CHORD_ALIAS_W_FAST_Q", 0.40),
+                a: env_nonneg_f64("CHORD_ALIAS_W_FAST_A", 0.30),
+                r: env_nonneg_f64("CHORD_ALIAS_W_FAST_R", 0.30),
             },
             deep_weights: BlendWeights {
-                q: env_f64("CHORD_ALIAS_W_DEEP_Q", 0.60),
-                a: env_f64("CHORD_ALIAS_W_DEEP_A", 0.30),
-                r: env_f64("CHORD_ALIAS_W_DEEP_R", 0.10),
+                q: env_nonneg_f64("CHORD_ALIAS_W_DEEP_Q", 0.60),
+                a: env_nonneg_f64("CHORD_ALIAS_W_DEEP_A", 0.30),
+                r: env_nonneg_f64("CHORD_ALIAS_W_DEEP_R", 0.10),
             },
         }
     }
@@ -225,7 +246,7 @@ impl Default for AliasUpdaterConfig {
     fn default() -> Self {
         AliasUpdaterConfig {
             refresh_secs: 900,
-            min_quality: 3.0,
+            min_quality: 0.0,
             switch_margin: 0.05,
             fast_weights: BlendWeights {
                 q: 0.40,
@@ -252,10 +273,17 @@ pub struct RawSignal {
     pub model_id: String,
     /// Aggregated `assistant_avg_value` (mean of the model's `model_dual_profile`
     /// rows). `None` ⇒ no assistant-value data (fails the quality floor).
-    pub q: Option<f64>,
-    /// dim-5 behavioral/prompted-adherence mean (max across backend rows).
+    pub q: Option<f64>, // RAW `assistant_avg_value` scale (un-normalized; ~hundreds).
+    /// dim-5 behavioral/prompted-adherence mean, taken from a GUARD-ELIGIBLE
+    /// backend row (max across the model's eligible rows only). Sourcing `a` from
+    /// an eligible row — rather than a global max that could come from an
+    /// excluded/ineligible backend — keeps it consistent with the backend that
+    /// actually makes the model a candidate. `None` ⇒ no eligible row.
     pub a: Option<f64>,
-    /// Responsiveness (tokens/sec) from `model_operational_profiles`.
+    /// Responsiveness (tokens/sec) from `model_operational_profiles`. This table
+    /// carries NO backend dimension (it is keyed per model_profile), so `r` is a
+    /// model-level signal — unlike `a`/`guard`, it cannot be tied to a specific
+    /// eligible backend. Documented limitation.
     pub r: Option<f64>,
     /// Whether the model cleared `select_chat_role`'s latency/degradation guard.
     pub guard_eligible: bool,
@@ -297,9 +325,10 @@ pub enum Repoint {
 
 /// Extract per-model [`RawSignal`]s from a built [`AssistantReport`] and a
 /// responsiveness map. Pure. `q` is the MEAN of the model's assistant-profiled
-/// `model_dual_profile` rows; `a` is the MAX behavioral_mean across the model's
-/// chat-role candidate rows; `guard_eligible` is true if ANY chat-role row for
-/// the model cleared the guard.
+/// `model_dual_profile` rows (RAW `assistant_avg_value` scale); `a` is the MAX
+/// behavioral_mean across the model's GUARD-ELIGIBLE chat-role rows only (so an
+/// excluded backend's adherence can't stand in for the eligible one);
+/// `guard_eligible` is true if ANY chat-role row for the model cleared the guard.
 pub fn extract_raw_signals(
     report: &AssistantReport,
     responsiveness: &HashMap<String, f64>,
@@ -316,18 +345,24 @@ pub fn extract_raw_signals(
         }
     }
 
-    // a: max behavioral_mean per model; guard: any Eligible verdict per model.
-    let mut a_max: HashMap<String, f64> = HashMap::new();
+    // a: max behavioral_mean over the model's GUARD-ELIGIBLE rows ONLY (not a
+    // global max — a high-adherence but EXCLUDED backend row must not inflate a
+    // model that only actually qualifies via a different, lower-adherence
+    // backend). guard: any Eligible verdict per model.
+    let mut a_eligible_max: HashMap<String, f64> = HashMap::new();
     let mut guard_ok: HashMap<String, bool> = HashMap::new();
     for cand in &report.chat_role.candidates {
-        let a = a_max
-            .entry(cand.key.model_id.clone())
-            .or_insert(f64::NEG_INFINITY);
-        if cand.behavioral_mean > *a {
-            *a = cand.behavioral_mean;
+        let is_eligible = matches!(cand.verdict, GuardVerdict::Eligible);
+        if is_eligible {
+            let a = a_eligible_max
+                .entry(cand.key.model_id.clone())
+                .or_insert(f64::NEG_INFINITY);
+            if cand.behavioral_mean > *a {
+                *a = cand.behavioral_mean;
+            }
         }
         let g = guard_ok.entry(cand.key.model_id.clone()).or_insert(false);
-        if matches!(cand.verdict, GuardVerdict::Eligible) {
+        if is_eligible {
             *g = true;
         }
     }
@@ -335,7 +370,7 @@ pub fn extract_raw_signals(
     // Deterministic union of every model id we have any signal for.
     let mut ids: BTreeSet<String> = BTreeSet::new();
     ids.extend(q_acc.keys().cloned());
-    ids.extend(a_max.keys().cloned());
+    ids.extend(guard_ok.keys().cloned());
 
     ids.into_iter()
         .map(|model_id| {
@@ -343,7 +378,11 @@ pub fn extract_raw_signals(
                 q_acc
                     .get(&model_id)
                     .and_then(|(sum, n)| if *n > 0 { Some(*sum / *n as f64) } else { None });
-            let a = a_max.get(&model_id).copied().filter(|v| v.is_finite());
+            // `a` from an eligible row only (see above).
+            let a = a_eligible_max
+                .get(&model_id)
+                .copied()
+                .filter(|v| v.is_finite());
             let r = responsiveness.get(&model_id).copied();
             let guard_eligible = guard_ok.get(&model_id).copied().unwrap_or(false);
             RawSignal {
@@ -360,21 +399,25 @@ pub fn extract_raw_signals(
 /// Apply the candidate gates and produce concrete-valued candidates.
 ///
 /// Gates: (a+b) `eligible` membership — servable & not arch-excluded — computed
-/// by the live caller from the registry + RoutingMap (an EMPTY `eligible` set
-/// SKIPS this gate, mirroring [`super::assistant_profile::decide_chat_role`]'s
-/// empty-`known_models` convention, so unit tests can inject candidates without
-/// a registry); (c) the chat-role guard (`guard_eligible`); (d) the quality
-/// floor `min_quality` on `q` (a model with no `q` at all is dropped).
+/// by the live caller from the registry + RoutingMap. `eligible` is an
+/// `Option`: `Some(set)` ALWAYS filters (even an empty set drops everything —
+/// the live path relies on this so an empty eligible set can't leak unservable
+/// models); `None` disables the gate entirely (unit-test convenience only, never
+/// used on the live path). (c) the chat-role guard (`guard_eligible`); (d) the
+/// RAW-scale quality floor `min_quality` on `q` — a model with no `q` at all is
+/// dropped (can't assess quality); the floor is disabled by default (0.0).
 pub fn gate_and_build(
     raws: &[RawSignal],
-    eligible: &HashSet<String>,
+    eligible: Option<&HashSet<String>>,
     min_quality: f64,
 ) -> Vec<AliasCandidate> {
     raws.iter()
         .filter_map(|raw| {
-            // (a+b) servable & not arch-excluded.
-            if !eligible.is_empty() && !eligible.contains(&raw.model_id) {
-                return None;
+            // (a+b) servable & not arch-excluded — Some(set) always filters.
+            if let Some(set) = eligible {
+                if !set.contains(&raw.model_id) {
+                    return None;
+                }
             }
             // (c) chat-role latency/degradation guard.
             if !raw.guard_eligible {
@@ -515,7 +558,7 @@ pub struct TierPlan {
 /// decision core is testable without any I/O.
 pub fn plan_repoints(
     raws: &[RawSignal],
-    eligible: &HashSet<String>,
+    eligible: Option<&HashSet<String>>,
     cfg: &AliasUpdaterConfig,
     tiers: &[TierPlan],
 ) -> Vec<(String, Repoint)> {
@@ -644,42 +687,47 @@ impl AssistantAliasSource for DbAssistantAliasSource {
 // Live orchestration
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Compute the eligible (servable & not-arch-excluded) model-id set from the
-/// live registry + serving RoutingMap, restricted to the models we actually have
-/// signals for. Gate (a): the registry must know the model (an empty registry —
-/// not yet loaded — skips this filter rather than dropping everything). Gate (b):
-/// the RoutingMap's winning row for the model must not be arch-excluded (a model
-/// excluded on all backends resolves to an excluded winning row).
-async fn compute_eligible(
+/// Compute the eligible (servable & has-a-usable-backend) model-id set, given a
+/// non-empty `servable` name set and the serving RoutingMap, restricted to the
+/// models we actually have signals for.
+///
+/// Gate (a) servable: the registry must know the model (the caller guarantees a
+/// non-empty `servable` — an empty/not-ready registry is handled upstream by
+/// keeping the current targets, never by scoring unservable models).
+///
+/// Gate (b) arch-exclusion — evaluated across the model's FULL backend set, not a
+/// single row: a model is dropped ONLY when it is arch-excluded on ALL of its
+/// available backends. `RoutingMap::load_from` collapses a model to its winning
+/// row, preferring any usable (non-excluded) backend over an excluded one — so
+/// the winning row is non-excluded IFF at least one backend is usable. A model
+/// with NO routing entry at all (unprofiled) carries no arch verdict and is not
+/// dropped on arch grounds. Thus: drop only when it HAS routing entries but the
+/// winner is still excluded (⇒ every known backend is excluded).
+fn compute_eligible(
     raws: &[RawSignal],
-    registry: &Arc<tokio::sync::Mutex<crate::models::registry::ModelRegistry>>,
-    routing: &Arc<tokio::sync::Mutex<crate::serving::profile::RoutingMap>>,
+    servable: &HashSet<String>,
+    rmap: &crate::serving::profile::RoutingMap,
 ) -> HashSet<String> {
     use terminus_rs::intake::serving::{ExclusionReason, ModelId};
 
-    let servable: HashSet<String> = {
-        let reg = registry.lock().await;
-        reg.all_records().map(|r| r.name.clone()).collect()
-    };
-    let rmap = routing.lock().await;
-
     raws.iter()
         .filter_map(|raw| {
-            let mid = ModelId::from(raw.model_id.as_str());
-            // (b) arch-excluded on all backends → the winning row is excluded.
-            let arch_excluded = rmap
-                .get(&mid)
-                .map(|entry| entry.profile.exclusion_reason != ExclusionReason::None)
-                .unwrap_or(false);
-            if arch_excluded {
+            // (a) servable per the registry.
+            if !servable.contains(&raw.model_id) {
                 return None;
             }
-            // (a) servable per the registry (skip the filter if it isn't loaded).
-            if servable.is_empty() || servable.contains(&raw.model_id) {
-                Some(raw.model_id.clone())
-            } else {
-                None
+            // (b) usable on at least one backend.
+            let mid = ModelId::from(raw.model_id.as_str());
+            let entry = rmap.get(&mid);
+            let has_routing = entry.is_some();
+            let winner_usable = entry
+                .map(|e| e.profile.exclusion_reason == ExclusionReason::None)
+                .unwrap_or(false);
+            let excluded_on_all_backends = has_routing && !winner_usable;
+            if excluded_on_all_backends {
+                return None;
             }
+            Some(raw.model_id.clone())
         })
         .collect()
 }
@@ -716,7 +764,29 @@ pub async fn run_alias_refresh_tick(
     };
 
     let raws = extract_raw_signals(&report, &responsiveness);
-    let eligible = compute_eligible(&raws, registry, routing).await;
+
+    // FIX 4: servability must be established before we score anything. An
+    // empty/not-yet-ready registry means we CANNOT judge which models are
+    // servable — scoring then risks pointing a lumina alias at a model Chord
+    // can't start. Fail-safe: keep the current targets, same posture as the
+    // empty-candidate / DB-down paths.
+    let servable: HashSet<String> = {
+        let reg = registry.lock().await;
+        reg.all_records().map(|r| r.name.clone()).collect()
+    };
+    if servable.is_empty() {
+        tracing::warn!(
+            "lumina alias updater: model registry not ready (no records) — keeping current \
+             lumina targets"
+        );
+        return;
+    }
+
+    // Snapshot the routing map (drop the lock before any store writes).
+    let eligible = {
+        let rmap = routing.lock().await;
+        compute_eligible(&raws, &servable, &rmap)
+    };
 
     let tiers = vec![
         TierPlan {
@@ -736,7 +806,7 @@ pub async fn run_alias_refresh_tick(
         },
     ];
 
-    for (key, repoint) in plan_repoints(&raws, &eligible, cfg, &tiers) {
+    for (key, repoint) in plan_repoints(&raws, Some(&eligible), cfg, &tiers) {
         match repoint {
             Repoint::Switch {
                 from,
@@ -770,10 +840,6 @@ mod tests {
             r,
             guard_eligible: guard,
         }
-    }
-
-    fn no_eligibility() -> HashSet<String> {
-        HashSet::new()
     }
 
     // ── Store: lock-free resolve + isolated repoint ────────────────────────────
@@ -818,7 +884,7 @@ mod tests {
             raw("winner", Some(5.0), Some(5.0), Some(100.0), true),
             raw("loser", Some(3.0), Some(3.0), Some(10.0), true),
         ];
-        let cands = gate_and_build(&raws, &no_eligibility(), 0.0);
+        let cands = gate_and_build(&raws, None, 0.0);
         let ranked = rank(
             &cands,
             BlendWeights {
@@ -854,7 +920,7 @@ mod tests {
                 current: None,
             },
         ];
-        let plans = plan_repoints(&raws, &no_eligibility(), &cfg, &tiers);
+        let plans = plan_repoints(&raws, None, &cfg, &tiers);
 
         let fast = &plans[0].1;
         let deep = &plans[1].1;
@@ -896,7 +962,7 @@ mod tests {
             weights: cfg.fast_weights,
             current: Some("b".into()),
         }];
-        let plans = plan_repoints(&raws, &no_eligibility(), &cfg, &tiers);
+        let plans = plan_repoints(&raws, None, &cfg, &tiers);
         assert!(
             matches!(plans[0].1, Repoint::Keep { .. }),
             "within-margin near-tie must NOT switch (got {:?})",
@@ -919,7 +985,7 @@ mod tests {
             weights: cfg.fast_weights,
             current: Some("b".into()),
         }];
-        let plans = plan_repoints(&raws, &no_eligibility(), &cfg, &tiers);
+        let plans = plan_repoints(&raws, None, &cfg, &tiers);
         match &plans[0].1 {
             Repoint::Switch { from, to, .. } => {
                 assert_eq!(from.as_deref(), Some("b"));
@@ -938,7 +1004,7 @@ mod tests {
             weights: cfg.fast_weights,
             current: Some("a".into()),
         }];
-        let plans = plan_repoints(&raws, &no_eligibility(), &cfg, &tiers);
+        let plans = plan_repoints(&raws, None, &cfg, &tiers);
         assert!(matches!(plans[0].1, Repoint::Keep { .. }));
     }
 
@@ -950,7 +1016,7 @@ mod tests {
             raw("guarded_out", Some(5.0), Some(5.0), Some(100.0), false),
             raw("ok", Some(4.0), Some(4.0), Some(50.0), true),
         ];
-        let cands = gate_and_build(&raws, &no_eligibility(), 0.0);
+        let cands = gate_and_build(&raws, None, 0.0);
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].model_id, "ok");
     }
@@ -961,7 +1027,7 @@ mod tests {
             raw("too_low", Some(2.5), Some(5.0), Some(100.0), true),
             raw("ok", Some(3.5), Some(4.0), Some(50.0), true),
         ];
-        let cands = gate_and_build(&raws, &no_eligibility(), 3.0);
+        let cands = gate_and_build(&raws, None, 3.0);
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].model_id, "ok");
     }
@@ -970,7 +1036,7 @@ mod tests {
     fn gate_drops_models_without_quality_data() {
         // No q value at all → cannot clear the floor, dropped.
         let raws = vec![raw("no_q", None, Some(5.0), Some(100.0), true)];
-        let cands = gate_and_build(&raws, &no_eligibility(), 0.0);
+        let cands = gate_and_build(&raws, None, 0.0);
         assert!(cands.is_empty());
     }
 
@@ -984,7 +1050,7 @@ mod tests {
         ];
         let mut eligible = HashSet::new();
         eligible.insert("servable".to_string());
-        let cands = gate_and_build(&raws, &eligible, 0.0);
+        let cands = gate_and_build(&raws, Some(&eligible), 0.0);
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].model_id, "servable");
     }
@@ -1001,7 +1067,7 @@ mod tests {
             weights: cfg.fast_weights,
             current: Some("granite4.1:30b".into()),
         }];
-        let plans = plan_repoints(&raws, &no_eligibility(), &cfg, &tiers);
+        let plans = plan_repoints(&raws, None, &cfg, &tiers);
         assert!(
             matches!(plans[0].1, Repoint::Keep { .. }),
             "no candidates must keep the current target, never blank it"
@@ -1018,7 +1084,7 @@ mod tests {
             weights: cfg.fast_weights,
             current: Some("stale".into()),
         }];
-        let plans = plan_repoints(&raws, &no_eligibility(), &cfg, &tiers);
+        let plans = plan_repoints(&raws, None, &cfg, &tiers);
         match &plans[0].1 {
             Repoint::Switch {
                 from,
@@ -1040,7 +1106,11 @@ mod tests {
     // ── Aggregation / extraction from a report ─────────────────────────────────
 
     #[test]
-    fn extract_aggregates_q_by_mean_and_a_by_max() {
+    fn extract_a_from_eligible_row_not_global_max() {
+        // FIX 5 regression: model "m" has an EXCLUDED backend row with a HIGHER
+        // behavioral_mean (4.9) than its ELIGIBLE row (4.8). `a` must come from
+        // the eligible row (4.8), NOT the global max (4.9) — the excluded
+        // backend's adherence must never stand in for the one that qualifies.
         use terminus_rs::intake::assistant::reporting::{
             ChatRoleCandidate, ChatRoleSelection, DualProfileRow, GuardVerdict, ModelKey,
             MoneyQuery, OceanShortlist, PersonalityRead,
@@ -1064,7 +1134,8 @@ mod tests {
         };
 
         // model "m": two dual-profile rows (values 4.0 and 2.0 → mean 3.0) and
-        // two chat-role rows (behavioral 4.2 and 4.8 → max 4.8; one Eligible).
+        // two chat-role rows — an EXCLUDED gpu row (behavioral 4.9) and an
+        // ELIGIBLE cpu row (behavioral 4.8). `a` must be 4.8 (eligible), not 4.9.
         let dual_profile = vec![
             DualProfileRow {
                 model_id: "m".into(),
@@ -1091,7 +1162,7 @@ mod tests {
                     model_id: "m".into(),
                     backend_tag: "gpu".into(),
                 },
-                behavioral_mean: 4.2,
+                behavioral_mean: 4.9,
                 recall_ceiling_turns: Some(40.0),
                 latency_ms: Some(1000.0),
                 verdict: GuardVerdict::Excluded {
@@ -1140,12 +1211,163 @@ mod tests {
         );
         assert!(
             (s.a.unwrap() - 4.8).abs() < 1e-9,
-            "a is the MAX behavioral_mean"
+            "a must come from the ELIGIBLE row (4.8), not the excluded row's 4.9"
         );
         assert!((s.r.unwrap() - 55.0).abs() < 1e-9);
         assert!(
             s.guard_eligible,
             "any Eligible chat-role row makes the model guard-eligible"
         );
+    }
+
+    // ── FIX 3: multi-backend arch-exclusion (usable-on-one survives) ───────────
+
+    #[test]
+    fn compute_eligible_keeps_model_usable_on_one_backend() {
+        use crate::serving::profile::RoutingMap;
+        use terminus_rs::intake::serving::{
+            ExclusionReason, ModelId, RecheckTrigger, Runtime, ServingBackend, ServingProfile,
+        };
+
+        fn prof(model: &str, backend: ServingBackend, excl: ExclusionReason) -> ServingProfile {
+            ServingProfile {
+                model_id: ModelId::from(model),
+                backend_tag: backend,
+                best_runtime: Runtime::Ollama,
+                env_json: String::new(),
+                tok_s: Some(30.0),
+                vram_or_ram_peak_gb: Some(8.0),
+                cold_load_s: Some(10.0),
+                keep_warm: false,
+                fallback_runtime: None,
+                exclusion_reason: excl,
+                recheck_trigger: RecheckTrigger::None,
+                provenance: None,
+            }
+        }
+
+        // "mixed" is arch-excluded on llama-gpu but USABLE on ollama-gpu → survives.
+        // "dead" is excluded on BOTH of its backends → dropped.
+        // "unprofiled" has no routing row at all → survives (no arch verdict).
+        let rmap = RoutingMap::load_from(vec![
+            prof(
+                "mixed",
+                ServingBackend::LlamaGpu,
+                ExclusionReason::PermanentUnknownArch,
+            ),
+            prof("mixed", ServingBackend::OllamaGpu, ExclusionReason::None),
+            prof(
+                "dead",
+                ServingBackend::LlamaGpu,
+                ExclusionReason::PermanentUnknownArch,
+            ),
+            prof(
+                "dead",
+                ServingBackend::OllamaGpu,
+                ExclusionReason::PermanentUnknownArch,
+            ),
+        ]);
+
+        let raws = vec![
+            raw("mixed", Some(50.0), Some(4.0), Some(80.0), true),
+            raw("dead", Some(60.0), Some(4.5), Some(90.0), true),
+            raw("unprofiled", Some(40.0), Some(3.5), Some(70.0), true),
+        ];
+        let servable: HashSet<String> = ["mixed", "dead", "unprofiled"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let eligible = compute_eligible(&raws, &servable, &rmap);
+        assert!(
+            eligible.contains("mixed"),
+            "a model usable on ONE backend must survive arch-exclusion"
+        );
+        assert!(
+            !eligible.contains("dead"),
+            "a model excluded on ALL backends must be dropped"
+        );
+        assert!(
+            eligible.contains("unprofiled"),
+            "an unprofiled model carries no arch verdict and is not dropped"
+        );
+    }
+
+    #[test]
+    fn compute_eligible_requires_servability() {
+        use crate::serving::profile::RoutingMap;
+        let rmap = RoutingMap::empty();
+        let raws = vec![raw("known", Some(50.0), Some(4.0), Some(80.0), true)];
+        // "known" is NOT in the servable set → dropped even with clean routing.
+        let servable: HashSet<String> = HashSet::new();
+        // (compute_eligible itself never sees an empty registry live — the tick
+        // bails first — but the servability filter must still hold here.)
+        let eligible = compute_eligible(&raws, &servable, &rmap);
+        assert!(
+            eligible.is_empty(),
+            "non-servable models must be filtered out"
+        );
+    }
+
+    // ── FIX 6: invalid config falls back to defaults ───────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn from_env_rejects_invalid_weights_and_refresh() {
+        let keys = [
+            "CHORD_ALIAS_REFRESH_SECS",
+            "CHORD_ALIAS_MIN_QUALITY",
+            "CHORD_ALIAS_SWITCH_MARGIN",
+            "CHORD_ALIAS_W_FAST_Q",
+            "CHORD_ALIAS_W_FAST_A",
+            "CHORD_ALIAS_W_FAST_R",
+            "CHORD_ALIAS_W_DEEP_Q",
+            "CHORD_ALIAS_W_DEEP_A",
+            "CHORD_ALIAS_W_DEEP_R",
+        ];
+        for k in keys {
+            std::env::remove_var(k);
+        }
+        // Invalid values: NaN, negative, and a zero/too-small refresh interval.
+        std::env::set_var("CHORD_ALIAS_REFRESH_SECS", "0"); // → floored to MIN_REFRESH_SECS
+        std::env::set_var("CHORD_ALIAS_W_FAST_Q", "NaN"); // → default
+        std::env::set_var("CHORD_ALIAS_W_FAST_A", "-1.0"); // → default
+        std::env::set_var("CHORD_ALIAS_W_DEEP_Q", "inf"); // → default
+        std::env::set_var("CHORD_ALIAS_SWITCH_MARGIN", "-0.5"); // → default
+
+        let cfg = AliasUpdaterConfig::from_env();
+        let def = AliasUpdaterConfig::default();
+
+        assert_eq!(
+            cfg.refresh_secs, MIN_REFRESH_SECS,
+            "0 refresh floored, never panics interval"
+        );
+        assert_eq!(
+            cfg.fast_weights.q, def.fast_weights.q,
+            "NaN weight → default"
+        );
+        assert_eq!(
+            cfg.fast_weights.a, def.fast_weights.a,
+            "negative weight → default"
+        );
+        assert_eq!(
+            cfg.deep_weights.q, def.deep_weights.q,
+            "inf weight → default"
+        );
+        assert_eq!(
+            cfg.switch_margin, def.switch_margin,
+            "negative margin → default"
+        );
+
+        for k in keys {
+            std::env::remove_var(k);
+        }
+    }
+
+    #[test]
+    fn default_min_quality_is_disabled() {
+        // FIX 2: the raw-scale floor is OFF by default so it can't silently
+        // filter on a wrong 1..5 assumption.
+        assert_eq!(AliasUpdaterConfig::default().min_quality, 0.0);
     }
 }

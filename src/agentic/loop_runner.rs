@@ -216,6 +216,20 @@ fn model_aliases_from_env() -> std::collections::HashMap<String, String> {
     crate::config::parse_model_aliases(std::env::var("CHORD_MODEL_ALIASES").ok())
 }
 
+/// CHRD-91390429: resolve a model name for an agentic turn EXACTLY like the chat
+/// hot path does — the runtime-mutable lumina store first (lock-free), then the
+/// static `CHORD_MODEL_ALIASES` map. Both PRIMARY paths must agree so chat and
+/// tool turns never send different lumina models after an updater repoint.
+fn resolve_agentic_alias(
+    lumina: Option<&crate::routing::lumina_alias::LuminaAliasStore>,
+    static_aliases: &std::collections::HashMap<String, String>,
+    model: &str,
+) -> String {
+    lumina
+        .and_then(|store| store.resolve(model))
+        .unwrap_or_else(|| crate::config::resolve_model_alias(static_aliases, model).to_string())
+}
+
 /// Call the LLM at `CHORD_LLM_URL`.
 ///
 /// If `CHORD_LLM_URL` is not set, returns a stub text response suitable for
@@ -225,6 +239,7 @@ async fn call_llm(
     tools: &[crate::agentic::context::ToolDefinition],
     model: &str,
     client: &reqwest::Client,
+    lumina: Option<&crate::routing::lumina_alias::LuminaAliasStore>,
 ) -> Result<LlmResponse, String> {
     let llm_url = match std::env::var("CHORD_LLM_URL") {
         Ok(url) if !url.is_empty() => url,
@@ -277,8 +292,11 @@ async fn call_llm(
     // "lumina-deep", which Ollama does not know — without this every agentic
     // /v1/agent/execute call returned HTTP 404 "model lumina-fast not found"
     // (the F1 user-facing outage). The map comes from CHORD_MODEL_ALIASES.
+    // Dynamic lumina aliases first (same lock-free ArcSwap store the chat hot
+    // path reads), falling through to the static CHORD_MODEL_ALIASES map — so a
+    // repoint of e.g. `lumina-fast` is reflected on BOTH chat and tool turns.
     let aliases = model_aliases_from_env();
-    let resolved_model = crate::config::resolve_model_alias(&aliases, model);
+    let resolved_model = resolve_agentic_alias(lumina, &aliases, model);
 
     let mut body = json!({
         "model": resolved_model,
@@ -383,6 +401,12 @@ pub struct AgenticExecutor {
     /// HRNS-05: optional Harness-1 research wiring. `None` ⇒ research branch is
     /// inert and behaviour is identical to the pre-harness executor.
     harness: Option<Arc<dyn HarnessProvider>>,
+    /// CHRD-91390429: the SAME runtime-mutable lumina alias store the chat hot
+    /// path uses. Threaded here so agentic (tool-augmented) turns resolve the
+    /// dynamic lumina target FIRST — identical to `/v1/chat/completions` — instead
+    /// of diverging to the static `CHORD_MODEL_ALIASES` env after a refresh.
+    /// `None` ⇒ fall back to the static env map only (e.g. in unit tests).
+    lumina_aliases: Option<crate::routing::lumina_alias::LuminaAliasStore>,
 }
 
 impl AgenticExecutor {
@@ -398,12 +422,25 @@ impl AgenticExecutor {
                 .build()
                 .expect("reqwest client"),
             harness: None,
+            lumina_aliases: None,
         }
     }
 
     /// Enable the Harness-1 deep-research path with an injected provider.
     pub fn with_harness(mut self, provider: Arc<dyn HarnessProvider>) -> Self {
         self.harness = Some(provider);
+        self
+    }
+
+    /// CHRD-91390429: share the runtime-mutable lumina alias store so agentic
+    /// turns resolve the dynamic lumina target the same way the chat hot path
+    /// does (dynamic-first, static fallback). Both PRIMARY paths then always send
+    /// the SAME lumina model after an updater repoint.
+    pub fn with_lumina_aliases(
+        mut self,
+        store: crate::routing::lumina_alias::LuminaAliasStore,
+    ) -> Self {
+        self.lumina_aliases = Some(store);
         self
     }
 
@@ -709,7 +746,14 @@ impl AgenticExecutor {
         // ── Main loop ─────────────────────────────────────────────────────────
         for _iteration in 0..max_calls {
             let llm_start = Instant::now();
-            let llm_result = call_llm(&messages, &effective_tools, &model, &self.http).await;
+            let llm_result = call_llm(
+                &messages,
+                &effective_tools,
+                &model,
+                &self.http,
+                self.lumina_aliases.as_ref(),
+            )
+            .await;
             let llm_ms = llm_start.elapsed().as_millis() as u64;
 
             match llm_result {
@@ -1081,7 +1125,15 @@ impl AgenticExecutor {
                 .into(),
             tool_call_id: None,
         });
-        let final_text = match call_llm(&messages, &no_tools, &model, &self.http).await {
+        let final_text = match call_llm(
+            &messages,
+            &no_tools,
+            &model,
+            &self.http,
+            self.lumina_aliases.as_ref(),
+        )
+        .await
+        {
             Ok(LlmResponse::Text { content, prompt_tokens, completion_tokens }) => {
                 tokens_used.prompt_tokens += prompt_tokens;
                 tokens_used.completion_tokens += completion_tokens;
@@ -1142,6 +1194,44 @@ mod tests {
     use crate::mcp_proxy::{FallbackRegistry, FallbackTool, McpProxy};
     use crate::error::ProxyError;
     use serde_json::json;
+
+    // ── CHRD-91390429: agentic path resolves via the SAME dynamic store ─────────
+
+    #[test]
+    fn agentic_alias_resolution_prefers_dynamic_store() {
+        use crate::routing::lumina_alias::LuminaAliasStore;
+
+        // Static CHORD_MODEL_ALIASES says lumina-fast → static-model.
+        let mut statics = std::collections::HashMap::new();
+        statics.insert("lumina-fast".to_string(), "static-model".to_string());
+        statics.insert("other".to_string(), "other-target".to_string());
+
+        // The runtime store has been repointed to dynamic-model.
+        let store = LuminaAliasStore::from_static(&statics);
+        store.set("lumina-fast", "dynamic-model".to_string());
+
+        // With the store, the agentic path resolves the DYNAMIC target — exactly
+        // like the chat hot path — not the stale static one.
+        assert_eq!(
+            resolve_agentic_alias(Some(&store), &statics, "lumina-fast"),
+            "dynamic-model"
+        );
+        // Non-lumina aliases still fall through to the static map.
+        assert_eq!(
+            resolve_agentic_alias(Some(&store), &statics, "other"),
+            "other-target"
+        );
+        // Without a store (e.g. unit context), it falls back to the static map.
+        assert_eq!(
+            resolve_agentic_alias(None, &statics, "lumina-fast"),
+            "static-model"
+        );
+        // An unknown model passes through unchanged.
+        assert_eq!(
+            resolve_agentic_alias(Some(&store), &statics, "qwen3:8b"),
+            "qwen3:8b"
+        );
+    }
 
     // ── Test infrastructure ───────────────────────────────────────────────────
 

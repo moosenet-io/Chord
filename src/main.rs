@@ -80,7 +80,11 @@ async fn main() {
             t
         })),
     ));
-    let agentic_executor = Arc::new(AgenticExecutor::new(proxy_arc));
+    // CHRD-91390429: share the dynamic lumina alias store with the agentic
+    // executor so /v1/agent/execute tool turns resolve the SAME lumina target as
+    // the chat hot path (both PRIMARY paths agree after an updater repoint).
+    let agentic_executor =
+        Arc::new(AgenticExecutor::new(proxy_arc).with_lumina_aliases(lumina_aliases.clone()));
 
     // ── Task 2 (federation): optional second McpProxy for terminus_personal ──
     // Only constructed when PERSONAL_BACKEND_URL is configured — Chord runs fine
