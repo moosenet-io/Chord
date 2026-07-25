@@ -341,6 +341,36 @@ async fn main() {
         });
     }
 
+    // ── CHRD-MINTSEL: MINT operational-score source for the unified /v1/resolve selector.
+    // Same fail-open discipline as the coding source above: an unconfigured/unreachable
+    // intake DB yields `None` (candidate scores stay unenriched, ranking falls back to
+    // capability/locality) rather than blocking startup.
+    let score_source: chord_proxy::models::score_source::SharedScoreSource =
+        Arc::new(Mutex::new(None));
+    {
+        let score_source = score_source.clone();
+        tokio::spawn(async move {
+            let Some(db_url) = terminus_rs::config::intake_database_url() else {
+                info!(
+                    "MINT selector score source: intake DB not configured — /v1/resolve \
+                     ranks by capability/locality only (scores unenriched)"
+                );
+                return;
+            };
+            let pool = match sqlx::PgPool::connect(&db_url).await {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("MINT selector score source: intake DB connect failed: {e}");
+                    return;
+                }
+            };
+            let source: Arc<dyn chord_proxy::models::score_source::ScoreSource> =
+                Arc::new(chord_proxy::models::score_source::DbScoreSource::new(pool));
+            *score_source.lock().await = Some(source);
+            info!("MINT selector score source connected");
+        });
+    }
+
     let state = Arc::new(AppState {
         proxy,
         jwt_secret,
@@ -361,6 +391,7 @@ async fn main() {
         model_gc_min_age_secs: config.model_gc_min_age_secs,
         routing_map,
         coding_profile_source,
+        score_source,
         personal_proxy,
         embeddings_config: chord_proxy::embeddings::EmbeddingsConfig::from_env(),
     });
