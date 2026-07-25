@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::models::backends::{self, Backend};
 use crate::models::rope_ingest::{self, RopeIngestOutcome};
 use crate::serving::profile::{RopeScaling, RopeScalingMethod};
+use terminus_rs::intake::serving::ServingBackend;
 
 /// Storage tier a model currently lives at.
 ///
@@ -450,6 +451,83 @@ impl ModelRegistry {
             }
         }
         self.default_backend()
+    }
+
+    /// The [`ServingBackend`] serving-tier a chord backend NAME belongs to, for
+    /// the arch-exclusion cross-check. Only the three profiled serving tiers map:
+    /// `llama-gpu` → llama.cpp-GPU, `ollama` (chord's primary Ollama, which
+    /// serves the profile's `ollama-gpu` tier on this fleet) → ollama-GPU,
+    /// `ollama-cpu` → genuine CPU. Backends with no serving-profile tier
+    /// (`vulkan`, `lemonade-coder`, `openrouter`) return `None` and are never
+    /// arch-guarded here — their tag is always honored.
+    fn serving_tier_of_backend(name: &str) -> Option<ServingBackend> {
+        match name {
+            "llama-gpu" => Some(ServingBackend::LlamaGpu),
+            "ollama" => Some(ServingBackend::OllamaGpu),
+            "ollama-cpu" => Some(ServingBackend::Cpu),
+            _ => None,
+        }
+    }
+
+    /// The chord backend NAME that serves a given [`ServingBackend`] tier —
+    /// inverse of [`serving_tier_of_backend`](Self::serving_tier_of_backend).
+    fn backend_name_for_tier(tier: ServingBackend) -> &'static str {
+        match tier {
+            ServingBackend::LlamaGpu => "llama-gpu",
+            ServingBackend::OllamaGpu => "ollama",
+            ServingBackend::Cpu => "ollama-cpu",
+        }
+    }
+
+    /// ARCH-AWARE backend resolution (CHRD arch-aware fix).
+    ///
+    /// Like [`backend_for`](Self::backend_for), but a resolution-time guard:
+    /// if the model's registry-tagged backend is arch-EXCLUDED for this model
+    /// (its serving tier appears in `excluded_tiers`, i.e. `exclusion_reason !=
+    /// None` — e.g. a `gpt-oss` model still tagged `llama-gpu` on disk, which
+    /// llama-server cannot load), the stale tag is IGNORED and the model
+    /// resolves to `chosen_tier` (the serving RoutingMap's chosen USABLE
+    /// backend, mapped back to a concrete chord backend), falling back to the
+    /// default backend (Ollama) if that mapping names no known backend. This
+    /// overrides bad tags already PERSISTED on disk, not just tagging-time.
+    ///
+    /// `excluded_tiers` / `chosen_tier` are OWNED values the caller extracts
+    /// from the [`RoutingMap`](crate::serving::profile::RoutingMap) BEFORE
+    /// locking this registry — the routing_map guard must NOT be held across
+    /// the registry lock (lock-order inversion vs `list_models`/`get_model`,
+    /// which lock the registry first). See
+    /// [`resolve_and_ensure`](crate::models::routing::resolve_and_ensure).
+    ///
+    /// A model with a usable tagged backend (e.g. `qwen3:8b` on `llama-gpu`,
+    /// which IS llama-loadable → no exclusion) is NOT touched. A model with no
+    /// serving/RoutingMap row (empty `excluded_tiers`, `None` `chosen_tier`)
+    /// keeps the current [`backend_for`] behavior (tag/default) — an unprofiled
+    /// model is never hard-failed here.
+    pub fn backend_for_arch_aware(
+        &self,
+        model: &str,
+        excluded_tiers: &[ServingBackend],
+        chosen_tier: Option<ServingBackend>,
+    ) -> Option<&Backend> {
+        let tag = self.records.get(model).and_then(|r| r.backend.as_deref());
+        if let Some(name) = tag {
+            if let Some(tier) = Self::serving_tier_of_backend(name) {
+                if excluded_tiers.contains(&tier) {
+                    // Stale/bad tag → steer to the chosen usable route, then
+                    // fall back to the default backend if that tier maps to no
+                    // known chord backend.
+                    if let Some(chosen) = chosen_tier {
+                        let chosen_name = Self::backend_name_for_tier(chosen);
+                        if let Some(b) = self.backends.get(chosen_name) {
+                            return Some(b);
+                        }
+                    }
+                    return self.default_backend();
+                }
+            }
+        }
+        // Not excluded (or unprofiled / unmapped tag) → unchanged behavior.
+        self.backend_for(model)
     }
 
     /// Set (or clear) a model's backend tag. Returns false if the model is
@@ -2159,5 +2237,148 @@ mod tests {
         })
         .await
         .expect("concurrent GC + reconcile-apply deadlocked (canonical disk_op→registry order broken)");
+    }
+
+    // ── CHRD arch-aware backend resolution ──────────────────────────────────
+
+    #[test]
+    fn backend_for_arch_aware_overrides_excluded_tag_and_preserves_usable_tag() {
+        use crate::models::backends::{BackendKind, Hardware};
+        use crate::serving::profile::RoutingMap;
+        use terminus_rs::intake::serving::{
+            ExclusionReason, ModelId, RecheckTrigger, Runtime, ServingBackend, ServingProfile,
+        };
+
+        fn row(
+            model: &str,
+            backend: ServingBackend,
+            best: Runtime,
+            excl: ExclusionReason,
+        ) -> ServingProfile {
+            ServingProfile {
+                model_id: ModelId::from(model),
+                backend_tag: backend,
+                best_runtime: best,
+                env_json: "{}".into(),
+                tok_s: None,
+                vram_or_ram_peak_gb: None,
+                cold_load_s: None,
+                keep_warm: false,
+                fallback_runtime: None,
+                exclusion_reason: excl,
+                recheck_trigger: RecheckTrigger::None,
+                provenance: None,
+            }
+        }
+
+        fn backend(name: &str, kind: BackendKind, hw: Hardware) -> Backend {
+            Backend {
+                name: name.into(),
+                url: format!("http://127.0.0.1:0/{name}"),
+                hardware: hw,
+                kind,
+                unit: None,
+                always_on: false,
+                idle_stop_secs: 0,
+                launch: None,
+                api_key_env: None,
+            }
+        }
+
+        fn record(name: &str, backend_tag: &str) -> ModelRecord {
+            ModelRecord {
+                name: name.into(),
+                tier: StorageTier::Warm,
+                local_path: None,
+                archive_path: None,
+                size_bytes: 0,
+                last_loaded: None,
+                last_requested: None,
+                protected: false,
+                managed_by: MANAGED_BY_OLLAMA.to_string(),
+                backend: Some(backend_tag.into()),
+                gguf_path: None,
+                rope_scaling: None,
+                rope_scaling_note: None,
+            }
+        }
+
+        let tmp = tempdir().unwrap();
+        let mut reg = reg_at(tmp.path(), vec![]);
+        reg.upsert_backend(backend(
+            "llama-gpu",
+            BackendKind::LlamaServer,
+            Hardware::Gpu,
+        ));
+        reg.upsert_backend(backend("ollama", BackendKind::Ollama, Hardware::Cpu));
+
+        // gpt-oss: tagged `llama-gpu` on disk, but that tier is arch-excluded
+        // (llama-server can't load gptoss); the usable route is ollama-gpu.
+        reg.records
+            .insert("gpt-oss:20b".into(), record("gpt-oss:20b", "llama-gpu"));
+        // qwen3:8b: tagged `llama-gpu` and genuinely llama-loadable (no exclusion).
+        reg.records
+            .insert("qwen3:8b".into(), record("qwen3:8b", "llama-gpu"));
+
+        let routing = RoutingMap::load_from(vec![
+            row(
+                "gpt-oss:20b",
+                ServingBackend::LlamaGpu,
+                Runtime::LlamaCpp,
+                ExclusionReason::PermanentUnknownArch,
+            ),
+            row(
+                "gpt-oss:20b",
+                ServingBackend::OllamaGpu,
+                Runtime::Ollama,
+                ExclusionReason::None,
+            ),
+            row(
+                "qwen3:8b",
+                ServingBackend::LlamaGpu,
+                Runtime::LlamaCpp,
+                ExclusionReason::None,
+            ),
+        ]);
+
+        // Resolve exactly as production does: extract the owned excluded/chosen
+        // tiers from the routing map (guard would be dropped before the registry
+        // lock in the live path), then call the arch-aware resolver.
+        let resolve = |reg: &ModelRegistry, model: &str| -> String {
+            let mid = ModelId::from(model);
+            reg.backend_for_arch_aware(
+                model,
+                &routing.excluded_tiers(&mid),
+                routing.chosen_backend(&mid),
+            )
+            .expect("resolves")
+            .name
+            .clone()
+        };
+
+        // Excluded tag IGNORED even though rec.backend == "llama-gpu"; resolves
+        // to the map's chosen usable route (ollama-gpu → chord "ollama").
+        assert_eq!(
+            resolve(&reg, "gpt-oss:20b"),
+            "ollama",
+            "gptoss must NOT dispatch to the arch-excluded llama-gpu backend"
+        );
+
+        // Usable tag preserved — no regression for a llama-loadable model.
+        assert_eq!(
+            resolve(&reg, "qwen3:8b"),
+            "llama-gpu",
+            "a model with no exclusion keeps its llama-gpu tag"
+        );
+
+        // A model with NO serving/RoutingMap row keeps current behavior (its
+        // tag) — an unprofiled model is never hard-failed by the guard.
+        reg.records
+            .insert("mystery:1b".into(), record("mystery:1b", "llama-gpu"));
+        assert_eq!(
+            resolve(&reg, "mystery:1b"),
+            "llama-gpu",
+            "unprofiled model keeps its tag (unchanged backend_for behavior)"
+        );
     }
 }
