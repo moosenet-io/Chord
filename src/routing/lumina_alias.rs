@@ -256,12 +256,18 @@ fn env_refresh_secs(key: &str, default: u64) -> u64 {
         .max(MIN_REFRESH_SECS)
 }
 
-/// Parse a non-negative u64 env value (e.g. a byte threshold); malformed → default.
-fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
+/// Parse a strictly-positive u64 env value (a SAFETY floor like the size gate).
+/// A `0` or malformed value falls back to `default` — it must NEVER silently
+/// disable the guard (`0` would re-open the tiny-model hole). A genuinely lower
+/// floor is an explicit small POSITIVE value.
+fn env_pos_u64(key: &str, default: u64) -> u64 {
+    match std::env::var(key)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(default)
+    {
+        Some(v) if v > 0 => v,
+        _ => default,
+    }
 }
 
 /// Parse a strictly-positive, finite f64 env value; anything malformed, NaN,
@@ -281,6 +287,63 @@ fn env_pos_f64(key: &str, default: f64) -> f64 {
 const DEFAULT_MIN_SIZE_BYTES: u64 = 5_000_000_000;
 /// Default responsiveness saturation target (tok/s).
 const DEFAULT_R_SATURATION_TOK_S: f64 = 40.0;
+/// Default hysteresis switch margin.
+const DEFAULT_SWITCH_MARGIN: f64 = 0.05;
+
+// ── Point-of-USE sanitizers ─────────────────────────────────────────────────
+// Validation lives HERE, at the point a value is applied, not only in
+// `from_env` — so ANY construction path (a struct literal in a test, a future
+// caller, a hand-built config) still gets a sane value. A NaN/inf/negative
+// weight or margin would corrupt/invert the blend; a `0`/invalid size floor or
+// saturation would silently disable a SAFETY guard. Each invalid value falls
+// back to its documented default.
+
+/// The size floor is a safety guard: `0` or (impossible for u64) invalid ⇒ the
+/// default, NEVER "disabled".
+fn sane_min_size_bytes(v: u64) -> u64 {
+    if v == 0 {
+        DEFAULT_MIN_SIZE_BYTES
+    } else {
+        v
+    }
+}
+
+/// Saturation must be finite and `> 0`; else the default (never zero-out `r`).
+fn sane_saturation_tok_s(v: f64) -> f64 {
+    if v.is_finite() && v > 0.0 {
+        v
+    } else {
+        DEFAULT_R_SATURATION_TOK_S
+    }
+}
+
+/// A blend weight must be finite and `>= 0`; an invalid weight is dropped to
+/// `0.0` (removes that signal) rather than allowed to corrupt/invert the score.
+fn sane_weight(w: f64) -> f64 {
+    if w.is_finite() && w >= 0.0 {
+        w
+    } else {
+        0.0
+    }
+}
+
+/// The hysteresis margin must be finite and `>= 0`; else the default.
+fn sane_margin(m: f64) -> f64 {
+    if m.is_finite() && m >= 0.0 {
+        m
+    } else {
+        DEFAULT_SWITCH_MARGIN
+    }
+}
+
+/// The quality floor must be finite and `>= 0`; else `0.0` (disabled default).
+fn sane_min_quality(q: f64) -> f64 {
+    if q.is_finite() && q >= 0.0 {
+        q
+    } else {
+        0.0
+    }
+}
 
 impl AliasUpdaterConfig {
     /// Read the config from the environment, applying the documented defaults for
@@ -291,7 +354,7 @@ impl AliasUpdaterConfig {
         AliasUpdaterConfig {
             refresh_secs: env_refresh_secs("CHORD_ALIAS_REFRESH_SECS", 900),
             min_quality: env_nonneg_f64("CHORD_ALIAS_MIN_QUALITY", 0.0),
-            min_size_bytes: env_u64("CHORD_ALIAS_MIN_SIZE_BYTES", DEFAULT_MIN_SIZE_BYTES),
+            min_size_bytes: env_pos_u64("CHORD_ALIAS_MIN_SIZE_BYTES", DEFAULT_MIN_SIZE_BYTES),
             r_saturation_tok_s: env_pos_f64(
                 "CHORD_ALIAS_R_SATURATION_TOK_S",
                 DEFAULT_R_SATURATION_TOK_S,
@@ -501,13 +564,17 @@ pub fn extract_raw_signals(
 ///
 /// `r_saturation_tok_s` caps each candidate's raw responsiveness (FIX C) so a
 /// tiny hyper-fast model earns no runaway speed advantage: once a model is
-/// "fast enough" it gets the same `r` as any faster one.
+/// "fast enough" it gets the same `r` as any faster one. Both `min_quality` and
+/// `r_saturation_tok_s` are sanitized HERE (point of use) so a bad value from ANY
+/// caller — not just `from_env` — is corrected (invalid → documented default).
 pub fn gate_and_build(
     raws: &[RawSignal],
     eligible: Option<&HashSet<String>>,
     min_quality: f64,
     r_saturation_tok_s: f64,
 ) -> Vec<AliasCandidate> {
+    let min_quality = sane_min_quality(min_quality);
+    let r_saturation_tok_s = sane_saturation_tok_s(r_saturation_tok_s);
     raws.iter()
         .filter_map(|raw| {
             // (a+b) servable, size-gated & not arch-excluded — Some(set) always filters.
@@ -563,6 +630,11 @@ pub fn rank(candidates: &[AliasCandidate], weights: BlendWeights) -> Vec<ScoredC
     if candidates.is_empty() {
         return Vec::new();
     }
+    // Sanitize weights at the point of use so a NaN/inf/negative from ANY caller
+    // (not just from_env) can never corrupt or invert the blend.
+    let w_q = sane_weight(weights.q);
+    let w_a = sane_weight(weights.a);
+    let w_r = sane_weight(weights.r);
     let (q_lo, q_hi) = min_max(candidates.iter().map(|c| c.q)).unwrap();
     let (a_lo, a_hi) = min_max(candidates.iter().map(|c| c.a)).unwrap();
     let (r_lo, r_hi) = min_max(candidates.iter().map(|c| c.r)).unwrap();
@@ -573,7 +645,7 @@ pub fn rank(candidates: &[AliasCandidate], weights: BlendWeights) -> Vec<ScoredC
             let q_norm = normalize(c.q, q_lo, q_hi);
             let a_norm = normalize(c.a, a_lo, a_hi);
             let r_norm = normalize(c.r, r_lo, r_hi);
-            let score = weights.q * q_norm + weights.a * a_norm + weights.r * r_norm;
+            let score = w_q * q_norm + w_a * a_norm + w_r * r_norm;
             ScoredCandidate {
                 model_id: c.model_id.clone(),
                 score,
@@ -602,6 +674,9 @@ pub fn rank(candidates: &[AliasCandidate], weights: BlendWeights) -> Vec<ScoredC
 /// that is absent from the ranked set (unset, or now-ineligible) counts as an
 /// unconditional loss, so the top candidate is adopted. Pure.
 pub fn select_target(ranked: &[ScoredCandidate], current: Option<&str>, margin: f64) -> Repoint {
+    // Sanitize the margin at the point of use (invalid → default) so a bad value
+    // from any caller can't defeat hysteresis.
+    let margin = sane_margin(margin);
     let Some(top) = ranked.first() else {
         return Repoint::Keep {
             reason: "no eligible candidates — keeping current target".into(),
@@ -832,6 +907,12 @@ fn compute_eligible(
     rmap: &crate::serving::profile::RoutingMap,
 ) -> HashSet<String> {
     use terminus_rs::intake::serving::{ExclusionReason, ModelId};
+
+    // Sanitize the SAFETY floor at the point of use: a `0` (or any invalid value
+    // reaching here from a non-`from_env` path) must NEVER disable the guard — it
+    // falls back to the default floor, so a 0 can't silently re-open the
+    // tiny-model hole.
+    let min_size_bytes = sane_min_size_bytes(min_size_bytes);
 
     raws.iter()
         .filter_map(|raw| {
@@ -1654,6 +1735,100 @@ mod tests {
             matches!(plans[0].repoint, Repoint::Keep { .. }),
             "a lone sub-threshold candidate must NOT be adopted — keep current"
         );
+    }
+
+    // ── Defensive round: safety guards can't be silently disabled ──────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn min_size_env_zero_falls_back_to_default_not_disabled() {
+        // FIX 1: MIN_SIZE_BYTES=0 must NOT disable the size floor.
+        std::env::remove_var("CHORD_ALIAS_MIN_SIZE_BYTES");
+        std::env::set_var("CHORD_ALIAS_MIN_SIZE_BYTES", "0");
+        let cfg = AliasUpdaterConfig::from_env();
+        assert_eq!(
+            cfg.min_size_bytes, DEFAULT_MIN_SIZE_BYTES,
+            "MIN_SIZE_BYTES=0 must fall back to the default floor, never disable it"
+        );
+        std::env::remove_var("CHORD_ALIAS_MIN_SIZE_BYTES");
+    }
+
+    #[test]
+    fn size_gate_zero_floor_still_excludes_tiny_via_sanitizer() {
+        // FIX 1 at the point of use: even if `0` reaches compute_eligible directly
+        // (bypassing from_env), the sanitizer restores the default floor so a 0.5B
+        // model is STILL excluded — the tiny-model hole cannot be re-opened.
+        use crate::serving::profile::RoutingMap;
+        let rmap = RoutingMap::empty();
+        let raws = vec![
+            raw("granite4.1:30b", Some(489.0), Some(4.5), Some(25.0), true),
+            raw("qwen2.5:0.5b", Some(344.0), Some(4.5), Some(400.0), true),
+        ];
+        let mut sizes: HashMap<String, u64> = HashMap::new();
+        sizes.insert("granite4.1:30b".into(), 18_000_000_000);
+        sizes.insert("qwen2.5:0.5b".into(), 400_000_000);
+
+        // Pass a `0` floor DIRECTLY — must behave like the default, not "disabled".
+        let eligible = compute_eligible(&raws, &sizes, 0, &rmap);
+        assert!(
+            eligible.contains("granite4.1:30b"),
+            "the capable model survives"
+        );
+        assert!(
+            !eligible.contains("qwen2.5:0.5b"),
+            "a 0 floor must NOT re-enable a 0.5B model — sanitizer restores the default"
+        );
+    }
+
+    #[test]
+    fn direct_config_bad_saturation_sanitized_at_use() {
+        // FIX 2: a directly-constructed config with an invalid saturation must be
+        // corrected at the point of use, not silently propagated.
+        let speedy = vec![raw("speedy", Some(300.0), Some(4.0), Some(400.0), true)];
+        for bad in [0.0, -5.0, f64::NAN, f64::INFINITY] {
+            let cands = gate_and_build(&speedy, None, 0.0, bad);
+            assert_eq!(
+                cands[0].r, DEFAULT_R_SATURATION_TOK_S,
+                "invalid saturation {bad} must be sanitized to the default at use \
+                 (400 tok/s capped to {DEFAULT_R_SATURATION_TOK_S})"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_config_bad_weights_do_not_corrupt_scores() {
+        // FIX 2 for weights: a NaN/negative weight must not produce NaN/inverted
+        // scores — rank sanitizes each weight to a finite, non-negative value.
+        let cands = vec![
+            AliasCandidate {
+                model_id: "a".into(),
+                q: 5.0,
+                a: 5.0,
+                r: 5.0,
+            },
+            AliasCandidate {
+                model_id: "b".into(),
+                q: 1.0,
+                a: 1.0,
+                r: 1.0,
+            },
+        ];
+        let bad_weights = BlendWeights {
+            q: f64::NAN,
+            a: -1.0,
+            r: f64::INFINITY,
+        };
+        let ranked = rank(&cands, bad_weights);
+        for sc in &ranked {
+            assert!(
+                sc.score.is_finite(),
+                "no candidate score may be NaN/inf even with corrupt weights"
+            );
+            assert!(
+                sc.score >= 0.0,
+                "scores stay non-negative with sanitized weights"
+            );
+        }
     }
 
     // ── FIX 6: invalid config falls back to defaults ───────────────────────────
