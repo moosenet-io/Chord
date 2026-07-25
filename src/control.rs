@@ -826,6 +826,7 @@ mod tests {
             model_gc_min_age_secs: 0,
             routing_map,
             coding_profile_source: Arc::new(Mutex::new(None)),
+            score_source: Arc::new(Mutex::new(None)),
             personal_proxy: None,
             embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
                 None,

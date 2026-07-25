@@ -115,6 +115,12 @@ pub struct AppState {
     /// EMBED-01: config for the local-first/OpenRouter-fallback `POST
     /// /v1/embeddings` proxy. See `crate::embeddings`.
     pub embeddings_config: crate::embeddings::EmbeddingsConfig,
+    /// CHRD-MINTSEL: MINT operational-score source for the unified `/v1/resolve`
+    /// selector. Best-effort/hot-swappable, same fail-open discipline as
+    /// `coding_profile_source`: `None` when the intake DB isn't configured/reachable,
+    /// in which case candidate scores stay `None` and ranking falls back to the
+    /// capability + locality tiebreaks (never blocks a resolution).
+    pub score_source: crate::models::score_source::SharedScoreSource,
 }
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -1969,14 +1975,41 @@ pub async fn resolve_task(
         )
             .into_response();
     }
+    // CHRD-EMBEDPIN: embedding never goes through the dynamic selector. It is hard-pinned
+    // to `EMBED_LOCAL_MODEL` — the exact value `route_embeddings` serves — so `/v1/resolve`
+    // and `/v1/embeddings` can never disagree on the embed model (a mismatch silently
+    // breaks vector compatibility). `resolve()` itself also refuses Task::Embed as
+    // defense-in-depth.
+    if desc.task == crate::models::selector::Task::Embed {
+        let model = state.embeddings_config.local_model.clone();
+        let backend = {
+            let reg = state.model_registry.lock().await;
+            reg.backend_for(&model).map(|b| b.name.clone())
+        }
+        .unwrap_or_else(|| "ollama".to_string());
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "model": model,
+                "backend": backend,
+                "reason": "embed pinned to EMBED_LOCAL_MODEL (out of the dynamic selector)"
+            })),
+        )
+            .into_response();
+    }
     // Capabilities are config-driven (CHORD_CAPABILITIES_PATH) + MINT-refreshable. Loaded per
     // request so config/MINT updates are picked up; this is a routing-decision endpoint, not
     // the hot inference path.
     let caps = crate::models::capability::CapabilityRegistry::from_env();
-    let candidates = {
+    let mut candidates = {
         let reg = state.model_registry.lock().await;
         crate::models::selector::candidates_from(&reg, &caps)
     };
+    // CHRD-MINTSEL: enrich candidate scores from MINT operational profiles before ranking
+    // (fail-open: unconfigured source or unprofiled model ⇒ score stays None ⇒ ranks last).
+    if let Some(src) = state.score_source.lock().await.clone() {
+        crate::models::selector::with_scores(&mut candidates, src.as_ref(), desc.task).await;
+    }
     match crate::models::selector::resolve(&desc, &caps, &candidates) {
         Some(sel) => (
             StatusCode::OK,
@@ -2338,6 +2371,12 @@ mod tests {
         Arc::new(Mutex::new(None))
     }
 
+    /// An unconfigured MINT score source for state builders — candidate scores stay
+    /// `None`, ranking falls back to capability/locality tiebreaks.
+    fn empty_score_source() -> crate::models::score_source::SharedScoreSource {
+        Arc::new(Mutex::new(None))
+    }
+
     fn test_state(mcp_url: String) -> Arc<AppState> {
         let mut reg = FallbackRegistry::new();
         reg.register(Box::new(PingTool));
@@ -2425,6 +2464,7 @@ mod tests {
             model_gc_min_age_secs: 300,
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
+            score_source: empty_score_source(),
             personal_proxy: None,
             embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
                 None,
@@ -2461,6 +2501,7 @@ mod tests {
             model_gc_min_age_secs: 300,
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
+            score_source: empty_score_source(),
             personal_proxy: None,
             embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
                 None,
@@ -2548,6 +2589,7 @@ mod tests {
             model_gc_min_age_secs: 300,
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
+            score_source: empty_score_source(),
             personal_proxy,
             embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
                 None,
@@ -2648,6 +2690,7 @@ mod tests {
             model_gc_min_age_secs: 300,
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
+            score_source: empty_score_source(),
             personal_proxy: None,
             embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
                 None,
@@ -2750,6 +2793,7 @@ mod tests {
             model_gc_min_age_secs: 300,
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
+            score_source: empty_score_source(),
             personal_proxy: None,
             embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
                 None,
@@ -2835,6 +2879,7 @@ mod tests {
             model_gc_min_age_secs: 300,
             routing_map,
             coding_profile_source: empty_coding_profile_source(),
+            score_source: empty_score_source(),
             personal_proxy: None,
             embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
                 None,
@@ -2928,6 +2973,7 @@ mod tests {
             model_gc_min_age_secs: 300,
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
+            score_source: empty_score_source(),
             personal_proxy: None,
             embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
                 None,
@@ -3033,6 +3079,7 @@ mod tests {
             model_gc_min_age_secs: 300,
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
+            score_source: empty_score_source(),
             personal_proxy: None,
             embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
                 None,
@@ -3141,6 +3188,7 @@ mod tests {
             model_gc_min_age_secs: 300,
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
+            score_source: empty_score_source(),
             personal_proxy: None,
             embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
                 None,
@@ -4398,6 +4446,7 @@ mod tests {
             model_gc_min_age_secs: 300,
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
+            score_source: empty_score_source(),
             personal_proxy: None,
             embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
                 None,
@@ -4881,6 +4930,7 @@ mod tests {
             model_gc_min_age_secs: 300,
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
+            score_source: empty_score_source(),
             personal_proxy,
             embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
                 None,

@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
 /// What kind of work a request needs. Maps 1:1 to a required [`Capability`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Task {
     Chat,
@@ -174,6 +174,15 @@ pub fn resolve(
     caps: &CapabilityRegistry,
     candidates: &[ModelCandidate],
 ) -> Option<Selection> {
+    // CHRD-EMBEDPIN: embedding is pinned OUT of the dynamic selector entirely — it is
+    // served only via the dedicated `/v1/embeddings` path against `EMBED_LOCAL_MODEL`.
+    // Dynamically picking an embed model here would silently break vector compatibility
+    // (a different model ⇒ a different embedding space). Refuse to resolve it; the route
+    // layer pins it explicitly. This makes it impossible for `resolve` to EVER return a
+    // non-pinned embed model.
+    if desc.task == Task::Embed {
+        return None;
+    }
     let need = desc.task.required_capability();
 
     // (1) Build the servable pool: capability-declared, satisfies ALL constraints, and is
@@ -321,6 +330,21 @@ pub fn candidates_from(
             })
         })
         .collect()
+}
+
+/// CHRD-MINTSEL: enrich a candidate set with MINT operational scores before ranking — the
+/// `with_scores` step the CH-SEL-01 doc comment always promised. For each candidate, sets
+/// `score = source.score_for(name, task)`; an unprofiled model leaves `score = None`
+/// (fail-open — `resolve`/`cmp_candidates` already rank a `None`/NaN score LAST). Async
+/// (the source hits the intake DB); call it after `candidates_from` and before `resolve`.
+pub async fn with_scores(
+    candidates: &mut [ModelCandidate],
+    source: &dyn crate::models::score_source::ScoreSource,
+    task: Task,
+) {
+    for c in candidates.iter_mut() {
+        c.score = source.score_for(&c.name, task).await;
+    }
 }
 
 #[cfg(test)]
@@ -521,5 +545,44 @@ mod tests {
         let a = resolve(&desc(Task::Chat), &caps, &cands).unwrap();
         let b = resolve(&desc(Task::Chat), &caps, &cands).unwrap();
         assert_eq!(a.backend, b.backend); // stable across calls
+    }
+
+    #[test]
+    fn embed_is_never_resolved_dynamically() {
+        // CHRD-EMBEDPIN: even with capable, high-scoring embed candidates present,
+        // `resolve` must refuse Task::Embed (it is pinned out of the dynamic path).
+        let caps = caps_with(&[
+            ("qwen3-embedding:0.6b", &[Capability::Embed]),
+            ("other-embed", &[Capability::Embed]),
+        ]);
+        let cands = vec![
+            cand("qwen3-embedding:0.6b", "ollama", BackendKind::Ollama, true, Some(0.5)),
+            cand("other-embed", "ollama", BackendKind::Ollama, true, Some(0.99)),
+        ];
+        assert!(resolve(&desc(Task::Embed), &caps, &cands).is_none());
+    }
+
+    #[tokio::test]
+    async fn with_scores_enriches_and_resolve_picks_highest_mint() {
+        // A non-code task (VisionQa): candidates start with score=None; after MINT
+        // enrichment the highest-scoring capable model wins (not the lexicographic
+        // tiebreak that used to decide every non-code resolution).
+        use crate::models::score_source::StaticScoreSource;
+        let caps = caps_with(&[
+            ("m-lo", &[Capability::Chat, Capability::Vlm]),
+            ("m-hi", &[Capability::Chat, Capability::Vlm]),
+        ]);
+        let mut cands = vec![
+            // Deliberately: 'm-hi' is lexicographically LARGER, so the old name tiebreak
+            // would have picked 'm-lo'. MINT score must override that.
+            cand("m-lo", "ollama", BackendKind::Ollama, true, None),
+            cand("m-hi", "ollama", BackendKind::Ollama, true, None),
+        ];
+        let src = StaticScoreSource::new()
+            .with_score("m-hi", Task::VisionQa, 0.9)
+            .with_score("m-lo", Task::VisionQa, 0.2);
+        with_scores(&mut cands, &src, Task::VisionQa).await;
+        let sel = resolve(&desc(Task::VisionQa), &caps, &cands).unwrap();
+        assert_eq!(sel.model, "m-hi");
     }
 }
