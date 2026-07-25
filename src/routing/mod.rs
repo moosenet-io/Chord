@@ -9,3 +9,4 @@
 //! it* mechanics.
 
 pub mod assistant_profile;
+pub mod lumina_alias;

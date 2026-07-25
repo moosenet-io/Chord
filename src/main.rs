@@ -54,6 +54,12 @@ async fn main() {
     if !model_aliases.is_empty() {
         info!("model aliases loaded: {} mapping(s)", model_aliases.len());
     }
+    // CHRD-91390429: seed the runtime-mutable lumina alias store from the static
+    // config so resolution is identical until the background updater first
+    // repoints a tier. The store is shared (cheap Arc clone) between AppState (hot
+    // path) and the updater task spawned below.
+    let lumina_aliases =
+        chord_proxy::routing::lumina_alias::LuminaAliasStore::from_static(&model_aliases);
     match &llm_backend_url {
         Some(url) => info!("LLM proxy enabled → {url}"),
         None => info!("LLM proxy disabled (CHORD_LLM_URL unset) — /v1/chat/completions returns 503"),
@@ -371,6 +377,50 @@ async fn main() {
         });
     }
 
+    // ── CHRD-91390429: dynamic lumina-proxy alias updater ──
+    // Background task that ranks the measured assistant fleet every
+    // CHORD_ALIAS_REFRESH_SECS and repoints lumina/lumina-fast/lumina-deep via
+    // the ArcSwap store (lock-free hot-path reads). Same fail-open discipline as
+    // the coding selector / serving-profile map above: an unconfigured/unreachable
+    // intake DB leaves the three targets at their static CHORD_MODEL_ALIASES
+    // values rather than blocking startup. Every other alias stays static.
+    {
+        let store = lumina_aliases.clone();
+        let registry = model_registry.clone();
+        let routing = routing_map.clone();
+        let alias_cfg = chord_proxy::routing::lumina_alias::AliasUpdaterConfig::from_env();
+        tokio::spawn(async move {
+            let Some(db_url) = terminus_rs::config::intake_database_url() else {
+                info!(
+                    "lumina alias updater: intake DB not configured — lumina/lumina-fast/lumina-deep \
+                     stay at their static CHORD_MODEL_ALIASES targets"
+                );
+                return;
+            };
+            let pool = match sqlx::PgPool::connect(&db_url).await {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("lumina alias updater: intake DB connect failed: {e} — keeping static targets");
+                    return;
+                }
+            };
+            let source = chord_proxy::routing::lumina_alias::DbAssistantAliasSource::new(pool);
+            info!(
+                "lumina alias updater started, interval={}s",
+                alias_cfg.refresh_secs
+            );
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(alias_cfg.refresh_secs));
+            loop {
+                ticker.tick().await;
+                chord_proxy::routing::lumina_alias::run_alias_refresh_tick(
+                    &source, &store, &registry, &routing, &alias_cfg,
+                )
+                .await;
+            }
+        });
+    }
+
     let state = Arc::new(AppState {
         proxy,
         jwt_secret,
@@ -379,6 +429,7 @@ async fn main() {
         agentic_executor,
         llm_backend_url,
         model_aliases,
+        lumina_aliases: lumina_aliases.clone(),
         http_client,
         model_registry,
         pull_coordinator,

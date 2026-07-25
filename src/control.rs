@@ -827,6 +827,7 @@ mod tests {
             routing_map,
             coding_profile_source: Arc::new(Mutex::new(None)),
             score_source: Arc::new(Mutex::new(None)),
+            lumina_aliases: crate::routing::lumina_alias::LuminaAliasStore::empty(),
             personal_proxy: None,
             embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
                 None,
