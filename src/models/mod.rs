@@ -14,6 +14,7 @@ pub mod score_source;
 pub mod selector;
 pub mod eviction;
 pub mod gc;
+pub mod ingest;
 pub mod registry;
 pub mod rope_ingest;
 pub mod routing;

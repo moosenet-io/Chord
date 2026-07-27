@@ -14,6 +14,7 @@
 //! | GET    | `/api/models/:name`          | yes  | single model detail (404 unknown) |
 //! | POST   | `/api/models/:name/archive`  | yes  | archive a warm model (warm → cold) |
 //! | POST   | `/api/models/:name/pull`     | yes  | pull a cold model (cold → warm) |
+//! | POST   | `/api/models/ingest`          | yes  | ASK4-P2A: pull a HuggingFace model into cold storage (default-OFF gate) |
 //! | POST   | `/api/models/:name/protect`  | yes  | toggle/set the protected flag |
 //! | GET    | `/api/storage`                | yes  | disk usage summary (local + archive) |
 //! | POST   | `/api/models/sweep`           | yes  | trigger a disk-pressure eviction sweep |
@@ -670,6 +671,359 @@ pub async fn sweep_session_advance(
     }
 }
 
+// ── POST /api/models/ingest (ASK4-P2A) ───────────────────────────────────────
+
+/// Request body for `POST /api/models/ingest`.
+///
+/// Re-exported shape of [`crate::models::ingest::IngestRequest`] — declared here
+/// so axum's `Json<...>` extractor rejects a malformed body with a 422 before
+/// the handler runs, consistent with the other control DTOs.
+pub use crate::models::ingest::IngestRequest;
+
+/// The real [`crate::models::ingest::IngestOps`] over the live [`AppState`]:
+/// Ollama for the HF download, the model registry + eviction machinery for the
+/// warm→cold demote. Constructed per-request (cheap; holds only references).
+struct AppStateIngestOps<'a> {
+    state: &'a AppState,
+    ollama_url: Option<String>,
+    /// CHORD_MODEL_INGEST_PULL_TIMEOUT_SECS — bounds the (potentially long) HF
+    /// download step. Distinct from `archive_copy_timeout`.
+    pull_timeout: std::time::Duration,
+    /// MODEL_ARCHIVE_COPY_TIMEOUT_SECS — bounds the warm→cold copy.
+    archive_copy_timeout: std::time::Duration,
+}
+
+impl<'a> AppStateIngestOps<'a> {
+    /// Map a registry [`ModelRecord`] tier to the module-local
+    /// [`crate::models::ingest::ModelTier`].
+    fn tier_of(rec: &ModelRecord) -> crate::models::ingest::ModelTier {
+        match rec.tier {
+            StorageTier::Cold => crate::models::ingest::ModelTier::Cold,
+            StorageTier::Warm => crate::models::ingest::ModelTier::Warm,
+            StorageTier::Hot => crate::models::ingest::ModelTier::Hot,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<'a> crate::models::ingest::IngestOps for AppStateIngestOps<'a> {
+    async fn find_existing(
+        &self,
+        candidates: &[String],
+    ) -> Option<crate::models::ingest::ExistingModel> {
+        // Candidates are the host-stripped registry keys (`org/model[:tag]`),
+        // exactly what `reconcile()` records — never a `hf.co/...` literal.
+        let reg = self.state.model_registry.lock().await;
+        for candidate in candidates {
+            if let Some(rec) = reg.get(candidate) {
+                return Some(crate::models::ingest::ExistingModel {
+                    name: rec.name.clone(),
+                    tier: Self::tier_of(rec),
+                });
+            }
+        }
+        None
+    }
+
+    async fn probe(
+        &self,
+        hf_repo: &str,
+        revision: Option<&str>,
+        token: Option<&str>,
+    ) -> Result<crate::models::ingest::HfProbe, String> {
+        // HuggingFace Hub model-info API. A gated repo returns 401/403 without
+        // an accepted token; a public one returns JSON with a `gated` field and
+        // (with ?blobs=true) per-sibling sizes. `revision` here is an Ollama
+        // quant selector, NOT an HF git ref — so it is used only to FILTER the
+        // sibling sizes, never placed in the URL path.
+        let url = format!("https://huggingface.co/api/models/{hf_repo}?blobs=true");
+        let mut rb = self
+            .state
+            .http_client
+            .get(&url)
+            .header("User-Agent", "chord-model-ingest");
+        if let Some(t) = token {
+            rb = rb.bearer_auth(t); // never logged
+        }
+        let resp = rb.send().await.map_err(|e| format!("request error: {e}"))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            // Access-restricted and unreadable (gated without an accepted token,
+            // or private/absent). Report gated so it's refused up front — the
+            // credential-free Ollama pull couldn't authenticate it anyway.
+            return Ok(crate::models::ingest::HfProbe {
+                gated: true,
+                private: false,
+                total_bytes: None,
+            });
+        }
+        if !status.is_success() {
+            return Err(format!("HTTP {status}"));
+        }
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("response not JSON: {e}"))?;
+        // Both `gated` (bool | "auto"/"manual") and `private` (bool) mark a repo
+        // the credential-free Ollama pull cannot fetch → refused by the caller.
+        let flag = |key: &str| match body.get(key) {
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(serde_json::Value::String(s)) => !s.eq_ignore_ascii_case("false"),
+            _ => false,
+        };
+        let total_bytes = hf_repo_size_bytes(&body, revision);
+        Ok(crate::models::ingest::HfProbe {
+            gated: flag("gated"),
+            private: flag("private"),
+            total_bytes,
+        })
+    }
+
+    async fn pull_warm(&self, ollama_ref: &str) -> Result<(), String> {
+        // Delegate the actual download to Ollama's native HF ingestion (public
+        // repos only — gated repos are refused before this step). The download
+        // writes blobs into the SAME local model store that the sweep / archive
+        // pull / orphan-GC manage, so it MUST hold `disk_op_lock` for its whole
+        // duration — otherwise a concurrent GC/sweep could reap the in-progress
+        // (or sharded/long) download's blobs before its manifest lands. Same
+        // discipline as `PullCoordinator::ensure_local` (holds the lock across
+        // the cold→warm copy). Acquired FIRST, no registry lock held, so the
+        // canonical disk_op→registry order is preserved; `land_cold` then takes
+        // its own guard afterwards (nothing is held between the two).
+        let _guard = self.state.disk_op_lock.lock().await;
+
+        let base = self
+            .ollama_url
+            .as_deref()
+            .ok_or_else(|| "OLLAMA_URL is not configured".to_string())?;
+        let url = format!("{}/api/pull", base.trim_end_matches('/'));
+        let fut = self
+            .state
+            .http_client
+            .post(&url)
+            .json(&serde_json::json!({ "name": ollama_ref, "stream": false }))
+            .send();
+        let resp = tokio::time::timeout(self.pull_timeout, fut)
+            .await
+            .map_err(|_| "ollama pull timed out".to_string())?
+            .map_err(|e| format!("ollama pull request error: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("ollama pull returned HTTP {}", resp.status()));
+        }
+        Ok(())
+    }
+
+    async fn land_cold(
+        &self,
+        candidates: &[String],
+    ) -> Result<crate::models::ingest::ColdLanded, String> {
+        // Serialise with the sweep / archive / GC via the shared disk-op lock,
+        // acquired FIRST (canonical disk_op → registry order), and never hold
+        // the registry mutex across the blocking NFS scan (S111 discipline:
+        // scan off-lock via spawn_blocking, apply under a brief lock).
+        let _guard = self.state.disk_op_lock.lock().await;
+
+        let (local_path, archive_path_root) = {
+            let reg = self.state.model_registry.lock().await;
+            (
+                reg.local_path().to_path_buf(),
+                reg.archive_path().to_path_buf(),
+            )
+        };
+        let scan = tokio::task::spawn_blocking(move || {
+            crate::models::registry::ModelRegistry::scan_disk(local_path, archive_path_root)
+        })
+        .await
+        .map_err(|e| format!("reconcile scan task failed: {e}"))?;
+
+        // Locate the model by the host-stripped key reconcile actually records.
+        // A concurrent ingest may have already demoted it to Cold between our
+        // pull and this reconcile — in that case the requested state is already
+        // achieved, so return success rather than a spurious "not found as warm".
+        enum Found {
+            Warm(String),
+            AlreadyCold(crate::models::ingest::ColdLanded),
+        }
+        let found = {
+            let mut reg = self.state.model_registry.lock().await;
+            reg.apply_reconcile(scan);
+            let matches = |r: &ModelRecord| candidates.iter().any(|c| c == &r.name);
+            // Bind to a local (note the trailing `;`) so the `all_records()`
+            // iterator borrow of `reg` is dropped before the block's tail.
+            let result: Found = if let Some(rec) = reg
+                .all_records()
+                .find(|r| r.tier == StorageTier::Warm && matches(r))
+            {
+                Found::Warm(rec.name.clone())
+            } else if let Some(rec) = reg
+                .all_records()
+                .find(|r| r.tier == StorageTier::Cold && matches(r))
+            {
+                Found::AlreadyCold(crate::models::ingest::ColdLanded {
+                    registry_name: rec.name.clone(),
+                    archive_path: rec
+                        .archive_path
+                        .clone()
+                        .unwrap_or_else(|| reg.archive_path().display().to_string()),
+                    bytes: rec.size_bytes,
+                })
+            } else {
+                return Err("pulled model not found as warm or cold after reconcile".to_string());
+            };
+            result
+        };
+
+        let registry_name = match found {
+            Found::AlreadyCold(landed) => return Ok(landed),
+            Found::Warm(name) => name,
+        };
+
+        let evicted = eviction::evict_to_archive(
+            &self.state.model_registry,
+            &registry_name,
+            self.state.local_evictor.as_ref(),
+            self.archive_copy_timeout,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let archive_path = {
+            let reg = self.state.model_registry.lock().await;
+            reg.get(&registry_name)
+                .and_then(|r| r.archive_path.clone())
+                .unwrap_or_else(|| reg.archive_path().display().to_string())
+        };
+
+        Ok(crate::models::ingest::ColdLanded {
+            registry_name,
+            archive_path,
+            bytes: evicted.freed_bytes,
+        })
+    }
+}
+
+/// Sum the on-disk size of an HF model from its `?blobs=true` model-info JSON.
+///
+/// When `revision` (an Ollama quant selector, e.g. `Q4_K_M`) is given, only
+/// sibling files whose filename contains that tag (case-insensitive) are summed,
+/// so a multi-quant GGUF repo's whole-repo `usedStorage` doesn't trigger a false
+/// `too_large`. When no quant is given, or no per-file sizes are available, falls
+/// back to `usedStorage`. `None` ⇒ size unknown (the caller skips the size gate).
+fn hf_repo_size_bytes(body: &serde_json::Value, revision: Option<&str>) -> Option<u64> {
+    let quant = revision.map(str::trim).filter(|r| !r.is_empty());
+    if let Some(siblings) = body.get("siblings").and_then(|s| s.as_array()) {
+        let mut sum: u64 = 0;
+        let mut matched = false;
+        for sib in siblings {
+            let rfilename = sib.get("rfilename").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(q) = quant {
+                if !rfilename
+                    .to_ascii_lowercase()
+                    .contains(&q.to_ascii_lowercase())
+                {
+                    continue;
+                }
+            }
+            // ?blobs=true surfaces `size` (and `lfs.size` for LFS objects).
+            let size = sib.get("size").and_then(|v| v.as_u64()).or_else(|| {
+                sib.get("lfs")
+                    .and_then(|l| l.get("size"))
+                    .and_then(|v| v.as_u64())
+            });
+            if let Some(sz) = size {
+                sum += sz;
+                matched = true;
+            }
+        }
+        if matched && sum > 0 {
+            return Some(sum);
+        }
+    }
+    // Fallback: whole-repo storage (only meaningful when no quant filter, but
+    // better than nothing when sibling sizes are absent).
+    body.get("usedStorage")
+        .and_then(|v| v.as_u64())
+        .filter(|b| *b > 0)
+}
+
+/// `POST /api/models/ingest` — ASK4-P2A: pull a HuggingFace model into cold
+/// storage so the MINT sweep can later promote+test it.
+///
+/// Same JWT auth as every other control endpoint. Master-gated OFF by default
+/// (`CHORD_MODEL_INGEST_ENABLED`) — the gate is checked BEFORE input validation,
+/// so a disabled endpoint returns `disabled` even for a malformed body. Returns
+/// a structured [`crate::models::ingest::IngestOutcome`] as JSON; the HTTP status
+/// code is derived from the outcome. Never panics; never leaks the HF token.
+pub async fn ingest_model(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<IngestRequest>,
+) -> Response {
+    if let Err(e) = auth_check(&headers, &state.jwt_secret) {
+        return auth_error_response(e);
+    }
+
+    let cfg = crate::models::ingest::IngestConfig::from_env();
+
+    // Gate FIRST — a disabled feature does no work and leaks no validation
+    // detail (mirrors the module's gate→validate order).
+    if !cfg.enabled {
+        let outcome = crate::models::ingest::ingest_model(&NoopIngestOps, &cfg, &req).await;
+        let code = StatusCode::from_u16(outcome.http_status())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        return (code, Json(outcome)).into_response();
+    }
+
+    // Precise 400 for malformed input, once enabled.
+    if let Err(msg) = crate::models::ingest::validate_request(&req) {
+        return error_response(StatusCode::BAD_REQUEST, msg);
+    }
+
+    let ops = AppStateIngestOps {
+        state: &state,
+        ollama_url: cfg.ollama_url.clone(),
+        pull_timeout: cfg.pull_timeout,
+        archive_copy_timeout: std::time::Duration::from_secs(state.model_archive_copy_timeout_secs),
+    };
+
+    let outcome = crate::models::ingest::ingest_model(&ops, &cfg, &req).await;
+    let code =
+        StatusCode::from_u16(outcome.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (code, Json(outcome)).into_response()
+}
+
+/// A no-op [`crate::models::ingest::IngestOps`] used only for the disabled-gate
+/// path: `ingest_model` returns `disabled` before touching any of these, so they
+/// are never actually called.
+struct NoopIngestOps;
+
+#[async_trait::async_trait]
+impl crate::models::ingest::IngestOps for NoopIngestOps {
+    async fn find_existing(
+        &self,
+        _candidates: &[String],
+    ) -> Option<crate::models::ingest::ExistingModel> {
+        None
+    }
+    async fn probe(
+        &self,
+        _hf_repo: &str,
+        _revision: Option<&str>,
+        _token: Option<&str>,
+    ) -> Result<crate::models::ingest::HfProbe, String> {
+        Err("ingest disabled".into())
+    }
+    async fn pull_warm(&self, _ollama_ref: &str) -> Result<(), String> {
+        Err("ingest disabled".into())
+    }
+    async fn land_cold(
+        &self,
+        _candidates: &[String],
+    ) -> Result<crate::models::ingest::ColdLanded, String> {
+        Err("ingest disabled".into())
+    }
+}
+
 // ── Router ───────────────────────────────────────────────────────────────────
 
 /// Build the TIER-05 control router over the shared [`AppState`].
@@ -686,6 +1040,8 @@ pub fn build_control_router(state: Arc<AppState>) -> axum::Router {
         .route("/api/models/:name/archive", post(archive_model))
         .route("/api/models/:name/pull", post(pull_model))
         .route("/api/models/:name/protect", post(protect_model))
+        // ASK4-P2A: pull a HuggingFace model into cold storage (default-OFF gate).
+        .route("/api/models/ingest", post(ingest_model))
         .route("/api/storage", get(storage_summary))
         .route("/api/storage/gc", post(trigger_gc))
         // RESIL-02: sweep action-queue cache (durable resume).
@@ -1466,5 +1822,133 @@ mod tests {
         assert_eq!(json["orphans_deleted"], 1);
         assert_eq!(json["freed_bytes"], 64);
         assert!(!base.join("local/blobs/sha256-orphan1").exists());
+    }
+
+    // ── ASK4-P2A: /api/models/ingest ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn ingest_requires_auth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let registry = Arc::new(Mutex::new(reg_at(base, vec![])));
+        let state = control_state_with_secret(registry, base.join("local"), "s");
+        let app = build_control_router(state);
+
+        // Valid JSON body so the Json extractor succeeds and the in-handler
+        // auth_check is what rejects the request.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/models/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "hf_repo": "org/model", "model_name": "m" })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ingest_disabled_by_default_refuses() {
+        // Default (gate unset) ⇒ disabled ⇒ 403 with status "disabled",
+        // touching no network/registry state.
+        std::env::remove_var("CHORD_MODEL_INGEST_ENABLED");
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let registry = Arc::new(Mutex::new(reg_at(base, vec![])));
+        // Empty jwt_secret ⇒ auth disabled, so we reach the gate.
+        let state = control_state(registry, base.join("local"), Arc::new(StatvfsProbe));
+        let app = build_control_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/models/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "hf_repo": "org/model", "model_name": "m" })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["status"], "disabled");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ingest_enabled_rejects_malformed_repo_with_400() {
+        // Gate is checked BEFORE validation, so the 400 path is only reachable
+        // once the feature is enabled.
+        std::env::set_var("CHORD_MODEL_INGEST_ENABLED", "1");
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let registry = Arc::new(Mutex::new(reg_at(base, vec![])));
+        let state = control_state(registry, base.join("local"), Arc::new(StatvfsProbe));
+        let app = build_control_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/models/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "hf_repo": "not a repo", "model_name": "m" })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        std::env::remove_var("CHORD_MODEL_INGEST_ENABLED");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ingest_disabled_refuses_even_malformed_before_validation() {
+        // Gate-first: a malformed body under a disabled gate returns `disabled`
+        // (403), never a 400 — the disabled endpoint leaks no validation detail.
+        std::env::remove_var("CHORD_MODEL_INGEST_ENABLED");
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let registry = Arc::new(Mutex::new(reg_at(base, vec![])));
+        let state = control_state(registry, base.join("local"), Arc::new(StatvfsProbe));
+        let app = build_control_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/models/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "hf_repo": "not a repo", "model_name": "m" })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["status"], "disabled");
     }
 }
