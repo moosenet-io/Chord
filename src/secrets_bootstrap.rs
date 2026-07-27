@@ -49,14 +49,16 @@ use chord_secrets::{fetch_secrets_batch, InfisicalConfig};
 /// here (never a literal, never logged) exactly like `CHORD_JWT_SECRET`/
 /// `CHORD_API_KEY`; `embeddings::openrouter_api_key()` reads it back from the
 /// process environment fresh on every request.
-/// ASK4-P2A: `HF_PAT_MOOSE` — the HuggingFace access token the model-ingest
-/// endpoint (`models::ingest`) uses to detect gated repos, and that the Ollama
-/// daemon needs (in its own env) to actually pull them. Fetched here (never a
-/// literal, never logged) exactly like the keys above, but **materialised under
-/// the HuggingFace-standard env var `HF_TOKEN`** (see [`downstream_env_var`]),
-/// which is what both `models::ingest::hf_token()` and Ollama read by
-/// convention. Absent ⇒ fail-soft (public models still pull; gated models
-/// return `gated_needs_token`).
+/// ASK4-P2A: `HF_PAT_MOOSE` — the HuggingFace access token used ONLY by the
+/// model-ingest endpoint's metadata probe (`models::ingest`) to reliably DETECT
+/// gated/private repos, which are then refused (the credential-free Ollama
+/// `/api/pull` cannot fetch them, so nothing is pulled). It is NOT consumed by
+/// Ollama and does NOT enable gated/private pulls. Fetched here (never a
+/// literal, never logged) like the keys above, but **materialised under the
+/// HuggingFace-standard env var `HF_TOKEN`** (see [`downstream_env_var`]), which
+/// is what `models::ingest::hf_token()` reads. Absent ⇒ fail-soft (public models
+/// still pull; a gated/private repo just can't be distinguished from a 404 and
+/// is refused all the same).
 const DOWNSTREAM_SECRET_KEYS: &[&str] = &[
     "CHORD_JWT_SECRET",
     "CHORD_API_KEY",

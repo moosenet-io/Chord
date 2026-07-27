@@ -57,20 +57,21 @@
 //!   `HF_PAT_MOOSE`, materialised under the standard env var `HF_TOKEN`), like
 //!   `OPENROUTER_API_KEY`. It is never hardcoded, never logged, and never echoed
 //!   into a response or error string.
-//! - **Gated-model contract (explicit refusal, never a dead-end pull).** The
-//!   actual download is delegated to the **separate Ollama daemon** over HTTP.
-//!   Ollama's `/api/pull` has no per-request credential field, and current
+//! - **Gated/private-model contract (explicit refusal, never a dead-end pull).**
+//!   The actual download is delegated to the **separate Ollama daemon** over
+//!   HTTP. Ollama's `/api/pull` has no per-request credential field, and current
 //!   Ollama builds have no HF-token consumer for `hf.co/...` pulls at all
-//!   (credential-free pull API) — so an *automated* gated pull cannot
-//!   authenticate through this path, regardless of any token Chord holds.
-//!   Rather than probe-pass a gated repo and then dead-end in an
-//!   un-authenticatable pull, a gated repo is **refused up front** with
+//!   (credential-free pull API) — so an *automated* pull of an access-restricted
+//!   repo (gated OR private) cannot authenticate through this path, regardless
+//!   of any token Chord holds. Rather than probe-pass such a repo and then
+//!   dead-end in an un-authenticatable pull, it is **refused up front** with
 //!   [`IngestStatus::GatedNeedsToken`] and a clear message; **nothing is
 //!   pulled**. Chord's `HF_TOKEN` is used ONLY for the metadata probe, so a
-//!   gated repo is reliably *detected* (a `gated` flag, or a `401/403`) instead
-//!   of being mistaken for a 404. A public repo pulls with no token at all.
-//!   (If a future Ollama build gains real gated-pull support, this is the one
-//!   place to relax the refusal — verify against the deployed daemon first.)
+//!   gated repo (`gated` flag / `401`/`403`) or a private repo (`private` flag)
+//!   is reliably *detected* instead of being mistaken for a 404. A public repo
+//!   pulls with no token at all. (If a future Ollama build gains real
+//!   authenticated-pull support, this is the one place to relax the refusal —
+//!   verify against the deployed daemon first.)
 //! - **Bounded:** an oversize repo is refused ([`IngestStatus::TooLarge`])
 //!   before any byte is copied, protecting the shared disk (<host> disk-pressure
 //!   discipline), and the pull/copy steps are wrapped in timeouts.
@@ -246,6 +247,11 @@ impl IngestOutcome {
 pub struct HfProbe {
     /// Whether the repo is access-gated (requires an accepted license / token).
     pub gated: bool,
+    /// Whether the repo is private (visible only to authorised accounts). Like
+    /// `gated`, a private repo cannot be pulled through the credential-free
+    /// Ollama `/api/pull` path, so it is refused up front — never dead-ended in
+    /// an un-authenticatable pull.
+    pub private: bool,
     /// Total on-disk size in bytes, when HuggingFace reports it (and, when a
     /// quant/`revision` was given, filtered to the matching files). `None` ⇒
     /// unknown, in which case the size gate is skipped (proceed).
@@ -289,9 +295,9 @@ pub trait IngestOps: Send + Sync {
     /// registry, returning the match + its tier (idempotency). The candidates
     /// come from [`canonical_registry_names`], never a `hf.co/...` literal.
     async fn find_existing(&self, candidates: &[String]) -> Option<ExistingModel>;
-    /// Fetch HF repo metadata (gated flag + quant-aware size). `token` MUST NOT
-    /// be logged. `revision` (a quant selector) is used only to filter the
-    /// sibling files summed for `total_bytes`, never as an HF git ref.
+    /// Fetch HF repo metadata (gated + private flags + quant-aware size).
+    /// `token` MUST NOT be logged. `revision` (a quant selector) is used only to
+    /// filter the sibling files summed for `total_bytes`, never as an HF git ref.
     async fn probe(
         &self,
         hf_repo: &str,
@@ -299,8 +305,9 @@ pub trait IngestOps: Send + Sync {
         token: Option<&str>,
     ) -> Result<HfProbe, String>;
     /// Pull the HF repo into the warm (local Ollama) tier via Ollama's own
-    /// `/api/pull`. No token is forwarded — a gated pull depends on the Ollama
-    /// daemon's own environment (see the module-level gated-model contract).
+    /// `/api/pull`. Handles PUBLIC repos only — gated/private repos are refused
+    /// before this point (see the module-level contract), so no credential is
+    /// involved and none is forwarded.
     async fn pull_warm(&self, ollama_ref: &str) -> Result<(), String>;
     /// Reconcile the registry, locate the freshly pulled model by one of the
     /// host-stripped `candidates`, and demote it warm→cold via the existing
@@ -396,10 +403,11 @@ pub enum PlanDecision {
 }
 
 pub fn plan_after_probe(cfg: &IngestConfig, probe: &HfProbe) -> PlanDecision {
-    // Gated repos are refused up front (regardless of any token Chord holds):
-    // the Ollama-delegated pull has no way to authenticate them. See the
-    // module-level gated-model contract.
-    if probe.gated {
+    // Gated OR private repos are refused up front (regardless of any token Chord
+    // holds): the credential-free Ollama `/api/pull` path has no way to
+    // authenticate either, so pulling would dead-end. See the module-level
+    // gated-model contract.
+    if probe.gated || probe.private {
         return PlanDecision::Refuse(IngestStatus::GatedNeedsToken);
     }
     if let Some(bytes) = probe.total_bytes {
@@ -504,9 +512,9 @@ pub async fn ingest_model(
         PlanDecision::Refuse(IngestStatus::GatedNeedsToken) => {
             return IngestOutcome::simple(
                 IngestStatus::GatedNeedsToken,
-                "gated model: automated ingest is not supported by the Ollama-delegated \
-                 pull path (no HF credential mechanism on /api/pull); acquire it out-of-band \
-                 or use a public/mirror repo",
+                "gated or private model: automated ingest is not supported by the \
+                 Ollama-delegated pull path (no HF credential mechanism on /api/pull); \
+                 acquire it out-of-band or use a public/mirror repo",
             );
         }
         PlanDecision::Refuse(IngestStatus::TooLarge) => {
@@ -659,10 +667,24 @@ mod tests {
         // this (the Ollama-delegated pull can't authenticate gated repos).
         let gated = HfProbe {
             gated: true,
+            private: false,
             total_bytes: Some(10),
         };
         assert_eq!(
             plan_after_probe(&cfg(true, DEFAULT_MAX_BYTES), &gated),
+            PlanDecision::Refuse(IngestStatus::GatedNeedsToken)
+        );
+    }
+
+    #[test]
+    fn plan_private_refuses() {
+        let private = HfProbe {
+            gated: false,
+            private: true,
+            total_bytes: Some(10),
+        };
+        assert_eq!(
+            plan_after_probe(&cfg(true, DEFAULT_MAX_BYTES), &private),
             PlanDecision::Refuse(IngestStatus::GatedNeedsToken)
         );
     }
@@ -673,6 +695,7 @@ mod tests {
             &cfg(true, 100),
             &HfProbe {
                 gated: false,
+                private: false,
                 total_bytes: Some(101),
             },
         );
@@ -685,6 +708,7 @@ mod tests {
             &cfg(true, 100),
             &HfProbe {
                 gated: false,
+                private: false,
                 total_bytes: None,
             },
         );
@@ -697,6 +721,7 @@ mod tests {
             &cfg(true, 100),
             &HfProbe {
                 gated: false,
+                private: false,
                 total_bytes: Some(100),
             },
         );
@@ -907,6 +932,7 @@ mod tests {
             let ops = MockOps {
                 probe: Some(Ok(HfProbe {
                     gated: true,
+                    private: false,
                     total_bytes: Some(10),
                 })),
                 ..Default::default()
@@ -924,10 +950,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn private_is_refused_without_pulling() {
+        // A PRIVATE repo (gated:false, private:true) — readable with Chord's
+        // token but not pullable by the credential-free Ollama path — is refused
+        // up front, same as gated. Mirrors gated_is_refused_without_pulling.
+        let ops = MockOps {
+            probe: Some(Ok(HfProbe {
+                gated: false,
+                private: true,
+                total_bytes: Some(10),
+            })),
+            ..Default::default()
+        };
+        let out = ingest_model(
+            &ops,
+            &cfg(true, DEFAULT_MAX_BYTES),
+            &req("org/model", "m", None),
+        )
+        .await;
+        assert_eq!(out.status, IngestStatus::GatedNeedsToken);
+        assert!(!*ops.pulled.lock().unwrap());
+    }
+
+    #[tokio::test]
     async fn oversize_refused_before_pull() {
         let ops = MockOps {
             probe: Some(Ok(HfProbe {
                 gated: false,
+                private: false,
                 total_bytes: Some(999),
             })),
             ..Default::default()
@@ -960,6 +1010,7 @@ mod tests {
         let ops = MockOps {
             probe: Some(Ok(HfProbe {
                 gated: false,
+                private: false,
                 total_bytes: Some(50),
             })),
             pull: Some(Ok(())),
@@ -990,6 +1041,7 @@ mod tests {
         let ops = MockOps {
             probe: Some(Ok(HfProbe {
                 gated: false,
+                private: false,
                 total_bytes: Some(50),
             })),
             pull: Some(Err("ollama 500".into())),
@@ -1015,6 +1067,7 @@ mod tests {
         let ops = MockOps {
             probe: Some(Ok(HfProbe {
                 gated: true,
+                private: false,
                 total_bytes: Some(10),
             })),
             ..Default::default()
@@ -1028,7 +1081,7 @@ mod tests {
         std::env::remove_var("HF_TOKEN");
         assert_eq!(out.status, IngestStatus::GatedNeedsToken);
         assert!(!*ops.pulled.lock().unwrap());
-        assert!(out.message.contains("gated model"));
+        assert!(out.message.contains("gated"));
     }
 
     #[tokio::test]
@@ -1036,6 +1089,7 @@ mod tests {
         let ops = MockOps {
             probe: Some(Ok(HfProbe {
                 gated: false,
+                private: false,
                 total_bytes: Some(50),
             })),
             pull: Some(Ok(())),

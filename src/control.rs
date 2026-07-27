@@ -748,10 +748,12 @@ impl<'a> crate::models::ingest::IngestOps for AppStateIngestOps<'a> {
         let resp = rb.send().await.map_err(|e| format!("request error: {e}"))?;
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            // Gated (or token lacks access). Report gated; the caller decides
-            // fail-soft based on whether a token was present.
+            // Access-restricted and unreadable (gated without an accepted token,
+            // or private/absent). Report gated so it's refused up front — the
+            // credential-free Ollama pull couldn't authenticate it anyway.
             return Ok(crate::models::ingest::HfProbe {
                 gated: true,
+                private: false,
                 total_bytes: None,
             });
         }
@@ -762,13 +764,19 @@ impl<'a> crate::models::ingest::IngestOps for AppStateIngestOps<'a> {
             .json()
             .await
             .map_err(|e| format!("response not JSON: {e}"))?;
-        let gated = match body.get("gated") {
+        // Both `gated` (bool | "auto"/"manual") and `private` (bool) mark a repo
+        // the credential-free Ollama pull cannot fetch → refused by the caller.
+        let flag = |key: &str| match body.get(key) {
             Some(serde_json::Value::Bool(b)) => *b,
             Some(serde_json::Value::String(s)) => !s.eq_ignore_ascii_case("false"),
             _ => false,
         };
         let total_bytes = hf_repo_size_bytes(&body, revision);
-        Ok(crate::models::ingest::HfProbe { gated, total_bytes })
+        Ok(crate::models::ingest::HfProbe {
+            gated: flag("gated"),
+            private: flag("private"),
+            total_bytes,
+        })
     }
 
     async fn pull_warm(&self, ollama_ref: &str) -> Result<(), String> {
