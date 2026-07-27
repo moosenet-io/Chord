@@ -772,11 +772,18 @@ impl<'a> crate::models::ingest::IngestOps for AppStateIngestOps<'a> {
     }
 
     async fn pull_warm(&self, ollama_ref: &str) -> Result<(), String> {
-        // Delegate the actual download to Ollama's native HF ingestion. Chord
-        // cannot inject the (separate) Ollama daemon's environment, and
-        // /api/pull has no per-request credential field — so a GATED pull
-        // succeeds only when the Ollama daemon itself carries HF_TOKEN
-        // (documented ops prereq; see models::ingest gated-model contract).
+        // Delegate the actual download to Ollama's native HF ingestion (public
+        // repos only — gated repos are refused before this step). The download
+        // writes blobs into the SAME local model store that the sweep / archive
+        // pull / orphan-GC manage, so it MUST hold `disk_op_lock` for its whole
+        // duration — otherwise a concurrent GC/sweep could reap the in-progress
+        // (or sharded/long) download's blobs before its manifest lands. Same
+        // discipline as `PullCoordinator::ensure_local` (holds the lock across
+        // the cold→warm copy). Acquired FIRST, no registry lock held, so the
+        // canonical disk_op→registry order is preserved; `land_cold` then takes
+        // its own guard afterwards (nothing is held between the two).
+        let _guard = self.state.disk_op_lock.lock().await;
+
         let base = self
             .ollama_url
             .as_deref()
@@ -821,15 +828,46 @@ impl<'a> crate::models::ingest::IngestOps for AppStateIngestOps<'a> {
         .await
         .map_err(|e| format!("reconcile scan task failed: {e}"))?;
 
-        let registry_name = {
+        // Locate the model by the host-stripped key reconcile actually records.
+        // A concurrent ingest may have already demoted it to Cold between our
+        // pull and this reconcile — in that case the requested state is already
+        // achieved, so return success rather than a spurious "not found as warm".
+        enum Found {
+            Warm(String),
+            AlreadyCold(crate::models::ingest::ColdLanded),
+        }
+        let found = {
             let mut reg = self.state.model_registry.lock().await;
             reg.apply_reconcile(scan);
-            // Match the host-stripped key reconcile actually records.
-            let found = reg
+            let matches = |r: &ModelRecord| candidates.iter().any(|c| c == &r.name);
+            // Bind to a local (note the trailing `;`) so the `all_records()`
+            // iterator borrow of `reg` is dropped before the block's tail.
+            let result: Found = if let Some(rec) = reg
                 .all_records()
-                .find(|r| r.tier == StorageTier::Warm && candidates.iter().any(|c| c == &r.name))
-                .map(|r| r.name.clone());
-            found.ok_or_else(|| "pulled model not found as warm after reconcile".to_string())?
+                .find(|r| r.tier == StorageTier::Warm && matches(r))
+            {
+                Found::Warm(rec.name.clone())
+            } else if let Some(rec) = reg
+                .all_records()
+                .find(|r| r.tier == StorageTier::Cold && matches(r))
+            {
+                Found::AlreadyCold(crate::models::ingest::ColdLanded {
+                    registry_name: rec.name.clone(),
+                    archive_path: rec
+                        .archive_path
+                        .clone()
+                        .unwrap_or_else(|| reg.archive_path().display().to_string()),
+                    bytes: rec.size_bytes,
+                })
+            } else {
+                return Err("pulled model not found as warm or cold after reconcile".to_string());
+            };
+            result
+        };
+
+        let registry_name = match found {
+            Found::AlreadyCold(landed) => return Ok(landed),
+            Found::Warm(name) => name,
         };
 
         let evicted = eviction::evict_to_archive(
