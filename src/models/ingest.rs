@@ -17,27 +17,59 @@
 //! - **Warm→cold demote:** the existing [`crate::models::eviction::evict_to_archive`]
 //!   (the same call `POST /api/models/:name/archive` uses) copies the freshly
 //!   pulled model's manifest + blobs into the archive root and flips its
-//!   registry record to [`StorageTier::Cold`](crate::models::registry::StorageTier).
+//!   registry record to [`crate::models::registry::StorageTier::Cold`].
 //! - **Registry discovery:** [`crate::models::registry::ModelRegistry::reconcile`]
 //!   picks up the just-pulled Ollama model, exactly as it does at startup.
 //! - **Later promotion:** once cold, the model is reachable by the acquire path
 //!   Terminus already calls — `POST /api/models/:name/pull` →
 //!   `pull_coordinator.ensure_local` → `transfer::archive_pull` (cold→warm).
 //!
+//! ## Registry naming (why we never search for `hf.co/...`)
+//! Ollama pulls an HF model under the source name `hf.co/<org>/<model>[:<tag>]`,
+//! but [`crate::models::registry::ModelRegistry::reconcile`] **strips the
+//! registry host** and records the model under `<org>/<model>:<tag>` (asserted
+//! by the reconciler's own test in `registry.rs`). So the idempotency check and
+//! the post-pull "find the warm model" step must use the host-stripped key — see
+//! [`canonical_registry_names`]. Searching for the literal `hf.co/...` name
+//! never matches and would leave the model stranded warm.
+//!
+//! ## `revision` is the Ollama tag / quant selector, NOT an HF git revision
+//! The request's `revision` field maps to the Ollama `hf.co/<repo>:<tag>` suffix
+//! — i.e. it selects a quantization/file variant (e.g. `Q4_K_M`), the way Ollama
+//! consumes HF GGUF repos. It is deliberately **not** used as an HF git
+//! revision in the metadata-probe URL (that would make a normal quant request
+//! probe a nonexistent git ref). The probe reads the repo root and, when a
+//! `revision`/quant is given, sizes only the sibling files matching that quant
+//! so a multi-quant repo's whole-repo `usedStorage` doesn't cause a false
+//! `too_large` refusal.
+//!
 //! ## Security posture
 //! - **Default-OFF master gate** (`CHORD_MODEL_INGEST_ENABLED`, default `0`):
-//!   merging this changes nothing until an operator explicitly enables it. A
-//!   disabled endpoint returns a clean structured refusal, never a 500.
+//!   merging this changes nothing until an operator explicitly enables it. The
+//!   gate is checked **before** input validation, so a disabled endpoint never
+//!   does any work or leaks validation detail.
 //! - **Authenticated** by the same JWT guard as every other control endpoint
 //!   (the handler in `control.rs` runs `auth_check` before calling in here).
 //! - **HF token from the vault, never a literal.** [`hf_token`] is the single
 //!   sanctioned read point; the value is materialised into the process
 //!   environment from <secret-manager> at startup by
-//!   `secrets_bootstrap::fetch_and_apply_downstream_secrets` (`HF_TOKEN` is in
-//!   its downstream allowlist), exactly like `OPENROUTER_API_KEY`. It is never
-//!   hardcoded, never logged, and never echoed into a response or error string.
-//!   Absent token ⇒ **fail soft**: public models still pull; a gated model
-//!   returns [`IngestStatus::GatedNeedsToken`], not a crash.
+//!   `secrets_bootstrap::fetch_and_apply_downstream_secrets` (vault key
+//!   `HF_PAT_MOOSE`, materialised under the standard env var `HF_TOKEN`), like
+//!   `OPENROUTER_API_KEY`. It is never hardcoded, never logged, and never echoed
+//!   into a response or error string.
+//! - **Gated-model contract (explicit, not silent).** Chord's `HF_TOKEN` is used
+//!   ONLY for the metadata probe (to *detect* gating). The actual download is
+//!   performed by the **separate Ollama daemon** over HTTP; Chord cannot inject
+//!   that daemon's process environment, and Ollama's `/api/pull` has no
+//!   per-request credential field. Therefore a gated repo can only be pulled if
+//!   **the Ollama daemon itself** has `HF_TOKEN`/`HF_HUB_TOKEN` in its own
+//!   environment (an ops prerequisite). Contract:
+//!   - gated repo + Chord has no token ⇒ [`IngestStatus::GatedNeedsToken`]
+//!     (fail-soft, no crash, nothing pulled);
+//!   - gated repo + Chord has a token ⇒ the flow proceeds, but a pull failure is
+//!     reported plainly with a hint that the Ollama daemon must also be
+//!     token-provisioned (never "success then silent failure");
+//!   - public repo ⇒ pulls with no token at all.
 //! - **Bounded:** an oversize repo is refused ([`IngestStatus::TooLarge`])
 //!   before any byte is copied, protecting the shared disk (<host> disk-pressure
 //!   discipline), and the pull/copy steps are wrapped in timeouts.
@@ -50,9 +82,10 @@ use serde::{Deserialize, Serialize};
 /// One sanctioned read point for the HuggingFace access token.
 ///
 /// The value is populated into the process environment at startup by
-/// `secrets_bootstrap::fetch_and_apply_downstream_secrets` (<secret-manager>-first) —
-/// it is never authored as a literal, never logged, and never returned in any
-/// response or error text. Mirrors `embeddings::openrouter_api_key()`. Returns
+/// `secrets_bootstrap::fetch_and_apply_downstream_secrets` (<secret-manager>-first,
+/// vault key `HF_PAT_MOOSE` → env `HF_TOKEN`) — it is never authored as a
+/// literal, never logged, and never returned in any response or error text.
+/// Mirrors `embeddings::openrouter_api_key()`. Returns
 /// `None` when unset/blank, which the ingestion flow treats as fail-soft (only
 /// gated models then fail, with a clear message).
 pub fn hf_token() -> Option<String> {
@@ -91,7 +124,7 @@ pub struct IngestConfig {
     /// Base URL of the Ollama daemon that performs the actual HF download.
     /// `None` ⇒ ingestion cannot run (returns a clean error, never panics).
     pub ollama_url: Option<String>,
-    /// Timeout for the Ollama `/api/pull` step.
+    /// Timeout for the Ollama `/api/pull` step (an HF download can be long).
     pub pull_timeout: Duration,
     /// Timeout for the warm→cold archive copy (shared semantics with the
     /// eviction sweep's `MODEL_ARCHIVE_COPY_TIMEOUT_SECS`).
@@ -135,11 +168,14 @@ impl IngestConfig {
 pub struct IngestRequest {
     /// HuggingFace repo id, `org/name` (e.g. `Qwen/Qwen3-8B-GGUF`).
     pub hf_repo: String,
-    /// Friendly model name the caller wants to track this under (used for the
-    /// idempotency check and echoed in the response).
+    /// Friendly model name the caller wants to track this under (echoed in the
+    /// response). NOTE: the registry key is derived from `hf_repo`/`revision`
+    /// (see [`canonical_registry_names`]), NOT from this field — so a
+    /// `model_name` collision can never misidentify an unrelated model.
     pub model_name: String,
-    /// Optional revision/quant tag (maps to the Ollama `hf.co/<repo>:<tag>`
-    /// suffix). `None` ⇒ Ollama's default.
+    /// Optional Ollama tag / quantization selector (e.g. `Q4_K_M`), mapped to
+    /// the `hf.co/<repo>:<tag>` suffix. NOT an HF git revision. `None` ⇒
+    /// Ollama's default (`latest`).
     #[serde(default)]
     pub revision: Option<String>,
 }
@@ -151,7 +187,7 @@ pub struct IngestRequest {
 pub enum IngestStatus {
     /// Pulled and staged cold; ready for the acquire/promote path.
     Ingested,
-    /// The model was already known to the registry — no-op success (idempotent).
+    /// The model was already cold-stored — no-op success (idempotent).
     AlreadyPresent,
     /// The repo is gated and no `HF_TOKEN` is provisioned (fail-soft, not a crash).
     GatedNeedsToken,
@@ -159,8 +195,8 @@ pub enum IngestStatus {
     TooLarge,
     /// The master gate (`CHORD_MODEL_INGEST_ENABLED`) is off.
     Disabled,
-    /// Any other failure (bad input, network/pull failure, ...). `message`
-    /// carries a non-secret explanation.
+    /// Any other failure (bad input, network/pull failure, model loaded hot, ...).
+    /// `message` carries a non-secret explanation.
     Error,
 }
 
@@ -209,9 +245,27 @@ impl IngestOutcome {
 pub struct HfProbe {
     /// Whether the repo is access-gated (requires an accepted license / token).
     pub gated: bool,
-    /// Total on-disk size in bytes, when HuggingFace reports it. `None` ⇒
+    /// Total on-disk size in bytes, when HuggingFace reports it (and, when a
+    /// quant/`revision` was given, filtered to the matching files). `None` ⇒
     /// unknown, in which case the size gate is skipped (proceed).
     pub total_bytes: Option<u64>,
+}
+
+/// Storage tier of an already-known model (decoupled from
+/// [`crate::models::registry::StorageTier`] so this module stays unit-testable
+/// without the registry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelTier {
+    Cold,
+    Warm,
+    Hot,
+}
+
+/// An already-known registry record matched during the idempotency check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingModel {
+    pub name: String,
+    pub tier: ModelTier,
 }
 
 /// Result of landing a model in cold storage.
@@ -230,9 +284,13 @@ pub struct ColdLanded {
 /// unit-testable without touching the network, Ollama, or the filesystem.
 #[async_trait]
 pub trait IngestOps: Send + Sync {
-    /// Whether a model is already tracked by the registry (idempotency check).
-    async fn model_exists(&self, model_name: &str, ollama_ref: &str) -> Option<String>;
-    /// Fetch HF repo metadata (gated flag + size). `token` MUST NOT be logged.
+    /// Look up whether any of the host-stripped `candidates` is already in the
+    /// registry, returning the match + its tier (idempotency). The candidates
+    /// come from [`canonical_registry_names`], never a `hf.co/...` literal.
+    async fn find_existing(&self, candidates: &[String]) -> Option<ExistingModel>;
+    /// Fetch HF repo metadata (gated flag + quant-aware size). `token` MUST NOT
+    /// be logged. `revision` (a quant selector) is used only to filter the
+    /// sibling files summed for `total_bytes`, never as an HF git ref.
     async fn probe(
         &self,
         hf_repo: &str,
@@ -240,20 +298,45 @@ pub trait IngestOps: Send + Sync {
         token: Option<&str>,
     ) -> Result<HfProbe, String>;
     /// Pull the HF repo into the warm (local Ollama) tier via Ollama's own
-    /// `/api/pull`. `token` MUST NOT be logged.
-    async fn pull_warm(&self, ollama_ref: &str, token: Option<&str>) -> Result<(), String>;
-    /// Reconcile the registry, locate the freshly pulled model, and demote it
-    /// warm→cold via the existing eviction machinery. Returns the cold handle.
-    async fn land_cold(&self, hf_repo: &str, ollama_ref: &str) -> Result<ColdLanded, String>;
+    /// `/api/pull`. No token is forwarded — a gated pull depends on the Ollama
+    /// daemon's own environment (see the module-level gated-model contract).
+    async fn pull_warm(&self, ollama_ref: &str) -> Result<(), String>;
+    /// Reconcile the registry, locate the freshly pulled model by one of the
+    /// host-stripped `candidates`, and demote it warm→cold via the existing
+    /// eviction machinery (under the shared disk-op lock). Returns the cold
+    /// handle.
+    async fn land_cold(&self, candidates: &[String]) -> Result<ColdLanded, String>;
 }
 
-/// Build the canonical Ollama model reference for an HF repo (+optional
-/// revision), e.g. `hf.co/Qwen/Qwen3-8B-GGUF:Q4_K_M`.
+/// Build the canonical Ollama source reference for an HF repo (+optional quant),
+/// e.g. `hf.co/Qwen/Qwen3-8B-GGUF:Q4_K_M`. This is the name Ollama pulls under;
+/// the *registry* records it host-stripped — see [`canonical_registry_names`].
 pub fn ollama_ref_for(hf_repo: &str, revision: Option<&str>) -> String {
     let base = format!("hf.co/{}", hf_repo.trim().trim_matches('/'));
     match revision.map(str::trim).filter(|r| !r.is_empty()) {
-        Some(rev) => format!("{base}:{rev}"),
+        Some(tag) => format!("{base}:{tag}"),
         None => base,
+    }
+}
+
+/// The registry key(s) [`crate::models::registry::ModelRegistry::reconcile`]
+/// records for an Ollama-pulled HF model, i.e. with the `hf.co/` host
+/// **stripped** (matching the reconciler's own behaviour: `hf.co/org/model:tag`
+/// → `org/model:tag`).
+///
+/// - With a `revision`/quant tag ⇒ exactly `org/model:<tag>`.
+/// - Without one ⇒ both `org/model:latest` (Ollama's default tag) and the bare
+///   `org/model`, since which of the two the reconciler records depends on how
+///   the manifest leaf is named on disk.
+///
+/// This is the load-bearing derivation the idempotency check and the post-pull
+/// "find the warm model" step rely on; it is unit-tested against the shape the
+/// reconciler test asserts.
+pub fn canonical_registry_names(hf_repo: &str, revision: Option<&str>) -> Vec<String> {
+    let repo = hf_repo.trim().trim_matches('/').to_string();
+    match revision.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(tag) => vec![format!("{repo}:{tag}")],
+        None => vec![format!("{repo}:latest"), repo],
     }
 }
 
@@ -325,15 +408,26 @@ pub fn plan_after_probe(cfg: &IngestConfig, probe: &HfProbe, token_present: bool
     }
 }
 
+/// Given a `land_cold` result, build the success outcome (shared by the
+/// already-warm and pulled-fresh paths).
+fn ingested_outcome(landed: ColdLanded, probe_bytes: Option<u64>) -> IngestOutcome {
+    IngestOutcome {
+        status: IngestStatus::Ingested,
+        cold_storage_ref: Some(landed.registry_name),
+        bytes: Some(landed.bytes).filter(|b| *b > 0).or(probe_bytes),
+        message: format!("ingested to cold storage at {}", landed.archive_path),
+    }
+}
+
 /// Orchestrate a full ingest. Never panics; every failure maps to a structured
-/// [`IngestOutcome`]. `validate_request` is expected to have run already (the
-/// handler does it to return a precise 400), but this re-checks defensively.
+/// [`IngestOutcome`]. Order: gate → validate → idempotency → probe → pull →
+/// land-cold.
 pub async fn ingest_model(
     ops: &dyn IngestOps,
     cfg: &IngestConfig,
     req: &IngestRequest,
 ) -> IngestOutcome {
-    // 1. Master gate — default OFF.
+    // 1. Master gate — default OFF — checked BEFORE validation.
     if !cfg.enabled {
         return IngestOutcome::simple(
             IngestStatus::Disabled,
@@ -341,21 +435,45 @@ pub async fn ingest_model(
         );
     }
 
-    // 2. Defensive validation.
+    // 2. Validation.
     if let Err(e) = validate_request(req) {
         return IngestOutcome::simple(IngestStatus::Error, e);
     }
 
     let ollama_ref = ollama_ref_for(&req.hf_repo, req.revision.as_deref());
+    let candidates = canonical_registry_names(&req.hf_repo, req.revision.as_deref());
 
-    // 3. Idempotency — already tracked ⇒ no-op success.
-    if let Some(existing) = ops.model_exists(req.model_name.trim(), &ollama_ref).await {
-        return IngestOutcome {
-            status: IngestStatus::AlreadyPresent,
-            cold_storage_ref: Some(existing),
-            bytes: None,
-            message: "model already present in the registry".into(),
-        };
+    // 3. Idempotency — tier-aware.
+    if let Some(existing) = ops.find_existing(&candidates).await {
+        match existing.tier {
+            ModelTier::Cold => {
+                return IngestOutcome {
+                    status: IngestStatus::AlreadyPresent,
+                    cold_storage_ref: Some(existing.name),
+                    bytes: None,
+                    message: "model already cold-stored".into(),
+                };
+            }
+            ModelTier::Hot => {
+                return IngestOutcome::simple(
+                    IngestStatus::Error,
+                    format!(
+                        "model {} is loaded (hot); unload it before ingesting to cold",
+                        existing.name
+                    ),
+                );
+            }
+            ModelTier::Warm => {
+                // Already local — skip the pull, just demote it to cold.
+                return match ops.land_cold(&candidates).await {
+                    Ok(landed) => ingested_outcome(landed, None),
+                    Err(e) => IngestOutcome::simple(
+                        IngestStatus::Error,
+                        format!("warm model present but cold-staging failed: {e}"),
+                    ),
+                };
+            }
+        }
     }
 
     // 4. Probe HF (gated flag + size). Token read once, at the sanctioned point.
@@ -403,19 +521,21 @@ pub async fn ingest_model(
         PlanDecision::Proceed { bytes } => bytes,
     };
 
-    // 6. Pull into warm via Ollama's native HF ingestion.
-    if let Err(e) = ops.pull_warm(&ollama_ref, token.as_deref()).await {
-        return IngestOutcome::simple(IngestStatus::Error, format!("model pull failed: {e}"));
+    // 6. Pull into warm via Ollama's native HF ingestion. For a gated repo this
+    //    only succeeds if the Ollama daemon is itself token-provisioned (see the
+    //    module-level contract) — a failure here is reported plainly below.
+    if let Err(e) = ops.pull_warm(&ollama_ref).await {
+        let hint = if probe.gated {
+            " (gated repo: the Ollama daemon must have HF_TOKEN in its own environment)"
+        } else {
+            ""
+        };
+        return IngestOutcome::simple(IngestStatus::Error, format!("model pull failed: {e}{hint}"));
     }
 
     // 7. Demote warm→cold via the existing eviction machinery.
-    match ops.land_cold(req.hf_repo.trim(), &ollama_ref).await {
-        Ok(landed) => IngestOutcome {
-            status: IngestStatus::Ingested,
-            cold_storage_ref: Some(landed.registry_name),
-            bytes: Some(landed.bytes).filter(|b| *b > 0).or(bytes),
-            message: format!("ingested to cold storage at {}", landed.archive_path),
-        },
+    match ops.land_cold(&candidates).await {
+        Ok(landed) => ingested_outcome(landed, bytes),
         Err(e) => IngestOutcome::simple(
             IngestStatus::Error,
             format!("pulled to warm but cold-staging failed: {e}"),
@@ -498,6 +618,36 @@ mod tests {
             "hf.co/Qwen/Q3:Q4_K_M"
         );
         assert_eq!(ollama_ref_for("Qwen/Q3", Some("  ")), "hf.co/Qwen/Q3");
+    }
+
+    // ── canonical_registry_names (the load-bearing name derivation) ───────────
+
+    #[test]
+    fn canonical_names_are_host_stripped_matching_reconcile() {
+        // reconcile records `hf.co/org/model:tag` as `org/model:tag` — NEVER the
+        // `hf.co/...` literal. This is the exact class of bug the gate caught.
+        assert_eq!(
+            canonical_registry_names("org/model", Some("Q4_K_M")),
+            vec!["org/model:Q4_K_M".to_string()]
+        );
+        // No revision ⇒ the reconciler may record either `:latest` or bare.
+        assert_eq!(
+            canonical_registry_names("org/model", None),
+            vec!["org/model:latest".to_string(), "org/model".to_string()]
+        );
+        // Crucially: none of the candidates carry the `hf.co/` host.
+        for c in canonical_registry_names("org/model", Some("Q4_K_M")) {
+            assert!(
+                !c.starts_with("hf.co/"),
+                "candidate must be host-stripped: {c}"
+            );
+        }
+        for c in canonical_registry_names("org/model", None) {
+            assert!(
+                !c.starts_with("hf.co/"),
+                "candidate must be host-stripped: {c}"
+            );
+        }
     }
 
     // ── plan_after_probe ─────────────────────────────────────────────────────
@@ -616,21 +766,26 @@ mod tests {
 
     // ── orchestration (mocked IO) ────────────────────────────────────────────
 
-    /// Records which IO steps ran, and lets each be scripted.
+    /// Records which IO steps ran, and captures the `candidates` that
+    /// find_existing/land_cold were called with, so tests assert the live-adapter
+    /// contract (host-stripped names) — closing the test-gap the gate flagged (a
+    /// mock that rubber-stamps a `hf.co/...` name would fail these assertions).
     #[derive(Default)]
     struct MockOps {
-        exists: Option<String>,
+        existing: Option<ExistingModel>,
         probe: Option<Result<HfProbe, String>>,
         pull: Option<Result<(), String>>,
         land: Option<Result<ColdLanded, String>>,
         pulled: Mutex<bool>,
-        landed: Mutex<bool>,
+        land_candidates: Mutex<Option<Vec<String>>>,
+        find_candidates: Mutex<Option<Vec<String>>>,
     }
 
     #[async_trait]
     impl IngestOps for MockOps {
-        async fn model_exists(&self, _model_name: &str, _ollama_ref: &str) -> Option<String> {
-            self.exists.clone()
+        async fn find_existing(&self, candidates: &[String]) -> Option<ExistingModel> {
+            *self.find_candidates.lock().unwrap() = Some(candidates.to_vec());
+            self.existing.clone()
         }
         async fn probe(
             &self,
@@ -640,28 +795,29 @@ mod tests {
         ) -> Result<HfProbe, String> {
             self.probe.clone().expect("probe should not be called")
         }
-        async fn pull_warm(&self, _ollama_ref: &str, _token: Option<&str>) -> Result<(), String> {
+        async fn pull_warm(&self, _ollama_ref: &str) -> Result<(), String> {
             *self.pulled.lock().unwrap() = true;
             self.pull.clone().expect("pull should not be called")
         }
-        async fn land_cold(&self, _hf_repo: &str, _ollama_ref: &str) -> Result<ColdLanded, String> {
-            *self.landed.lock().unwrap() = true;
+        async fn land_cold(&self, candidates: &[String]) -> Result<ColdLanded, String> {
+            *self.land_candidates.lock().unwrap() = Some(candidates.to_vec());
             self.land.clone().expect("land should not be called")
         }
     }
 
     #[tokio::test]
-    async fn disabled_gate_refuses_without_touching_io() {
+    async fn disabled_gate_refuses_before_validation() {
+        // Even a malformed request is refused with `disabled`, not `error`,
+        // because the gate is checked first.
         let ops = MockOps::default();
         let out = ingest_model(
             &ops,
             &cfg(false, DEFAULT_MAX_BYTES),
-            &req("org/model", "m", None),
+            &req("bad repo", "m", None),
         )
         .await;
         assert_eq!(out.status, IngestStatus::Disabled);
         assert!(!*ops.pulled.lock().unwrap());
-        assert!(!*ops.landed.lock().unwrap());
     }
 
     #[tokio::test]
@@ -678,9 +834,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn already_present_is_noop_success() {
+    async fn cold_present_is_noop_success_and_uses_host_stripped_candidates() {
         let ops = MockOps {
-            exists: Some("hf.co/org/model".into()),
+            existing: Some(ExistingModel {
+                name: "org/model:Q4_K_M".into(),
+                tier: ModelTier::Cold,
+            }),
+            ..Default::default()
+        };
+        let out = ingest_model(
+            &ops,
+            &cfg(true, DEFAULT_MAX_BYTES),
+            &req("org/model", "m", Some("Q4_K_M")),
+        )
+        .await;
+        assert_eq!(out.status, IngestStatus::AlreadyPresent);
+        assert_eq!(out.cold_storage_ref.as_deref(), Some("org/model:Q4_K_M"));
+        assert!(!*ops.pulled.lock().unwrap());
+        // The idempotency lookup used the host-stripped key, never `hf.co/...`.
+        let cands = ops.find_candidates.lock().unwrap().clone().unwrap();
+        assert_eq!(cands, vec!["org/model:Q4_K_M".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn warm_present_skips_pull_and_lands_cold() {
+        let ops = MockOps {
+            existing: Some(ExistingModel {
+                name: "org/model:latest".into(),
+                tier: ModelTier::Warm,
+            }),
+            land: Some(Ok(ColdLanded {
+                registry_name: "org/model:latest".into(),
+                archive_path: "/archive".into(),
+                bytes: 42,
+            })),
             ..Default::default()
         };
         let out = ingest_model(
@@ -689,17 +876,39 @@ mod tests {
             &req("org/model", "m", None),
         )
         .await;
-        assert_eq!(out.status, IngestStatus::AlreadyPresent);
-        assert_eq!(out.cold_storage_ref.as_deref(), Some("hf.co/org/model"));
+        assert_eq!(out.status, IngestStatus::Ingested);
+        assert_eq!(out.cold_storage_ref.as_deref(), Some("org/model:latest"));
+        assert!(
+            !*ops.pulled.lock().unwrap(),
+            "warm model must not be re-pulled"
+        );
+        // land_cold was handed the host-stripped candidates.
+        let cands = ops.land_candidates.lock().unwrap().clone().unwrap();
+        assert!(cands.iter().all(|c| !c.starts_with("hf.co/")));
+    }
+
+    #[tokio::test]
+    async fn hot_present_returns_error() {
+        let ops = MockOps {
+            existing: Some(ExistingModel {
+                name: "org/model:latest".into(),
+                tier: ModelTier::Hot,
+            }),
+            ..Default::default()
+        };
+        let out = ingest_model(
+            &ops,
+            &cfg(true, DEFAULT_MAX_BYTES),
+            &req("org/model", "m", None),
+        )
+        .await;
+        assert_eq!(out.status, IngestStatus::Error);
+        assert!(out.message.contains("hot"));
         assert!(!*ops.pulled.lock().unwrap());
     }
 
     #[tokio::test]
     async fn gated_without_token_fails_soft() {
-        // No HF_TOKEN in env for this test's process is not guaranteed, so this
-        // asserts the plan path: probe reports gated, and (in CI without a
-        // token) we get GatedNeedsToken. Guard by clearing the var locally.
-        let _ = std::env::var("HF_TOKEN"); // observe only
         let ops = MockOps {
             probe: Some(Ok(HfProbe {
                 gated: true,
@@ -707,10 +916,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        // Only meaningful when no token is present; if the runner has one set,
-        // the flow would proceed to pull. hf_token() reads the process env, so
-        // we assert the token-absent contract via plan_after_probe directly
-        // (covered above) and here assert no crash + no land when it refuses.
+        // Only meaningful when no token is present in this process's env.
         if hf_token().is_none() {
             let out = ingest_model(
                 &ops,
@@ -719,7 +925,7 @@ mod tests {
             )
             .await;
             assert_eq!(out.status, IngestStatus::GatedNeedsToken);
-            assert!(!*ops.landed.lock().unwrap());
+            assert!(!*ops.pulled.lock().unwrap());
         }
     }
 
@@ -764,7 +970,7 @@ mod tests {
             })),
             pull: Some(Ok(())),
             land: Some(Ok(ColdLanded {
-                registry_name: "hf.co/org/model:latest".into(),
+                registry_name: "org/model:latest".into(),
                 archive_path: "/archive".into(),
                 bytes: 50,
             })),
@@ -777,13 +983,12 @@ mod tests {
         )
         .await;
         assert_eq!(out.status, IngestStatus::Ingested);
-        assert_eq!(
-            out.cold_storage_ref.as_deref(),
-            Some("hf.co/org/model:latest")
-        );
+        assert_eq!(out.cold_storage_ref.as_deref(), Some("org/model:latest"));
         assert_eq!(out.bytes, Some(50));
         assert!(*ops.pulled.lock().unwrap());
-        assert!(*ops.landed.lock().unwrap());
+        // land_cold received host-stripped candidates (never `hf.co/...`).
+        let cands = ops.land_candidates.lock().unwrap().clone().unwrap();
+        assert!(cands.iter().all(|c| !c.starts_with("hf.co/")));
     }
 
     #[tokio::test]
@@ -804,7 +1009,31 @@ mod tests {
         .await;
         assert_eq!(out.status, IngestStatus::Error);
         assert!(out.message.contains("pull failed"));
-        assert!(!*ops.landed.lock().unwrap());
+        assert!(ops.land_candidates.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn gated_pull_failure_mentions_ollama_daemon_token() {
+        // With a token present the flow proceeds; if the pull then fails on a
+        // gated repo, the message must name the Ollama-daemon-env requirement.
+        std::env::set_var("HF_TOKEN", "x"); // pii-test-fixture
+        let ops = MockOps {
+            probe: Some(Ok(HfProbe {
+                gated: true,
+                total_bytes: Some(10),
+            })),
+            pull: Some(Err("401".into())),
+            ..Default::default()
+        };
+        let out = ingest_model(
+            &ops,
+            &cfg(true, DEFAULT_MAX_BYTES),
+            &req("org/model", "m", None),
+        )
+        .await;
+        std::env::remove_var("HF_TOKEN");
+        assert_eq!(out.status, IngestStatus::Error);
+        assert!(out.message.contains("Ollama daemon"));
     }
 
     #[tokio::test]

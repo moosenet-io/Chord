@@ -686,20 +686,40 @@ pub use crate::models::ingest::IngestRequest;
 struct AppStateIngestOps<'a> {
     state: &'a AppState,
     ollama_url: Option<String>,
+    /// CHORD_MODEL_INGEST_PULL_TIMEOUT_SECS — bounds the (potentially long) HF
+    /// download step. Distinct from `archive_copy_timeout`.
+    pull_timeout: std::time::Duration,
+    /// MODEL_ARCHIVE_COPY_TIMEOUT_SECS — bounds the warm→cold copy.
     archive_copy_timeout: std::time::Duration,
+}
+
+impl<'a> AppStateIngestOps<'a> {
+    /// Map a registry [`ModelRecord`] tier to the module-local
+    /// [`crate::models::ingest::ModelTier`].
+    fn tier_of(rec: &ModelRecord) -> crate::models::ingest::ModelTier {
+        match rec.tier {
+            StorageTier::Cold => crate::models::ingest::ModelTier::Cold,
+            StorageTier::Warm => crate::models::ingest::ModelTier::Warm,
+            StorageTier::Hot => crate::models::ingest::ModelTier::Hot,
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl<'a> crate::models::ingest::IngestOps for AppStateIngestOps<'a> {
-    async fn model_exists(&self, model_name: &str, ollama_ref: &str) -> Option<String> {
+    async fn find_existing(
+        &self,
+        candidates: &[String],
+    ) -> Option<crate::models::ingest::ExistingModel> {
+        // Candidates are the host-stripped registry keys (`org/model[:tag]`),
+        // exactly what `reconcile()` records — never a `hf.co/...` literal.
         let reg = self.state.model_registry.lock().await;
-        for candidate in [
-            model_name.to_string(),
-            ollama_ref.to_string(),
-            format!("{ollama_ref}:latest"),
-        ] {
-            if reg.get(&candidate).is_some() {
-                return Some(candidate);
+        for candidate in candidates {
+            if let Some(rec) = reg.get(candidate) {
+                return Some(crate::models::ingest::ExistingModel {
+                    name: rec.name.clone(),
+                    tier: Self::tier_of(rec),
+                });
             }
         }
         None
@@ -712,12 +732,11 @@ impl<'a> crate::models::ingest::IngestOps for AppStateIngestOps<'a> {
         token: Option<&str>,
     ) -> Result<crate::models::ingest::HfProbe, String> {
         // HuggingFace Hub model-info API. A gated repo returns 401/403 without
-        // an accepted token; a public one returns JSON with an optional
-        // `usedStorage` byte count and a `gated` field.
-        let mut url = format!("https://huggingface.co/api/models/{hf_repo}");
-        if let Some(rev) = revision.filter(|r| !r.is_empty()) {
-            url = format!("{url}/revision/{rev}");
-        }
+        // an accepted token; a public one returns JSON with a `gated` field and
+        // (with ?blobs=true) per-sibling sizes. `revision` here is an Ollama
+        // quant selector, NOT an HF git ref — so it is used only to FILTER the
+        // sibling sizes, never placed in the URL path.
+        let url = format!("https://huggingface.co/api/models/{hf_repo}?blobs=true");
         let mut rb = self
             .state
             .http_client
@@ -748,17 +767,16 @@ impl<'a> crate::models::ingest::IngestOps for AppStateIngestOps<'a> {
             Some(serde_json::Value::String(s)) => !s.eq_ignore_ascii_case("false"),
             _ => false,
         };
-        let total_bytes = body
-            .get("usedStorage")
-            .and_then(|v| v.as_u64())
-            .filter(|b| *b > 0);
+        let total_bytes = hf_repo_size_bytes(&body, revision);
         Ok(crate::models::ingest::HfProbe { gated, total_bytes })
     }
 
-    async fn pull_warm(&self, ollama_ref: &str, _token: Option<&str>) -> Result<(), String> {
-        // Delegate the actual download to Ollama's native HF ingestion. Ollama
-        // reads its own `HF_TOKEN` from its process env for gated pulls; Chord
-        // never forwards the token in the request body.
+    async fn pull_warm(&self, ollama_ref: &str) -> Result<(), String> {
+        // Delegate the actual download to Ollama's native HF ingestion. Chord
+        // cannot inject the (separate) Ollama daemon's environment, and
+        // /api/pull has no per-request credential field — so a GATED pull
+        // succeeds only when the Ollama daemon itself carries HF_TOKEN
+        // (documented ops prereq; see models::ingest gated-model contract).
         let base = self
             .ollama_url
             .as_deref()
@@ -770,7 +788,7 @@ impl<'a> crate::models::ingest::IngestOps for AppStateIngestOps<'a> {
             .post(&url)
             .json(&serde_json::json!({ "name": ollama_ref, "stream": false }))
             .send();
-        let resp = tokio::time::timeout(self.archive_copy_timeout, fut)
+        let resp = tokio::time::timeout(self.pull_timeout, fut)
             .await
             .map_err(|_| "ollama pull timed out".to_string())?
             .map_err(|e| format!("ollama pull request error: {e}"))?;
@@ -782,20 +800,34 @@ impl<'a> crate::models::ingest::IngestOps for AppStateIngestOps<'a> {
 
     async fn land_cold(
         &self,
-        _hf_repo: &str,
-        ollama_ref: &str,
+        candidates: &[String],
     ) -> Result<crate::models::ingest::ColdLanded, String> {
-        // Pick up the freshly pulled model, then demote warm→cold via the same
-        // eviction machinery `POST /api/models/:name/archive` uses.
+        // Serialise with the sweep / archive / GC via the shared disk-op lock,
+        // acquired FIRST (canonical disk_op → registry order), and never hold
+        // the registry mutex across the blocking NFS scan (S111 discipline:
+        // scan off-lock via spawn_blocking, apply under a brief lock).
+        let _guard = self.state.disk_op_lock.lock().await;
+
+        let (local_path, archive_path_root) = {
+            let reg = self.state.model_registry.lock().await;
+            (
+                reg.local_path().to_path_buf(),
+                reg.archive_path().to_path_buf(),
+            )
+        };
+        let scan = tokio::task::spawn_blocking(move || {
+            crate::models::registry::ModelRegistry::scan_disk(local_path, archive_path_root)
+        })
+        .await
+        .map_err(|e| format!("reconcile scan task failed: {e}"))?;
+
         let registry_name = {
             let mut reg = self.state.model_registry.lock().await;
-            reg.reconcile();
-            // Ollama may store the model as `<ollama_ref>` or `<ollama_ref>:latest`.
-            let want = ollama_ref.to_string();
-            let want_latest = format!("{ollama_ref}:latest");
+            reg.apply_reconcile(scan);
+            // Match the host-stripped key reconcile actually records.
             let found = reg
                 .all_records()
-                .find(|r| r.tier == StorageTier::Warm && (r.name == want || r.name == want_latest))
+                .find(|r| r.tier == StorageTier::Warm && candidates.iter().any(|c| c == &r.name))
                 .map(|r| r.name.clone());
             found.ok_or_else(|| "pulled model not found as warm after reconcile".to_string())?
         };
@@ -824,13 +856,58 @@ impl<'a> crate::models::ingest::IngestOps for AppStateIngestOps<'a> {
     }
 }
 
+/// Sum the on-disk size of an HF model from its `?blobs=true` model-info JSON.
+///
+/// When `revision` (an Ollama quant selector, e.g. `Q4_K_M`) is given, only
+/// sibling files whose filename contains that tag (case-insensitive) are summed,
+/// so a multi-quant GGUF repo's whole-repo `usedStorage` doesn't trigger a false
+/// `too_large`. When no quant is given, or no per-file sizes are available, falls
+/// back to `usedStorage`. `None` ⇒ size unknown (the caller skips the size gate).
+fn hf_repo_size_bytes(body: &serde_json::Value, revision: Option<&str>) -> Option<u64> {
+    let quant = revision.map(str::trim).filter(|r| !r.is_empty());
+    if let Some(siblings) = body.get("siblings").and_then(|s| s.as_array()) {
+        let mut sum: u64 = 0;
+        let mut matched = false;
+        for sib in siblings {
+            let rfilename = sib.get("rfilename").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(q) = quant {
+                if !rfilename
+                    .to_ascii_lowercase()
+                    .contains(&q.to_ascii_lowercase())
+                {
+                    continue;
+                }
+            }
+            // ?blobs=true surfaces `size` (and `lfs.size` for LFS objects).
+            let size = sib.get("size").and_then(|v| v.as_u64()).or_else(|| {
+                sib.get("lfs")
+                    .and_then(|l| l.get("size"))
+                    .and_then(|v| v.as_u64())
+            });
+            if let Some(sz) = size {
+                sum += sz;
+                matched = true;
+            }
+        }
+        if matched && sum > 0 {
+            return Some(sum);
+        }
+    }
+    // Fallback: whole-repo storage (only meaningful when no quant filter, but
+    // better than nothing when sibling sizes are absent).
+    body.get("usedStorage")
+        .and_then(|v| v.as_u64())
+        .filter(|b| *b > 0)
+}
+
 /// `POST /api/models/ingest` — ASK4-P2A: pull a HuggingFace model into cold
 /// storage so the MINT sweep can later promote+test it.
 ///
 /// Same JWT auth as every other control endpoint. Master-gated OFF by default
-/// (`CHORD_MODEL_INGEST_ENABLED`). Returns a structured
-/// [`crate::models::ingest::IngestOutcome`] as JSON; the HTTP status code is
-/// derived from the outcome. Never panics; never leaks the HF token.
+/// (`CHORD_MODEL_INGEST_ENABLED`) — the gate is checked BEFORE input validation,
+/// so a disabled endpoint returns `disabled` even for a malformed body. Returns
+/// a structured [`crate::models::ingest::IngestOutcome`] as JSON; the HTTP status
+/// code is derived from the outcome. Never panics; never leaks the HF token.
 pub async fn ingest_model(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -842,7 +919,16 @@ pub async fn ingest_model(
 
     let cfg = crate::models::ingest::IngestConfig::from_env();
 
-    // Precise 400 for malformed input (before the gate/idempotency flow).
+    // Gate FIRST — a disabled feature does no work and leaks no validation
+    // detail (mirrors the module's gate→validate order).
+    if !cfg.enabled {
+        let outcome = crate::models::ingest::ingest_model(&NoopIngestOps, &cfg, &req).await;
+        let code = StatusCode::from_u16(outcome.http_status())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        return (code, Json(outcome)).into_response();
+    }
+
+    // Precise 400 for malformed input, once enabled.
     if let Err(msg) = crate::models::ingest::validate_request(&req) {
         return error_response(StatusCode::BAD_REQUEST, msg);
     }
@@ -850,6 +936,7 @@ pub async fn ingest_model(
     let ops = AppStateIngestOps {
         state: &state,
         ollama_url: cfg.ollama_url.clone(),
+        pull_timeout: cfg.pull_timeout,
         archive_copy_timeout: std::time::Duration::from_secs(state.model_archive_copy_timeout_secs),
     };
 
@@ -857,6 +944,38 @@ pub async fn ingest_model(
     let code =
         StatusCode::from_u16(outcome.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (code, Json(outcome)).into_response()
+}
+
+/// A no-op [`crate::models::ingest::IngestOps`] used only for the disabled-gate
+/// path: `ingest_model` returns `disabled` before touching any of these, so they
+/// are never actually called.
+struct NoopIngestOps;
+
+#[async_trait::async_trait]
+impl crate::models::ingest::IngestOps for NoopIngestOps {
+    async fn find_existing(
+        &self,
+        _candidates: &[String],
+    ) -> Option<crate::models::ingest::ExistingModel> {
+        None
+    }
+    async fn probe(
+        &self,
+        _hf_repo: &str,
+        _revision: Option<&str>,
+        _token: Option<&str>,
+    ) -> Result<crate::models::ingest::HfProbe, String> {
+        Err("ingest disabled".into())
+    }
+    async fn pull_warm(&self, _ollama_ref: &str) -> Result<(), String> {
+        Err("ingest disabled".into())
+    }
+    async fn land_cold(
+        &self,
+        _candidates: &[String],
+    ) -> Result<crate::models::ingest::ColdLanded, String> {
+        Err("ingest disabled".into())
+    }
 }
 
 // ── Router ───────────────────────────────────────────────────────────────────
@@ -1725,7 +1844,39 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn ingest_rejects_malformed_repo_with_400() {
+    async fn ingest_enabled_rejects_malformed_repo_with_400() {
+        // Gate is checked BEFORE validation, so the 400 path is only reachable
+        // once the feature is enabled.
+        std::env::set_var("CHORD_MODEL_INGEST_ENABLED", "1");
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let registry = Arc::new(Mutex::new(reg_at(base, vec![])));
+        let state = control_state(registry, base.join("local"), Arc::new(StatvfsProbe));
+        let app = build_control_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/models/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "hf_repo": "not a repo", "model_name": "m" })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        std::env::remove_var("CHORD_MODEL_INGEST_ENABLED");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ingest_disabled_refuses_even_malformed_before_validation() {
+        // Gate-first: a malformed body under a disabled gate returns `disabled`
+        // (403), never a 400 — the disabled endpoint leaks no validation detail.
         std::env::remove_var("CHORD_MODEL_INGEST_ENABLED");
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path();
@@ -1747,6 +1898,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["status"], "disabled");
     }
 }

@@ -49,18 +49,33 @@ use chord_secrets::{fetch_secrets_batch, InfisicalConfig};
 /// here (never a literal, never logged) exactly like `CHORD_JWT_SECRET`/
 /// `CHORD_API_KEY`; `embeddings::openrouter_api_key()` reads it back from the
 /// process environment fresh on every request.
-/// ASK4-P2A: `HF_TOKEN` — the HuggingFace access token the model-ingest
-/// endpoint (`models::ingest`) sends as `Authorization: Bearer <token>` when
-/// pulling a gated repo. Fetched here (never a literal, never logged) exactly
-/// like the keys above; `models::ingest::hf_token()` reads it back from the
-/// process environment. Absent ⇒ fail-soft (public models still pull; gated
-/// models return `gated_needs_token`).
+/// ASK4-P2A: `HF_PAT_MOOSE` — the HuggingFace access token the model-ingest
+/// endpoint (`models::ingest`) uses to detect gated repos, and that the Ollama
+/// daemon needs (in its own env) to actually pull them. Fetched here (never a
+/// literal, never logged) exactly like the keys above, but **materialised under
+/// the HuggingFace-standard env var `HF_TOKEN`** (see [`downstream_env_var`]),
+/// which is what both `models::ingest::hf_token()` and Ollama read by
+/// convention. Absent ⇒ fail-soft (public models still pull; gated models
+/// return `gated_needs_token`).
 const DOWNSTREAM_SECRET_KEYS: &[&str] = &[
     "CHORD_JWT_SECRET",
     "CHORD_API_KEY",
     "OPENROUTER_API_KEY",
-    "HF_TOKEN",
+    "HF_PAT_MOOSE",
 ];
+
+/// Map an <secret-manager> secret key to the process env var name downstream code reads
+/// it under. Identity for every key except `HF_PAT_MOOSE`, whose value is
+/// materialised as the HuggingFace-standard `HF_TOKEN` — the var both
+/// `models::ingest::hf_token()` and the Ollama daemon expect by convention. This
+/// keeps the vault naming (`HF_PAT_MOOSE`) and the consumer naming (`HF_TOKEN`)
+/// decoupled without renaming either. Never logs the value.
+fn downstream_env_var(infisical_key: &str) -> &str {
+    match infisical_key {
+        "HF_PAT_MOOSE" => "HF_TOKEN",
+        other => other,
+    }
+}
 
 /// Outcome of the startup <secret-manager> fetch attempt, for the caller (`main()`)
 /// to log and for tests to assert on directly rather than scraping log text.
@@ -117,7 +132,9 @@ pub async fn fetch_and_apply_downstream_secrets() -> SecretFetchOutcome {
             for key in DOWNSTREAM_SECRET_KEYS {
                 match fetched.get(*key) {
                     Some(value) => {
-                        std::env::set_var(key, value);
+                        // Materialise under the consumer env var name (identity
+                        // except HF_PAT_MOOSE → HF_TOKEN). Value never logged.
+                        std::env::set_var(downstream_env_var(key), value);
                         count += 1;
                     }
                     None => missing.push((*key).to_string()),
@@ -175,6 +192,7 @@ mod tests {
         "CHORD_JWT_SECRET",
         "CHORD_API_KEY",
         "OPENROUTER_API_KEY",
+        "HF_PAT_MOOSE",
         "HF_TOKEN",
     ];
 
@@ -222,7 +240,7 @@ mod tests {
                     { "secretKey": "CHORD_JWT_SECRET", "secretValue": "fetched-jwt" }, // pii-test-fixture
                     { "secretKey": "CHORD_API_KEY", "secretValue": "fetched-key" }, // pii-test-fixture
                     { "secretKey": "OPENROUTER_API_KEY", "secretValue": "fetched-openrouter-key" }, // pii-test-fixture
-                    { "secretKey": "HF_TOKEN", "secretValue": "fetched-hf-token" } // pii-test-fixture
+                    { "secretKey": "HF_PAT_MOOSE", "secretValue": "fetched-hf-token" } // pii-test-fixture
                 ]
             }));
         });
@@ -245,7 +263,13 @@ mod tests {
             std::env::var("OPENROUTER_API_KEY").unwrap(),
             "fetched-openrouter-key"
         );
+        // <secret-manager> key HF_PAT_MOOSE materialises under the consumer var HF_TOKEN
+        // (what ingest::hf_token() and Ollama read), NOT under its vault name.
         assert_eq!(std::env::var("HF_TOKEN").unwrap(), "fetched-hf-token");
+        assert!(
+            std::env::var("HF_PAT_MOOSE").is_err(),
+            "vault key name must not leak into the env; only the HF_TOKEN alias is set"
+        );
         clear_all();
     }
 
@@ -279,7 +303,8 @@ mod tests {
                 assert!(missing.contains(&"CHORD_JWT_SECRET".to_string()));
                 assert!(missing.contains(&"CHORD_API_KEY".to_string()));
                 assert!(missing.contains(&"OPENROUTER_API_KEY".to_string()));
-                assert!(missing.contains(&"HF_TOKEN".to_string()));
+                // `missing` names the <secret-manager>/vault key, not the env alias.
+                assert!(missing.contains(&"HF_PAT_MOOSE".to_string()));
             }
             other => panic!("expected Fetched outcome, got {other:?}"),
         }
