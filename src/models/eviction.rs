@@ -1454,4 +1454,61 @@ mod tests {
             "never-requested model is infinitely idle → cooldown-evicted"
         );
     }
+
+    #[tokio::test]
+    async fn cooldown_keeps_freshly_pulled_model_with_ancient_manifest_mtime() {
+        // CHRD-75 regression. A freshly pulled/warmed model that has NEVER been
+        // served must read ~0h idle and must NOT be cooldown-evicted — even when
+        // its manifest file carries an ancient on-disk mtime (blob dedup /
+        // copy-preserving timestamps). reconcile used to seed `last_requested`
+        // from that mtime, so with MODEL_WARM_COOLDOWN_HOURS=1 a model pulled
+        // minutes ago looked ~918h idle and was deleted mid-use. Discovery (the
+        // warm/pull moment) is now the last-access time, so idle is ~0h.
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        fs::create_dir_all(base.join("archive")).unwrap();
+        let model = make_model(&base.join("local"), "freshpull", "latest", &[100]);
+
+        // Backdate the manifest leaf mtime to ~918h ago (the exact bug symptom).
+        let manifest =
+            base.join("local/manifests/registry.ollama.ai/library/freshpull/latest");
+        let ancient = std::time::SystemTime::now() - Duration::from_secs(918 * 3600);
+        fs::File::options()
+            .write(true)
+            .open(&manifest)
+            .unwrap()
+            .set_modified(ancient)
+            .unwrap();
+
+        let mut reg = reg_with(base, vec![]);
+        reg.reconcile(); // seeds last_requested — must be ~now, not the ancient mtime
+
+        // Freshly discovered → ~0h idle, not ~918h.
+        let now = now_epoch_secs();
+        let lr = reg
+            .get(&model)
+            .unwrap()
+            .last_requested
+            .expect("newly discovered model has last_requested");
+        let idle_hours = (now - lr) / 3_600;
+        assert!(
+            idle_hours < 1,
+            "freshly pulled model idle {idle_hours}h; must read ~0h, not ~918h"
+        );
+
+        // …and the cooldown pass with a 1h cooldown must leave it warm.
+        let registry = Arc::new(Mutex::new(reg));
+        let evictor = fs_evictor(base);
+        let lock = new_disk_op_lock();
+        run_eviction_sweep_at(
+            &registry, 80, 1, now, &NoPressureProbe, &evictor, &lock, TEST_COPY_TIMEOUT,
+        )
+        .await;
+
+        assert_eq!(
+            registry.lock().await.get(&model).unwrap().tier,
+            StorageTier::Warm,
+            "freshly pulled, never-served model must survive the cooldown pass"
+        );
+    }
 }

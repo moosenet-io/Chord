@@ -613,7 +613,12 @@ impl ModelRegistry {
     ///
     /// Record updates:
     /// - Local model already known → tier becomes `Warm` (left `Hot` if Hot),
-    ///   `local_path` set; new → added as `Warm` with `last_requested = mtime`.
+    ///   `local_path` set; new → added as `Warm` with `last_requested = now`
+    ///   (the warm/pull moment, NOT the manifest file mtime). A freshly pulled
+    ///   model must read ~0h idle so the TIER-04 cooldown pass does not delete it
+    ///   mid-use; the manifest mtime can be far in the past (blob dedup /
+    ///   copy-preserving timestamps), which used to make a just-pulled model look
+    ///   ~918h idle and get evicted seconds after the pull (CHRD-75).
     /// - Archive-only model already known → tier `Cold`, `archive_path` set;
     ///   new → added as `Cold`.
     /// - Registry entries found in neither tier are left in place with a warning
@@ -649,7 +654,11 @@ impl ModelRegistry {
                             archive_path: None,
                             size_bytes: m.size_bytes,
                             last_loaded: None,
-                            last_requested: Some(m.mtime),
+                            // A newly-discovered local model has just been warmed
+                            // (pulled) into the local tier — treat discovery as the
+                            // last-access time so it reads ~0h idle, never the
+                            // possibly-ancient manifest mtime (CHRD-75).
+                            last_requested: Some(now_epoch_secs()),
                             protected,
                             managed_by: MANAGED_BY_OLLAMA.to_string(),
                             backend: None, gguf_path: None,
@@ -1565,7 +1574,7 @@ mod tests {
         reg.reconcile();
         let rec = reg.get("mistral:7b").expect("newly discovered");
         assert_eq!(rec.tier, StorageTier::Warm);
-        assert!(rec.last_requested.is_some(), "new local model gets last_requested = mtime");
+        assert!(rec.last_requested.is_some(), "new local model gets last_requested = now (warm/pull moment)");
     }
 
     #[test]
