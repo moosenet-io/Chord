@@ -14,6 +14,7 @@
 //! | GET    | `/api/models/:name`          | yes  | single model detail (404 unknown) |
 //! | POST   | `/api/models/:name/archive`  | yes  | archive a warm model (warm → cold) |
 //! | POST   | `/api/models/:name/pull`     | yes  | pull a cold model (cold → warm) |
+//! | POST   | `/api/models/ingest`          | yes  | ASK4-P2A: pull a HuggingFace model into cold storage (default-OFF gate) |
 //! | POST   | `/api/models/:name/protect`  | yes  | toggle/set the protected flag |
 //! | GET    | `/api/storage`                | yes  | disk usage summary (local + archive) |
 //! | POST   | `/api/models/sweep`           | yes  | trigger a disk-pressure eviction sweep |
@@ -670,6 +671,194 @@ pub async fn sweep_session_advance(
     }
 }
 
+// ── POST /api/models/ingest (ASK4-P2A) ───────────────────────────────────────
+
+/// Request body for `POST /api/models/ingest`.
+///
+/// Re-exported shape of [`crate::models::ingest::IngestRequest`] — declared here
+/// so axum's `Json<...>` extractor rejects a malformed body with a 422 before
+/// the handler runs, consistent with the other control DTOs.
+pub use crate::models::ingest::IngestRequest;
+
+/// The real [`crate::models::ingest::IngestOps`] over the live [`AppState`]:
+/// Ollama for the HF download, the model registry + eviction machinery for the
+/// warm→cold demote. Constructed per-request (cheap; holds only references).
+struct AppStateIngestOps<'a> {
+    state: &'a AppState,
+    ollama_url: Option<String>,
+    archive_copy_timeout: std::time::Duration,
+}
+
+#[async_trait::async_trait]
+impl<'a> crate::models::ingest::IngestOps for AppStateIngestOps<'a> {
+    async fn model_exists(&self, model_name: &str, ollama_ref: &str) -> Option<String> {
+        let reg = self.state.model_registry.lock().await;
+        for candidate in [
+            model_name.to_string(),
+            ollama_ref.to_string(),
+            format!("{ollama_ref}:latest"),
+        ] {
+            if reg.get(&candidate).is_some() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    async fn probe(
+        &self,
+        hf_repo: &str,
+        revision: Option<&str>,
+        token: Option<&str>,
+    ) -> Result<crate::models::ingest::HfProbe, String> {
+        // HuggingFace Hub model-info API. A gated repo returns 401/403 without
+        // an accepted token; a public one returns JSON with an optional
+        // `usedStorage` byte count and a `gated` field.
+        let mut url = format!("https://huggingface.co/api/models/{hf_repo}");
+        if let Some(rev) = revision.filter(|r| !r.is_empty()) {
+            url = format!("{url}/revision/{rev}");
+        }
+        let mut rb = self
+            .state
+            .http_client
+            .get(&url)
+            .header("User-Agent", "chord-model-ingest");
+        if let Some(t) = token {
+            rb = rb.bearer_auth(t); // never logged
+        }
+        let resp = rb.send().await.map_err(|e| format!("request error: {e}"))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            // Gated (or token lacks access). Report gated; the caller decides
+            // fail-soft based on whether a token was present.
+            return Ok(crate::models::ingest::HfProbe {
+                gated: true,
+                total_bytes: None,
+            });
+        }
+        if !status.is_success() {
+            return Err(format!("HTTP {status}"));
+        }
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("response not JSON: {e}"))?;
+        let gated = match body.get("gated") {
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(serde_json::Value::String(s)) => !s.eq_ignore_ascii_case("false"),
+            _ => false,
+        };
+        let total_bytes = body
+            .get("usedStorage")
+            .and_then(|v| v.as_u64())
+            .filter(|b| *b > 0);
+        Ok(crate::models::ingest::HfProbe { gated, total_bytes })
+    }
+
+    async fn pull_warm(&self, ollama_ref: &str, _token: Option<&str>) -> Result<(), String> {
+        // Delegate the actual download to Ollama's native HF ingestion. Ollama
+        // reads its own `HF_TOKEN` from its process env for gated pulls; Chord
+        // never forwards the token in the request body.
+        let base = self
+            .ollama_url
+            .as_deref()
+            .ok_or_else(|| "OLLAMA_URL is not configured".to_string())?;
+        let url = format!("{}/api/pull", base.trim_end_matches('/'));
+        let fut = self
+            .state
+            .http_client
+            .post(&url)
+            .json(&serde_json::json!({ "name": ollama_ref, "stream": false }))
+            .send();
+        let resp = tokio::time::timeout(self.archive_copy_timeout, fut)
+            .await
+            .map_err(|_| "ollama pull timed out".to_string())?
+            .map_err(|e| format!("ollama pull request error: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("ollama pull returned HTTP {}", resp.status()));
+        }
+        Ok(())
+    }
+
+    async fn land_cold(
+        &self,
+        _hf_repo: &str,
+        ollama_ref: &str,
+    ) -> Result<crate::models::ingest::ColdLanded, String> {
+        // Pick up the freshly pulled model, then demote warm→cold via the same
+        // eviction machinery `POST /api/models/:name/archive` uses.
+        let registry_name = {
+            let mut reg = self.state.model_registry.lock().await;
+            reg.reconcile();
+            // Ollama may store the model as `<ollama_ref>` or `<ollama_ref>:latest`.
+            let want = ollama_ref.to_string();
+            let want_latest = format!("{ollama_ref}:latest");
+            let found = reg
+                .all_records()
+                .find(|r| r.tier == StorageTier::Warm && (r.name == want || r.name == want_latest))
+                .map(|r| r.name.clone());
+            found.ok_or_else(|| "pulled model not found as warm after reconcile".to_string())?
+        };
+
+        let evicted = eviction::evict_to_archive(
+            &self.state.model_registry,
+            &registry_name,
+            self.state.local_evictor.as_ref(),
+            self.archive_copy_timeout,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let archive_path = {
+            let reg = self.state.model_registry.lock().await;
+            reg.get(&registry_name)
+                .and_then(|r| r.archive_path.clone())
+                .unwrap_or_else(|| reg.archive_path().display().to_string())
+        };
+
+        Ok(crate::models::ingest::ColdLanded {
+            registry_name,
+            archive_path,
+            bytes: evicted.freed_bytes,
+        })
+    }
+}
+
+/// `POST /api/models/ingest` — ASK4-P2A: pull a HuggingFace model into cold
+/// storage so the MINT sweep can later promote+test it.
+///
+/// Same JWT auth as every other control endpoint. Master-gated OFF by default
+/// (`CHORD_MODEL_INGEST_ENABLED`). Returns a structured
+/// [`crate::models::ingest::IngestOutcome`] as JSON; the HTTP status code is
+/// derived from the outcome. Never panics; never leaks the HF token.
+pub async fn ingest_model(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<IngestRequest>,
+) -> Response {
+    if let Err(e) = auth_check(&headers, &state.jwt_secret) {
+        return auth_error_response(e);
+    }
+
+    let cfg = crate::models::ingest::IngestConfig::from_env();
+
+    // Precise 400 for malformed input (before the gate/idempotency flow).
+    if let Err(msg) = crate::models::ingest::validate_request(&req) {
+        return error_response(StatusCode::BAD_REQUEST, msg);
+    }
+
+    let ops = AppStateIngestOps {
+        state: &state,
+        ollama_url: cfg.ollama_url.clone(),
+        archive_copy_timeout: std::time::Duration::from_secs(state.model_archive_copy_timeout_secs),
+    };
+
+    let outcome = crate::models::ingest::ingest_model(&ops, &cfg, &req).await;
+    let code =
+        StatusCode::from_u16(outcome.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (code, Json(outcome)).into_response()
+}
+
 // ── Router ───────────────────────────────────────────────────────────────────
 
 /// Build the TIER-05 control router over the shared [`AppState`].
@@ -686,6 +875,8 @@ pub fn build_control_router(state: Arc<AppState>) -> axum::Router {
         .route("/api/models/:name/archive", post(archive_model))
         .route("/api/models/:name/pull", post(pull_model))
         .route("/api/models/:name/protect", post(protect_model))
+        // ASK4-P2A: pull a HuggingFace model into cold storage (default-OFF gate).
+        .route("/api/models/ingest", post(ingest_model))
         .route("/api/storage", get(storage_summary))
         .route("/api/storage/gc", post(trigger_gc))
         // RESIL-02: sweep action-queue cache (durable resume).
@@ -1466,5 +1657,96 @@ mod tests {
         assert_eq!(json["orphans_deleted"], 1);
         assert_eq!(json["freed_bytes"], 64);
         assert!(!base.join("local/blobs/sha256-orphan1").exists());
+    }
+
+    // ── ASK4-P2A: /api/models/ingest ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn ingest_requires_auth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let registry = Arc::new(Mutex::new(reg_at(base, vec![])));
+        let state = control_state_with_secret(registry, base.join("local"), "s");
+        let app = build_control_router(state);
+
+        // Valid JSON body so the Json extractor succeeds and the in-handler
+        // auth_check is what rejects the request.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/models/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "hf_repo": "org/model", "model_name": "m" })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ingest_disabled_by_default_refuses() {
+        // Default (gate unset) ⇒ disabled ⇒ 403 with status "disabled",
+        // touching no network/registry state.
+        std::env::remove_var("CHORD_MODEL_INGEST_ENABLED");
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let registry = Arc::new(Mutex::new(reg_at(base, vec![])));
+        // Empty jwt_secret ⇒ auth disabled, so we reach the gate.
+        let state = control_state(registry, base.join("local"), Arc::new(StatvfsProbe));
+        let app = build_control_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/models/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "hf_repo": "org/model", "model_name": "m" })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["status"], "disabled");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ingest_rejects_malformed_repo_with_400() {
+        std::env::remove_var("CHORD_MODEL_INGEST_ENABLED");
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let registry = Arc::new(Mutex::new(reg_at(base, vec![])));
+        let state = control_state(registry, base.join("local"), Arc::new(StatvfsProbe));
+        let app = build_control_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/models/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "hf_repo": "not a repo", "model_name": "m" })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

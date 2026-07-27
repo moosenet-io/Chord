@@ -49,8 +49,18 @@ use chord_secrets::{fetch_secrets_batch, InfisicalConfig};
 /// here (never a literal, never logged) exactly like `CHORD_JWT_SECRET`/
 /// `CHORD_API_KEY`; `embeddings::openrouter_api_key()` reads it back from the
 /// process environment fresh on every request.
-const DOWNSTREAM_SECRET_KEYS: &[&str] =
-    &["CHORD_JWT_SECRET", "CHORD_API_KEY", "OPENROUTER_API_KEY"];
+/// ASK4-P2A: `HF_TOKEN` — the HuggingFace access token the model-ingest
+/// endpoint (`models::ingest`) sends as `Authorization: Bearer <token>` when
+/// pulling a gated repo. Fetched here (never a literal, never logged) exactly
+/// like the keys above; `models::ingest::hf_token()` reads it back from the
+/// process environment. Absent ⇒ fail-soft (public models still pull; gated
+/// models return `gated_needs_token`).
+const DOWNSTREAM_SECRET_KEYS: &[&str] = &[
+    "CHORD_JWT_SECRET",
+    "CHORD_API_KEY",
+    "OPENROUTER_API_KEY",
+    "HF_TOKEN",
+];
 
 /// Outcome of the startup <secret-manager> fetch attempt, for the caller (`main()`)
 /// to log and for tests to assert on directly rather than scraping log text.
@@ -165,6 +175,7 @@ mod tests {
         "CHORD_JWT_SECRET",
         "CHORD_API_KEY",
         "OPENROUTER_API_KEY",
+        "HF_TOKEN",
     ];
 
     fn clear_all() {
@@ -210,7 +221,8 @@ mod tests {
                 "secrets": [
                     { "secretKey": "CHORD_JWT_SECRET", "secretValue": "fetched-jwt" }, // pii-test-fixture
                     { "secretKey": "CHORD_API_KEY", "secretValue": "fetched-key" }, // pii-test-fixture
-                    { "secretKey": "OPENROUTER_API_KEY", "secretValue": "fetched-openrouter-key" } // pii-test-fixture
+                    { "secretKey": "OPENROUTER_API_KEY", "secretValue": "fetched-openrouter-key" }, // pii-test-fixture
+                    { "secretKey": "HF_TOKEN", "secretValue": "fetched-hf-token" } // pii-test-fixture
                 ]
             }));
         });
@@ -223,7 +235,7 @@ mod tests {
         let outcome = fetch_and_apply_downstream_secrets().await;
         assert_eq!(
             outcome,
-            SecretFetchOutcome::Fetched { count: 3, missing: vec![] }
+            SecretFetchOutcome::Fetched { count: 4, missing: vec![] }
         );
 
         // Simulate the downstream `from_env()` reads that happen later in main().
@@ -233,6 +245,7 @@ mod tests {
             std::env::var("OPENROUTER_API_KEY").unwrap(),
             "fetched-openrouter-key"
         );
+        assert_eq!(std::env::var("HF_TOKEN").unwrap(), "fetched-hf-token");
         clear_all();
     }
 
@@ -266,6 +279,7 @@ mod tests {
                 assert!(missing.contains(&"CHORD_JWT_SECRET".to_string()));
                 assert!(missing.contains(&"CHORD_API_KEY".to_string()));
                 assert!(missing.contains(&"OPENROUTER_API_KEY".to_string()));
+                assert!(missing.contains(&"HF_TOKEN".to_string()));
             }
             other => panic!("expected Fetched outcome, got {other:?}"),
         }
