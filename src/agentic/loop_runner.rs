@@ -65,9 +65,24 @@ fn action_str(action: &SecurityAction) -> String {
 /// Extracted as a free function so it can be unit-tested without a live LLM
 /// (RESP-06): a test builds an `AgenticResponse` and asserts the emitted events.
 /// Carries ONLY metadata (tool name, duration, status) — never tool arguments.
+/// TRTR-03: `execution_log` step type for a SYNTHETIC tool call intercepted before
+/// it could reach the MCP proxy. A named const (rather than a bare literal at each
+/// site) because the dispatch site and [`emit_tail`] MUST agree: dispatch has
+/// already emitted `ToolCallStarted`, so if `emit_tail` does not recognise this
+/// step type the streaming client is left with a start event that never completes.
+const STEP_SYNTHETIC_TOOL: &str = "synthetic_tool";
+
+/// Step types that represent a tool call which STARTED (and therefore already
+/// emitted [`ProgressEvent::ToolCallStarted`]) and so must emit a matching
+/// [`ProgressEvent::ToolCallComplete`]. Every start needs an end — a streaming
+/// client that receives an unterminated tool call renders a spinner forever.
+fn emits_tool_call_complete(step_type: &str) -> bool {
+    matches!(step_type, "tool_call" | "guard_block" | STEP_SYNTHETIC_TOOL)
+}
+
 fn emit_tail(progress: Option<&UnboundedSender<ProgressEvent>>, resp: &AgenticResponse) {
     for step in &resp.execution_log {
-        if step.step_type == "tool_call" || step.step_type == "guard_block" {
+        if emits_tool_call_complete(&step.step_type) {
             emit(
                 progress,
                 ProgressEvent::ToolCallComplete {
@@ -168,6 +183,26 @@ fn latest_user_query(messages: &[Message]) -> String {
 ///
 /// Extracted as a pure function so the branch logic is unit-testable without a mock
 /// LLM to drive a real tool call through the loop.
+/// TRTR-03: the WHOLE synthetic-dispatch decision — name recognition AND the
+/// message — as one testable unit.
+///
+/// `Some(msg)` means "this name is synthetic: intercept it, do NOT call the MCP
+/// proxy, and hand the model `msg`". `None` means "ordinary tool, dispatch it
+/// normally". Keeping recognition and message together (rather than testing only
+/// the message) is what makes the interception CONTRACT testable without a mock
+/// LLM to drive a real tool call through the loop.
+fn synthetic_tool_interception(
+    tool_name: &str,
+    harness_wired: bool,
+    research_ran: bool,
+) -> Option<&'static str> {
+    if crate::harness::tool_definition::is_deep_research(tool_name) {
+        Some(synthetic_deep_research_message(harness_wired, research_ran))
+    } else {
+        None
+    }
+}
+
 fn synthetic_deep_research_message(harness_wired: bool, research_ran: bool) -> &'static str {
     if !harness_wired {
         "Deep research is not available in this deployment — no research harness is \
@@ -1089,13 +1124,13 @@ impl AgenticExecutor {
                         // message: the harness runs as a PRE-LOOP branch, so by the
                         // time the model is calling tools the research phase has
                         // already had its chance to fire.
-                        if crate::harness::tool_definition::is_deep_research(tc_name) {
-                            let detail = synthetic_deep_research_message(
-                                self.harness.is_some(),
-                                research_ran,
-                            );
+                        if let Some(detail) = synthetic_tool_interception(
+                            tc_name,
+                            self.harness.is_some(),
+                            research_ran,
+                        ) {
                             execution_log.push(ExecutionStep {
-                                step_type: "synthetic_tool".into(),
+                                step_type: STEP_SYNTHETIC_TOOL.into(),
                                 tool_name: Some(tc_name.to_string()),
                                 duration_ms: tool_start.elapsed().as_millis() as u64,
                                 status: "intercepted".into(),
@@ -2008,6 +2043,45 @@ mod tests {
             );
             assert!(!msg.is_empty());
         }
+    }
+
+    // TRTR-03 r3: the interception CONTRACT — name recognition plus decision.
+    #[test]
+    fn test_synthetic_interception_recognises_only_deep_research() {
+        // Ordinary tools must NOT be intercepted — they dispatch to the MCP proxy.
+        for name in ["news_headlines", "weather", "utc_now", "searxng_search", "pve__get_nodes"] {
+            assert!(
+                synthetic_tool_interception(name, true, false).is_none(),
+                "{name} is a real MCP tool and must dispatch normally, not be intercepted"
+            );
+        }
+        // The synthetic one must be intercepted in EVERY configuration — it has no
+        // MCP catalog entry, so reaching the proxy always yields "Tool not found".
+        for (wired, ran) in [(false, false), (false, true), (true, false), (true, true)] {
+            assert!(
+                synthetic_tool_interception(DEEP_RESEARCH_TOOL, wired, ran).is_some(),
+                "deep_research must be intercepted (wired={wired}, ran={ran})"
+            );
+        }
+    }
+
+    // TRTR-03 r3: every tool call that STARTED must also COMPLETE. Dispatch emits
+    // ToolCallStarted before the interception branch, so if `emit_tail` did not
+    // recognise the synthetic step type a streaming client would be left with an
+    // unterminated tool call (spinner forever). Caught in review round 2.
+    #[test]
+    fn test_synthetic_tool_step_emits_a_completion_event() {
+        assert!(
+            emits_tool_call_complete(STEP_SYNTHETIC_TOOL),
+            "an intercepted synthetic tool call already emitted ToolCallStarted, so it \
+             MUST emit a matching ToolCallComplete"
+        );
+        // The pre-existing lifecycle contract is unchanged.
+        assert!(emits_tool_call_complete("tool_call"));
+        assert!(emits_tool_call_complete("guard_block"));
+        // Steps that never emitted a start must not fabricate a completion.
+        assert!(!emits_tool_call_complete("research_source"));
+        assert!(!emits_tool_call_complete("harness_search"));
     }
 
     // HRNS-06: the depth parameter on the offered tool maps to the harness budget.
