@@ -1872,11 +1872,22 @@ mod tests {
         );
     }
 
-    // HRNS-06: deep_research is advertised in the always-on tool set when the
-    // caller ships no explicit tools, so the LLM can always discover it.
+    /// A minimal `HarnessProvider` for advertisement tests — never actually run,
+    /// it only needs to make `self.harness` be `Some`.
+    fn advertise_only_provider() -> Arc<dyn HarnessProvider> {
+        Arc::new(ScriptProvider {
+            detector: ResearchDetector::new(false, 0.6),
+            model: ScriptModel::new(vec![HarnessAction::EndSearch]),
+            build_backend: Box::new(|| MockBackend::new()),
+        })
+    }
+
+    // HRNS-06 + TRTR-03: deep_research is advertised in the always-on tool set —
+    // but ONLY when a HarnessProvider is actually wired.
     #[tokio::test]
-    async fn test_deep_research_is_advertised_in_select_tools() {
-        let executor = AgenticExecutor::new(make_proxy(vec![]));
+    async fn test_deep_research_is_advertised_when_harness_is_wired() {
+        let executor =
+            AgenticExecutor::new(make_proxy(vec![])).with_harness(advertise_only_provider());
         let messages = vec![Message {
             role: "user".into(),
             content: "tell me about photosynthesis".into(),
@@ -1884,11 +1895,37 @@ mod tests {
         }];
         let tools = executor.select_tools(&messages).await;
         let dr = tools.iter().find(|t| t.name == DEEP_RESEARCH_TOOL);
-        assert!(dr.is_some(), "deep_research must be advertised");
+        assert!(dr.is_some(), "deep_research must be advertised when the harness is wired");
         let dr = dr.unwrap();
         assert!(dr.description.contains("searxng_search"));
         assert_eq!(dr.parameters["properties"]["depth"]["enum"], json!(["standard", "thorough"]));
         assert_eq!(dr.parameters["properties"]["query"]["type"], "string");
+    }
+
+    // TRTR-03 (the regression this item exists for): with NO harness wired,
+    // `deep_research` must NOT be advertised. It used to be advertised
+    // unconditionally, which made it a PHANTOM tool — the model would call it,
+    // dispatch had no interception for a synthetic name, so it fell through to
+    // the MCP proxy and was rejected as non-allowlisted, surfacing to the user
+    // as "Tool not found: deep_research". Observed live (S128): Lumina burned
+    // two loop steps on it answering a news question, then reported "the
+    // research tool ran into an error".
+    //
+    // The invariant: never advertise a tool that cannot be dispatched.
+    #[tokio::test]
+    async fn test_deep_research_not_advertised_without_harness() {
+        let executor = AgenticExecutor::new(make_proxy(vec![]));
+        let messages = vec![Message {
+            role: "user".into(),
+            content: "tell me about photosynthesis".into(),
+            tool_call_id: None,
+        }];
+        let tools = executor.select_tools(&messages).await;
+        assert!(
+            !tools.iter().any(|t| t.name == DEEP_RESEARCH_TOOL),
+            "deep_research must NOT be advertised when no harness is wired — \
+             advertising an undispatchable tool is the TRTR-03 phantom-tool bug"
+        );
     }
 
     // HRNS-06: the depth parameter on the offered tool maps to the harness budget.
