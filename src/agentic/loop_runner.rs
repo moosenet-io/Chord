@@ -65,9 +65,24 @@ fn action_str(action: &SecurityAction) -> String {
 /// Extracted as a free function so it can be unit-tested without a live LLM
 /// (RESP-06): a test builds an `AgenticResponse` and asserts the emitted events.
 /// Carries ONLY metadata (tool name, duration, status) — never tool arguments.
+/// TRTR-03: `execution_log` step type for a SYNTHETIC tool call intercepted before
+/// it could reach the MCP proxy. A named const (rather than a bare literal at each
+/// site) because the dispatch site and [`emit_tail`] MUST agree: dispatch has
+/// already emitted `ToolCallStarted`, so if `emit_tail` does not recognise this
+/// step type the streaming client is left with a start event that never completes.
+const STEP_SYNTHETIC_TOOL: &str = "synthetic_tool";
+
+/// Step types that represent a tool call which STARTED (and therefore already
+/// emitted [`ProgressEvent::ToolCallStarted`]) and so must emit a matching
+/// [`ProgressEvent::ToolCallComplete`]. Every start needs an end — a streaming
+/// client that receives an unterminated tool call renders a spinner forever.
+fn emits_tool_call_complete(step_type: &str) -> bool {
+    matches!(step_type, "tool_call" | "guard_block" | STEP_SYNTHETIC_TOOL)
+}
+
 fn emit_tail(progress: Option<&UnboundedSender<ProgressEvent>>, resp: &AgenticResponse) {
     for step in &resp.execution_log {
-        if step.step_type == "tool_call" || step.step_type == "guard_block" {
+        if emits_tool_call_complete(&step.step_type) {
             emit(
                 progress,
                 ProgressEvent::ToolCallComplete {
@@ -146,6 +161,58 @@ fn latest_user_query(messages: &[Message]) -> String {
         .find(|m| m.role == "user")
         .map(|m| m.content.clone())
         .unwrap_or_default()
+}
+
+/// TRTR-03: the WHOLE synthetic-dispatch decision — name recognition AND the
+/// message — as one testable unit.
+///
+/// `Some(msg)` means "this name is synthetic: intercept it, do NOT call the MCP
+/// proxy, and hand the model `msg`". `None` means "ordinary tool, dispatch it
+/// normally". Keeping recognition and message together (rather than testing only
+/// the message) is what makes the interception CONTRACT testable without a mock
+/// LLM to drive a real tool call through the loop.
+fn synthetic_tool_interception(
+    tool_name: &str,
+    harness_wired: bool,
+    research_ran: bool,
+) -> Option<&'static str> {
+    if crate::harness::tool_definition::is_deep_research(tool_name) {
+        Some(synthetic_deep_research_message(harness_wired, research_ran))
+    } else {
+        None
+    }
+}
+
+/// TRTR-03: the tool-role message returned when the model calls the SYNTHETIC
+/// `deep_research` tool as a loop step.
+///
+/// `deep_research` has no MCP catalog entry, so it must never reach
+/// `proxy.tool_call()` — that path rejects it as non-allowlisted and surfaces the
+/// misleading `Tool not found: deep_research` to the user. The three cases are
+/// genuinely different and the model needs to be told which one it is:
+///
+/// - **no harness wired** — the capability does not exist in this deployment at all.
+///   A caller can still put `deep_research` in `req.tools` (the HRNS-05 explicit
+///   trigger) on a harness-less deployment, so this case is reachable even though
+///   `select_tools` will not advertise it. Saying "it runs automatically" here would
+///   be a lie — it can never run.
+/// - **harness wired, research already ran** — the findings are in the transcript;
+///   calling it again is a loop.
+/// - **harness wired, research did not run** — the pre-loop branch declined it (the
+///   detector did not fire); it is not invocable as a step.
+fn synthetic_deep_research_message(harness_wired: bool, research_ran: bool) -> &'static str {
+    if !harness_wired {
+        "Deep research is not available in this deployment — no research harness is \
+         configured. Do not call `deep_research` again. Answer using the tools you \
+         have (for example a web search), or say plainly that you cannot research this."
+    } else if research_ran {
+        "Deep research has ALREADY run for this query and its findings are in the \
+         conversation above. Do not call it again — answer from those findings."
+    } else {
+        "`deep_research` is not callable as a step: it runs automatically before the \
+         tool loop when a query warrants it. Answer using the tools available to you \
+         now (for example a web search)."
+    }
 }
 
 /// Whether the request explicitly offers the `deep_research` tool — a signal that
@@ -507,10 +574,24 @@ impl AgenticExecutor {
         }
 
         // HRNS-06: deep_research is a *synthetic* Chord tool — it is not in the MCP
-        // catalog, so we advertise it directly. Always-on alongside the essentials
-        // so the LLM can always choose deep multi-source research over a quick
-        // searxng_search lookup.
-        if seen.insert(DEEP_RESEARCH_TOOL.to_string()) {
+        // catalog, so we advertise it directly.
+        //
+        // TRTR-03: it is advertised ONLY when a `HarnessProvider` is actually wired
+        // (`self.harness.is_some()`). It used to be advertised unconditionally, which
+        // made it a PHANTOM tool on every deployment with no harness: the model would
+        // call it, dispatch had no interception for a synthetic name, so it fell
+        // through to `proxy.tool_call()` and the MCP layer rejected it as
+        // non-allowlisted — surfacing to the user as "Tool not found: deep_research".
+        // Observed live (S128): Lumina burned two loop steps on it for a news question
+        // and then told the operator "the research tool ran into an error".
+        //
+        // Note this tool is NOT dispatchable even when the harness IS wired — the
+        // harness runs as a PRE-LOOP branch (see the HRNS-05 block in `execute`),
+        // triggered by the research detector or by the CALLER offering this tool in
+        // `req.tools`. Advertising it here is what lets the model signal "this warrants
+        // deep research"; `dispatch_synthetic` below turns that signal into a useful
+        // tool-role message instead of a misleading not-found error.
+        if self.harness.is_some() && seen.insert(DEEP_RESEARCH_TOOL.to_string()) {
             use crate::harness::tool_definition;
             selected.push(ToolDefinition {
                 name: DEEP_RESEARCH_TOOL.to_string(),
@@ -1030,6 +1111,35 @@ impl AgenticExecutor {
                             continue;
                         }
                         executed_calls.insert(call_key);
+
+                        // ── TRTR-03: synthetic-tool interception ──────────────
+                        // `deep_research` is a SYNTHETIC Chord tool with no MCP
+                        // catalog entry. It must never reach `proxy.tool_call()`,
+                        // which would reject it as non-allowlisted and surface the
+                        // misleading "Tool not found: deep_research" to the user.
+                        // Intercept it here and return an actionable tool-role
+                        // message: the harness runs as a PRE-LOOP branch, so by the
+                        // time the model is calling tools the research phase has
+                        // already had its chance to fire.
+                        if let Some(detail) = synthetic_tool_interception(
+                            tc_name,
+                            self.harness.is_some(),
+                            research_ran,
+                        ) {
+                            execution_log.push(ExecutionStep {
+                                step_type: STEP_SYNTHETIC_TOOL.into(),
+                                tool_name: Some(tc_name.to_string()),
+                                duration_ms: tool_start.elapsed().as_millis() as u64,
+                                status: "intercepted".into(),
+                                error_message: None,
+                            });
+                            messages.push(Message {
+                                role: "tool".into(),
+                                content: detail.into(),
+                                tool_call_id: Some(tc_id.clone()),
+                            });
+                            continue;
+                        }
 
                         // ── Execute via MCP proxy ─────────────────────────────
                         new_execution_this_iter = true;
@@ -1824,11 +1934,22 @@ mod tests {
         );
     }
 
-    // HRNS-06: deep_research is advertised in the always-on tool set when the
-    // caller ships no explicit tools, so the LLM can always discover it.
+    /// A minimal `HarnessProvider` for advertisement tests — never actually run,
+    /// it only needs to make `self.harness` be `Some`.
+    fn advertise_only_provider() -> Arc<dyn HarnessProvider> {
+        Arc::new(ScriptProvider {
+            detector: ResearchDetector::new(false, 0.6),
+            model: ScriptModel::new(vec![HarnessAction::EndSearch]),
+            build_backend: Box::new(|| MockBackend::new()),
+        })
+    }
+
+    // HRNS-06 + TRTR-03: deep_research is advertised in the always-on tool set —
+    // but ONLY when a HarnessProvider is actually wired.
     #[tokio::test]
-    async fn test_deep_research_is_advertised_in_select_tools() {
-        let executor = AgenticExecutor::new(make_proxy(vec![]));
+    async fn test_deep_research_is_advertised_when_harness_is_wired() {
+        let executor =
+            AgenticExecutor::new(make_proxy(vec![])).with_harness(advertise_only_provider());
         let messages = vec![Message {
             role: "user".into(),
             content: "tell me about photosynthesis".into(),
@@ -1836,11 +1957,128 @@ mod tests {
         }];
         let tools = executor.select_tools(&messages).await;
         let dr = tools.iter().find(|t| t.name == DEEP_RESEARCH_TOOL);
-        assert!(dr.is_some(), "deep_research must be advertised");
+        assert!(dr.is_some(), "deep_research must be advertised when the harness is wired");
         let dr = dr.unwrap();
         assert!(dr.description.contains("searxng_search"));
         assert_eq!(dr.parameters["properties"]["depth"]["enum"], json!(["standard", "thorough"]));
         assert_eq!(dr.parameters["properties"]["query"]["type"], "string");
+    }
+
+    // TRTR-03 (the regression this item exists for): with NO harness wired,
+    // `deep_research` must NOT be advertised. It used to be advertised
+    // unconditionally, which made it a PHANTOM tool — the model would call it,
+    // dispatch had no interception for a synthetic name, so it fell through to
+    // the MCP proxy and was rejected as non-allowlisted, surfacing to the user
+    // as "Tool not found: deep_research". Observed live (S128): Lumina burned
+    // two loop steps on it answering a news question, then reported "the
+    // research tool ran into an error".
+    //
+    // The invariant: never advertise a tool that cannot be dispatched.
+    #[tokio::test]
+    async fn test_deep_research_not_advertised_without_harness() {
+        let executor = AgenticExecutor::new(make_proxy(vec![]));
+        let messages = vec![Message {
+            role: "user".into(),
+            content: "tell me about photosynthesis".into(),
+            tool_call_id: None,
+        }];
+        let tools = executor.select_tools(&messages).await;
+        assert!(
+            !tools.iter().any(|t| t.name == DEEP_RESEARCH_TOOL),
+            "deep_research must NOT be advertised when no harness is wired — \
+             advertising an undispatchable tool is the TRTR-03 phantom-tool bug"
+        );
+    }
+
+    // TRTR-03: the dispatch-side interception message. The synthetic `deep_research`
+    // name must never reach `proxy.tool_call()` (which would reject it as
+    // non-allowlisted and surface "Tool not found"), and the message it returns
+    // instead must be TRUTHFUL about which of the three situations the model is in.
+    #[test]
+    fn test_synthetic_deep_research_message_no_harness_says_unavailable() {
+        // Reachable even though select_tools won't advertise it: a caller can put
+        // deep_research in req.tools (the HRNS-05 explicit trigger) on a deployment
+        // with no harness. Telling the model it "runs automatically" would be a lie.
+        let msg = synthetic_deep_research_message(false, false);
+        assert!(
+            msg.contains("not available") && msg.contains("no research harness"),
+            "no-harness case must say the capability is unavailable, got: {msg}"
+        );
+        assert!(
+            !msg.contains("runs automatically"),
+            "must NOT claim it runs automatically when it can never run, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_synthetic_deep_research_message_already_ran() {
+        let msg = synthetic_deep_research_message(true, true);
+        assert!(
+            msg.contains("ALREADY run"),
+            "already-ran case must point the model at the existing findings, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_synthetic_deep_research_message_pre_loop() {
+        let msg = synthetic_deep_research_message(true, false);
+        assert!(
+            msg.contains("runs automatically before the tool loop"),
+            "harness-wired-but-not-run case must explain the pre-loop contract, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_synthetic_deep_research_message_never_says_tool_not_found() {
+        // The whole point of TRTR-03: the user-visible failure was
+        // "Tool not found: deep_research". No branch may reproduce that.
+        for (wired, ran) in [(false, false), (false, true), (true, false), (true, true)] {
+            let msg = synthetic_deep_research_message(wired, ran);
+            assert!(
+                !msg.to_lowercase().contains("not found"),
+                "no branch may surface a not-found error (wired={wired}, ran={ran}): {msg}"
+            );
+            assert!(!msg.is_empty());
+        }
+    }
+
+    // TRTR-03 r3: the interception CONTRACT — name recognition plus decision.
+    #[test]
+    fn test_synthetic_interception_recognises_only_deep_research() {
+        // Ordinary tools must NOT be intercepted — they dispatch to the MCP proxy.
+        for name in ["news_headlines", "weather", "utc_now", "searxng_search", "pve__get_nodes"] {
+            assert!(
+                synthetic_tool_interception(name, true, false).is_none(),
+                "{name} is a real MCP tool and must dispatch normally, not be intercepted"
+            );
+        }
+        // The synthetic one must be intercepted in EVERY configuration — it has no
+        // MCP catalog entry, so reaching the proxy always yields "Tool not found".
+        for (wired, ran) in [(false, false), (false, true), (true, false), (true, true)] {
+            assert!(
+                synthetic_tool_interception(DEEP_RESEARCH_TOOL, wired, ran).is_some(),
+                "deep_research must be intercepted (wired={wired}, ran={ran})"
+            );
+        }
+    }
+
+    // TRTR-03 r3: every tool call that STARTED must also COMPLETE. Dispatch emits
+    // ToolCallStarted before the interception branch, so if `emit_tail` did not
+    // recognise the synthetic step type a streaming client would be left with an
+    // unterminated tool call (spinner forever). Caught in review round 2.
+    #[test]
+    fn test_synthetic_tool_step_emits_a_completion_event() {
+        assert!(
+            emits_tool_call_complete(STEP_SYNTHETIC_TOOL),
+            "an intercepted synthetic tool call already emitted ToolCallStarted, so it \
+             MUST emit a matching ToolCallComplete"
+        );
+        // The pre-existing lifecycle contract is unchanged.
+        assert!(emits_tool_call_complete("tool_call"));
+        assert!(emits_tool_call_complete("guard_block"));
+        // Steps that never emitted a start must not fabricate a completion.
+        assert!(!emits_tool_call_complete("research_source"));
+        assert!(!emits_tool_call_complete("harness_search"));
     }
 
     // HRNS-06: the depth parameter on the offered tool maps to the harness budget.
