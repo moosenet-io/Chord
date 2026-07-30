@@ -56,9 +56,10 @@
 //!   below N cold models.
 //! - **Hard misconfig floor:** abort the whole pass (delete NOTHING) + alert if a
 //!   single pass would remove more than `MODEL_ARCHIVE_QUOTA_MAX_PASS_FRACTION`
-//!   (default 0.25 ⇒ >25 %) of the cold models, OR the resolved ABSOLUTE quota is
-//!   below `MODEL_ARCHIVE_QUOTA_MIN_SANE_GB` (default 10 GiB). A fat-fingered
-//!   `MODEL_ARCHIVE_QUOTA_GB=1` must NOT wipe the archive.
+//!   (default 0.25 ⇒ >25 %) of the cold models, OR the RESOLVED quota (either
+//!   path) is 0 (e.g. `MODEL_ARCHIVE_QUOTA_PERCENT=0`) or below
+//!   `MODEL_ARCHIVE_QUOTA_MIN_SANE_GB` (default 10 GiB). A fat-fingered
+//!   `MODEL_ARCHIVE_QUOTA_GB=1` or `_PERCENT=0` must NOT wipe the archive.
 //! - **Re-pullability:** deletes ONLY the archive files + drops the Chord registry
 //!   record. It NEVER writes to the intake DB — the model's Terminus
 //!   `model_discovery_candidate` / `model_fleet_catalog` row is left intact, so a
@@ -140,10 +141,12 @@ pub struct ColdQuotaConfig {
     /// nothing) if it would remove more than this fraction of the cold models
     /// (default 0.25 ⇒ >25 %). The fat-finger guard.
     pub max_pass_fraction: f64,
-    /// `MODEL_ARCHIVE_QUOTA_MIN_SANE_GB` — a resolved ABSOLUTE quota below this
-    /// many GiB is treated as a misconfiguration and aborts the pass (default 10).
-    /// Only applies to the absolute (`quota_gb`) path — a percent quota is
-    /// inherently proportional and never trips this.
+    /// `MODEL_ARCHIVE_QUOTA_MIN_SANE_GB` — a RESOLVED quota below this many GiB is
+    /// treated as a misconfiguration and aborts the pass (default 10). Applies to
+    /// the resolved quota regardless of which knob produced it (a fat-fingered
+    /// absolute `QUOTA_GB`, OR a tiny `QUOTA_PERCENT` that resolves below the
+    /// floor). A resolved quota of exactly 0 (e.g. `QUOTA_PERCENT=0`) always
+    /// aborts, independent of this floor.
     pub min_sane_gb: u64,
     /// `MODEL_ARCHIVE_QUOTA_FALLBACK_FIT` — default `true`. When false, un-swept
     /// (no measured `assistant_avg_value`) models are NEVER pruned ("measured-only"
@@ -164,6 +167,20 @@ impl Default for ColdQuotaConfig {
             min_sane_gb: DEFAULT_MIN_SANE_GB,
             fallback_fit: true,
         }
+    }
+}
+
+/// Parse the DRY-RUN flag with a DELIBERATELY ASYMMETRIC, fail-safe contract:
+/// deletion is armed ONLY when the trimmed value is exactly `"0"`. EVERY other
+/// value — unset, `"1"`, `"true"`, but also `"false"`/`"no"`/`"off"`/anything
+/// typo'd — keeps dry-run ON. This matches the documented contract
+/// ("any value but 0 keeps dry-run; set 0 to arm") and means a fat-fingered
+/// `MODEL_ARCHIVE_QUOTA_DRY_RUN=false` can NEVER accidentally arm deletion (the
+/// #1 arming footgun): the only way to delete is the unambiguous literal `0`.
+fn dry_run_from_raw(raw: Option<String>) -> bool {
+    match raw {
+        Some(v) => v.trim() != "0",
+        None => true,
     }
 }
 
@@ -215,7 +232,7 @@ impl ColdQuotaConfig {
         ColdQuotaConfig {
             quota_gb,
             quota_percent,
-            dry_run: env_bool("MODEL_ARCHIVE_QUOTA_DRY_RUN", true),
+            dry_run: dry_run_from_raw(std::env::var("MODEL_ARCHIVE_QUOTA_DRY_RUN").ok()),
             grace_days: env_u64("MODEL_ARCHIVE_QUOTA_GRACE_DAYS", DEFAULT_GRACE_DAYS),
             min_keep: env_usize("MODEL_ARCHIVE_QUOTA_MIN_KEEP", DEFAULT_MIN_KEEP),
             max_pass_fraction,
@@ -559,36 +576,50 @@ pub fn plan_prune(
     }
 
     // ── Hard-misconfig floors → abort (delete nothing) + alert ──
+    // Only meaningful when actually over quota (a pass that wouldn't prune has
+    // nothing to refuse).
     let mut aborted: Option<String> = None;
-    // (a) resolved ABSOLUTE quota below the sane minimum (fat-fingered QUOTA_GB).
-    if cfg.quota_gb.is_some() {
+    if used_bytes > quota_bytes {
         let min_sane_bytes = cfg.min_sane_gb.saturating_mul(GIB);
-        if quota_bytes < min_sane_bytes {
+        if quota_bytes == 0 {
+            // (a0) A resolved quota of 0 (e.g. MODEL_ARCHIVE_QUOTA_PERCENT=0, or a
+            // 0-GB absolute) would try to empty the archive down to the min-keep
+            // floor — always a misconfiguration. Applies to BOTH the percent and
+            // absolute paths.
+            aborted = Some(
+                "resolved quota is 0 bytes (MODEL_ARCHIVE_QUOTA_PERCENT=0 / GB=0) — refusing to \
+                 prune the entire archive (suspected misconfiguration)"
+                    .to_string(),
+            );
+        } else if quota_bytes < min_sane_bytes {
+            // (a) resolved quota below the sane minimum — applies to the RESOLVED
+            // quota regardless of which knob set it (a fat-fingered absolute
+            // QUOTA_GB, OR a tiny percent that resolves below the floor).
             aborted = Some(format!(
-                "resolved absolute quota {:.2} GiB is below the sane minimum {} GiB — refusing to \
-                 prune (suspected misconfiguration)",
+                "resolved quota {:.2} GiB is below the sane minimum {} GiB — refusing to prune \
+                 (suspected misconfiguration)",
                 bytes_to_gb(quota_bytes),
                 cfg.min_sane_gb
             ));
-        }
-    }
-    // (b) a single pass would remove more than the max-pass fraction of cold
-    // models. The cap is `floor(fraction * cold_total)`; for a tiny cold set
-    // (cold_total < 1/fraction, e.g. < 4 at 25 %) the cap rounds to 0 and this
-    // guard is INACTIVE — the min-keep floor governs those small sets instead
-    // (in production min_keep defaults to 20, so pruning only ever happens once
-    // cold_total > 20, where the cap is always ≥ 5 and this guard is live).
-    if aborted.is_none() && cold_total > 0 && !items.is_empty() {
-        let cap = (cfg.sane_max_pass_fraction() * cold_total as f64).floor() as usize;
-        if cap >= 1 && items.len() > cap {
-            aborted = Some(format!(
-                "plan would prune {} of {} cold models (> {:.0}% cap of {}) in a single pass — \
-                 refusing (suspected misconfiguration / quota too low)",
-                items.len(),
-                cold_total,
-                cfg.sane_max_pass_fraction() * 100.0,
-                cap
-            ));
+        } else if cold_total > 0 && !items.is_empty() {
+            // (b) a single pass would remove more than the max-pass fraction of
+            // cold models. The cap is `floor(fraction * cold_total)`; for a tiny
+            // cold set (cold_total < 1/fraction, e.g. < 4 at 25 %) the cap rounds
+            // to 0 and this guard is INACTIVE — the min-keep floor governs those
+            // small sets instead (in production min_keep defaults to 20, so
+            // pruning only ever happens once cold_total > 20, where the cap is
+            // always ≥ 5 and this guard is live).
+            let cap = (cfg.sane_max_pass_fraction() * cold_total as f64).floor() as usize;
+            if cap >= 1 && items.len() > cap {
+                aborted = Some(format!(
+                    "plan would prune {} of {} cold models (> {:.0}% cap of {}) in a single pass — \
+                     refusing (suspected misconfiguration / quota too low)",
+                    items.len(),
+                    cold_total,
+                    cfg.sane_max_pass_fraction() * 100.0,
+                    cap
+                ));
+            }
         }
     }
 
@@ -880,12 +911,59 @@ pub async fn run_cold_quota_pass_at(
     let mut freed_actual: u64 = 0;
     for item in &plan.items {
         // Re-check live df: stop as soon as we're back under quota (idempotent,
-        // GC-aware — df reflects what shared-blob deletes actually freed).
-        if let Some(cur) = archive_quota_status(archive_root, cfg, probe) {
-            if !cur.over_quota {
+        // GC-aware — df reflects what shared-blob deletes actually freed). A probe
+        // FAILURE mid-pass STOPS the loop (fail-safe): never keep deleting when we
+        // can no longer confirm we're still over quota.
+        match archive_quota_status(archive_root, cfg, probe) {
+            Some(cur) if !cur.over_quota => break,
+            Some(_) => {}
+            None => {
+                warn!("[cold-quota] archive df unavailable mid-pass; stopping (fail-safe)");
                 break;
             }
         }
+
+        // TOCTOU guard: the plan was computed BEFORE we took the disk-op lock. A
+        // concurrent cold→warm pull, protect toggle, or lumina-alias repoint
+        // between plan and now could make this model no longer eligible. Holding
+        // disk_op_lock already blocks a concurrent pull's copy; re-validate the
+        // registry-only conditions (tier still Cold, not protected, not in the
+        // keep-set) and the LIVE min-keep floor under a brief registry lock right
+        // before deleting, and confirm the archive manifest still exists. Skip any
+        // item that no longer qualifies — never delete a now-Warm/protected/kept
+        // model's archive or drop its record.
+        {
+            let reg = registry.lock().await;
+            if reg.cold_count() <= cfg.min_keep {
+                drop(reg);
+                info!("[cold-quota] live cold count at min-keep floor mid-pass; stopping");
+                break;
+            }
+            let still_eligible = reg
+                .get(&item.name)
+                .map(|r| r.tier == StorageTier::Cold)
+                .unwrap_or(false)
+                && !reg.is_protected(&item.name)
+                && !keep_set.contains(&item.name);
+            drop(reg);
+            if !still_eligible {
+                warn!(
+                    model = %item.name,
+                    "[cold-quota] item no longer eligible at delete time (promoted/protected/kept) — skipping"
+                );
+                continue;
+            }
+        }
+        // A missing archive manifest at delete time ⇒ already gone, or the archive
+        // became unreadable/unmounted since planning → skip rather than error.
+        if find_manifest_leaf(archive_root, &item.name).is_none() {
+            warn!(
+                model = %item.name,
+                "[cold-quota] archive manifest not found at delete time (already gone / archive unreachable) — skipping"
+            );
+            continue;
+        }
+
         match remover.remove(&item.name).await {
             Ok(()) => {
                 // Drop the Chord registry record (archive copy is gone). The
@@ -1021,6 +1099,41 @@ mod tests {
     const NOW: i64 = 1_700_000_000;
     const DAY: i64 = 86_400;
 
+    /// Config for the PURE ranking tests: the sanity floors use realistic GiB
+    /// magnitudes, but these fixtures use tiny byte-scale quotas to exercise
+    /// ranking/greedy logic — so disable the min-sane floor (0) to isolate the
+    /// behavior under test. The dedicated hard-floor tests set their own cfg.
+    fn rank_cfg() -> ColdQuotaConfig {
+        ColdQuotaConfig {
+            min_sane_gb: 0,
+            ..ColdQuotaConfig::default()
+        }
+    }
+
+    #[test]
+    fn dry_run_armed_only_by_literal_zero() {
+        // The #1 arming footgun contract: ONLY the literal "0" arms deletion;
+        // every other value — including "false"/"no"/"off" and typos — keeps
+        // dry-run ON (fail-safe), and unset defaults to dry-run ON.
+        assert!(dry_run_from_raw(None), "unset ⇒ dry-run ON");
+        assert!(!dry_run_from_raw(Some("0".into())), "\"0\" arms");
+        assert!(
+            !dry_run_from_raw(Some("  0  ".into())),
+            "trimmed \"0\" arms"
+        );
+        assert!(dry_run_from_raw(Some("1".into())), "\"1\" ⇒ dry-run ON");
+        assert!(
+            dry_run_from_raw(Some("false".into())),
+            "\"false\" must NOT arm (footgun guard)"
+        );
+        assert!(dry_run_from_raw(Some("off".into())), "\"off\" must NOT arm");
+        assert!(dry_run_from_raw(Some("no".into())), "\"no\" must NOT arm");
+        assert!(
+            dry_run_from_raw(Some("00".into())),
+            "\"00\" is not \"0\" ⇒ ON"
+        );
+    }
+
     // ── Ranking ──────────────────────────────────────────────────────────────
 
     #[test]
@@ -1047,15 +1160,7 @@ mod tests {
                 600,
             ),
         ];
-        let plan = plan_prune(
-            &cands,
-            &HashSet::new(),
-            &ColdQuotaConfig::default(),
-            NOW,
-            100,
-            1000,
-            500,
-        );
+        let plan = plan_prune(&cands, &HashSet::new(), &rank_cfg(), NOW, 100, 1000, 500);
         assert!(plan.aborted.is_none());
         assert_eq!(plan.items.len(), 1);
         assert_eq!(
@@ -1088,15 +1193,7 @@ mod tests {
                 400,
             ),
         ];
-        let plan = plan_prune(
-            &cands,
-            &HashSet::new(),
-            &ColdQuotaConfig::default(),
-            NOW,
-            100,
-            1000,
-            200,
-        );
+        let plan = plan_prune(&cands, &HashSet::new(), &rank_cfg(), NOW, 100, 1000, 200);
         assert!(plan.aborted.is_none());
         assert_eq!(plan.items[0].name, "measured");
         assert_eq!(plan.items[1].name, "unswept");
@@ -1125,15 +1222,7 @@ mod tests {
                 600,
             ),
         ];
-        let plan = plan_prune(
-            &cands,
-            &HashSet::new(),
-            &ColdQuotaConfig::default(),
-            NOW,
-            100,
-            1000,
-            500,
-        );
+        let plan = plan_prune(&cands, &HashSet::new(), &rank_cfg(), NOW, 100, 1000, 500);
         assert_eq!(plan.items.len(), 1);
         assert_eq!(plan.items[0].name, "lo_fit");
     }
@@ -1171,15 +1260,7 @@ mod tests {
                 100,
             ),
         ];
-        let plan = plan_prune(
-            &cands,
-            &HashSet::new(),
-            &ColdQuotaConfig::default(),
-            NOW,
-            100,
-            1000,
-            999,
-        );
+        let plan = plan_prune(&cands, &HashSet::new(), &rank_cfg(), NOW, 100, 1000, 999);
         // used 1000, quota 999, each frees 100 → one prune; oldest wins the LRU.
         assert_eq!(plan.items[0].name, "older");
     }
@@ -1210,15 +1291,7 @@ mod tests {
                 600,
             ),
         ];
-        let plan = plan_prune(
-            &cands,
-            &keep,
-            &ColdQuotaConfig::default(),
-            NOW,
-            100,
-            1000,
-            500,
-        );
+        let plan = plan_prune(&cands, &keep, &rank_cfg(), NOW, 100, 1000, 500);
         assert_eq!(plan.items.len(), 1);
         assert_eq!(
             plan.items[0].name, "prunable",
@@ -1238,15 +1311,7 @@ mod tests {
             Some(NOW - 3 * DAY),
             600,
         )];
-        let plan = plan_prune(
-            &cands,
-            &HashSet::new(),
-            &ColdQuotaConfig::default(),
-            NOW,
-            100,
-            1000,
-            100,
-        );
+        let plan = plan_prune(&cands, &HashSet::new(), &rank_cfg(), NOW, 100, 1000, 100);
         assert!(
             plan.items.is_empty(),
             "within-grace un-swept model is exempt"
@@ -1264,15 +1329,7 @@ mod tests {
             Some(NOW - 30 * DAY),
             600,
         )];
-        let plan = plan_prune(
-            &cands,
-            &HashSet::new(),
-            &ColdQuotaConfig::default(),
-            NOW,
-            100,
-            1000,
-            100,
-        );
+        let plan = plan_prune(&cands, &HashSet::new(), &rank_cfg(), NOW, 100, 1000, 100);
         assert_eq!(plan.items.len(), 1);
         assert_eq!(plan.items[0].name, "old_unswept");
     }
@@ -1304,6 +1361,7 @@ mod tests {
         // 3 cold total, min_keep 2 → at most 1 prunable even though quota wants more.
         let cfg = ColdQuotaConfig {
             min_keep: 2,
+            min_sane_gb: 0,
             ..ColdQuotaConfig::default()
         };
         let cands = vec![
@@ -1335,7 +1393,8 @@ mod tests {
                 100,
             ),
         ];
-        let plan = plan_prune(&cands, &HashSet::new(), &cfg, NOW, 3, 1000, 0);
+        let plan = plan_prune(&cands, &HashSet::new(), &cfg, NOW, 3, 1000, 1);
+        assert!(plan.aborted.is_none());
         assert_eq!(
             plan.items.len(),
             1,
@@ -1356,15 +1415,7 @@ mod tests {
         )];
         // used 400 <= quota 500 shouldn't even be called, but plan is safe: greedy
         // stops immediately.
-        let plan = plan_prune(
-            &cands,
-            &HashSet::new(),
-            &ColdQuotaConfig::default(),
-            NOW,
-            100,
-            400,
-            500,
-        );
+        let plan = plan_prune(&cands, &HashSet::new(), &rank_cfg(), NOW, 100, 400, 500);
         assert!(plan.items.is_empty());
     }
 
@@ -1395,9 +1446,12 @@ mod tests {
     #[test]
     fn hard_floor_aborts_when_over_pass_fraction() {
         // 10 cold models, 25% cap → 2; a plan needing 6 aborts (delete nothing).
-        // min_keep 0 so the greedy plan isn't capped below the fraction guard.
+        // min_keep 0 so the greedy plan isn't capped below the fraction guard;
+        // min_sane_gb 0 so the fraction guard fires (not the min-sane floor) at
+        // this test's tiny byte-scale quota.
         let cfg = ColdQuotaConfig {
             min_keep: 0,
+            min_sane_gb: 0,
             ..ColdQuotaConfig::default()
         };
         let mut cands = Vec::new();
@@ -1804,5 +1858,145 @@ mod tests {
         assert!(archive
             .join("manifests/registry.ollama.ai/library/keepme/1")
             .is_file());
+    }
+
+    #[tokio::test]
+    async fn toctou_reprotected_item_is_skipped_at_delete_time() {
+        // A model planned for pruning that becomes PROTECTED between plan and the
+        // per-item delete (simulating a concurrent protect / promotion) must be
+        // re-validated under the lock and SKIPPED — its archive + record survive.
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        let archive = base.join("archive");
+        make_archive_model(&archive, "lowq", "1", &[100]);
+        make_archive_model(&archive, "midq", "1", &[100]);
+        make_archive_model(&archive, "hiq", "1", &[100]);
+        let mut reg = reg_with(base, vec![]);
+        reg.reconcile();
+        reg.set_last_requested_for_test("lowq:1", 1000);
+        reg.set_last_requested_for_test("midq:1", 1000);
+        reg.set_last_requested_for_test("hiq:1", 1000);
+        let registry = Arc::new(Mutex::new(reg));
+        let mut scores = QualificationScores::default();
+        scores.assistant_avg_value.insert("lowq:1".into(), 1.0);
+        scores.assistant_avg_value.insert("midq:1".into(), 2.0);
+        scores.assistant_avg_value.insert("hiq:1".into(), 500.0);
+
+        // Remover that, when it deletes the FIRST item (lowq), concurrently marks
+        // midq protected — exactly the TOCTOU the re-validation must catch.
+        struct ReprotectRemover {
+            archive_root: PathBuf,
+            registry: Arc<Mutex<ModelRegistry>>,
+        }
+        #[async_trait]
+        impl ColdArchiveRemover for ReprotectRemover {
+            async fn remove(&self, model: &str) -> Result<(), String> {
+                if model == "lowq:1" {
+                    let mut reg = self.registry.lock().await;
+                    reg.set_protected("midq:1", true);
+                }
+                fs_remove_model(&self.archive_root, model)
+            }
+        }
+        let remover = ReprotectRemover {
+            archive_root: archive.clone(),
+            registry: registry.clone(),
+        };
+        // Maximally over quota so the plan wants to prune several.
+        let free = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let probe = FixedProbe { total: 1000, free };
+        let lock = new_disk_op_lock();
+
+        run_cold_quota_pass_at(
+            &registry,
+            &archive,
+            &probe,
+            &scores,
+            &HashSet::new(),
+            &remover,
+            &armed_cfg(),
+            &lock,
+            NOW,
+        )
+        .await;
+
+        let reg = registry.lock().await;
+        assert!(reg.get("lowq:1").is_none(), "lowq pruned");
+        assert!(
+            reg.get("midq:1").is_some(),
+            "midq re-protected mid-pass must be skipped, not pruned"
+        );
+        assert!(
+            archive
+                .join("manifests/registry.ollama.ai/library/midq/1")
+                .is_file(),
+            "midq archive must survive the TOCTOU re-validation"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_failure_mid_pass_stops_deletion() {
+        // If the archive df probe fails MID-PASS, the armed loop must STOP
+        // (fail-safe) rather than keep deleting blind.
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        let archive = base.join("archive");
+        make_archive_model(&archive, "lowq", "1", &[100]);
+        make_archive_model(&archive, "midq", "1", &[100]);
+        make_archive_model(&archive, "hiq", "1", &[100]);
+        let mut reg = reg_with(base, vec![]);
+        reg.reconcile();
+        reg.set_last_requested_for_test("lowq:1", 1000);
+        reg.set_last_requested_for_test("midq:1", 1000);
+        reg.set_last_requested_for_test("hiq:1", 1000);
+        let registry = Arc::new(Mutex::new(reg));
+        let mut scores = QualificationScores::default();
+        scores.assistant_avg_value.insert("lowq:1".into(), 1.0);
+        scores.assistant_avg_value.insert("midq:1".into(), 2.0);
+        scores.assistant_avg_value.insert("hiq:1".into(), 3.0);
+
+        // `available_bytes` returns Some for the first two status evaluations (top
+        // probe + first loop item) then None → the 2nd loop item hits a probe
+        // failure and the loop stops. Exactly ONE model is pruned.
+        struct FlakyProbe(Arc<AtomicUsize>);
+        impl DiskSpaceProbe for FlakyProbe {
+            fn total_bytes(&self, _: &Path) -> Option<u64> {
+                Some(1000)
+            }
+            fn available_bytes(&self, _: &Path) -> Option<u64> {
+                let n = self.0.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    Some(0) // used 1000 > quota 800 → over
+                } else {
+                    None // probe failure
+                }
+            }
+        }
+        let probe = FlakyProbe(Arc::new(AtomicUsize::new(0)));
+        let remover = FsColdArchiveRemover::new(archive.clone());
+        let lock = new_disk_op_lock();
+
+        run_cold_quota_pass_at(
+            &registry,
+            &archive,
+            &probe,
+            &scores,
+            &HashSet::new(),
+            &remover,
+            &armed_cfg(),
+            &lock,
+            NOW,
+        )
+        .await;
+
+        let reg = registry.lock().await;
+        let remaining = ["lowq:1", "midq:1", "hiq:1"]
+            .iter()
+            .filter(|m| reg.get(m).is_some())
+            .count();
+        assert_eq!(
+            remaining, 2,
+            "probe failure mid-pass must stop after exactly one prune (fail-safe)"
+        );
     }
 }
