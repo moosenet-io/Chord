@@ -163,26 +163,6 @@ fn latest_user_query(messages: &[Message]) -> String {
         .unwrap_or_default()
 }
 
-/// TRTR-03: the tool-role message returned when the model calls the SYNTHETIC
-/// `deep_research` tool as a loop step.
-///
-/// `deep_research` has no MCP catalog entry, so it must never reach
-/// `proxy.tool_call()` — that path rejects it as non-allowlisted and surfaces the
-/// misleading `Tool not found: deep_research` to the user. The three cases are
-/// genuinely different and the model needs to be told which one it is:
-///
-/// - **no harness wired** — the capability does not exist in this deployment at all.
-///   A caller can still put `deep_research` in `req.tools` (the HRNS-05 explicit
-///   trigger) on a harness-less deployment, so this case is reachable even though
-///   `select_tools` will not advertise it. Saying "it runs automatically" here would
-///   be a lie — it can never run.
-/// - **harness wired, research already ran** — the findings are in the transcript;
-///   calling it again is a loop.
-/// - **harness wired, research did not run** — the pre-loop branch declined it (the
-///   detector did not fire); it is not invocable as a step.
-///
-/// Extracted as a pure function so the branch logic is unit-testable without a mock
-/// LLM to drive a real tool call through the loop.
 /// TRTR-03: the WHOLE synthetic-dispatch decision — name recognition AND the
 /// message — as one testable unit.
 ///
@@ -203,6 +183,23 @@ fn synthetic_tool_interception(
     }
 }
 
+/// TRTR-03: the tool-role message returned when the model calls the SYNTHETIC
+/// `deep_research` tool as a loop step.
+///
+/// `deep_research` has no MCP catalog entry, so it must never reach
+/// `proxy.tool_call()` — that path rejects it as non-allowlisted and surfaces the
+/// misleading `Tool not found: deep_research` to the user. The three cases are
+/// genuinely different and the model needs to be told which one it is:
+///
+/// - **no harness wired** — the capability does not exist in this deployment at all.
+///   A caller can still put `deep_research` in `req.tools` (the HRNS-05 explicit
+///   trigger) on a harness-less deployment, so this case is reachable even though
+///   `select_tools` will not advertise it. Saying "it runs automatically" here would
+///   be a lie — it can never run.
+/// - **harness wired, research already ran** — the findings are in the transcript;
+///   calling it again is a loop.
+/// - **harness wired, research did not run** — the pre-loop branch declined it (the
+///   detector did not fire); it is not invocable as a step.
 fn synthetic_deep_research_message(harness_wired: bool, research_ran: bool) -> &'static str {
     if !harness_wired {
         "Deep research is not available in this deployment — no research harness is \
