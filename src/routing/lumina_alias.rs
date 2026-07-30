@@ -70,8 +70,12 @@
 //!   c. Fails the existing latency/degradation guard that
 //!      [`reporting::select_chat_role`] applies (we only accept models it marks
 //!      [`GuardVerdict::Eligible`]).
-//!   d. Below the assistant-quality floor `CHORD_ALIAS_MIN_QUALITY` (on `q`;
-//!      disabled by default — the size gate is the real filter).
+//!   d. Below the assistant-quality floor (on `q`; disabled by default — the
+//!      size gate is the real filter). The floor is PER-TIER: the global
+//!      `CHORD_ALIAS_MIN_QUALITY` is overridable per tier by
+//!      `CHORD_ALIAS_MIN_QUALITY_{MAIN,FAST,DEEP}` (each defaulting to the global
+//!      when unset), so e.g. the assistant tiers can stay floored while
+//!      `lumina-deep` is unfloored to pick its best by the deep-weighted blend.
 //!
 //! ### Hysteresis
 //! A tier only repoints when the new top model's blended score beats the CURRENT
@@ -203,7 +207,31 @@ pub struct AliasUpdaterConfig {
     /// the live distribution and cannot be known at build time. **Default 0.0 =
     /// DISABLED** (no quality filtering); an operator sets a real raw value (e.g.
     /// 50) from the observed distribution to exclude weak models.
+    ///
+    /// This is the GLOBAL floor; each tier can OVERRIDE it via a per-tier var
+    /// ([`min_quality_main`](Self::min_quality_main) /
+    /// [`min_quality_fast`](Self::min_quality_fast) /
+    /// [`min_quality_deep`](Self::min_quality_deep)), each of which DEFAULTS to
+    /// this global value when its own var is unset — so behavior is unchanged
+    /// unless a per-tier var is explicitly set. The effective floor for a given
+    /// alias key is resolved by [`min_quality_for`](Self::min_quality_for).
     pub min_quality: f64,
+    /// `CHORD_ALIAS_MIN_QUALITY_MAIN` — per-tier quality floor for the `lumina`
+    /// (main assistant) tier. Overrides [`min_quality`](Self::min_quality) for
+    /// that tier only; UNSET ⇒ falls back to the global `min_quality` (so the
+    /// prior global-only behavior is preserved when this is unset). Sanitized
+    /// like the global floor (invalid/NaN/inf/negative ⇒ 0.0 = disabled).
+    pub min_quality_main: f64,
+    /// `CHORD_ALIAS_MIN_QUALITY_FAST` — per-tier quality floor for the
+    /// `lumina-fast` tier. Overrides [`min_quality`](Self::min_quality) for that
+    /// tier only; UNSET ⇒ falls back to the global `min_quality`.
+    pub min_quality_fast: f64,
+    /// `CHORD_ALIAS_MIN_QUALITY_DEEP` — per-tier quality floor for the
+    /// `lumina-deep` tier. Overrides [`min_quality`](Self::min_quality) for that
+    /// tier only; UNSET ⇒ falls back to the global `min_quality`. Set to `0` to
+    /// UNFLOOR the deep tier so it picks its best by the deep-weighted blend +
+    /// size gate, unconstrained by the assistant-quality floor.
+    pub min_quality_deep: f64,
     /// `CHORD_ALIAS_MIN_SIZE_BYTES` — PRIMARY capability gate (metric-v2). A model
     /// whose registry `size_bytes` is below this is too small to be a real
     /// conversational assistant and is EXCLUDED before scoring (no blend can
@@ -351,9 +379,16 @@ impl AliasUpdaterConfig {
     /// [`env_refresh_secs`] — invalid weights/margins fall back to defaults, the
     /// interval is floored).
     pub fn from_env() -> Self {
+        let min_quality = env_nonneg_f64("CHORD_ALIAS_MIN_QUALITY", 0.0);
         AliasUpdaterConfig {
             refresh_secs: env_refresh_secs("CHORD_ALIAS_REFRESH_SECS", 900),
-            min_quality: env_nonneg_f64("CHORD_ALIAS_MIN_QUALITY", 0.0),
+            min_quality,
+            // Per-tier floors each DEFAULT to the global `min_quality` when their
+            // own var is unset — so unless an operator sets a per-tier var, every
+            // tier keeps the exact global-only behavior.
+            min_quality_main: env_nonneg_f64("CHORD_ALIAS_MIN_QUALITY_MAIN", min_quality),
+            min_quality_fast: env_nonneg_f64("CHORD_ALIAS_MIN_QUALITY_FAST", min_quality),
+            min_quality_deep: env_nonneg_f64("CHORD_ALIAS_MIN_QUALITY_DEEP", min_quality),
             min_size_bytes: env_pos_u64("CHORD_ALIAS_MIN_SIZE_BYTES", DEFAULT_MIN_SIZE_BYTES),
             r_saturation_tok_s: env_pos_f64(
                 "CHORD_ALIAS_R_SATURATION_TOK_S",
@@ -374,6 +409,22 @@ impl AliasUpdaterConfig {
             },
         }
     }
+
+    /// Resolve the effective quality floor for one alias tier by its key. The
+    /// three lumina tiers map to their per-tier floor (each of which already
+    /// defaulted to the global `min_quality` at construction if its own var was
+    /// unset); any OTHER key falls back to the global `min_quality`. The returned
+    /// value is sanitized at the point of use (see [`sane_min_quality`]) so a
+    /// hand-built config with a bad value can never invert the gate.
+    pub fn min_quality_for(&self, key: &str) -> f64 {
+        let raw = match key {
+            "lumina" => self.min_quality_main,
+            "lumina-fast" => self.min_quality_fast,
+            "lumina-deep" => self.min_quality_deep,
+            _ => self.min_quality,
+        };
+        sane_min_quality(raw)
+    }
 }
 
 impl Default for AliasUpdaterConfig {
@@ -381,6 +432,9 @@ impl Default for AliasUpdaterConfig {
         AliasUpdaterConfig {
             refresh_secs: 900,
             min_quality: 0.0,
+            min_quality_main: 0.0,
+            min_quality_fast: 0.0,
+            min_quality_deep: 0.0,
             min_size_bytes: DEFAULT_MIN_SIZE_BYTES,
             r_saturation_tok_s: DEFAULT_R_SATURATION_TOK_S,
             switch_margin: 0.05,
@@ -739,20 +793,34 @@ pub struct TierDecision {
 }
 
 /// Compute the repoint decision for every tier from one shared raw-signal set.
-/// The gates are identical across tiers (they don't depend on the weights); only
-/// the blend/ranking differs per tier's weights. Pure — the whole
-/// decision core is testable without any I/O. Returns each tier's ranked list so
-/// the caller can log the full selection rationale.
+/// The size/arch/chat-role/q-exists gates and responsiveness saturation are
+/// tier-independent and computed once into a shared base set; the QUALITY floor
+/// (gate d) is applied PER-TIER via [`AliasUpdaterConfig::min_quality_for`], and
+/// the blend/ranking differs per tier's weights. Pure — the whole decision core
+/// is testable without any I/O. Returns each tier's ranked list so the caller can
+/// log the full selection rationale.
 pub fn plan_repoints(
     raws: &[RawSignal],
     eligible: Option<&HashSet<String>>,
     cfg: &AliasUpdaterConfig,
     tiers: &[TierPlan],
 ) -> Vec<TierDecision> {
-    let candidates = gate_and_build(raws, eligible, cfg.min_quality, cfg.r_saturation_tok_s);
+    // Build the SHARED base candidate set with every gate EXCEPT the quality
+    // floor (pass 0.0) — the floor is now applied PER-TIER below so each tier can
+    // carry a different `CHORD_ALIAS_MIN_QUALITY_{MAIN,FAST,DEEP}`. The size /
+    // arch / chat-role / q-exists gates and the responsiveness saturation are
+    // tier-independent and stay here, computed once.
+    let base = gate_and_build(raws, eligible, 0.0, cfg.r_saturation_tok_s);
     tiers
         .iter()
         .map(|tier| {
+            // Per-tier quality floor: overrides the global for this tier, else
+            // falls back to it. When all tiers resolve to the same floor (the
+            // default, or a uniform global setting) each tier's filtered set is
+            // identical to the old single shared set — behavior is unchanged.
+            let floor = cfg.min_quality_for(&tier.key);
+            let candidates: Vec<AliasCandidate> =
+                base.iter().filter(|c| c.q >= floor).cloned().collect();
             let ranked = rank(&candidates, tier.weights);
             let repoint = select_target(&ranked, tier.current.as_deref(), cfg.switch_margin);
             TierDecision {
@@ -1898,5 +1966,160 @@ mod tests {
         // FIX 2: the raw-scale floor is OFF by default so it can't silently
         // filter on a wrong 1..5 assumption.
         assert_eq!(AliasUpdaterConfig::default().min_quality, 0.0);
+    }
+
+    // ── Per-tier quality floor (CHRD-PTQ-01) ───────────────────────────────────
+
+    /// The per-tier override actually filters ONLY its own tier: with the deep
+    /// floor unfloored (0) and the fast floor high, a mediocre-q but capable model
+    /// is a candidate for deep but is dropped for fast. Uses distinct weights so
+    /// the assertion is about the floor, not the blend.
+    #[test]
+    fn per_tier_floor_overrides_only_its_tier() {
+        // "big" clears the high fast floor; "mid" does not, but is above 0.
+        let raws = vec![
+            raw("big", Some(200.0), Some(4.0), Some(20.0), true),
+            raw("mid", Some(50.0), Some(9.0), Some(20.0), true),
+        ];
+        let cfg = AliasUpdaterConfig {
+            min_quality: 0.0,
+            min_quality_fast: 140.0, // fast tier floored above "mid"
+            min_quality_deep: 0.0,   // deep tier unfloored
+            ..AliasUpdaterConfig::default()
+        };
+        let tiers = vec![
+            TierPlan {
+                key: "lumina-fast".into(),
+                weights: cfg.fast_weights,
+                current: None,
+            },
+            TierPlan {
+                key: "lumina-deep".into(),
+                weights: cfg.deep_weights,
+                current: None,
+            },
+        ];
+        let plans = plan_repoints(&raws, None, &cfg, &tiers);
+
+        // fast: only "big" survives its 140 floor → it must win.
+        let fast = plans.iter().find(|d| d.key == "lumina-fast").unwrap();
+        assert_eq!(fast.ranked.len(), 1, "fast floor drops 'mid'");
+        assert_eq!(fast.ranked[0].model_id, "big");
+
+        // deep: unfloored → both "big" and "mid" are candidates.
+        let deep = plans.iter().find(|d| d.key == "lumina-deep").unwrap();
+        assert_eq!(deep.ranked.len(), 2, "deep is unfloored → both candidates");
+        let deep_ids: BTreeSet<&str> = deep.ranked.iter().map(|s| s.model_id.as_str()).collect();
+        assert!(deep_ids.contains("big") && deep_ids.contains("mid"));
+    }
+
+    /// An UNSET per-tier var falls back to the global floor: with only the global
+    /// floor set (per-tier vars unset), every tier applies that global floor —
+    /// preserving the prior global-only behavior.
+    #[test]
+    fn unset_per_tier_floor_falls_back_to_global() {
+        // from_env with only the global var set → all three per-tier floors equal it.
+        let keys = [
+            "CHORD_ALIAS_MIN_QUALITY",
+            "CHORD_ALIAS_MIN_QUALITY_MAIN",
+            "CHORD_ALIAS_MIN_QUALITY_FAST",
+            "CHORD_ALIAS_MIN_QUALITY_DEEP",
+        ];
+        for k in keys {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("CHORD_ALIAS_MIN_QUALITY", "75");
+        let cfg = AliasUpdaterConfig::from_env();
+        assert_eq!(cfg.min_quality, 75.0);
+        assert_eq!(
+            cfg.min_quality_for("lumina"),
+            75.0,
+            "main falls back to global"
+        );
+        assert_eq!(cfg.min_quality_for("lumina-fast"), 75.0, "fast falls back");
+        assert_eq!(cfg.min_quality_for("lumina-deep"), 75.0, "deep falls back");
+        assert_eq!(cfg.min_quality_for("other"), 75.0, "unknown key → global");
+        for k in keys {
+            std::env::remove_var(k);
+        }
+    }
+
+    /// A set per-tier var OVERRIDES the global for its tier only (from_env path).
+    #[test]
+    fn set_per_tier_floor_overrides_global_from_env() {
+        let keys = [
+            "CHORD_ALIAS_MIN_QUALITY",
+            "CHORD_ALIAS_MIN_QUALITY_MAIN",
+            "CHORD_ALIAS_MIN_QUALITY_FAST",
+            "CHORD_ALIAS_MIN_QUALITY_DEEP",
+        ];
+        for k in keys {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("CHORD_ALIAS_MIN_QUALITY", "140");
+        std::env::set_var("CHORD_ALIAS_MIN_QUALITY_DEEP", "0");
+        let cfg = AliasUpdaterConfig::from_env();
+        assert_eq!(
+            cfg.min_quality_for("lumina"),
+            140.0,
+            "main = global (unset)"
+        );
+        assert_eq!(
+            cfg.min_quality_for("lumina-fast"),
+            140.0,
+            "fast = global (unset)"
+        );
+        assert_eq!(
+            cfg.min_quality_for("lumina-deep"),
+            0.0,
+            "deep overridden to 0"
+        );
+        for k in keys {
+            std::env::remove_var(k);
+        }
+    }
+
+    /// Global-only behavior is preserved: applying a uniform global floor via the
+    /// per-tier path yields the same surviving candidate set every tier would have
+    /// gotten from the old single shared `gate_and_build(min_quality)` call.
+    #[test]
+    fn global_only_behavior_preserved() {
+        let raws = vec![
+            raw("keep", Some(200.0), Some(4.0), Some(20.0), true),
+            raw("drop", Some(10.0), Some(4.0), Some(20.0), true),
+        ];
+        // Uniform floor of 100 across all tiers (per-tier == global).
+        let cfg = AliasUpdaterConfig {
+            min_quality: 100.0,
+            min_quality_main: 100.0,
+            min_quality_fast: 100.0,
+            min_quality_deep: 100.0,
+            ..AliasUpdaterConfig::default()
+        };
+        let tiers = vec![
+            TierPlan {
+                key: "lumina".into(),
+                weights: cfg.fast_weights,
+                current: None,
+            },
+            TierPlan {
+                key: "lumina-deep".into(),
+                weights: cfg.deep_weights,
+                current: None,
+            },
+        ];
+        let plans = plan_repoints(&raws, None, &cfg, &tiers);
+        // The OLD path: one shared gate_and_build with the same global floor.
+        let shared = gate_and_build(&raws, None, 100.0, cfg.r_saturation_tok_s);
+        let shared_ids: BTreeSet<&str> = shared.iter().map(|c| c.model_id.as_str()).collect();
+        assert_eq!(shared_ids, BTreeSet::from(["keep"]));
+        for plan in &plans {
+            let ids: BTreeSet<&str> = plan.ranked.iter().map(|s| s.model_id.as_str()).collect();
+            assert_eq!(
+                ids, shared_ids,
+                "per-tier path with uniform floor == old shared gate for tier {}",
+                plan.key
+            );
+        }
     }
 }
