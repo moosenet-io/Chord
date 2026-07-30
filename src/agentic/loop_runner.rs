@@ -507,10 +507,24 @@ impl AgenticExecutor {
         }
 
         // HRNS-06: deep_research is a *synthetic* Chord tool — it is not in the MCP
-        // catalog, so we advertise it directly. Always-on alongside the essentials
-        // so the LLM can always choose deep multi-source research over a quick
-        // searxng_search lookup.
-        if seen.insert(DEEP_RESEARCH_TOOL.to_string()) {
+        // catalog, so we advertise it directly.
+        //
+        // TRTR-03: it is advertised ONLY when a `HarnessProvider` is actually wired
+        // (`self.harness.is_some()`). It used to be advertised unconditionally, which
+        // made it a PHANTOM tool on every deployment with no harness: the model would
+        // call it, dispatch had no interception for a synthetic name, so it fell
+        // through to `proxy.tool_call()` and the MCP layer rejected it as
+        // non-allowlisted — surfacing to the user as "Tool not found: deep_research".
+        // Observed live (S128): Lumina burned two loop steps on it for a news question
+        // and then told the operator "the research tool ran into an error".
+        //
+        // Note this tool is NOT dispatchable even when the harness IS wired — the
+        // harness runs as a PRE-LOOP branch (see the HRNS-05 block in `execute`),
+        // triggered by the research detector or by the CALLER offering this tool in
+        // `req.tools`. Advertising it here is what lets the model signal "this warrants
+        // deep research"; `dispatch_synthetic` below turns that signal into a useful
+        // tool-role message instead of a misleading not-found error.
+        if self.harness.is_some() && seen.insert(DEEP_RESEARCH_TOOL.to_string()) {
             use crate::harness::tool_definition;
             selected.push(ToolDefinition {
                 name: DEEP_RESEARCH_TOOL.to_string(),
@@ -1030,6 +1044,40 @@ impl AgenticExecutor {
                             continue;
                         }
                         executed_calls.insert(call_key);
+
+                        // ── TRTR-03: synthetic-tool interception ──────────────
+                        // `deep_research` is a SYNTHETIC Chord tool with no MCP
+                        // catalog entry. It must never reach `proxy.tool_call()`,
+                        // which would reject it as non-allowlisted and surface the
+                        // misleading "Tool not found: deep_research" to the user.
+                        // Intercept it here and return an actionable tool-role
+                        // message: the harness runs as a PRE-LOOP branch, so by the
+                        // time the model is calling tools the research phase has
+                        // already had its chance to fire.
+                        if crate::harness::tool_definition::is_deep_research(tc_name) {
+                            let detail = if research_ran {
+                                "Deep research has ALREADY run for this query and its findings are \
+                                 in the conversation above. Do not call it again — answer from \
+                                 those findings."
+                            } else {
+                                "`deep_research` is not callable as a step: it runs automatically \
+                                 before the tool loop when a query warrants it. Answer using the \
+                                 tools available to you now (for example a web search)."
+                            };
+                            execution_log.push(ExecutionStep {
+                                step_type: "synthetic_tool".into(),
+                                tool_name: Some(tc_name.to_string()),
+                                duration_ms: tool_start.elapsed().as_millis() as u64,
+                                status: "intercepted".into(),
+                                error_message: None,
+                            });
+                            messages.push(Message {
+                                role: "tool".into(),
+                                content: detail.into(),
+                                tool_call_id: Some(tc_id.clone()),
+                            });
+                            continue;
+                        }
 
                         // ── Execute via MCP proxy ─────────────────────────────
                         new_execution_this_iter = true;
