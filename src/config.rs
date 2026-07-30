@@ -312,7 +312,7 @@ impl Config {
 
         let model_protected = parse_protected_models(
             &std::env::var("MODEL_PROTECTED").unwrap_or_else(|_| {
-                "lumina,lumina-fast,lumina-deep,qwen3-coder:30b,qwen3.6:35b-a3b,qwen3:8b".into()
+                "lumina-fast,lumina-deep,qwen3-coder:30b,qwen3.6:35b-a3b,qwen3:8b".into()
             }),
         );
 
@@ -982,9 +982,12 @@ mod tests {
         let cfg = Config::from_env().unwrap();
         assert_eq!(cfg.model_archive_path, "/var/lib/model-archive");
         assert_eq!(cfg.model_local_path, "/opt/ollama-models");
-        assert!(cfg.model_protected.contains(&"lumina".to_string()));
+        // The retired `lumina` main alias was dropped from the default set.
+        assert!(!cfg.model_protected.contains(&"lumina".to_string()));
+        assert!(cfg.model_protected.contains(&"lumina-fast".to_string()));
+        assert!(cfg.model_protected.contains(&"lumina-deep".to_string()));
         assert!(cfg.model_protected.contains(&"qwen3-coder:30b".to_string()));
-        assert_eq!(cfg.model_protected.len(), 6);
+        assert_eq!(cfg.model_protected.len(), 5);
         // Pull timeout default (TIER-02).
         assert_eq!(cfg.model_pull_timeout_secs, 600);
         // Eviction defaults (TIER-03).

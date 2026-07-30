@@ -1,18 +1,19 @@
 //! CHRD-91390429: dynamic lumina-proxy alias updater — a blended, assistant-fit
-//! background task that repoints the three Lumina chat aliases (`lumina`,
-//! `lumina-fast`, `lumina-deep`) at runtime, WITHOUT a restart.
+//! background task that repoints the two Lumina chat aliases (`lumina-fast`,
+//! `lumina-deep`) at runtime, WITHOUT a restart. (The former `lumina` main/core
+//! tier was removed as dead — `lumina-core` only requests fast/deep.)
 //!
 //! ## What this replaces
-//! The three lumina alias targets used to be STATIC entries in
+//! The lumina alias targets used to be STATIC entries in
 //! `CHORD_MODEL_ALIASES` (parsed once at startup, immutable). An interim ops
 //! drop-in pinned them to a single hand-picked model. This module makes those
-//! three (and ONLY those three) targets runtime-mutable: a background task
+//! two (and ONLY those two) targets runtime-mutable: a background task
 //! ranks the measured assistant fleet every `CHORD_ALIAS_REFRESH_SECS` and
 //! hot-swaps the targets through an [`arc_swap::ArcSwap`], so the chat hot path
 //! ([`crate::routes::chat_completions`]) resolves the current target with a
 //! single lock-free `ArcSwap::load` — inference is NEVER blocked on the updater.
-//! Every non-lumina alias stays in the static `CHORD_MODEL_ALIASES` map,
-//! untouched.
+//! Every non-lumina alias (and the retired `lumina` main key) stays in the static
+//! `CHORD_MODEL_ALIASES` map, untouched.
 //!
 //! ## The blended metric (operator-chosen — see CHRD-91390429)
 //! Each candidate model is scored as a weighted blend of three signals,
@@ -54,11 +55,11 @@
 //!     `q` is kept as-is (dividing by `assistant_score_count` would be wrong).
 //!
 //! ### Per-tier weights (env-configurable; metric-v2 defaults below)
-//! Both tiers are q-heavy; `lumina`/`lumina-fast` keep a small responsiveness
+//! Both tiers are q-heavy; `lumina-fast` keeps a small responsiveness
 //! tie-breaker, `lumina-deep` almost none:
 //! ```text
-//! lumina / lumina-fast : 0.55*q + 0.30*a + 0.15*r
-//! lumina-deep          : 0.65*q + 0.30*a + 0.05*r
+//! lumina-fast : 0.55*q + 0.30*a + 0.15*r
+//! lumina-deep : 0.65*q + 0.30*a + 0.05*r
 //! ```
 //!
 //! ### Gates (a candidate is dropped BEFORE scoring if any fails)
@@ -73,7 +74,7 @@
 //!   d. Below the assistant-quality floor (on `q`; disabled by default — the
 //!      size gate is the real filter). The floor is PER-TIER: the global
 //!      `CHORD_ALIAS_MIN_QUALITY` is overridable per tier by
-//!      `CHORD_ALIAS_MIN_QUALITY_{MAIN,FAST,DEEP}` (each defaulting to the global
+//!      `CHORD_ALIAS_MIN_QUALITY_{FAST,DEEP}` (each defaulting to the global
 //!      when unset), so e.g. the assistant tiers can stay floored while
 //!      `lumina-deep` is unfloored to pick its best by the deep-weighted blend.
 //!
@@ -106,9 +107,14 @@ use terminus_rs::intake::assistant::reporting::{
     self, AssistantReport, GuardVerdict, ReportConfig,
 };
 
-/// The three lumina alias keys this updater owns. EVERY other alias in
+/// The two lumina alias keys this updater owns. EVERY other alias in
 /// `CHORD_MODEL_ALIASES` stays static and is never touched here.
-pub const LUMINA_ALIAS_KEYS: [&str; 3] = ["lumina", "lumina-fast", "lumina-deep"];
+///
+/// The former `"lumina"` (main/core) tier was removed — `lumina-core` only ever
+/// requests `lumina-fast`/`lumina-deep`, so the main tier was dead weight and its
+/// removal also cleanly separates concerns (`fast_weights` now affect ONLY
+/// `lumina-fast`). The JWT `sub:"lumina"` identity is unrelated auth and untouched.
+pub const LUMINA_ALIAS_KEYS: [&str; 2] = ["lumina-fast", "lumina-deep"];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Runtime-mutable store (lock-free hot-path reads)
@@ -209,19 +215,12 @@ pub struct AliasUpdaterConfig {
     /// 50) from the observed distribution to exclude weak models.
     ///
     /// This is the GLOBAL floor; each tier can OVERRIDE it via a per-tier var
-    /// ([`min_quality_main`](Self::min_quality_main) /
-    /// [`min_quality_fast`](Self::min_quality_fast) /
+    /// ([`min_quality_fast`](Self::min_quality_fast) /
     /// [`min_quality_deep`](Self::min_quality_deep)), each of which DEFAULTS to
     /// this global value when its own var is unset — so behavior is unchanged
     /// unless a per-tier var is explicitly set. The effective floor for a given
     /// alias key is resolved by [`min_quality_for`](Self::min_quality_for).
     pub min_quality: f64,
-    /// `CHORD_ALIAS_MIN_QUALITY_MAIN` — per-tier quality floor for the `lumina`
-    /// (main assistant) tier. Overrides [`min_quality`](Self::min_quality) for
-    /// that tier only; UNSET ⇒ falls back to the global `min_quality` (so the
-    /// prior global-only behavior is preserved when this is unset). Sanitized
-    /// like the global floor (invalid/NaN/inf/negative ⇒ 0.0 = disabled).
-    pub min_quality_main: f64,
     /// `CHORD_ALIAS_MIN_QUALITY_FAST` — per-tier quality floor for the
     /// `lumina-fast` tier. Overrides [`min_quality`](Self::min_quality) for that
     /// tier only; UNSET ⇒ falls back to the global `min_quality`.
@@ -386,7 +385,6 @@ impl AliasUpdaterConfig {
             // Per-tier floors each DEFAULT to the global `min_quality` when their
             // own var is unset — so unless an operator sets a per-tier var, every
             // tier keeps the exact global-only behavior.
-            min_quality_main: env_nonneg_f64("CHORD_ALIAS_MIN_QUALITY_MAIN", min_quality),
             min_quality_fast: env_nonneg_f64("CHORD_ALIAS_MIN_QUALITY_FAST", min_quality),
             min_quality_deep: env_nonneg_f64("CHORD_ALIAS_MIN_QUALITY_DEEP", min_quality),
             min_size_bytes: env_pos_u64("CHORD_ALIAS_MIN_SIZE_BYTES", DEFAULT_MIN_SIZE_BYTES),
@@ -411,14 +409,13 @@ impl AliasUpdaterConfig {
     }
 
     /// Resolve the effective quality floor for one alias tier by its key. The
-    /// three lumina tiers map to their per-tier floor (each of which already
+    /// two lumina tiers map to their per-tier floor (each of which already
     /// defaulted to the global `min_quality` at construction if its own var was
     /// unset); any OTHER key falls back to the global `min_quality`. The returned
     /// value is sanitized at the point of use (see [`sane_min_quality`]) so a
     /// hand-built config with a bad value can never invert the gate.
     pub fn min_quality_for(&self, key: &str) -> f64 {
         let raw = match key {
-            "lumina" => self.min_quality_main,
             "lumina-fast" => self.min_quality_fast,
             "lumina-deep" => self.min_quality_deep,
             _ => self.min_quality,
@@ -432,7 +429,6 @@ impl Default for AliasUpdaterConfig {
         AliasUpdaterConfig {
             refresh_secs: 900,
             min_quality: 0.0,
-            min_quality_main: 0.0,
             min_quality_fast: 0.0,
             min_quality_deep: 0.0,
             min_size_bytes: DEFAULT_MIN_SIZE_BYTES,
@@ -1085,11 +1081,6 @@ pub async fn run_alias_refresh_tick(
 
     let tiers = vec![
         TierPlan {
-            key: "lumina".to_string(),
-            weights: cfg.fast_weights,
-            current: store.current("lumina"),
-        },
-        TierPlan {
             key: "lumina-fast".to_string(),
             weights: cfg.fast_weights,
             current: store.current("lumina-fast"),
@@ -1185,29 +1176,45 @@ mod tests {
     #[test]
     fn store_seeds_only_lumina_keys_from_static() {
         let mut statics = HashMap::new();
+        // The retired `lumina` main key is now just another static alias — it is
+        // NOT one of the managed keys and must never be captured by the store.
         statics.insert("lumina".to_string(), "granite4.1:30b".to_string());
         statics.insert("lumina-fast".to_string(), "qwen3:8b".to_string());
         statics.insert("lumina-deep".to_string(), "qwen3:32b".to_string());
         statics.insert("some-other-alias".to_string(), "mystery:7b".to_string());
 
         let store = LuminaAliasStore::from_static(&statics);
-        assert_eq!(store.resolve("lumina").as_deref(), Some("granite4.1:30b"));
         assert_eq!(store.resolve("lumina-fast").as_deref(), Some("qwen3:8b"));
         assert_eq!(store.resolve("lumina-deep").as_deref(), Some("qwen3:32b"));
-        // Non-lumina aliases are NEVER captured by the dynamic store.
+        // The retired `lumina` main key and every other non-managed alias are
+        // NEVER captured by the dynamic store.
+        assert_eq!(store.resolve("lumina"), None);
         assert_eq!(store.resolve("some-other-alias"), None);
-        assert_eq!(store.snapshot().len(), 3);
+        assert_eq!(store.snapshot().len(), 2);
+    }
+
+    /// The updater manages EXACTLY the two live tiers {lumina-fast, lumina-deep}
+    /// and the retired `lumina` main tier is gone — a regression guard so the dead
+    /// main key can't silently creep back into the managed set.
+    #[test]
+    fn managed_keys_are_exactly_fast_and_deep() {
+        let managed: BTreeSet<&str> = LUMINA_ALIAS_KEYS.iter().copied().collect();
+        assert_eq!(managed, BTreeSet::from(["lumina-fast", "lumina-deep"]));
+        assert!(
+            !managed.contains("lumina"),
+            "retired main tier must not be managed"
+        );
     }
 
     #[test]
     fn store_set_repoints_one_key_only() {
         let mut statics = HashMap::new();
-        statics.insert("lumina".to_string(), "a:1b".to_string());
+        statics.insert("lumina-fast".to_string(), "a:1b".to_string());
         statics.insert("lumina-deep".to_string(), "b:2b".to_string());
         let store = LuminaAliasStore::from_static(&statics);
 
-        store.set("lumina", "c:3b".to_string());
-        assert_eq!(store.resolve("lumina").as_deref(), Some("c:3b"));
+        store.set("lumina-fast", "c:3b".to_string());
+        assert_eq!(store.resolve("lumina-fast").as_deref(), Some("c:3b"));
         // lumina-deep untouched.
         assert_eq!(store.resolve("lumina-deep").as_deref(), Some("b:2b"));
     }
@@ -1305,7 +1312,7 @@ mod tests {
             ..AliasUpdaterConfig::default()
         };
         let tiers = vec![TierPlan {
-            key: "lumina".into(),
+            key: "lumina-fast".into(),
             weights: cfg.fast_weights,
             current: Some("b".into()),
         }];
@@ -1328,7 +1335,7 @@ mod tests {
             ..AliasUpdaterConfig::default()
         };
         let tiers = vec![TierPlan {
-            key: "lumina".into(),
+            key: "lumina-fast".into(),
             weights: cfg.fast_weights,
             current: Some("b".into()),
         }];
@@ -1347,7 +1354,7 @@ mod tests {
         let raws = vec![raw("a", Some(5.0), Some(5.0), Some(100.0), true)];
         let cfg = AliasUpdaterConfig::default();
         let tiers = vec![TierPlan {
-            key: "lumina".into(),
+            key: "lumina-fast".into(),
             weights: cfg.fast_weights,
             current: Some("a".into()),
         }];
@@ -1410,7 +1417,7 @@ mod tests {
         let raws = vec![raw("x", Some(5.0), Some(5.0), Some(100.0), false)];
         let cfg = AliasUpdaterConfig::default();
         let tiers = vec![TierPlan {
-            key: "lumina".into(),
+            key: "lumina-fast".into(),
             weights: cfg.fast_weights,
             current: Some("granite4.1:30b".into()),
         }];
@@ -1427,7 +1434,7 @@ mod tests {
         let raws = vec![raw("fresh", Some(4.5), Some(4.5), Some(80.0), true)];
         let cfg = AliasUpdaterConfig::default();
         let tiers = vec![TierPlan {
-            key: "lumina".into(),
+            key: "lumina-fast".into(),
             weights: cfg.fast_weights,
             current: Some("stale".into()),
         }];
@@ -1794,7 +1801,7 @@ mod tests {
 
         let cfg = AliasUpdaterConfig::default();
         let tiers = vec![TierPlan {
-            key: "lumina".into(),
+            key: "lumina-fast".into(),
             weights: cfg.fast_weights,
             current: Some("granite4.1:30b".into()),
         }];
@@ -2018,10 +2025,9 @@ mod tests {
     /// preserving the prior global-only behavior.
     #[test]
     fn unset_per_tier_floor_falls_back_to_global() {
-        // from_env with only the global var set → all three per-tier floors equal it.
+        // from_env with only the global var set → both per-tier floors equal it.
         let keys = [
             "CHORD_ALIAS_MIN_QUALITY",
-            "CHORD_ALIAS_MIN_QUALITY_MAIN",
             "CHORD_ALIAS_MIN_QUALITY_FAST",
             "CHORD_ALIAS_MIN_QUALITY_DEEP",
         ];
@@ -2031,11 +2037,6 @@ mod tests {
         std::env::set_var("CHORD_ALIAS_MIN_QUALITY", "75");
         let cfg = AliasUpdaterConfig::from_env();
         assert_eq!(cfg.min_quality, 75.0);
-        assert_eq!(
-            cfg.min_quality_for("lumina"),
-            75.0,
-            "main falls back to global"
-        );
         assert_eq!(cfg.min_quality_for("lumina-fast"), 75.0, "fast falls back");
         assert_eq!(cfg.min_quality_for("lumina-deep"), 75.0, "deep falls back");
         assert_eq!(cfg.min_quality_for("other"), 75.0, "unknown key → global");
@@ -2049,7 +2050,6 @@ mod tests {
     fn set_per_tier_floor_overrides_global_from_env() {
         let keys = [
             "CHORD_ALIAS_MIN_QUALITY",
-            "CHORD_ALIAS_MIN_QUALITY_MAIN",
             "CHORD_ALIAS_MIN_QUALITY_FAST",
             "CHORD_ALIAS_MIN_QUALITY_DEEP",
         ];
@@ -2059,11 +2059,6 @@ mod tests {
         std::env::set_var("CHORD_ALIAS_MIN_QUALITY", "140");
         std::env::set_var("CHORD_ALIAS_MIN_QUALITY_DEEP", "0");
         let cfg = AliasUpdaterConfig::from_env();
-        assert_eq!(
-            cfg.min_quality_for("lumina"),
-            140.0,
-            "main = global (unset)"
-        );
         assert_eq!(
             cfg.min_quality_for("lumina-fast"),
             140.0,
@@ -2091,14 +2086,13 @@ mod tests {
         // Uniform floor of 100 across all tiers (per-tier == global).
         let cfg = AliasUpdaterConfig {
             min_quality: 100.0,
-            min_quality_main: 100.0,
             min_quality_fast: 100.0,
             min_quality_deep: 100.0,
             ..AliasUpdaterConfig::default()
         };
         let tiers = vec![
             TierPlan {
-                key: "lumina".into(),
+                key: "lumina-fast".into(),
                 weights: cfg.fast_weights,
                 current: None,
             },
