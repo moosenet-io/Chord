@@ -162,6 +162,14 @@ async fn main() {
         .with_archive_copy_timeout(archive_copy_timeout),
     );
 
+    // TIER-05 cold-quota: qualification-score source, created here so BOTH the
+    // nightly sweep's cold-quota pass (below) and the post-ingest pre-flight
+    // (AppState) share the one hot-swappable handle. The connect task that fills
+    // it in is spawned further down (fail-open; see the block after the alias
+    // updater).
+    let cold_score_source: chord_proxy::models::cold_quota::SharedColdScoreSource =
+        Arc::new(Mutex::new(None));
+
     // Background disk-pressure eviction sweep (non-fatal; logs and continues).
     //
     // MSM-01: every tick starts with reconcile() + an atomic persist so the
@@ -181,6 +189,12 @@ async fn main() {
         let gc_min_age_secs = config.model_gc_min_age_secs;
         let local_path = std::path::PathBuf::from(&config.model_local_path);
         let archive_path = std::path::PathBuf::from(&config.model_archive_path);
+        // TIER-05 cold-quota: the nightly cold-quota pass runs in this same sweep,
+        // AFTER the warm→cold passes. It needs the score source + the current
+        // lumina targets (keep-set) + the archive probe.
+        let cold_score_source = cold_score_source.clone();
+        let lumina_aliases_sweep = lumina_aliases.clone();
+        let cold_archive_path = archive_path.clone();
         if cooldown_hours == 0 {
             warn!("MODEL_WARM_COOLDOWN_HOURS=0; cooldown eviction (warm→cold after inactivity) is DISABLED");
         }
@@ -241,6 +255,27 @@ async fn main() {
                     if let Err(e) = reg.save() {
                         warn!("eviction sweep: failed to persist registry after eviction: {e}");
                     }
+                }
+
+                // TIER-05 cold-quota pass: AFTER the warm→cold passes, bound the
+                // cold archive itself (the Ask-4 loop grows it monotonically).
+                // DRY-RUN by default (deploys inert). Fail-open: empty scores when
+                // the intake DB isn't connected. Keep-set = the current dynamic
+                // lumina targets so a live proxy target is never pruned.
+                {
+                    let cold_cfg = chord_proxy::models::cold_quota::ColdQuotaConfig::from_env();
+                    let keep_set: std::collections::HashSet<String> =
+                        lumina_aliases_sweep.snapshot().into_values().collect();
+                    chord_proxy::models::cold_quota::run_cold_quota_pass_with_source(
+                        &registry,
+                        &cold_archive_path,
+                        &probe,
+                        &cold_score_source,
+                        &keep_set,
+                        &cold_cfg,
+                        &lock,
+                    )
+                    .await;
                 }
 
                 // MSM-03: orphan-blob GC, after eviction so newly-orphaned blobs
@@ -381,6 +416,35 @@ async fn main() {
         });
     }
 
+    // ── TIER-05 cold-quota: connect the qualification-score source (declared
+    // above so the nightly sweep shares it). Same fail-open discipline as the
+    // coding/score sources: an unconfigured/unreachable intake DB leaves it
+    // `None` (cold-quota runs with empty scores — quota still enforced via
+    // grace/min-keep, DRY-RUN by default) rather than blocking startup.
+    {
+        let cold_score_source = cold_score_source.clone();
+        tokio::spawn(async move {
+            let Some(db_url) = terminus_rs::config::intake_database_url() else {
+                info!(
+                    "[cold-quota] intake DB not configured — cold-quota pruning runs with \
+                     unenriched scores (grace/min-keep still apply; DRY-RUN default ON)"
+                );
+                return;
+            };
+            let pool = match sqlx::PgPool::connect(&db_url).await {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("[cold-quota] intake DB connect failed: {e}");
+                    return;
+                }
+            };
+            let source: Arc<dyn chord_proxy::models::cold_quota::ColdScoreSource> =
+                Arc::new(chord_proxy::models::cold_quota::DbColdScoreSource::new(pool));
+            *cold_score_source.lock().await = Some(source);
+            info!("[cold-quota] qualification-score source connected");
+        });
+    }
+
     // ── CHRD-91390429: dynamic lumina-proxy alias updater ──
     // Background task that ranks the measured assistant fleet every
     // CHORD_ALIAS_REFRESH_SECS and repoints lumina/lumina-fast/lumina-deep via
@@ -447,6 +511,7 @@ async fn main() {
         routing_map,
         coding_profile_source,
         score_source,
+        cold_score_source: cold_score_source.clone(),
         personal_proxy,
         embeddings_config: chord_proxy::embeddings::EmbeddingsConfig::from_env(),
     });

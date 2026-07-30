@@ -130,6 +130,14 @@ pub struct AppState {
     /// in which case candidate scores stay `None` and ranking falls back to the
     /// capability + locality tiebreaks (never blocks a resolution).
     pub score_source: crate::models::score_source::SharedScoreSource,
+    /// TIER-05 cold-quota: read-only qualification-score source (measured
+    /// `assistant_avg_value` + practical `fit_score`) for the cold-archive
+    /// score-based pruner. Best-effort/hot-swappable, same fail-open discipline as
+    /// `coding_profile_source` / `score_source`: `None` when the intake DB isn't
+    /// configured/reachable, in which case the post-ingest cold-quota pre-flight
+    /// runs with empty scores (still enforces the quota via grace/min-keep, and
+    /// stays DRY-RUN by default).
+    pub cold_score_source: crate::models::cold_quota::SharedColdScoreSource,
 }
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -2397,6 +2405,10 @@ mod tests {
         Arc::new(Mutex::new(None))
     }
 
+    fn empty_cold_score_source() -> crate::models::cold_quota::SharedColdScoreSource {
+        Arc::new(Mutex::new(None))
+    }
+
     fn test_state(mcp_url: String) -> Arc<AppState> {
         let mut reg = FallbackRegistry::new();
         reg.register(Box::new(PingTool));
@@ -2485,6 +2497,7 @@ mod tests {
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
             score_source: empty_score_source(),
+            cold_score_source: empty_cold_score_source(),
             lumina_aliases: crate::routing::lumina_alias::LuminaAliasStore::empty(),
             personal_proxy: None,
             embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
@@ -2523,6 +2536,7 @@ mod tests {
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
             score_source: empty_score_source(),
+            cold_score_source: empty_cold_score_source(),
             lumina_aliases: crate::routing::lumina_alias::LuminaAliasStore::empty(),
             personal_proxy: None,
             embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
@@ -2612,6 +2626,7 @@ mod tests {
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
             score_source: empty_score_source(),
+            cold_score_source: empty_cold_score_source(),
             lumina_aliases: crate::routing::lumina_alias::LuminaAliasStore::empty(),
             personal_proxy,
             embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
@@ -2714,6 +2729,7 @@ mod tests {
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
             score_source: empty_score_source(),
+            cold_score_source: empty_cold_score_source(),
             lumina_aliases: crate::routing::lumina_alias::LuminaAliasStore::empty(),
             personal_proxy: None,
             embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
@@ -2818,6 +2834,7 @@ mod tests {
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
             score_source: empty_score_source(),
+            cold_score_source: empty_cold_score_source(),
             lumina_aliases: crate::routing::lumina_alias::LuminaAliasStore::empty(),
             personal_proxy: None,
             embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
@@ -2905,6 +2922,7 @@ mod tests {
             routing_map,
             coding_profile_source: empty_coding_profile_source(),
             score_source: empty_score_source(),
+            cold_score_source: empty_cold_score_source(),
             lumina_aliases: crate::routing::lumina_alias::LuminaAliasStore::empty(),
             personal_proxy: None,
             embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
@@ -3000,6 +3018,7 @@ mod tests {
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
             score_source: empty_score_source(),
+            cold_score_source: empty_cold_score_source(),
             lumina_aliases: crate::routing::lumina_alias::LuminaAliasStore::empty(),
             personal_proxy: None,
             embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
@@ -3107,6 +3126,7 @@ mod tests {
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
             score_source: empty_score_source(),
+            cold_score_source: empty_cold_score_source(),
             lumina_aliases: crate::routing::lumina_alias::LuminaAliasStore::empty(),
             personal_proxy: None,
             embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
@@ -3217,6 +3237,7 @@ mod tests {
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
             score_source: empty_score_source(),
+            cold_score_source: empty_cold_score_source(),
             lumina_aliases: crate::routing::lumina_alias::LuminaAliasStore::empty(),
             personal_proxy: None,
             embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
@@ -4476,6 +4497,7 @@ mod tests {
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
             score_source: empty_score_source(),
+            cold_score_source: empty_cold_score_source(),
             lumina_aliases: crate::routing::lumina_alias::LuminaAliasStore::empty(),
             personal_proxy: None,
             embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
@@ -4961,6 +4983,7 @@ mod tests {
             routing_map: empty_routing_map(),
             coding_profile_source: empty_coding_profile_source(),
             score_source: empty_score_source(),
+            cold_score_source: empty_cold_score_source(),
             lumina_aliases: crate::routing::lumina_alias::LuminaAliasStore::empty(),
             personal_proxy,
             embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(
