@@ -148,6 +148,41 @@ fn latest_user_query(messages: &[Message]) -> String {
         .unwrap_or_default()
 }
 
+/// TRTR-03: the tool-role message returned when the model calls the SYNTHETIC
+/// `deep_research` tool as a loop step.
+///
+/// `deep_research` has no MCP catalog entry, so it must never reach
+/// `proxy.tool_call()` — that path rejects it as non-allowlisted and surfaces the
+/// misleading `Tool not found: deep_research` to the user. The three cases are
+/// genuinely different and the model needs to be told which one it is:
+///
+/// - **no harness wired** — the capability does not exist in this deployment at all.
+///   A caller can still put `deep_research` in `req.tools` (the HRNS-05 explicit
+///   trigger) on a harness-less deployment, so this case is reachable even though
+///   `select_tools` will not advertise it. Saying "it runs automatically" here would
+///   be a lie — it can never run.
+/// - **harness wired, research already ran** — the findings are in the transcript;
+///   calling it again is a loop.
+/// - **harness wired, research did not run** — the pre-loop branch declined it (the
+///   detector did not fire); it is not invocable as a step.
+///
+/// Extracted as a pure function so the branch logic is unit-testable without a mock
+/// LLM to drive a real tool call through the loop.
+fn synthetic_deep_research_message(harness_wired: bool, research_ran: bool) -> &'static str {
+    if !harness_wired {
+        "Deep research is not available in this deployment — no research harness is \
+         configured. Do not call `deep_research` again. Answer using the tools you \
+         have (for example a web search), or say plainly that you cannot research this."
+    } else if research_ran {
+        "Deep research has ALREADY run for this query and its findings are in the \
+         conversation above. Do not call it again — answer from those findings."
+    } else {
+        "`deep_research` is not callable as a step: it runs automatically before the \
+         tool loop when a query warrants it. Answer using the tools available to you \
+         now (for example a web search)."
+    }
+}
+
 /// Whether the request explicitly offers the `deep_research` tool — a signal that
 /// the caller wants the harness path available. (HRNS-06 registers the tool and
 /// its dispatch; HRNS-05 only recognises its presence as a trigger condition.)
@@ -1055,15 +1090,10 @@ impl AgenticExecutor {
                         // time the model is calling tools the research phase has
                         // already had its chance to fire.
                         if crate::harness::tool_definition::is_deep_research(tc_name) {
-                            let detail = if research_ran {
-                                "Deep research has ALREADY run for this query and its findings are \
-                                 in the conversation above. Do not call it again — answer from \
-                                 those findings."
-                            } else {
-                                "`deep_research` is not callable as a step: it runs automatically \
-                                 before the tool loop when a query warrants it. Answer using the \
-                                 tools available to you now (for example a web search)."
-                            };
+                            let detail = synthetic_deep_research_message(
+                                self.harness.is_some(),
+                                research_ran,
+                            );
                             execution_log.push(ExecutionStep {
                                 step_type: "synthetic_tool".into(),
                                 tool_name: Some(tc_name.to_string()),
@@ -1926,6 +1956,58 @@ mod tests {
             "deep_research must NOT be advertised when no harness is wired — \
              advertising an undispatchable tool is the TRTR-03 phantom-tool bug"
         );
+    }
+
+    // TRTR-03: the dispatch-side interception message. The synthetic `deep_research`
+    // name must never reach `proxy.tool_call()` (which would reject it as
+    // non-allowlisted and surface "Tool not found"), and the message it returns
+    // instead must be TRUTHFUL about which of the three situations the model is in.
+    #[test]
+    fn test_synthetic_deep_research_message_no_harness_says_unavailable() {
+        // Reachable even though select_tools won't advertise it: a caller can put
+        // deep_research in req.tools (the HRNS-05 explicit trigger) on a deployment
+        // with no harness. Telling the model it "runs automatically" would be a lie.
+        let msg = synthetic_deep_research_message(false, false);
+        assert!(
+            msg.contains("not available") && msg.contains("no research harness"),
+            "no-harness case must say the capability is unavailable, got: {msg}"
+        );
+        assert!(
+            !msg.contains("runs automatically"),
+            "must NOT claim it runs automatically when it can never run, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_synthetic_deep_research_message_already_ran() {
+        let msg = synthetic_deep_research_message(true, true);
+        assert!(
+            msg.contains("ALREADY run"),
+            "already-ran case must point the model at the existing findings, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_synthetic_deep_research_message_pre_loop() {
+        let msg = synthetic_deep_research_message(true, false);
+        assert!(
+            msg.contains("runs automatically before the tool loop"),
+            "harness-wired-but-not-run case must explain the pre-loop contract, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_synthetic_deep_research_message_never_says_tool_not_found() {
+        // The whole point of TRTR-03: the user-visible failure was
+        // "Tool not found: deep_research". No branch may reproduce that.
+        for (wired, ran) in [(false, false), (false, true), (true, false), (true, true)] {
+            let msg = synthetic_deep_research_message(wired, ran);
+            assert!(
+                !msg.to_lowercase().contains("not found"),
+                "no branch may surface a not-found error (wired={wired}, ran={ran}): {msg}"
+            );
+            assert!(!msg.is_empty());
+        }
     }
 
     // HRNS-06: the depth parameter on the offered tool maps to the harness budget.
