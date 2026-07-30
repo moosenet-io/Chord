@@ -1203,6 +1203,28 @@ impl ModelRegistry {
         true
     }
 
+    /// TIER-05 (cold-quota): drop a model's record entirely — used AFTER its
+    /// archive files have been GC-aware deleted by the cold-quota pruner, so a
+    /// pruned cold model (no local copy, no archive copy) leaves no dangling
+    /// record. Returns `true` if a record was removed. Persisting is the
+    /// caller's responsibility (`save()`), matching the mutate-then-save pattern.
+    ///
+    /// This only touches Chord's own registry — it never deletes the model's
+    /// Terminus `model_discovery_candidate` / `model_fleet_catalog` row, so the
+    /// model stays re-pullable later (the cold-quota re-pullability invariant).
+    pub fn remove_record(&mut self, name: &str) -> bool {
+        self.records.remove(name).is_some()
+    }
+
+    /// Number of records currently at the [`StorageTier::Cold`] tier — the
+    /// denominator for the cold-quota min-keep floor and hard-misconfig cap.
+    pub fn cold_count(&self) -> usize {
+        self.records
+            .values()
+            .filter(|r| r.tier == StorageTier::Cold)
+            .count()
+    }
+
     /// Whether a model is protected (never auto-archived). Consults both the
     /// record flag and the configured protected list.
     pub fn is_protected(&self, name: &str) -> bool {

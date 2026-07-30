@@ -987,6 +987,32 @@ pub async fn ingest_model(
     };
 
     let outcome = crate::models::ingest::ingest_model(&ops, &cfg, &req).await;
+
+    // TIER-05 cold-quota pre-flight (trigger a): a fresh cold pull just grew the
+    // archive — if it is now over quota, prune the least-qualified cold models
+    // back under it. DRY-RUN by default (logs a would-prune plan, deletes
+    // nothing). Only after a NEW landing (Ingested); an AlreadyPresent/gated/error
+    // outcome added no bytes. Best-effort + non-blocking to the ingest response.
+    if matches!(outcome.status, crate::models::ingest::IngestStatus::Ingested) {
+        let archive_root = {
+            let reg = state.model_registry.lock().await;
+            reg.archive_path().to_path_buf()
+        };
+        let cold_cfg = crate::models::cold_quota::ColdQuotaConfig::from_env();
+        let keep_set: std::collections::HashSet<String> =
+            state.lumina_aliases.snapshot().into_values().collect();
+        crate::models::cold_quota::run_cold_quota_pass_with_source(
+            &state.model_registry,
+            &archive_root,
+            state.disk_probe.as_ref(),
+            &state.cold_score_source,
+            &keep_set,
+            &cold_cfg,
+            &state.disk_op_lock,
+        )
+        .await;
+    }
+
     let code =
         StatusCode::from_u16(outcome.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (code, Json(outcome)).into_response()
@@ -1183,6 +1209,7 @@ mod tests {
             routing_map,
             coding_profile_source: Arc::new(Mutex::new(None)),
             score_source: Arc::new(Mutex::new(None)),
+            cold_score_source: Arc::new(Mutex::new(None)),
             lumina_aliases: crate::routing::lumina_alias::LuminaAliasStore::empty(),
             personal_proxy: None,
             embeddings_config: crate::embeddings::EmbeddingsConfig::test_default(

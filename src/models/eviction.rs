@@ -167,8 +167,15 @@ impl LocalEvictor for FsLocalEvictor {
     }
 }
 
-/// GC-aware local removal of `model` under `local_root`.
-fn fs_remove_model(local_root: &Path, model: &str) -> Result<(), String> {
+/// GC-aware removal of `model` under `root` (a local OR an archive Ollama root).
+///
+/// Deletes the model's manifest leaf, then each referenced blob *iff* no other
+/// manifest under the same `root` references it (content-addressed blobs are
+/// shared). Pointed at the local root this is warm-eviction's local delete;
+/// pointed at the archive root it is TIER-05 cold-quota's GC-aware archive
+/// delete — the SAME primitive, so cold pruning never re-invents blob-sharing
+/// logic and Chord stays the single deletion authority for both tiers.
+pub(crate) fn fs_remove_model(local_root: &Path, model: &str) -> Result<(), String> {
     let manifest = find_manifest_leaf(local_root, model)
         .ok_or_else(|| format!("local manifest not found for {model}"))?;
     let blobs = parse_manifest_blobs(&manifest);
@@ -199,8 +206,10 @@ fn fs_remove_model(local_root: &Path, model: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Set of blob digests referenced by every local manifest *except* `exclude`.
-fn referenced_by_other_manifests(local_root: &Path, exclude: &Path) -> HashSet<String> {
+/// Set of blob digests referenced by every manifest under `local_root` *except*
+/// `exclude`. Shared by warm eviction (local root) and TIER-05 cold-quota
+/// pruning (archive root) so both compute blob-sharing identically.
+pub(crate) fn referenced_by_other_manifests(local_root: &Path, exclude: &Path) -> HashSet<String> {
     let mut referenced = HashSet::new();
     for leaf in collect_manifest_leaves(local_root) {
         if leaf == exclude {
