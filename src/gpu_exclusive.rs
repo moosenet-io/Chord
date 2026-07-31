@@ -405,25 +405,62 @@ pub fn ollama_base_from_env() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Best-effort: unload EVERY model Ollama currently has resident, so the GPU is
-/// clear for the exclusive holder. Non-fatal by construction — a missing
-/// `OLLAMA_URL`, an unreachable Ollama, or nothing loaded all yield `0` with a
-/// log line, never an error. Reuses the harness's own `/api/ps` poll shape.
-pub async fn evict_resident_models(client: &reqwest::Client, ollama_base: &str) -> usize {
+/// Phase 1 (lumina resident mode): is `name` in the keep-resident `exempt` set?
+/// Pure/testable — exact-match against the operator's `MODEL_KEEP_RESIDENT` names
+/// (same names Ollama reports in `/api/ps` and that the warm path pins). An empty
+/// `exempt` (the default) never matches, so eviction behaves exactly as before.
+pub fn is_keep_resident(name: &str, exempt: &[String]) -> bool {
+    exempt.iter().any(|e| e == name)
+}
+
+/// Phase 1: split a list of resident model names into `(to_evict, kept)` given the
+/// keep-resident `exempt` set. Pure — the eviction policy in one testable place,
+/// no network. `kept` is the keep-resident models that were resident and are being
+/// left loaded (for `[keep-resident]` logging).
+pub fn partition_evictable(resident: &[String], exempt: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut to_evict = Vec::new();
+    let mut kept = Vec::new();
+    for name in resident {
+        if name.is_empty() {
+            continue;
+        }
+        if is_keep_resident(name, exempt) {
+            kept.push(name.clone());
+        } else {
+            to_evict.push(name.clone());
+        }
+    }
+    (to_evict, kept)
+}
+
+/// Best-effort: unload the models Ollama currently has resident so the GPU is clear
+/// for the exclusive holder — EXCEPT any name in `exempt` (the Phase 1 keep-resident
+/// working-set), which is left loaded so the assistant stays hot through a sweep.
+/// Pass `&[]` to unload everything (idle-mode's whole-GPU release keeps that shape).
+/// Non-fatal by construction — a missing `OLLAMA_URL`, an unreachable Ollama, or
+/// nothing loaded all yield `0` with a log line, never an error. Reuses the harness's
+/// own `/api/ps` poll shape. Returns the count actually unloaded.
+pub async fn evict_resident_models(
+    client: &reqwest::Client,
+    ollama_base: &str,
+    exempt: &[String],
+) -> usize {
     let base = ollama_base.trim_end_matches('/');
     let stats = crate::sweep_status::ollama::query_ollama_ps(client, base).await;
     if !stats.available {
         info!("gpu-exclusive: Ollama /api/ps unavailable — nothing to evict (best-effort)");
         return 0;
     }
+    let resident: Vec<String> = stats.models.into_iter().map(|m| m.name).collect();
+    let (to_evict, kept) = partition_evictable(&resident, exempt);
+    for name in &kept {
+        info!(model = %name, "[keep-resident] gpu-exclusive: exempting model from eviction (staying VRAM-resident)");
+    }
     let mut unloaded = 0usize;
-    for m in stats.models {
-        if m.name.is_empty() {
-            continue;
-        }
+    for name in to_evict {
         // Ollama unloads a resident model when handed keep_alive:0.
         let url = format!("{base}/api/generate");
-        let body = serde_json::json!({ "model": m.name, "keep_alive": 0 });
+        let body = serde_json::json!({ "model": name, "keep_alive": 0 });
         match client
             .post(&url)
             .json(&body)
@@ -432,16 +469,16 @@ pub async fn evict_resident_models(client: &reqwest::Client, ollama_base: &str) 
             .await
         {
             Ok(r) if r.status().is_success() => {
-                info!(model = %m.name, "gpu-exclusive: evicted resident model");
+                info!(model = %name, "gpu-exclusive: evicted resident model");
                 unloaded += 1;
             }
             Ok(r) => warn!(
-                model = %m.name,
+                model = %name,
                 status = r.status().as_u16(),
                 "gpu-exclusive: unload request rejected (best-effort, continuing)"
             ),
             Err(e) => warn!(
-                model = %m.name,
+                model = %name,
                 error = %e,
                 "gpu-exclusive: unload request failed (best-effort, continuing)"
             ),
@@ -451,6 +488,66 @@ pub async fn evict_resident_models(client: &reqwest::Client, ollama_base: &str) 
         info!(count = unloaded, "gpu-exclusive: resident models evicted for exclusive holder");
     }
     unloaded
+}
+
+/// Phase 1: the request body that PINS a model VRAM-resident — `keep_alive:-1`
+/// (indefinite) with an empty prompt, so Ollama loads the model (if cold) and sets
+/// its keep_alive so a normal request can't let it drift to the 2h default and out
+/// of VRAM. Pure/testable (asserts the `-1` sentinel). The `/api/generate` empty-
+/// prompt "just load / set keep_alive" shape is the mirror of the `keep_alive:0`
+/// unload used above.
+pub fn keep_resident_warm_body(model: &str) -> serde_json::Value {
+    serde_json::json!({ "model": model, "prompt": "", "keep_alive": -1 })
+}
+
+/// Phase 1: pin each `models` name VRAM-resident by issuing a tiny `keep_alive:-1`
+/// warm request. Best-effort / fail-SOFT by construction: a warm failure for one
+/// model logs and moves on — it NEVER errors or panics (so a startup pre-warm or a
+/// periodic re-warm can't take Chord down). Returns the count successfully warmed.
+/// An empty `models` (the default keep-resident set) is a no-op.
+pub async fn warm_keep_resident_models(
+    client: &reqwest::Client,
+    ollama_base: &str,
+    models: &[String],
+) -> usize {
+    let base = ollama_base.trim_end_matches('/');
+    let url = format!("{base}/api/generate");
+    let mut warmed = 0usize;
+    for model in models {
+        if model.is_empty() {
+            continue;
+        }
+        let body = keep_resident_warm_body(model);
+        match client
+            .post(&url)
+            .json(&body)
+            // A cold model can take a while to load into VRAM; give the warm a
+            // generous bound but still cap it so a wedged Ollama never hangs the
+            // re-warm timer forever.
+            .timeout(Duration::from_secs(180))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                info!(model = %model, "[keep-resident] pinned model VRAM-resident (keep_alive=-1)");
+                warmed += 1;
+            }
+            Ok(r) => warn!(
+                model = %model,
+                status = r.status().as_u16(),
+                "[keep-resident] warm request rejected (best-effort, continuing)"
+            ),
+            Err(e) => warn!(
+                model = %model,
+                error = %e,
+                "[keep-resident] warm request failed (best-effort, continuing)"
+            ),
+        }
+    }
+    if warmed > 0 {
+        info!(count = warmed, "[keep-resident] re-warm pass complete");
+    }
+    warmed
 }
 
 #[cfg(test)]
@@ -648,6 +745,94 @@ mod tests {
     fn iso_utc_is_rfc3339() {
         // 2021-01-01T00:00:00Z
         assert!(iso_utc(1609459200).starts_with("2021-01-01T00:00:00"));
+    }
+
+    // ── Phase 1: keep-resident exemption + warm ──────────────────────────────
+
+    #[test]
+    fn keep_resident_membership() {
+        let exempt = vec!["granite4.1:8b".to_string(), "lumina:latest".to_string()];
+        assert!(is_keep_resident("granite4.1:8b", &exempt));
+        assert!(is_keep_resident("lumina:latest", &exempt));
+        assert!(!is_keep_resident("qwen3-coder:30b", &exempt));
+        // Empty exempt set (the default) never matches → today's behavior.
+        assert!(!is_keep_resident("granite4.1:8b", &[]));
+    }
+
+    #[test]
+    fn partition_exempts_keep_resident_only() {
+        // granite/embedding are keep-resident; the qwen coder is a sweep model
+        // (→ evict); the empty name is dropped entirely.
+        let resident = vec![
+            "granite4.1:8b".to_string(),
+            "qwen3-coder:30b".to_string(),
+            "qwen3-embedding:0.6b".to_string(),
+            "".to_string(),
+        ];
+        let exempt = vec![
+            "granite4.1:8b".to_string(),
+            "qwen3-embedding:0.6b".to_string(),
+        ];
+        let (to_evict, kept) = partition_evictable(&resident, &exempt);
+        // The keep-resident models are NOT in the evict list...
+        assert_eq!(to_evict, vec!["qwen3-coder:30b".to_string()]);
+        // ...and the non-resident sweep model IS.
+        assert!(to_evict.contains(&"qwen3-coder:30b".to_string()));
+        assert!(!to_evict.contains(&"granite4.1:8b".to_string()));
+        assert!(!to_evict.contains(&"qwen3-embedding:0.6b".to_string()));
+        assert_eq!(
+            kept,
+            vec![
+                "granite4.1:8b".to_string(),
+                "qwen3-embedding:0.6b".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn partition_empty_exempt_evicts_everything() {
+        // Default (empty exempt) preserves the original "unload all" behavior.
+        let resident = vec!["a".to_string(), "b".to_string()];
+        let (to_evict, kept) = partition_evictable(&resident, &[]);
+        assert_eq!(to_evict, vec!["a".to_string(), "b".to_string()]);
+        assert!(kept.is_empty());
+    }
+
+    #[tokio::test]
+    async fn warm_is_fail_soft_on_unreachable_ollama() {
+        // A warm against an unreachable Ollama must return 0 and NEVER panic/error
+        // (a startup pre-warm or periodic re-warm can't be allowed to take Chord down).
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let models = vec!["granite4.1:8b".to_string()];
+        // Reserved-for-docs TEST-NET-1 (RFC 5737) → connection fails fast.
+        let warmed = warm_keep_resident_models(&client, "http://192.0.2.1:65535", &models).await;
+        assert_eq!(warmed, 0);
+    }
+
+    #[tokio::test]
+    async fn evict_is_fail_soft_on_unreachable_ollama() {
+        // Same fail-soft guarantee for the eviction path (Ollama /api/ps unavailable
+        // → 0, no error), with a keep-resident exempt set passed through.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let exempt = vec!["granite4.1:8b".to_string()];
+        let unloaded = evict_resident_models(&client, "http://192.0.2.1:65535", &exempt).await;
+        assert_eq!(unloaded, 0);
+    }
+
+    #[test]
+    fn warm_body_pins_indefinitely() {
+        // The re-warm logic must issue keep_alive:-1 (indefinite residency).
+        let body = keep_resident_warm_body("granite4.1:8b");
+        assert_eq!(body["model"], "granite4.1:8b");
+        assert_eq!(body["keep_alive"], -1);
+        // Empty prompt: load / set keep_alive without generating.
+        assert_eq!(body["prompt"], "");
     }
 
     // ── RESIL-01: durable lease persistence ──────────────────────────────────
