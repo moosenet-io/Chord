@@ -17,10 +17,11 @@
 //! single tool turn could cold-load several GB.
 //!
 //! ## Roles resolve through Chord ALIASES, never a concrete model name
-//! Each role names a Chord **alias key** (default: personality → `lumina-deep`,
-//! router → `lumina-fast` — the alias Terminus's router already asks for via
-//! `TERMINUS_ROUTER_MODEL` — embedding → `lumina-embed`), overridable per role by
-//! env. The alias is resolved through the dynamic [`LuminaAliasStore`] first and
+//! Each role names a Chord **alias key** (default: personality → `lumina-fast` —
+//! the INTERACTIVE tier, see [`Role::default_alias`] — router → `lumina-fast`, the
+//! alias Terminus's router already asks for via `TERMINUS_ROUTER_MODEL` — embedding
+//! → `lumina-embed`, which falls back to the configured `EMBED_LOCAL_MODEL` when
+//! that alias is absent, see [`resolve_role_target`]), overridable per role by env. The alias is resolved through the dynamic [`LuminaAliasStore`] first and
 //! the static `CHORD_MODEL_ALIASES` map second. A role whose alias resolves to
 //! nothing is [`RoleState::Unresolved`] and simply degrades — the resident set
 //! NEVER hard-wires a model name, because Chord owns model selection (north-star
@@ -257,12 +258,30 @@ impl Role {
     /// charge of what actually serves them.
     fn default_alias(self) -> &'static str {
         match self {
-            // The deliberate chat tier — Lumina's voice.
-            Role::Personality => "lumina-deep",
-            // The alias Terminus's tool-selecting sub-agent already requests.
+            // Lumina's voice — the chat turn a HUMAN waits on, so it resolves
+            // through the INTERACTIVE tier.
+            //
+            // CHRD-PIN-01: this was `lumina-deep`. `lumina-deep` is by construction
+            // the biggest/deepest tier (its blend is 0.65*q + 0.30*a + only 0.05*r,
+            // i.e. responsiveness is almost unweighted), so it legitimately selects a
+            // model that cannot produce a conversational turn in a realistic
+            // interactive timeframe — and on the live fleet it resolved to a target
+            // that was not even pulled (`warm rejected with status 404`). The
+            // personality slot therefore points at the tier that carries a
+            // responsiveness weight and that Lumina's own chat path already requests.
+            // Still an ALIAS, never a model name: the dynamic updater stays in charge
+            // of which model actually serves it, subject to its quality floor.
+            // Override per deployment with `CHORD_RESIDENT_ROLE_PERSONALITY`.
+            Role::Personality => "lumina-fast",
+            // The alias Terminus's tool-selecting sub-agent already requests. Sharing
+            // it with personality is not a degradation — `plan_warm` holds a shared
+            // model ONCE (`WarmDecision::Shared`) and both roles read it warm.
             Role::Router => "lumina-fast",
-            // Engram memory. Unconfigured on a fleet with no embedding alias ⇒
-            // the role degrades to `unresolved` rather than pinning a guess.
+            // Engram memory. There is deliberately no `lumina-embed` alias on this
+            // fleet; rather than degrade to nothing, an unresolved embedding role
+            // falls back to the CONFIGURED local embedding model
+            // (`EMBED_LOCAL_MODEL` — the exact model `/v1/embeddings` serves). See
+            // [`embedding_fallback_target`].
             Role::Embedding => "lumina-embed",
         }
     }
@@ -466,6 +485,54 @@ pub fn resolve_alias(
         .or_else(|| statics.get(alias).cloned())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Where a role's concrete target came from — reported so a fallback is visible
+/// in the log rather than looking like a normal alias resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetSource {
+    /// The role's alias key resolved (dynamic store or static map).
+    Alias,
+    /// The alias resolved to nothing and a CONFIGURED default was used instead.
+    /// Only the embedding role has one (`EMBED_LOCAL_MODEL`).
+    ConfiguredDefault,
+    /// Nothing resolved — the role degrades.
+    None,
+}
+
+/// CHRD-PIN-01 (Task B): resolve a role's concrete target, with the ONE sanctioned
+/// fallback.
+///
+/// The rule is deliberately narrow. A role whose alias resolves to nothing normally
+/// degrades LOUDLY and holds nothing — falling back to a guess would be exactly the
+/// hard-wiring this module forbids. But the embedding role is different: Chord
+/// ALREADY has a configured, authoritative answer to "which local embedding model do
+/// we serve" — `EMBED_LOCAL_MODEL`, the model `/v1/embeddings` actually calls. Using
+/// it is not a guess and not a hard-wired name; it is reading the config that is
+/// already the source of truth, and it keeps the two from disagreeing about which
+/// model Engram's memory vectors come from. Every other role has no such config, so
+/// it gets no fallback.
+///
+/// `embedding_default` is passed in (never read from env here) so this stays pure.
+pub fn resolve_role_target(
+    role: Role,
+    alias: &str,
+    dynamic: &LuminaAliasStore,
+    statics: &HashMap<String, String>,
+    embedding_default: Option<&str>,
+) -> (Option<String>, TargetSource) {
+    if let Some(model) = resolve_alias(alias, dynamic, statics) {
+        return (Some(model), TargetSource::Alias);
+    }
+    if role == Role::Embedding {
+        if let Some(d) = embedding_default
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            return (Some(d.to_string()), TargetSource::ConfiguredDefault);
+        }
+    }
+    (None, TargetSource::None)
 }
 
 /// A role's resolution outcome, before any VRAM budgeting.
@@ -672,10 +739,29 @@ fn ollama_role_request(
 impl<'a> ResidentEnv for AppStateEnv<'a> {
     async fn resolve(&self, aliases: &[(Role, String)]) -> Vec<Resolved> {
         let state = self.state;
+        // The configured local embedding model — the same value `/v1/embeddings`
+        // serves. Read once per pass, never hard-wired.
+        let embedding_default = crate::embeddings::EmbeddingsConfig::from_env().local_model;
         let targets: Vec<(Role, String, Option<String>)> = aliases
             .iter()
             .map(|(role, alias)| {
-                let model = resolve_alias(alias, &state.lumina_aliases, &state.model_aliases);
+                let (model, source) = resolve_role_target(
+                    *role,
+                    alias,
+                    &state.lumina_aliases,
+                    &state.model_aliases,
+                    Some(embedding_default.as_str()),
+                );
+                if source == TargetSource::ConfiguredDefault {
+                    // LOUD on purpose: the role is serviceable, but the operator
+                    // should know the alias is missing and a config default stood in.
+                    warn!(
+                        role = role.id(),
+                        alias = %alias,
+                        model = model.as_deref().unwrap_or(""),
+                        "resident-set: role alias resolves to no target — falling back to the CONFIGURED local embedding model (set the alias to silence this)"
+                    );
+                }
                 (*role, alias.clone(), model)
             })
             .collect();
@@ -1718,6 +1804,176 @@ impl ResidentSet {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CHRD-PIN-01: startup pin convergence
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The retired `MODEL_KEEP_RESIDENT` mechanism pinned models with `keep_alive:-1`
+// (INDEFINITE). Deleting the code that issues those pins does NOT unpin what is
+// already pinned: Ollama holds a `-1` model until the process is restarted or
+// something explicitly unloads it, and a Chord restart does not touch Ollama. On
+// the live host that is four models and ~60 GB of VRAM that no lifecycle owns and
+// no mode swap can reclaim — exactly the starvation this change exists to end.
+//
+// So the fix CONVERGES the running host instead of requiring a manual unload: once
+// at startup, after the resident set's own first warm, look at what Ollama actually
+// has loaded and unload anything pinned indefinitely that the resident set does not
+// hold. Deliberately conservative:
+//   - a model the set HOLDS is never touched (its own warm has already re-asserted
+//     the bounded `keep_alive`, so it no longer reads as an indefinite pin anyway —
+//     the explicit skip is belt-and-braces);
+//   - an expiry we cannot PARSE is left alone (never unload on ambiguity);
+//   - only an expiry beyond the horizon counts. A bounded keep_alive — including
+//     the resident set's own 24h — is never mistaken for a pin.
+//   - best-effort throughout: an unreachable Ollama logs and does nothing.
+
+/// `CHORD_RESIDENT_PIN_HORIZON_DAYS` (default 365). An `/api/ps` expiry further out
+/// than this is a legacy INDEFINITE pin, not a keep_alive. Ollama renders `-1` as a
+/// year-2318-style timestamp, so the horizon has enormous margin over any real
+/// keep_alive while never catching one.
+pub fn pin_horizon_days() -> i64 {
+    std::env::var("CHORD_RESIDENT_PIN_HORIZON_DAYS")
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(365)
+}
+
+/// Is this `/api/ps` `expires_at` an INDEFINITE pin (further out than `horizon_days`
+/// from `now`)? Pure. Unparseable/absent ⇒ `false` — we never unload on ambiguity.
+pub fn is_indefinite_pin(expires_at: Option<&str>, now_epoch_secs: i64, horizon_days: i64) -> bool {
+    let Some(raw) = expires_at.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let Ok(ts) = chrono::DateTime::parse_from_rfc3339(raw) else {
+        return false;
+    };
+    ts.timestamp().saturating_sub(now_epoch_secs) > horizon_days.saturating_mul(86_400)
+}
+
+/// Which loaded models are legacy indefinite pins that must be released: pinned
+/// beyond the horizon AND not held by the resident set. Pure — the whole policy in
+/// one testable place, no network.
+pub fn plan_unpin(
+    loaded: &[(String, Option<String>)],
+    held: &HashSet<String>,
+    now_epoch_secs: i64,
+    horizon_days: i64,
+) -> Vec<String> {
+    loaded
+        .iter()
+        .filter(|(name, _)| !name.trim().is_empty())
+        .filter(|(name, _)| !held.contains(name.as_str()))
+        .filter(|(_, exp)| is_indefinite_pin(exp.as_deref(), now_epoch_secs, horizon_days))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Unload one arbitrary (role-unknown) model: `/api/generate` with `keep_alive: 0`,
+/// falling back to the embeddings endpoint for an embedding model, which cannot be
+/// addressed through `/api/generate` at all. Best-effort — returns whether it
+/// landed, never errors.
+async fn unload_untyped(client: &reqwest::Client, base: &str, model: &str) -> bool {
+    async fn post(client: &reqwest::Client, url: &str, body: serde_json::Value) -> Option<(u16, String)> {
+        let r = client
+            .post(url)
+            .json(&body)
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await
+            .ok()?;
+        let status = r.status().as_u16();
+        let text = r.text().await.unwrap_or_default();
+        Some((status, text))
+    }
+    let embed = || async {
+        let body = serde_json::json!({ "model": model, "input": "", "keep_alive": 0 });
+        matches!(
+            post(client, &format!("{base}/api/embed"), body).await,
+            Some((s, _)) if (200..300).contains(&s)
+        )
+    };
+    if crate::gpu_exclusive::is_embedding_model(model) {
+        return embed().await;
+    }
+    let body = serde_json::json!({ "model": model, "keep_alive": 0 });
+    match post(client, &format!("{base}/api/generate"), body).await {
+        Some((s, _)) if (200..300).contains(&s) => true,
+        // An embedder whose NAME did not match the heuristic: Ollama says so
+        // explicitly, and only then do we retry on the embeddings endpoint.
+        Some((400, body)) if crate::gpu_exclusive::is_generate_unsupported_rejection(&body) => {
+            embed().await
+        }
+        _ => false,
+    }
+}
+
+/// How many models a convergence pass released (returned for observability/tests).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConvergeReport {
+    pub found: usize,
+    pub unpinned: usize,
+}
+
+/// Run the startup convergence described above. Best-effort and idempotent.
+pub async fn converge_legacy_pins(state: &Arc<crate::routes::AppState>) -> ConvergeReport {
+    let Some(base) = crate::gpu_exclusive::ollama_base_from_env() else {
+        info!("resident-set: OLLAMA_URL unset — skipping legacy pin convergence (best-effort)");
+        return ConvergeReport::default();
+    };
+    let base = base.trim_end_matches('/').to_string();
+    let stats = crate::sweep_status::ollama::query_ollama_ps(&state.http_client, &base).await;
+    if !stats.available {
+        info!("resident-set: Ollama /api/ps unavailable — skipping legacy pin convergence");
+        return ConvergeReport::default();
+    }
+    let held: HashSet<String> = global()
+        .status()
+        .await
+        .roles
+        .into_iter()
+        .filter(|r| r.warm)
+        .filter_map(|r| r.model)
+        .collect();
+    let loaded: Vec<(String, Option<String>)> = stats
+        .models
+        .into_iter()
+        .map(|m| (m.name, m.expires_at))
+        .collect();
+    let targets = plan_unpin(
+        &loaded,
+        &held,
+        crate::gpu_exclusive::now_epoch() as i64,
+        pin_horizon_days(),
+    );
+    let mut report = ConvergeReport {
+        found: targets.len(),
+        unpinned: 0,
+    };
+    for model in targets {
+        warn!(
+            model = %model,
+            "resident-set: found a LEGACY INDEFINITE VRAM pin owned by no lifecycle (retired keep-resident mechanism) — releasing it"
+        );
+        if unload_untyped(&state.http_client, &base, &model).await {
+            report.unpinned += 1;
+        } else {
+            warn!(
+                model = %model,
+                "resident-set: legacy pin release did not land (best-effort, continuing)"
+            );
+        }
+    }
+    if report.found > 0 {
+        info!(
+            found = report.found,
+            unpinned = report.unpinned,
+            "resident-set: legacy pin convergence complete — residency now has a single owner"
+        );
+    }
+    report
+}
+
 /// Background loop: periodically reconcile the resident set so an alias repoint
 /// or a drifted keep_alive is corrected without a restart. Best-effort and
 /// no-op while released — it never contends with a mode swap.
@@ -1786,6 +2042,205 @@ mod tests {
             "an unconfigured alias must degrade, NOT become a hard-wired model name"
         );
         assert_eq!(resolve_alias("", &dynamic, &statics), None);
+    }
+
+    // ── CHRD-PIN-01 Task B: role targets ────────────────────────────────────
+
+    #[test]
+    fn personality_resolves_through_the_interactive_tier_not_the_deep_tier() {
+        // The regression this guards: personality pointed at `lumina-deep`, whose
+        // blend all but ignores responsiveness, so it selected a model that cannot
+        // produce a conversational turn in a realistic timeframe (and on the live
+        // fleet was not even pulled).
+        assert_eq!(Role::Personality.default_alias(), "lumina-fast");
+        assert_ne!(Role::Personality.default_alias(), "lumina-deep");
+        // Still an ALIAS, never a model name.
+        let a = Role::Personality.default_alias();
+        assert!(!a.contains(':') && !a.contains('/'));
+    }
+
+    #[test]
+    fn embedding_role_falls_back_to_the_configured_local_embedding_model() {
+        let statics = HashMap::new();
+        let dynamic = LuminaAliasStore::empty();
+        // The alias does not exist (as on the live fleet) — but Chord already knows
+        // which local embedding model it serves, so the role is served, not degraded.
+        let (model, source) = resolve_role_target(
+            Role::Embedding,
+            "lumina-embed",
+            &dynamic,
+            &statics,
+            Some("configured-embed-model:0.6b"),
+        );
+        assert_eq!(model.as_deref(), Some("configured-embed-model:0.6b"));
+        assert_eq!(source, TargetSource::ConfiguredDefault);
+    }
+
+    #[test]
+    fn a_resolvable_alias_always_wins_over_the_configured_default() {
+        let mut statics = HashMap::new();
+        statics.insert("lumina-embed".to_string(), "alias-model:1b".to_string());
+        let dynamic = LuminaAliasStore::empty();
+        let (model, source) = resolve_role_target(
+            Role::Embedding,
+            "lumina-embed",
+            &dynamic,
+            &statics,
+            Some("configured-embed-model:0.6b"),
+        );
+        assert_eq!(model.as_deref(), Some("alias-model:1b"));
+        assert_eq!(source, TargetSource::Alias);
+    }
+
+    #[test]
+    fn only_the_embedding_role_has_a_configured_fallback() {
+        let statics = HashMap::new();
+        let dynamic = LuminaAliasStore::empty();
+        for role in [Role::Personality, Role::Router] {
+            let (model, source) = resolve_role_target(
+                role,
+                "no-such-alias",
+                &dynamic,
+                &statics,
+                Some("configured-embed-model:0.6b"),
+            );
+            assert_eq!(model, None, "{} must NOT inherit a fallback", role.id());
+            assert_eq!(source, TargetSource::None);
+        }
+        // …and an embedding role with no configured default degrades too, rather
+        // than inventing a name.
+        for empty in [None, Some(""), Some("   ")] {
+            let (model, source) =
+                resolve_role_target(Role::Embedding, "lumina-embed", &dynamic, &statics, empty);
+            assert_eq!(model, None);
+            assert_eq!(source, TargetSource::None);
+        }
+    }
+
+    // ── CHRD-PIN-01 Task A: no indefinite pin survives ──────────────────────
+
+    /// The load-bearing invariant, asserted against the SOURCE TREE rather than a
+    /// behavior: **no code path anywhere in this crate may ask Ollama for an
+    /// indefinite `keep_alive`.** A behavioral test can only cover the paths it
+    /// knows about; the failure mode being guarded is a NEW (or resurrected) path
+    /// nobody wired a test to — which is exactly how the retired keep-resident pass
+    /// coexisted with the resident set in the first place.
+    ///
+    /// A genuinely bounded, explicitly-released phase may opt out by putting the
+    /// marker `RESIDENCY-PIN-ALLOWED` on the line, which makes the exception
+    /// deliberate, greppable, and reviewable instead of silent.
+    #[test]
+    fn no_code_path_pins_a_model_indefinitely() {
+        // Built at runtime so this guard cannot match its own source.
+        let key: String = ["keep", "_alive"].concat();
+        let indefinite: String = ["-", "1"].concat();
+        let allow = ["RESIDENCY", "-PIN-ALLOWED"].concat();
+
+        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    rs_files(&p, out);
+                } else if p.extension().and_then(|s| s.to_str()) == Some("rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rs_files(&root, &mut files);
+        assert!(files.len() > 10, "source scan found suspiciously few files");
+
+        let mut offenders = Vec::new();
+        for f in files {
+            let Ok(text) = std::fs::read_to_string(&f) else {
+                continue;
+            };
+            for (n, line) in text.lines().enumerate() {
+                let t = line.trim_start();
+                // Prose (docs/comments) may DISCUSS the retired mechanism.
+                if t.starts_with("//") || t.starts_with("*") {
+                    continue;
+                }
+                if line.contains(&allow) {
+                    continue;
+                }
+                if line.contains(&key) && line.contains(&indefinite) {
+                    offenders.push(format!("{}:{}: {}", f.display(), n + 1, t));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "an INDEFINITE keep_alive pin is outside every lifecycle — no mode swap can \
+             reclaim it. Hold models through `ResidentSet` (bounded keep_alive + release) \
+             instead. Offending lines:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    #[test]
+    fn an_indefinite_expiry_is_a_pin_but_a_bounded_keep_alive_is_not() {
+        let now = 1_800_000_000i64; // fixed epoch; no wall clock in the assertion
+        let horizon = 365;
+        // Ollama renders keep_alive:-1 as a year-2318-style timestamp.
+        assert!(is_indefinite_pin(
+            Some("2318-01-01T00:00:00Z"),
+            now,
+            horizon
+        ));
+        // The resident set's own 24h keep_alive must NEVER read as a pin.
+        let in_24h = chrono::DateTime::from_timestamp(now + 86_400, 0)
+            .unwrap()
+            .to_rfc3339();
+        assert!(!is_indefinite_pin(Some(&in_24h), now, horizon));
+        // Ambiguity is never a reason to unload.
+        assert!(!is_indefinite_pin(None, now, horizon));
+        assert!(!is_indefinite_pin(Some(""), now, horizon));
+        assert!(!is_indefinite_pin(Some("not-a-timestamp"), now, horizon));
+        // Exactly at the horizon is NOT past it (strict >).
+        let at_horizon = chrono::DateTime::from_timestamp(now + 365 * 86_400, 0)
+            .unwrap()
+            .to_rfc3339();
+        assert!(!is_indefinite_pin(Some(&at_horizon), now, horizon));
+    }
+
+    #[test]
+    fn convergence_releases_stranded_pins_and_never_touches_what_the_set_holds() {
+        let now = 1_800_000_000i64;
+        let far = "2318-01-01T00:00:00Z".to_string();
+        let soon = chrono::DateTime::from_timestamp(now + 3600, 0)
+            .unwrap()
+            .to_rfc3339();
+        let loaded = vec![
+            // Pinned indefinitely by the retired mechanism, held by nobody.
+            ("stranded-a:8b".to_string(), Some(far.clone())),
+            ("stranded-b:30b".to_string(), Some(far.clone())),
+            // Pinned indefinitely BUT the resident set holds it — its own warm owns
+            // the lifecycle, so convergence must not fight it.
+            ("held-by-the-set:30b".to_string(), Some(far.clone())),
+            // An ordinary bounded model: not a pin, not our business.
+            ("ordinary:3b".to_string(), Some(soon)),
+            // Unparseable expiry: never unload on ambiguity.
+            ("unknown-expiry:1b".to_string(), Some("???".to_string())),
+            ("".to_string(), Some(far)),
+        ];
+        let held: HashSet<String> = ["held-by-the-set:30b".to_string()].into_iter().collect();
+        let plan = plan_unpin(&loaded, &held, now, 365);
+        assert_eq!(plan, vec!["stranded-a:8b", "stranded-b:30b"]);
+    }
+
+    #[test]
+    fn convergence_is_a_noop_on_a_host_with_no_legacy_pins() {
+        let now = 1_800_000_000i64;
+        let soon = chrono::DateTime::from_timestamp(now + 86_400, 0)
+            .unwrap()
+            .to_rfc3339();
+        let loaded = vec![("a:1b".to_string(), Some(soon))];
+        assert!(plan_unpin(&loaded, &HashSet::new(), now, 365).is_empty());
     }
 
     // ── The never-pulled guard ──────────────────────────────────────────────
@@ -1971,7 +2426,10 @@ mod tests {
             );
         }
         assert_eq!(cfg.alias_for(Role::Router), "lumina-fast");
-        assert_eq!(cfg.alias_for(Role::Personality), "lumina-deep");
+        // CHRD-PIN-01: personality resolves through the INTERACTIVE tier, not the
+        // deep tier (which selects for depth over responsiveness and cannot produce
+        // a conversational turn in a realistic timeframe).
+        assert_eq!(cfg.alias_for(Role::Personality), "lumina-fast");
         assert_eq!(cfg.alias_for(Role::Embedding), "lumina-embed");
     }
 
@@ -2457,6 +2915,53 @@ mod tests {
     /// with a sensible (discarded, coalesced) verdict rather than hanging forever
     /// on a broadcast that never arrives.
     #[tokio::test]
+    async fn all_three_roles_are_held_when_every_alias_resolves() {
+        // The positive statement of the whole feature: three resolving aliases ⇒
+        // three roles held, three models exempt, set active.
+        let set = Arc::new(ResidentSet::new(live_cfg()));
+        let (env, _entered) = FakeEnv::new(three_roles(), Some(96.0));
+        let report = set.warm_with(&*env, "startup", true, None).await;
+
+        assert_eq!(report.warmed, 3);
+        assert_eq!(report.skipped, 0);
+        let status = set.status().await;
+        assert!(status.active);
+        for r in &status.roles {
+            assert_eq!(r.state, RoleState::Warm, "role {} not held", r.role.id());
+        }
+        assert_eq!(status.exempt.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_role_with_a_missing_alias_degrades_and_pins_nothing() {
+        // An unresolvable role must be visibly `unresolved`, must issue NO warm
+        // request, and must not appear in the exemption — while its siblings are
+        // held normally (degrade the role, never the set).
+        let set = Arc::new(ResidentSet::new(live_cfg()));
+        let mut roles = three_roles();
+        roles[0] = resolved(Role::Personality, None, None, false);
+        let (env, _entered) = FakeEnv::new(roles, Some(96.0));
+
+        let report = set.warm_with(&*env, "startup", true, None).await;
+
+        assert_eq!(report.warmed, 2);
+        assert_eq!(report.skipped, 1);
+        let status = set.status().await;
+        let personality = status
+            .roles
+            .iter()
+            .find(|r| r.role == Role::Personality)
+            .unwrap();
+        assert_eq!(personality.state, RoleState::Unresolved);
+        assert!(!personality.warm);
+        assert_eq!(personality.model, None);
+        // Nothing was warmed or exempted on its behalf.
+        assert_eq!(env.warm_calls().len(), 2);
+        assert!(!env.exempt().iter().any(|m| m == "voice:1"));
+        assert_eq!(status.exempt.len(), 2);
+    }
+
+    #[tokio::test]
     async fn a_cancelled_leader_does_not_strand_its_coalesced_subscribers() {
         let set = Arc::new(ResidentSet::new(live_cfg()));
         let (env, mut entered) = FakeEnv::new(three_roles(), Some(96.0));
@@ -2702,6 +3207,17 @@ mod tests {
         ResidentSetConfig {
             keep_alive: keep_alive.to_string(),
             rewarm_debounce: Duration::from_secs(0),
+            // Personality is overridden to the DEEP alias here (the per-role env
+            // override, `CHORD_RESIDENT_ROLE_PERSONALITY`, in config form) purely so
+            // this harness keeps THREE DISTINCT role targets and can assert three
+            // distinct Ollama requests. Production defaults personality and router to
+            // the same interactive alias, which `plan_warm` holds once as `Shared`;
+            // that path has its own test.
+            aliases: vec![
+                (Role::Personality, "lumina-deep".to_string()),
+                (Role::Router, "lumina-fast".to_string()),
+                (Role::Embedding, "lumina-embed".to_string()),
+            ],
             ..Default::default()
         }
     }
@@ -3251,11 +3767,12 @@ mod tests {
     /// Seam config with explicit release bounds.
     fn seam_cfg_bounds(drain: Duration, grace: Duration) -> ResidentSetConfig {
         ResidentSetConfig {
-            keep_alive: "24h".to_string(),
-            rewarm_debounce: Duration::ZERO,
             release_drain: drain,
             cancel_grace: grace,
-            ..Default::default()
+            // Same THREE-DISTINCT-TARGETS harness as `seam_cfg` (see its comment):
+            // personality is overridden to the deep alias so these lifecycle tests
+            // can still observe three separate in-flight warms.
+            ..seam_cfg("24h")
         }
     }
 

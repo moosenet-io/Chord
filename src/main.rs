@@ -122,24 +122,15 @@ async fn main() {
     // ── Model registry + pull coordinator (TIER-01/02) ──
     // load_or_new never fails (corrupt JSON rebuilds empty); reconcile()/save()
     // are best-effort and must NOT crash startup.
-    // Phase 1 (lumina resident mode): a keep-resident (VRAM-pinned) model is ALSO
-    // implicitly disk-protected — fold MODEL_KEEP_RESIDENT into the registry's
-    // protected set so a pinned model can never be archived (warm→cold) out from
-    // under its own residency. This is a UNION (dedup) so operators need only set
-    // MODEL_KEEP_RESIDENT; they don't have to duplicate it into MODEL_PROTECTED.
-    let mut registry_protected = config.model_protected.clone();
-    for name in &config.model_keep_resident {
-        if !registry_protected.iter().any(|p| p == name) {
-            registry_protected.push(name.clone());
-        }
-    }
-    if !config.model_keep_resident.is_empty() {
-        info!(
-            "[keep-resident] pinning {} model(s) VRAM-resident (also disk-protected): {}",
-            config.model_keep_resident.len(),
-            config.model_keep_resident.join(", ")
-        );
-    }
+    // CHRD-PIN-01: the old `MODEL_KEEP_RESIDENT` set used to be folded into the
+    // registry's protected (disk-tiering) list here. That conflation is exactly how
+    // the two mechanisms drifted: DISK protection (`MODEL_PROTECTED` — blobs stay
+    // local, never archived) and VRAM residency are different axes, and a set that
+    // pinned VRAM silently granted disk protection too. `MODEL_PROTECTED` is now the
+    // sole disk-tiering input; VRAM residency is owned solely by
+    // `crate::routing::resident_set`, which protects its held models from the
+    // eviction SWEEP through the registry's separate residency exemption.
+    let registry_protected = config.model_protected.clone();
     let mut model_registry = ModelRegistry::load_or_new(
         std::path::PathBuf::from(&config.model_registry_path),
         std::path::PathBuf::from(&config.model_local_path),
@@ -327,62 +318,13 @@ async fn main() {
         });
     }
 
-    // ── Phase 1 (lumina resident mode): keep-resident pre-warm + periodic re-warm ──
-    // Durably pin the assistant working-set (MODEL_KEEP_RESIDENT) in VRAM: pre-warm
-    // each model once at startup with keep_alive:-1, then re-issue keep_alive:-1 on a
-    // timer (MODEL_KEEP_RESIDENT_REWARM_SECS, default 2 min) so a normal request —
-    // which silently resets keep_alive to Ollama's 2h default — can never let the
-    // working-set drift out of VRAM. Fail-SOFT throughout: a warm failure logs and
-    // the loop continues, never crashing Chord. Inert (task not spawned) when the
-    // keep-resident set is empty (today's default) or OLLAMA_URL is unset.
-    {
-        let keep_resident = config.model_keep_resident.clone();
-        let rewarm_secs = config.model_keep_resident_rewarm_secs.max(1);
-        if keep_resident.is_empty() {
-            info!("[keep-resident] MODEL_KEEP_RESIDENT empty — VRAM pinning disabled (default)");
-        } else if let Some(base) = chord_proxy::gpu_exclusive::ollama_base_from_env() {
-            let http_client = http_client.clone();
-            info!(
-                "[keep-resident] pre-warm + re-warm task started, interval={rewarm_secs}s, models={}",
-                keep_resident.join(", ")
-            );
-            tokio::spawn(async move {
-                // Pre-warm immediately at startup (durable pin across a restart).
-                chord_proxy::gpu_exclusive::warm_keep_resident_models(
-                    &http_client,
-                    &base,
-                    &keep_resident,
-                )
-                .await;
-                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(rewarm_secs));
-                // The immediate first tick fires right away; skip it (we just warmed).
-                ticker.tick().await;
-                loop {
-                    ticker.tick().await;
-                    // Skip re-warming while a GPU-exclusive holder legitimately owns
-                    // the GPU AND exemption is OFF — in that (opt-out) config the
-                    // working-set was deliberately evicted, so re-warming would fight
-                    // the sweep. When exemption is ON (the default) the models are
-                    // still resident, and a re-warm just refreshes keep_alive:-1.
-                    let now = chord_proxy::gpu_exclusive::now_epoch();
-                    let held = chord_proxy::gpu_exclusive::GPU_EXCLUSIVE
-                        .active_holder(now)
-                        .is_some();
-                    if held && !chord_proxy::config::gpu_exclusive_exempt_keep_resident() {
-                        continue;
-                    }
-                    chord_proxy::gpu_exclusive::warm_keep_resident_models(
-                        &http_client,
-                        &base,
-                        &keep_resident,
-                    )
-                    .await;
-                }
-            });
-        } else {
-            info!("[keep-resident] OLLAMA_URL unset — VRAM pinning disabled (best-effort)");
-        }
-    }
+    // CHRD-PIN-01: the `MODEL_KEEP_RESIDENT` pre-warm + periodic re-warm task lived
+    // here. It pinned every configured model with `keep_alive:-1` (INDEFINITE) every
+    // ~2 minutes — a residency that no lifecycle owned and no mode swap could
+    // reclaim, so a Harmony/MINT run could be starved by models Chord itself had
+    // pinned forever. It is REMOVED. The TRTR-07 resident set below is now the single
+    // owner of VRAM residency: bounded keep_alive, generation-guarded, and it YIELDS
+    // (cancellation + drain + compensating unload) on every mode swap.
 
     // ── CHRD-DIFF-01: DiffusionGemma idle-eviction reaper ──
     // Chord now owns `llama-diffusion-daemon`'s lifecycle (lazy-start on the
@@ -645,6 +587,21 @@ async fn main() {
             let _ = chord_proxy::routing::resident_set::global()
                 .warm(&resident_state, "startup", true)
                 .await;
+            // CHRD-PIN-01: converge the RUNNING host. The retired keep-resident
+            // mechanism pinned models with an indefinite keep_alive, and deleting the
+            // code that issued those pins does not unpin what Ollama already holds —
+            // a restart alone would leave them stranded forever, outside every
+            // lifecycle. Sequenced AFTER the warm above so a model this set legitimately
+            // holds has already had its bounded keep_alive re-asserted and is skipped.
+            let converged =
+                chord_proxy::routing::resident_set::converge_legacy_pins(&resident_state).await;
+            if converged.found > 0 {
+                info!(
+                    found = converged.found,
+                    unpinned = converged.unpinned,
+                    "resident-set: released legacy indefinite VRAM pins at startup"
+                );
+            }
             // Then reconcile periodically so a dynamic alias repoint mid-residency
             // is picked up (new target warmed, old one dropped) without a restart.
             chord_proxy::routing::resident_set::reconcile_loop(resident_state, refresh).await;

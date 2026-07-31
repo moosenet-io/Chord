@@ -104,35 +104,14 @@ pub struct Config {
     ///
     /// **DISK-tiering only.** This governs the warm→cold archive (eviction.rs) — a
     /// protected model's *blobs* stay on local disk. It says NOTHING about VRAM
-    /// residency; see [`Config::model_keep_resident`] for the VRAM axis.
+    /// residency; VRAM residency is owned solely by `crate::routing::resident_set`.
     pub model_protected: Vec<String>,
-    /// Phase 1 (lumina resident mode): model names Chord keeps VRAM-RESIDENT — it
-    /// pre-warms them at startup with `keep_alive:-1` and periodically re-warms them
-    /// (normal requests silently reset keep_alive to Ollama's 2h default, so without
-    /// the re-warm they drift out of VRAM). Reads `MODEL_KEEP_RESIDENT` (comma-
-    /// separated). Default EMPTY → today's behavior is preserved exactly (no pinning).
-    ///
-    /// **Distinct from [`Config::model_protected`]:** `MODEL_PROTECTED` is DISK
-    /// tiering (blobs stay local); `MODEL_KEEP_RESIDENT` is VRAM residency (the model
-    /// stays loaded). A keep-resident model is *also* implicitly disk-protected — at
-    /// startup `main.rs` folds this set into the registry's protected list so a pinned
-    /// model can never be archived out from under its own residency.
-    pub model_keep_resident: Vec<String>,
-    /// Phase 1: interval (seconds) between periodic keep-resident re-warms. Reads
-    /// `MODEL_KEEP_RESIDENT_REWARM_SECS` (default 120 = 2 min — comfortably under
-    /// Ollama's 2h keep_alive default so a request that resets a model to 2h is
-    /// corrected long before it could actually expire). `0` falls back to the default.
-    pub model_keep_resident_rewarm_secs: u64,
-    /// Phase 1: when a GPU-exclusive holder (compiler/intake sweep) is granted the
-    /// lock, EXEMPT [`Config::model_keep_resident`] models from the resident-model
-    /// eviction so the assistant working-set stays hot during a sweep. Reads
-    /// `GPU_EXCLUSIVE_EXEMPT_KEEP_RESIDENT` (default TRUE). Rationale: under the
-    /// unified 120GB GTT the GPU is no longer a scarce exclusive pool — the working
-    /// set (~40-60GB) leaves ample room for a sweep's transient models to coexist, so
-    /// the assistant should stay responsive rather than be evicted every ~2 minutes.
-    /// This ONLY narrows which models the exclusive grant evicts; it never weakens the
-    /// exclusive lease itself (the holder still gets its lock, TTL, and gating).
-    pub gpu_exclusive_exempt_keep_resident: bool,
+    // CHRD-PIN-01: `model_keep_resident` / `model_keep_resident_rewarm_secs` /
+    // `gpu_exclusive_exempt_keep_resident` (the old `MODEL_KEEP_RESIDENT`
+    // `keep_alive:-1` pinning mechanism) were REMOVED here. VRAM residency now has
+    // exactly ONE owner — `crate::routing::resident_set` — which holds its role
+    // models on a BOUNDED `keep_alive` and RELEASES them on a mode swap. See the
+    // module docs there.
     /// Maximum duration (seconds) for a cold→warm archive pull before it aborts
     /// and cleans up partial files. Reads MODEL_PULL_TIMEOUT_SECS (default 600).
     pub model_pull_timeout_secs: u64,
@@ -221,15 +200,6 @@ impl std::fmt::Debug for Config {
             .field("model_archive_path", &self.model_archive_path)
             .field("model_local_path", &self.model_local_path)
             .field("model_protected", &self.model_protected)
-            .field("model_keep_resident", &self.model_keep_resident)
-            .field(
-                "model_keep_resident_rewarm_secs",
-                &self.model_keep_resident_rewarm_secs,
-            )
-            .field(
-                "gpu_exclusive_exempt_keep_resident",
-                &self.gpu_exclusive_exempt_keep_resident,
-            )
             .field("model_pull_timeout_secs", &self.model_pull_timeout_secs)
             .field("model_registry_path", &self.model_registry_path)
             .field(
@@ -281,35 +251,11 @@ pub fn parse_protected_models(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// Phase 1 (lumina resident mode): read the VRAM keep-resident set from
-/// `MODEL_KEEP_RESIDENT` (comma-separated, same parse as `MODEL_PROTECTED`).
-/// **UNSET/blank → empty**, which preserves today's behavior exactly (Chord pins
-/// nothing). This is a standalone reader (mirroring `ollama_base_from_env` /
-/// `ttl_secs_from_env`) so the gpu-exclusive route handler can consult it directly
-/// without threading it through `AppState`; `Config::from_env` uses it too so the
-/// value is materialized once and identically everywhere.
-pub fn model_keep_resident() -> Vec<String> {
-    match std::env::var("MODEL_KEEP_RESIDENT") {
-        Ok(raw) => parse_protected_models(&raw),
-        Err(_) => Vec::new(),
-    }
-}
-
-/// Phase 1: whether a GPU-exclusive grant exempts the keep-resident set from its
-/// resident-model eviction. Reads `GPU_EXCLUSIVE_EXEMPT_KEEP_RESIDENT`; **default
-/// TRUE** (the unified-GTT posture — see [`Config::gpu_exclusive_exempt_keep_resident`]).
-/// Any case-insensitive `false`/`0`/`no`/`off` disables it (restores the old
-/// "exclusive grant evicts everything" behavior). Inert while the keep-resident set
-/// is empty regardless of this value.
-pub fn gpu_exclusive_exempt_keep_resident() -> bool {
-    match std::env::var("GPU_EXCLUSIVE_EXEMPT_KEEP_RESIDENT") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "false" | "0" | "no" | "off"
-        ),
-        Err(_) => true,
-    }
-}
+// CHRD-PIN-01: the `model_keep_resident()` / `gpu_exclusive_exempt_keep_resident()`
+// readers were REMOVED with the pinning mechanism they served. Nothing in Chord
+// may pin a model with an indefinite `keep_alive` any more; residency is owned by
+// `crate::routing::resident_set` alone, on a bounded keep_alive with an explicit
+// mode-swap release.
 
 /// Parse a raw `CHORD_MODEL_ALIASES` value (a JSON object of string→string) into a
 /// map. A missing, empty, whitespace-only, or malformed value yields an empty map
@@ -386,16 +332,6 @@ impl Config {
             }),
         );
 
-        // Phase 1 (lumina resident mode): VRAM keep-resident set + re-warm cadence +
-        // gpu-exclusive exemption. All default to today's behavior (empty set → no
-        // pinning; exemption defaults TRUE but is inert while the set is empty).
-        let model_keep_resident = model_keep_resident();
-        let model_keep_resident_rewarm_secs = std::env::var("MODEL_KEEP_RESIDENT_REWARM_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(120u64);
-        let gpu_exclusive_exempt_keep_resident = gpu_exclusive_exempt_keep_resident();
 
         let model_pull_timeout_secs = std::env::var("MODEL_PULL_TIMEOUT_SECS")
             .ok()
@@ -467,9 +403,6 @@ impl Config {
             model_archive_path,
             model_local_path,
             model_protected,
-            model_keep_resident,
-            model_keep_resident_rewarm_secs,
-            gpu_exclusive_exempt_keep_resident,
             model_pull_timeout_secs,
             model_registry_path,
             model_disk_pressure_percent,
@@ -504,9 +437,6 @@ impl Config {
             model_archive_path: "/var/lib/model-archive".into(),
             model_local_path: "/opt/ollama-models".into(),
             model_protected: Vec::new(),
-            model_keep_resident: Vec::new(),
-            model_keep_resident_rewarm_secs: 120,
-            gpu_exclusive_exempt_keep_resident: true,
             model_pull_timeout_secs: 600,
             model_registry_path: "<path>/model-registry.json".into(),
             model_disk_pressure_percent: 80,
@@ -1050,88 +980,6 @@ mod tests {
         assert_eq!(v, vec!["lumina", "lumina-fast", "qwen3:8b"]);
         assert!(parse_protected_models("").is_empty());
         assert!(parse_protected_models("  , ,").is_empty());
-    }
-
-    #[test]
-    #[serial]
-    fn test_model_keep_resident_parse_and_default() {
-        // Unset → empty (preserves today's no-pinning behavior).
-        std::env::remove_var("MODEL_KEEP_RESIDENT");
-        assert!(model_keep_resident().is_empty());
-        // Blank/whitespace-only → empty.
-        std::env::set_var("MODEL_KEEP_RESIDENT", "  , ,");
-        assert!(model_keep_resident().is_empty());
-        // Comma-separated, trimmed, empties dropped.
-        std::env::set_var(
-            "MODEL_KEEP_RESIDENT",
-            " granite4.1:8b, granite4.1:30b ,, qwen3-embedding:0.6b ,",
-        );
-        assert_eq!(
-            model_keep_resident(),
-            vec!["granite4.1:8b", "granite4.1:30b", "qwen3-embedding:0.6b"]
-        );
-        std::env::remove_var("MODEL_KEEP_RESIDENT");
-    }
-
-    #[test]
-    #[serial]
-    fn test_gpu_exclusive_exempt_keep_resident_default_true() {
-        // Unset → TRUE (unified-GTT default: keep the assistant hot during sweeps).
-        std::env::remove_var("GPU_EXCLUSIVE_EXEMPT_KEEP_RESIDENT");
-        assert!(gpu_exclusive_exempt_keep_resident());
-        // Explicit opt-out variants → FALSE (old "evict everything" behavior).
-        for falsy in ["false", "0", "no", "off", "FALSE", "Off"] {
-            std::env::set_var("GPU_EXCLUSIVE_EXEMPT_KEEP_RESIDENT", falsy);
-            assert!(
-                !gpu_exclusive_exempt_keep_resident(),
-                "{falsy} should disable exemption"
-            );
-        }
-        // Anything else (incl. "true"/"1") → TRUE.
-        std::env::set_var("GPU_EXCLUSIVE_EXEMPT_KEEP_RESIDENT", "true");
-        assert!(gpu_exclusive_exempt_keep_resident());
-        std::env::remove_var("GPU_EXCLUSIVE_EXEMPT_KEEP_RESIDENT");
-    }
-
-    #[test]
-    #[serial]
-    fn test_config_keep_resident_defaults_preserve_behavior() {
-        std::env::set_var("MCP_BACKEND_URL", "http://mcp-test-backend:3200");
-        std::env::remove_var("MODEL_KEEP_RESIDENT");
-        std::env::remove_var("MODEL_KEEP_RESIDENT_REWARM_SECS");
-        std::env::remove_var("GPU_EXCLUSIVE_EXEMPT_KEEP_RESIDENT");
-        let cfg = Config::from_env().unwrap();
-        // Empty keep-resident set → no pinning (today's behavior).
-        assert!(cfg.model_keep_resident.is_empty());
-        // Re-warm cadence default 2 min.
-        assert_eq!(cfg.model_keep_resident_rewarm_secs, 120);
-        // Exemption defaults on (inert while the set is empty).
-        assert!(cfg.gpu_exclusive_exempt_keep_resident);
-        std::env::remove_var("MCP_BACKEND_URL");
-    }
-
-    #[test]
-    #[serial]
-    fn test_config_keep_resident_rewarm_secs_override_and_zero_fallback() {
-        std::env::set_var("MCP_BACKEND_URL", "http://mcp-test-backend:3200");
-        std::env::set_var("MODEL_KEEP_RESIDENT_REWARM_SECS", "300");
-        assert_eq!(
-            Config::from_env().unwrap().model_keep_resident_rewarm_secs,
-            300
-        );
-        // Zero / junk → default 120 (never a 0-interval busy loop).
-        std::env::set_var("MODEL_KEEP_RESIDENT_REWARM_SECS", "0");
-        assert_eq!(
-            Config::from_env().unwrap().model_keep_resident_rewarm_secs,
-            120
-        );
-        std::env::set_var("MODEL_KEEP_RESIDENT_REWARM_SECS", "notanumber");
-        assert_eq!(
-            Config::from_env().unwrap().model_keep_resident_rewarm_secs,
-            120
-        );
-        std::env::remove_var("MODEL_KEEP_RESIDENT_REWARM_SECS");
-        std::env::remove_var("MCP_BACKEND_URL");
     }
 
     #[test]
