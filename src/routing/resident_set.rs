@@ -42,7 +42,7 @@
 //! live request) and BEFORE it unloads VRAM. [`crate::admin::idle::activate`]
 //! re-warms. No new mode-swap primitive is invented here.
 //!
-//! ## Lifecycle concurrency: RELEASE ALWAYS WINS (TRTR-07b)
+//! ## Lifecycle concurrency: RELEASE ALWAYS WINS (TRTR-07b/07d)
 //! A warm pass is mostly slow network I/O (an Ollama load can take minutes) and
 //! it CANNOT hold a lock across that. Three callers can start one — startup,
 //! `activate`, and the periodic reconcile — and a mode swap (`release`) can land
@@ -67,13 +67,66 @@
 //!   never deadlock).
 //! - Therefore: once `release` has returned, its generation bump is visible to
 //!   every in-flight pass, and each of them will discard at commit. No in-flight
-//!   warm can re-install an exemption after a release. That is the invariant.
+//!   warm can re-install an exemption after a release.
 //! - `reconcile` additionally captures the generation at the moment it observes
 //!   `active` and passes it in as an EXPECTATION, so a release landing between
 //!   "observed active" and "started the pass" also cancels it.
 //! - Concurrent warms COALESCE: the first pass registers an in-flight broadcast
 //!   channel under the lock, and any concurrent caller subscribes and awaits that
 //!   pass's report instead of issuing a duplicate set of warm requests.
+//!
+//! ## The generation guard alone is a BOOKKEEPING guarantee, not a GPU one (TRTR-07d)
+//! Discarding a pass stops Chord from *recording* residency. It does not stop the
+//! HTTP request that pass already put on the wire. So this remained possible:
+//!
+//! 1. a warm pass drops the lock and starts a slow `warm_one`;
+//! 2. `release` takes the lock, bumps the generation, clears the exemption, returns;
+//! 3. the idle path unloads VRAM;
+//! 4. **the already-issued Ollama request completes and loads the model again with
+//!    `keep_alive=24h`.**
+//!
+//! Chord's state says released; the GPU says occupied, for a day — starving exactly
+//! the Harmony/MINT run the mode swap was making room for. Three mechanisms close
+//! it, and the guarantee is stated per layer:
+//!
+//! - **Cancellation.** Every warm pass carries a [`CancelToken`] captured on
+//!   admission. `release` cancels it, and [`AppStateEnv::warm_one`] `select!`s the
+//!   HTTP future against it — so the request is DROPPED (connection torn down),
+//!   not merely ignored. A fresh token is installed for the next epoch.
+//! - **Bounded drain.** `release` WAITS for the in-flight pass to finish and undo
+//!   itself before returning (and therefore before the idle path's VRAM unload):
+//!   `CHORD_RESIDENT_RELEASE_DRAIN_SECS` (default 30) of graceful wait, then
+//!   cancellation, then `CHORD_RESIDENT_RELEASE_CANCEL_GRACE_SECS` (default 5).
+//!   A release that hangs is its own outage on a shared GPU, so the total wait is
+//!   hard-bounded at 35s and release ALWAYS returns. Waiting rather than
+//!   cancelling FIRST is deliberate: a warm that is allowed to finish is a warm
+//!   whose load state we KNOW, so the unload that follows definitively undoes it.
+//!   Cancellation is the escape hatch that keeps the bound, not the primary
+//!   mechanism.
+//! - **Compensating unload.** Every model a pass ISSUED a warm request for is
+//!   remembered. When the pass discards, it POSTs the role-shaped
+//!   `keep_alive: 0` unload for each of them — undoing a load that landed
+//!   regardless of whether we saw its response. It never fights a legitimate
+//!   concurrent re-warm: a model the set currently HOLDS is skipped, and the
+//!   in-flight slot is held across the compensation so no new pass can start
+//!   underneath it. On the drain-timeout fallback `release` issues the same
+//!   compensation itself, under the same two guards.
+//!
+//! **What is guaranteed, and where.** At the BOOKKEEPING layer: once `release`
+//! returns, no in-flight warm can re-install an exemption or mark the set active.
+//! At the OLLAMA/GPU layer: once `release` returns *having drained* (the normal
+//! path — `ReleaseReport::drained`), every warm request that pass issued has been
+//! compensated with an explicit unload, so no load caused by the cancelled pass is
+//! still in effect. **Not guaranteed:** a genuinely in-flight HTTP request cannot
+//! be aborted *inside Ollama* — dropping the connection stops us waiting, but a
+//! load already begun server-side may still complete. That case is covered by the
+//! compensating unload, which is issued after the request settles. The one
+//! irreducible residual is the drain-TIMEOUT path
+//! ([`ReleaseReport::drain_timed_out`]): there, release compensates from its
+//! snapshot and returns anyway, and a load that completes *after* both that
+//! compensation and the idle path's own `evict_resident_models` sweep would
+//! survive until the pass itself completes and compensates (it always does — the
+//! unload is idempotent). Nothing here can outlive the pass.
 //!
 //! ## Residency is not lost on an ordinary tick
 //! The models the set already holds are CONSUMING the free VRAM the planner
@@ -104,10 +157,62 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::Serialize;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, watch, Mutex};
 use tracing::{info, warn};
 
 use super::lumina_alias::LuminaAliasStore;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cancellation (TRTR-07d)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A latch-once, cloneable cancellation signal for a warm pass.
+///
+/// Hand-rolled on `tokio::sync::watch` rather than adding a `tokio-util`
+/// dependency for one type: the semantics needed here are exactly "latch a flag
+/// once, wake everyone waiting, never un-latch".
+#[derive(Clone, Debug)]
+pub struct CancelToken {
+    tx: Arc<watch::Sender<bool>>,
+}
+
+impl Default for CancelToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CancelToken {
+    pub fn new() -> Self {
+        let (tx, _rx) = watch::channel(false);
+        CancelToken { tx: Arc::new(tx) }
+    }
+
+    /// Latch the token. Idempotent.
+    pub fn cancel(&self) {
+        let _ = self.tx.send(true);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        *self.tx.borrow()
+    }
+
+    /// Resolves as soon as the token is cancelled — immediately if it already is.
+    /// Never resolves otherwise, so it is safe as a `select!` arm.
+    pub async fn cancelled(&self) {
+        let mut rx = self.tx.subscribe();
+        loop {
+            if *rx.borrow_and_update() {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                // The sender lives inside this token, so this is unreachable in
+                // practice. Park rather than report a cancel we never received.
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+}
 
 /// The three role slots of the assistant-mode resident set.
 ///
@@ -257,6 +362,16 @@ pub struct ResidentSetConfig {
     /// well before expiry) but MUCH longer than `refresh`, so the periodic tick
     /// is a cheap no-op instead of a warm storm every `refresh` seconds.
     pub reassert: Duration,
+    /// `CHORD_RESIDENT_RELEASE_DRAIN_SECS` (default 30) — TRTR-07d. How long
+    /// [`ResidentSet::release_with`] waits GRACEFULLY for an in-flight warm pass
+    /// to finish and undo itself before escalating to cancellation.
+    pub release_drain: Duration,
+    /// `CHORD_RESIDENT_RELEASE_CANCEL_GRACE_SECS` (default 5) — TRTR-07d. How
+    /// long release waits AFTER cancelling for the pass to compensate, before it
+    /// compensates from its own snapshot and returns anyway. Release therefore
+    /// blocks for at most `release_drain + cancel_grace` (35s by default) — a
+    /// release that hangs is its own outage on a shared GPU.
+    pub cancel_grace: Duration,
 }
 
 fn env_flag(key: &str, default: bool) -> bool {
@@ -295,6 +410,8 @@ impl Default for ResidentSetConfig {
             warm_timeout: Duration::from_secs(300),
             refresh: Duration::from_secs(300),
             reassert: Duration::from_secs(3600),
+            release_drain: Duration::from_secs(30),
+            cancel_grace: Duration::from_secs(5),
         }
     }
 }
@@ -312,6 +429,8 @@ impl ResidentSetConfig {
             warm_timeout: env_secs("CHORD_RESIDENT_WARM_TIMEOUT_SECS", 300),
             refresh: env_secs("CHORD_RESIDENT_REFRESH_SECS", 300),
             reassert: env_secs("CHORD_RESIDENT_REASSERT_SECS", 3600),
+            release_drain: env_secs("CHORD_RESIDENT_RELEASE_DRAIN_SECS", 30),
+            cancel_grace: env_secs("CHORD_RESIDENT_RELEASE_CANCEL_GRACE_SECS", 5),
         }
     }
 
@@ -480,7 +599,24 @@ pub trait ResidentEnv: Send + Sync {
     /// Free VRAM in GB; `None` when the counter is unreadable (fail soft).
     fn free_vram_gb(&self) -> Option<f64>;
     /// Load `model` and hold it for `keep_alive`. Errors are genericized (S77).
-    async fn warm_one(&self, role: Role, model: &str, keep_alive: &str) -> Result<(), String>;
+    ///
+    /// TRTR-07d: MUST be cancellation-aware — when `cancel` latches, abandon the
+    /// request (drop the future / tear the connection down) and return `Err`
+    /// rather than continuing to wait. An implementation that merely ignores the
+    /// token re-opens the post-release-load race this seam exists to close.
+    async fn warm_one(
+        &self,
+        role: Role,
+        model: &str,
+        keep_alive: &str,
+        cancel: &CancelToken,
+    ) -> Result<(), String>;
+    /// TRTR-07d COMPENSATION: force `model` back out of VRAM immediately
+    /// (role-shaped `keep_alive: 0`). Issued for any model whose warm request was
+    /// put on the wire by a pass that a release then invalidated — the load may
+    /// have landed server-side even though we never accepted its response. MUST
+    /// be idempotent: unloading a model that is not loaded is a no-op.
+    async fn unload_one(&self, role: Role, model: &str) -> Result<(), String>;
     /// Replace the registry residency exemption with exactly `models`.
     async fn set_exempt(&self, models: &[String]);
     /// Drop the registry residency exemption entirely.
@@ -500,6 +636,35 @@ impl<'a> AppStateEnv<'a> {
             state,
             warm_timeout,
         }
+    }
+}
+
+/// Build the role-shaped Ollama request. `keep_alive` is a JSON value so the same
+/// builder serves both the warm (`"24h"`) and the TRTR-07d compensating unload
+/// (`0`) — the two must hit the SAME endpoint per role or the undo silently misses
+/// (an embedding model cannot be addressed through `/api/generate`).
+fn ollama_role_request(
+    base: &str,
+    role: Role,
+    model: &str,
+    keep_alive: serde_json::Value,
+) -> (String, serde_json::Value) {
+    match role {
+        Role::Embedding => (
+            format!("{base}/api/embed"),
+            serde_json::json!({
+                "model": model,
+                "input": "",
+                "keep_alive": keep_alive,
+            }),
+        ),
+        _ => (
+            format!("{base}/api/generate"),
+            serde_json::json!({
+                "model": model,
+                "keep_alive": keep_alive,
+            }),
+        ),
     }
 }
 
@@ -551,28 +716,59 @@ impl<'a> ResidentEnv for AppStateEnv<'a> {
     /// prompt — Ollama's documented "load this model and hold it for keep_alive"
     /// call. Never fatal: every failure is a genericized `Err` string (S77 — no
     /// infrastructure in the message) the caller logs and degrades on.
-    async fn warm_one(&self, role: Role, model: &str, keep_alive: &str) -> Result<(), String> {
+    ///
+    /// TRTR-07d: the send future is raced against `cancel`. Dropping a `reqwest`
+    /// send future tears the connection down, so a cancelled warm genuinely stops
+    /// being an in-flight request instead of quietly completing after a release.
+    /// It cannot un-issue a load Ollama already started, which is why the caller
+    /// pairs cancellation with a compensating unload.
+    async fn warm_one(
+        &self,
+        role: Role,
+        model: &str,
+        keep_alive: &str,
+        cancel: &CancelToken,
+    ) -> Result<(), String> {
         let Some(base) = crate::gpu_exclusive::ollama_base_from_env() else {
             return Err("ollama base not configured".to_string());
         };
         let base = base.trim_end_matches('/');
-        let (url, body) = match role {
-            Role::Embedding => (
-                format!("{base}/api/embed"),
-                serde_json::json!({
-                    "model": model,
-                    "input": "",
-                    "keep_alive": keep_alive,
-                }),
-            ),
-            _ => (
-                format!("{base}/api/generate"),
-                serde_json::json!({
-                    "model": model,
-                    "keep_alive": keep_alive,
-                }),
-            ),
+        let (url, body) = ollama_role_request(base, role, model, serde_json::json!(keep_alive));
+        if cancel.is_cancelled() {
+            return Err("warm cancelled before it was issued".to_string());
+        }
+        let send = self
+            .state
+            .http_client
+            .post(&url)
+            .json(&body)
+            .timeout(self.warm_timeout)
+            .send();
+        tokio::pin!(send);
+        let res = tokio::select! {
+            biased;
+            r = &mut send => r,
+            _ = cancel.cancelled() => {
+                // Dropping `send` here is what aborts the HTTP request.
+                return Err("warm cancelled mid-flight by a mode-swap release".to_string());
+            }
         };
+        match res {
+            Ok(r) if r.status().is_success() => Ok(()),
+            Ok(r) => Err(format!("warm rejected with status {}", r.status().as_u16())),
+            Err(_) => Err("warm request failed".to_string()),
+        }
+    }
+
+    /// TRTR-07d compensation: the same role-shaped endpoint with `keep_alive: 0`,
+    /// which is Ollama's documented "drop this model from VRAM now". Deliberately
+    /// NOT cancellable — this is the undo, and it must be allowed to land.
+    async fn unload_one(&self, role: Role, model: &str) -> Result<(), String> {
+        let Some(base) = crate::gpu_exclusive::ollama_base_from_env() else {
+            return Err("ollama base not configured".to_string());
+        };
+        let base = base.trim_end_matches('/');
+        let (url, body) = ollama_role_request(base, role, model, serde_json::json!(0));
         match self
             .state
             .http_client
@@ -583,8 +779,8 @@ impl<'a> ResidentEnv for AppStateEnv<'a> {
             .await
         {
             Ok(r) if r.status().is_success() => Ok(()),
-            Ok(r) => Err(format!("warm rejected with status {}", r.status().as_u16())),
-            Err(_) => Err("warm request failed".to_string()),
+            Ok(r) => Err(format!("unload rejected with status {}", r.status().as_u16())),
+            Err(_) => Err("unload request failed".to_string()),
         }
     }
 
@@ -626,6 +822,15 @@ struct Inner {
     /// Set for the duration of a warm pass. A concurrent caller subscribes to it
     /// and awaits that pass's report rather than duplicating the warm requests.
     in_flight: Option<broadcast::Sender<WarmReport>>,
+    /// TRTR-07d. Cancellation token for the CURRENT lifecycle epoch. A warm pass
+    /// clones it on admission; `release` cancels it (aborting the in-flight HTTP)
+    /// and installs a fresh one for the next epoch.
+    cancel: CancelToken,
+    /// TRTR-07d. `(role, model)` for every warm request the in-flight pass has
+    /// ISSUED and not yet reconciled. This is the compensation worklist: a request
+    /// that went out may have loaded a model even if we never accepted its
+    /// response, so it has to be undoable from outside the pass too.
+    pending: Vec<(Role, String)>,
 }
 
 /// Outcome of a warm pass (logged + returned for observability).
@@ -648,6 +853,12 @@ pub struct WarmReport {
     pub discarded: bool,
     /// This caller joined an already-in-flight pass instead of duplicating it.
     pub coalesced: bool,
+    /// TRTR-07d: roles whose warm request was never issued because a release had
+    /// already cancelled this pass.
+    pub cancelled: usize,
+    /// TRTR-07d: models this pass had put a warm request on the wire for and then
+    /// explicitly UNLOADED again, because a release invalidated the pass.
+    pub compensated: usize,
 }
 
 /// Outcome of a release (logged + returned for observability).
@@ -660,6 +871,18 @@ pub struct ReleaseReport {
     /// The lifecycle generation AFTER this release. Every warm pass in flight at
     /// this point is now stale and will discard.
     pub generation: u64,
+    /// TRTR-07d: an in-flight warm pass was awaited to completion (and therefore
+    /// to its compensating unloads) before this release returned. `false` when
+    /// there was nothing in flight OR the bounded wait expired.
+    pub drained: bool,
+    /// TRTR-07d: the bounded wait (`release_drain` + `cancel_grace`) expired. The
+    /// documented FALLBACK ran: release issued the compensating unloads itself
+    /// from its own pending snapshot and returned rather than blocking a shared
+    /// GPU. The pass will also compensate when it finishes; unloads are idempotent.
+    pub drain_timed_out: bool,
+    /// TRTR-07d: how many models were explicitly unloaded as compensation for
+    /// warm requests that a cancelled pass had already put on the wire.
+    pub compensated: usize,
 }
 
 /// What one role's pass produced, before the commit applies downgrade protection.
@@ -683,6 +906,7 @@ struct Snapshot {
 enum Admission {
     Proceed {
         generation: u64,
+        cancel: CancelToken,
         snapshot: Snapshot,
     },
     Join(broadcast::Receiver<WarmReport>),
@@ -736,6 +960,8 @@ impl ResidentSet {
                 slots,
                 last_warm: None,
                 in_flight: None,
+                cancel: CancelToken::new(),
+                pending: Vec::new(),
             }),
         }
     }
@@ -878,8 +1104,12 @@ impl ResidentSet {
 
         let (tx, _rx) = broadcast::channel(8);
         inner.in_flight = Some(tx);
+        // A fresh pass owns a fresh compensation worklist.
+        inner.pending.clear();
+        let cancel = inner.cancel.clone();
         Admission::Proceed {
             generation: inner.generation,
+            cancel,
             snapshot: Snapshot {
                 resident,
                 retainable,
@@ -902,13 +1132,32 @@ impl ResidentSet {
         if !self.cfg.enabled {
             return WarmReport::default();
         }
-        let (generation, snapshot) = match self.admit(trigger, force, expect_gen).await {
+        let (generation, cancel, snapshot) = match self.admit(trigger, force, expect_gen).await {
             Admission::Skip(r) => return r,
             Admission::Join(mut rx) => {
                 // Join the in-flight pass: no duplicate warm requests, and we
                 // report ITS outcome. `changed` is false because THIS caller
                 // changed nothing.
-                let mut report = rx.recv().await.unwrap_or_default();
+                //
+                // TRTR-07d requirement 3: this wait is BOUNDED. A leader that is
+                // cancelled always reaches its commit and broadcasts, so the
+                // normal path returns promptly — but a subscriber must never be
+                // able to hang forever on a leader that somehow never reports.
+                let bound = self.cfg.warm_timeout
+                    + self.cfg.release_drain
+                    + self.cfg.cancel_grace
+                    + Duration::from_secs(5);
+                let mut report = match tokio::time::timeout(bound, rx.recv()).await {
+                    Ok(r) => r.unwrap_or_default(),
+                    Err(_) => {
+                        warn!(
+                            trigger,
+                            bound_secs = bound.as_secs(),
+                            "resident-set: coalesced warm gave up waiting for the leader's report — reporting nothing rather than hanging"
+                        );
+                        WarmReport::default()
+                    }
+                };
                 report.changed = false;
                 report.coalesced = true;
                 info!(
@@ -919,11 +1168,12 @@ impl ResidentSet {
             }
             Admission::Proceed {
                 generation,
+                cancel,
                 snapshot,
-            } => (generation, snapshot),
+            } => (generation, cancel, snapshot),
         };
 
-        self.run_pass(env, trigger, generation, snapshot).await
+        self.run_pass(env, trigger, generation, cancel, snapshot).await
     }
 
     /// The slow half (resolution + warm I/O, NO lock held) followed by the
@@ -933,6 +1183,7 @@ impl ResidentSet {
         env: &dyn ResidentEnv,
         trigger: &str,
         generation: u64,
+        cancel: CancelToken,
         snapshot: Snapshot,
     ) -> WarmReport {
         let resolved = env.resolve(&self.cfg.aliases).await;
@@ -950,12 +1201,40 @@ impl ResidentSet {
             ..Default::default()
         };
         let mut outcomes: Vec<PassOutcome> = Vec::with_capacity(plan.len());
+        // TRTR-07d: every model this pass actually put a request on the wire for.
+        // The compensation worklist — issuing the request is what can load a
+        // model, so it is issuance (not success) that creates the obligation.
+        let mut issued: Vec<(Role, String)> = Vec::new();
 
         for (r, (role, decision)) in resolved.iter().zip(plan.into_iter()) {
             debug_assert_eq!(r.role, role);
             let (state_for_slot, warmed_at) = match decision {
+                WarmDecision::Warm { model, size_gb } if cancel.is_cancelled() => {
+                    // A release has already landed. Do not open a NEW request we
+                    // would only have to undo.
+                    report.cancelled += 1;
+                    let _ = size_gb;
+                    info!(
+                        trigger,
+                        role = role.id(),
+                        model = %model,
+                        "resident-set: warm not issued — a mode-swap release cancelled this pass"
+                    );
+                    (RoleState::Released, None)
+                }
                 WarmDecision::Warm { model, size_gb } => {
-                    match env.warm_one(role, &model, &self.cfg.keep_alive).await {
+                    // Record the obligation BEFORE the request goes out, so a
+                    // release that lands mid-flight can compensate for it even if
+                    // this pass never gets to run again.
+                    {
+                        let mut inner = self.inner.lock().await;
+                        inner.pending.push((role, model.clone()));
+                    }
+                    issued.push((role, model.clone()));
+                    match env
+                        .warm_one(role, &model, &self.cfg.keep_alive, &cancel)
+                        .await
+                    {
                         Ok(()) => {
                             report.warmed += 1;
                             info!(
@@ -1042,7 +1321,8 @@ impl ResidentSet {
             });
         }
 
-        self.commit(env, trigger, generation, outcomes, report).await
+        self.commit(env, trigger, generation, issued, outcomes, report)
+            .await
     }
 
     /// Commit a completed pass — or throw it away because a release won.
@@ -1056,6 +1336,7 @@ impl ResidentSet {
         env: &dyn ResidentEnv,
         trigger: &str,
         generation: u64,
+        issued: Vec<(Role, String)>,
         outcomes: Vec<PassOutcome>,
         mut report: WarmReport,
     ) -> WarmReport {
@@ -1070,12 +1351,62 @@ impl ResidentSet {
                 changed: false,
                 ..report
             };
+            // TRTR-07d: discarding is only the BOOKKEEPING half. Every warm
+            // request this pass put on the wire may have loaded a model, so undo
+            // each one explicitly — skipping any model the set currently HOLDS,
+            // because that means a legitimate later pass owns it and we must not
+            // fight it.
+            let held_now: HashSet<String> = inner
+                .slots
+                .iter()
+                .filter(|(_, s)| s.state.is_held())
+                .filter_map(|(_, s)| s.model.clone())
+                .collect();
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut to_undo: Vec<(Role, String)> = Vec::new();
+            for (role, model) in issued.iter() {
+                if held_now.contains(model) || !seen.insert(model.clone()) {
+                    continue;
+                }
+                to_undo.push((*role, model.clone()));
+            }
+            inner
+                .pending
+                .retain(|(_, m)| !to_undo.iter().any(|(_, u)| u == m));
             warn!(
                 trigger,
                 pass_generation = generation,
                 current_generation = inner.generation,
-                "resident-set: warm pass DISCARDED — a mode-swap release landed mid-warm; the GPU stays released"
+                undo = to_undo.len(),
+                "resident-set: warm pass DISCARDED — a mode-swap release landed mid-warm; unloading anything it loaded so the GPU really is released"
             );
+            // NOTE: `in_flight` is deliberately NOT taken yet. Holding it keeps
+            // any concurrent caller COALESCED onto this (discarded) pass, so no
+            // new warm can start and race the compensating unloads below.
+            drop(inner);
+
+            for (role, model) in &to_undo {
+                match env.unload_one(*role, model).await {
+                    Ok(()) => {
+                        report.compensated += 1;
+                        warn!(
+                            trigger,
+                            role = role.id(),
+                            model = %model,
+                            "resident-set: compensating unload issued for a warm that a release invalidated"
+                        );
+                    }
+                    Err(reason) => warn!(
+                        trigger,
+                        role = role.id(),
+                        model = %model,
+                        reason = %reason,
+                        "resident-set: compensating unload did not succeed — the idle path's own VRAM eviction is the backstop"
+                    ),
+                }
+            }
+
+            let mut inner = self.inner.lock().await;
             if let Some(tx) = inner.in_flight.take() {
                 let _ = tx.send(report.clone());
             }
@@ -1147,6 +1478,8 @@ impl ResidentSet {
         inner.slots = new_slots;
         inner.active = true;
         inner.last_warm = Some(Instant::now());
+        // The pass committed: nothing is owed a compensating unload.
+        inner.pending.clear();
         if let Some(tx) = inner.in_flight.take() {
             let _ = tx.send(report.clone());
         }
@@ -1179,44 +1512,162 @@ impl ResidentSet {
     /// after us. Calling release first is what lets that step actually reclaim
     /// these models instead of stepping around a pin.
     pub(crate) async fn release_with(&self, env: &dyn ResidentEnv, reason: &str) -> ReleaseReport {
-        let mut inner = self.inner.lock().await;
-        let was_active = inner.active;
-        inner.generation = inner.generation.wrapping_add(1);
-        let generation = inner.generation;
+        let (mut report, in_flight, pending, cancel, generation) = {
+            let mut inner = self.inner.lock().await;
+            let was_active = inner.active;
+            inner.generation = inner.generation.wrapping_add(1);
+            let generation = inner.generation;
 
-        let mut released: Vec<String> = inner
-            .slots
-            .iter()
-            .filter(|(_, s)| s.state.is_held())
-            .filter_map(|(_, s)| s.model.clone())
-            .collect();
-        released.sort();
-        released.dedup();
-        for (_, s) in inner.slots.iter_mut() {
-            if s.state.is_held() {
-                s.state = RoleState::Released;
+            let mut released: Vec<String> = inner
+                .slots
+                .iter()
+                .filter(|(_, s)| s.state.is_held())
+                .filter_map(|(_, s)| s.model.clone())
+                .collect();
+            released.sort();
+            released.dedup();
+            for (_, s) in inner.slots.iter_mut() {
+                if s.state.is_held() {
+                    s.state = RoleState::Released;
+                }
+                s.warmed_at = None;
             }
-            s.warmed_at = None;
-        }
-        inner.active = false;
+            inner.active = false;
 
-        // Inside the `inner` lock, same order the commit uses — so a warm pass can
-        // neither observe a half-applied release nor slip its exemption in after
-        // this clear.
-        env.clear_exempt().await;
-        drop(inner);
+            // Inside the `inner` lock, same order the commit uses — so a warm pass
+            // can neither observe a half-applied release nor slip its exemption in
+            // after this clear.
+            env.clear_exempt().await;
+
+            // TRTR-07d: subscribe to the in-flight pass BEFORE dropping the lock
+            // (so its report cannot be missed), snapshot its compensation
+            // worklist, and take the epoch's cancel token. A pass admitted after
+            // this point gets the FRESH token and is not cancelled by us.
+            let in_flight = inner.in_flight.as_ref().map(|tx| tx.subscribe());
+            let pending = inner.pending.clone();
+            let cancel = inner.cancel.clone();
+            inner.cancel = CancelToken::new();
+
+            let report = ReleaseReport {
+                released: released.len(),
+                changed: was_active,
+                generation,
+                ..Default::default()
+            };
+            (report, in_flight, pending, cancel, generation)
+        };
+
+        if let Some(mut rx) = in_flight {
+            // Phase 1 — GRACEFUL DRAIN. Let the in-flight pass finish naturally
+            // and undo itself. Bounded, because release must never become the
+            // outage: a blocked release blocks the whole mode swap.
+            let drained = match tokio::time::timeout(self.cfg.release_drain, rx.recv()).await {
+                Ok(Ok(pass)) => Some(pass.compensated),
+                // Sender dropped without a report: the pass is gone, nothing more
+                // can land from it.
+                Ok(Err(_)) => Some(0),
+                Err(_) => None,
+            };
+            match drained {
+                Some(c) => {
+                    report.drained = true;
+                    report.compensated += c;
+                }
+                None => {
+                    // Phase 2 — ESCALATE: abort the in-flight HTTP request itself,
+                    // then give the pass a short grace to compensate.
+                    warn!(
+                        reason,
+                        drain_secs = self.cfg.release_drain.as_secs(),
+                        "resident-set: release drain bound exceeded — CANCELLING the in-flight warm"
+                    );
+                    cancel.cancel();
+                    match tokio::time::timeout(self.cfg.cancel_grace, rx.recv()).await {
+                        Ok(Ok(pass)) => {
+                            report.drained = true;
+                            report.compensated += pass.compensated;
+                        }
+                        Ok(Err(_)) => report.drained = true,
+                        Err(_) => {
+                            // Phase 3 — DOCUMENTED FALLBACK. Never block: return,
+                            // but compensate from our own snapshot first so the
+                            // GPU is not left holding a model we believe we
+                            // released. The pass will compensate too when it
+                            // finally completes; the unload is idempotent.
+                            report.drain_timed_out = true;
+                            warn!(
+                                reason,
+                                grace_secs = self.cfg.cancel_grace.as_secs(),
+                                pending = pending.len(),
+                                "resident-set: in-flight warm did not settle within the bounded wait — compensating from the release side and returning anyway"
+                            );
+                            report.compensated +=
+                                self.compensate_pending(env, generation, &pending).await;
+                        }
+                    }
+                }
+            }
+        }
 
         info!(
             reason,
-            released = released.len(),
+            released = report.released,
             generation,
+            drained = report.drained,
+            drain_timed_out = report.drain_timed_out,
+            compensated = report.compensated,
             "resident-set: RELEASED for a mode swap — models are immediately reclaimable"
         );
-        ReleaseReport {
-            released: released.len(),
-            changed: was_active,
-            generation,
+        report
+    }
+
+    /// TRTR-07d fallback compensation, issued by `release` itself when the bounded
+    /// wait expired. Same two guards as the pass-side compensation: stop if a
+    /// NEWER release has taken over (it owns the decision now), and never unload a
+    /// model the set currently HOLDS (a legitimate re-warm owns it).
+    async fn compensate_pending(
+        &self,
+        env: &dyn ResidentEnv,
+        generation: u64,
+        pending: &[(Role, String)],
+    ) -> usize {
+        let mut done = 0usize;
+        let mut seen: HashSet<String> = HashSet::new();
+        for (role, model) in pending {
+            if !seen.insert(model.clone()) {
+                continue;
+            }
+            {
+                let inner = self.inner.lock().await;
+                if inner.generation != generation {
+                    break;
+                }
+                if inner
+                    .slots
+                    .iter()
+                    .any(|(_, s)| s.state.is_held() && s.model.as_deref() == Some(model.as_str()))
+                {
+                    continue;
+                }
+            }
+            match env.unload_one(*role, model).await {
+                Ok(()) => {
+                    done += 1;
+                    warn!(
+                        role = role.id(),
+                        model = %model,
+                        "resident-set: release-side compensating unload issued for an unsettled in-flight warm"
+                    );
+                }
+                Err(reason) => warn!(
+                    role = role.id(),
+                    model = %model,
+                    reason = %reason,
+                    "resident-set: release-side compensating unload did not succeed — the idle path's VRAM eviction is the backstop"
+                ),
+            }
         }
+        done
     }
 
     /// Background reconcile: catch a dynamic alias repoint and a keep_alive that
@@ -1590,10 +2041,17 @@ mod tests {
         resolved: StdMutex<Vec<Resolved>>,
         free_gb: StdMutex<Option<f64>>,
         warm_calls: StdMutex<Vec<String>>,
+        /// TRTR-07d: every compensating unload the manager issued, in order.
+        unloads: StdMutex<Vec<String>>,
         exempt: StdMutex<Vec<String>>,
         exempt_ops: StdMutex<Vec<String>>,
         fail: AtomicBool,
         gated: AtomicBool,
+        /// When set, a gated warm IGNORES the cancel token — modelling an
+        /// in-flight warm that simply will not stop (an unresponsive Ollama, a
+        /// stuck connection). This is the only situation release's bounded-wait
+        /// FALLBACK exists for, so it is the only honest way to drive it.
+        uncancellable: AtomicBool,
         gate: Semaphore,
         entered: mpsc::UnboundedSender<String>,
     }
@@ -1609,10 +2067,12 @@ mod tests {
                     resolved: StdMutex::new(resolved),
                     free_gb: StdMutex::new(free_gb),
                     warm_calls: StdMutex::new(Vec::new()),
+                    unloads: StdMutex::new(Vec::new()),
                     exempt: StdMutex::new(Vec::new()),
                     exempt_ops: StdMutex::new(Vec::new()),
                     fail: AtomicBool::new(false),
                     gated: AtomicBool::new(false),
+                    uncancellable: AtomicBool::new(false),
                     gate: Semaphore::new(0),
                     entered: tx,
                 }),
@@ -1622,6 +2082,12 @@ mod tests {
 
         fn gate_warms(&self) {
             self.gated.store(true, Ordering::SeqCst);
+        }
+        /// Gate the warms AND make them unstoppable: cancellation will not free
+        /// them, so release's bounded wait must expire.
+        fn gate_warms_uncancellable(&self) {
+            self.gated.store(true, Ordering::SeqCst);
+            self.uncancellable.store(true, Ordering::SeqCst);
         }
         fn open_gate(&self, permits: usize) {
             self.gated.store(false, Ordering::SeqCst);
@@ -1635,6 +2101,9 @@ mod tests {
         }
         fn warm_calls(&self) -> Vec<String> {
             self.warm_calls.lock().unwrap().clone()
+        }
+        fn unloads(&self) -> Vec<String> {
+            self.unloads.lock().unwrap().clone()
         }
         fn exempt(&self) -> Vec<String> {
             self.exempt.lock().unwrap().clone()
@@ -1652,17 +2121,41 @@ mod tests {
         fn free_vram_gb(&self) -> Option<f64> {
             *self.free_gb.lock().unwrap()
         }
-        async fn warm_one(&self, _role: Role, model: &str, _ka: &str) -> Result<(), String> {
+        async fn warm_one(
+            &self,
+            _role: Role,
+            model: &str,
+            _ka: &str,
+            cancel: &CancelToken,
+        ) -> Result<(), String> {
             self.warm_calls.lock().unwrap().push(model.to_string());
             let _ = self.entered.send(model.to_string());
             if self.gated.load(Ordering::SeqCst) {
-                self.gate.acquire().await.expect("gate").forget();
+                // TRTR-07d: a gated warm is "mid network I/O". It must be
+                // ABORTABLE, exactly as the production `AppStateEnv::warm_one`
+                // races its send future against the token — otherwise a test env
+                // that ignored cancellation would make the drain look like it
+                // works when it only ever times out.
+                if self.uncancellable.load(Ordering::SeqCst) {
+                    self.gate.acquire().await.expect("gate").forget();
+                } else {
+                    tokio::select! {
+                        p = self.gate.acquire() => { p.expect("gate").forget(); }
+                        _ = cancel.cancelled() => {
+                            return Err("fake warm cancelled".to_string());
+                        }
+                    }
+                }
             }
             if self.fail.load(Ordering::SeqCst) {
                 Err("fake warm failure".to_string())
             } else {
                 Ok(())
             }
+        }
+        async fn unload_one(&self, _role: Role, model: &str) -> Result<(), String> {
+            self.unloads.lock().unwrap().push(model.to_string());
+            Ok(())
         }
         async fn set_exempt(&self, models: &[String]) {
             *self.exempt.lock().unwrap() = models.to_vec();
@@ -1691,7 +2184,26 @@ mod tests {
         ResidentSetConfig {
             rewarm_debounce: Duration::ZERO,
             reassert: Duration::from_secs(3600),
+            // TRTR-07d: escalate to cancellation IMMEDIATELY rather than waiting
+            // out a graceful drain. These tests gate the warm deliberately, so the
+            // graceful phase can only ever expire; going straight to cancellation
+            // keeps them deterministic AND with no wall-clock sleeping. The grace
+            // that follows is generous and never actually elapses, because a
+            // cancelled `FakeEnv::warm_one` returns at once.
+            release_drain: Duration::ZERO,
+            cancel_grace: Duration::from_secs(30),
             ..Default::default()
+        }
+    }
+
+    /// Await a spawned pass that cancellation is supposed to unblock, FAILING
+    /// loudly instead of hanging if it does not. A regression that made
+    /// [`ResidentEnv::warm_one`] ignore its [`CancelToken`] would otherwise turn
+    /// these tests into a hang, and a hang is not a red test.
+    async fn join_unblocked<T>(h: tokio::task::JoinHandle<T>, what: &str) -> T {
+        match tokio::time::timeout(Duration::from_secs(20), h).await {
+            Ok(r) => r.unwrap(),
+            Err(_) => panic!("{what} never completed — cancellation did not unblock it"),
         }
     }
 
@@ -1725,7 +2237,7 @@ mod tests {
 
         // Let the warm finish.
         env.open_gate(16);
-        let report = warming.await.unwrap();
+        let report = join_unblocked(warming, "the cancelled startup pass").await;
 
         assert!(
             report.discarded,
@@ -1741,6 +2253,16 @@ mod tests {
             "the registry must never be re-pinned after a release: {:?}",
             env.exempt_ops()
         );
+        // TRTR-07d: bookkeeping is not enough. The one warm request that DID go
+        // out must have been undone at the model layer too, and release must have
+        // waited for that before returning.
+        assert!(rel.drained, "release must drain the in-flight pass: {rel:?}");
+        assert_eq!(
+            env.unloads(),
+            env.warm_calls(),
+            "every warm request the cancelled pass issued must be compensated by an unload"
+        );
+        assert_eq!(rel.compensated, env.unloads().len());
         let status = set.status().await;
         assert!(!status.active, "the set must remain inactive after a release");
         assert!(
@@ -1777,10 +2299,15 @@ mod tests {
 
         set.release_with(&*env, "mint-sweep").await;
         env.open_gate(16);
-        let report = reconciling.await.unwrap();
+        let report = join_unblocked(reconciling, "the cancelled reconcile pass").await;
 
         assert!(report.discarded, "reconcile must discard after a release");
         assert!(env.exempt().is_empty(), "reconcile must not re-pin after a release");
+        assert!(
+            env.unloads().contains(&"voice:2".to_string()),
+            "the repointed target the cancelled reconcile had already asked for must be unloaded again: {:?}",
+            env.unloads()
+        );
         assert!(!set.status().await.active);
     }
 
@@ -1923,6 +2450,111 @@ mod tests {
         assert!(status.active);
         assert!(status.roles.iter().all(|r| r.warm));
         assert_eq!(status.exempt.len(), 3);
+    }
+
+    /// **TRTR-07d requirement 3.** Cancelling the LEADER of a coalesced group must
+    /// not strand the subscribers awaiting its report: they must return, promptly,
+    /// with a sensible (discarded, coalesced) verdict rather than hanging forever
+    /// on a broadcast that never arrives.
+    #[tokio::test]
+    async fn a_cancelled_leader_does_not_strand_its_coalesced_subscribers() {
+        let set = Arc::new(ResidentSet::new(live_cfg()));
+        let (env, mut entered) = FakeEnv::new(three_roles(), Some(96.0));
+        env.gate_warms();
+
+        let (s, e) = (set.clone(), env.clone());
+        let leader = tokio::spawn(async move { s.warm_with(&*e, "startup", true, None).await });
+        entered.recv().await.expect("the leader is inside its warm I/O");
+
+        let (s1, e1) = (set.clone(), env.clone());
+        let sub_a = tokio::spawn(async move { s1.warm_with(&*e1, "activate", true, None).await });
+        let (s2, e2) = (set.clone(), env.clone());
+        let sub_b = tokio::spawn(async move { s2.warm_with(&*e2, "reconcile", true, None).await });
+        // Both subscribers are parked on the leader's broadcast, not warming.
+        settle().await;
+
+        // The mode swap cancels the leader. Nothing ever opens the gate.
+        let rel = set.release_with(&*env, "harmony-idle-lease").await;
+
+        let lead = join_unblocked(leader, "the cancelled leader").await;
+        let ra = join_unblocked(sub_a, "coalesced subscriber a").await;
+        let rb = join_unblocked(sub_b, "coalesced subscriber b").await;
+
+        assert!(lead.discarded, "the cancelled leader discards its pass");
+        for (name, r) in [("a", &ra), ("b", &rb)] {
+            assert!(r.coalesced, "subscriber {name} must report as coalesced");
+            assert!(
+                r.discarded,
+                "subscriber {name} must inherit the leader's discarded verdict: {r:?}"
+            );
+            assert!(!r.changed, "subscriber {name} changed nothing itself");
+        }
+        assert_eq!(
+            env.warm_calls().len(),
+            1,
+            "only the leader ever issued a warm request: {:?}",
+            env.warm_calls()
+        );
+        assert!(rel.drained);
+        assert!(env.exempt().is_empty());
+        assert!(!set.status().await.active);
+    }
+
+    /// **TRTR-07d requirement 2: the bounded wait and its documented FALLBACK.**
+    ///
+    /// When in-flight warm work will not settle inside
+    /// `release_drain + cancel_grace` — here an env whose gated warm ignores
+    /// cancellation outright — release must NOT hang (a stuck release is its own
+    /// outage on a shared GPU). It must report `drain_timed_out`, issue the
+    /// compensating unloads ITSELF from its pending snapshot, and return.
+    #[tokio::test]
+    async fn release_bounded_wait_expires_and_release_compensates_itself() {
+        // Both phases expire immediately; the warm is unstoppable throughout, so
+        // no report can arrive during either window. Deterministic, no sleeps.
+        let cfg = ResidentSetConfig {
+            rewarm_debounce: Duration::ZERO,
+            release_drain: Duration::ZERO,
+            cancel_grace: Duration::ZERO,
+            ..Default::default()
+        };
+        let set = Arc::new(ResidentSet::new(cfg));
+        let (env, mut entered) = FakeEnv::new(three_roles(), Some(96.0));
+        env.gate_warms_uncancellable();
+
+        let (s, e) = (set.clone(), env.clone());
+        let warming = tokio::spawn(async move { s.warm_with(&*e, "startup", true, None).await });
+        let stuck = entered
+            .recv()
+            .await
+            .expect("a warm request is out and will not come back");
+
+        let rel = set.release_with(&*env, "harmony-idle-lease").await;
+
+        assert!(
+            rel.drain_timed_out,
+            "the bounded wait must EXPIRE and be reported, never silently extended: {rel:?}"
+        );
+        assert!(
+            !rel.drained,
+            "nothing was drained — the pass never settled: {rel:?}"
+        );
+        assert_eq!(
+            rel.compensated, 1,
+            "the fallback must compensate from release's own snapshot: {rel:?}"
+        );
+        assert_eq!(
+            env.unloads(),
+            vec![stuck.clone()],
+            "release itself must unload the model the unsettled warm may have loaded"
+        );
+        assert!(env.exempt().is_empty());
+        assert!(!set.status().await.active);
+
+        // Let the stuck pass finish so the test leaves nothing running. It
+        // discards (and re-issues an idempotent unload of its own).
+        env.open_gate(16);
+        let pass = join_unblocked(warming, "the unstoppable pass").await;
+        assert!(pass.discarded, "the pass still discards: {pass:?}");
     }
 
     /// A release must not permanently poison the set: the next activate re-warms
@@ -2104,19 +2736,19 @@ mod tests {
         let env = AppStateEnv::new(&state, Duration::from_secs(10));
 
         assert!(
-            env.warm_one(Role::Personality, SEAM_PERSONALITY_MODEL, "24h")
+            env.warm_one(Role::Personality, SEAM_PERSONALITY_MODEL, "24h", &CancelToken::new())
                 .await
                 .is_ok(),
             "the personality warm must succeed against a 200 Ollama"
         );
         assert!(
-            env.warm_one(Role::Router, SEAM_ROUTER_MODEL, "24h")
+            env.warm_one(Role::Router, SEAM_ROUTER_MODEL, "24h", &CancelToken::new())
                 .await
                 .is_ok(),
             "the router warm must succeed against a 200 Ollama"
         );
         assert!(
-            env.warm_one(Role::Embedding, SEAM_EMBED_MODEL, "24h")
+            env.warm_one(Role::Embedding, SEAM_EMBED_MODEL, "24h", &CancelToken::new())
                 .await
                 .is_ok(),
             "the embedding warm must succeed against a 200 Ollama"
@@ -2231,7 +2863,7 @@ mod tests {
             (Role::Router, SEAM_ROUTER_MODEL),
             (Role::Embedding, SEAM_EMBED_MODEL),
         ] {
-            assert!(env.warm_one(role, model, "17h").await.is_ok());
+            assert!(env.warm_one(role, model, "17h", &CancelToken::new()).await.is_ok());
         }
 
         let seen = seen_requests();
@@ -2261,7 +2893,7 @@ mod tests {
         let env = AppStateEnv::new(&state, Duration::from_secs(10));
 
         let err = env
-            .warm_one(Role::Personality, SEAM_PERSONALITY_MODEL, "24h")
+            .warm_one(Role::Personality, SEAM_PERSONALITY_MODEL, "24h", &CancelToken::new())
             .await
             .expect_err("a 503 must NOT be reported as a successful warm");
         assert!(
@@ -2288,7 +2920,7 @@ mod tests {
         let env = AppStateEnv::new(&state, Duration::from_secs(5));
 
         let err = env
-            .warm_one(Role::Router, SEAM_ROUTER_MODEL, "24h")
+            .warm_one(Role::Router, SEAM_ROUTER_MODEL, "24h", &CancelToken::new())
             .await
             .expect_err("an unreachable Ollama must NOT be reported as a successful warm");
         assert!(
@@ -2442,6 +3074,407 @@ mod tests {
         let mut exempt = state.model_registry.lock().await.residency_exempt();
         exempt.sort();
         assert_eq!(exempt.len(), 3, "the exemption is restored by the re-warm");
+        assert!(set.status().await.active);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // TRTR-07d: the POST-RELEASE LOAD. The generation guard is a bookkeeping
+    // guarantee; these tests are about the GPU.
+    //
+    // None of the tests above can catch the residual race, and it is worth being
+    // precise about why: `FakeEnv::warm_one` has no model-loading side effect at
+    // all, and every httpmock seam test only ever releases AFTER its warm
+    // requests have already completed. The real failure needs a warm request that
+    // is STILL ON THE WIRE when the release lands and that then LOADS THE MODEL
+    // ANYWAY — Ollama does not abandon a load because the client hung up.
+    //
+    // So the stub below is not httpmock: it is a loopback HTTP server whose
+    // responses can be HELD OPEN, and which marks a model LOADED when its work
+    // finishes whether or not the client is still there. That is the whole point.
+    // Interleaving is driven by opening the gate, never by sleeping.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[derive(Default)]
+    struct HeldOllamaState {
+        /// Models the stub considers resident in "VRAM". A warm marks its model
+        /// loaded when the held request finally completes — EVEN IF the client
+        /// already disconnected. A `keep_alive: 0` request unloads it.
+        loaded: StdMutex<HashSet<String>>,
+        /// Every request seen: `(path, model, keep_alive)`.
+        seen: StdMutex<Vec<(String, String, serde_json::Value)>>,
+    }
+
+    /// A stub Ollama on loopback whose warm responses are gated.
+    struct HeldOllama {
+        base: String,
+        state: Arc<HeldOllamaState>,
+        gate: Arc<Semaphore>,
+    }
+
+    impl HeldOllama {
+        /// Let `n` more held warm requests complete (and therefore load).
+        fn open(&self, n: usize) {
+            self.gate.add_permits(n);
+        }
+        fn loaded(&self) -> Vec<String> {
+            let mut v: Vec<String> = self.state.loaded.lock().unwrap().iter().cloned().collect();
+            v.sort();
+            v
+        }
+        fn requests(&self) -> Vec<(String, String, serde_json::Value)> {
+            self.state.seen.lock().unwrap().clone()
+        }
+        /// Unload requests (`keep_alive: 0`) seen, by model.
+        fn unloaded_models(&self) -> Vec<String> {
+            let mut v: Vec<String> = self
+                .requests()
+                .into_iter()
+                .filter(|(_, _, ka)| *ka == serde_json::json!(0))
+                .map(|(_, m, _)| m)
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        }
+    }
+
+    fn headers_end(buf: &[u8]) -> Option<usize> {
+        buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+    }
+
+    async fn start_held_ollama() -> (HeldOllama, mpsc::UnboundedReceiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Loopback only, ephemeral port — never a real fleet address.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::new(HeldOllamaState::default());
+        let gate = Arc::new(Semaphore::new(0));
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        {
+            let state = state.clone();
+            let gate = gate.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut sock, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let state = state.clone();
+                    let gate = gate.clone();
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let mut buf: Vec<u8> = Vec::new();
+                        let mut tmp = [0u8; 2048];
+                        let (path, body) = loop {
+                            let n = match sock.read(&mut tmp).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => n,
+                            };
+                            buf.extend_from_slice(&tmp[..n]);
+                            let Some(end) = headers_end(&buf) else { continue };
+                            let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                            let mut len = 0usize;
+                            for line in head.lines() {
+                                let lower = line.to_ascii_lowercase();
+                                if let Some(v) = lower.strip_prefix("content-length:") {
+                                    len = v.trim().parse().unwrap_or(0);
+                                }
+                            }
+                            if buf.len() < end + len {
+                                continue;
+                            }
+                            let path = head
+                                .lines()
+                                .next()
+                                .and_then(|l| l.split_whitespace().nth(1))
+                                .unwrap_or("/")
+                                .to_string();
+                            let body: serde_json::Value =
+                                serde_json::from_slice(&buf[end..end + len])
+                                    .unwrap_or(serde_json::Value::Null);
+                            break (path, body);
+                        };
+
+                        let model = body
+                            .get("model")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        let keep_alive = body
+                            .get("keep_alive")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        state
+                            .seen
+                            .lock()
+                            .unwrap()
+                            .push((path, model.clone(), keep_alive.clone()));
+                        let _ = tx.send(model.clone());
+
+                        if keep_alive == serde_json::json!(0) {
+                            // The compensating unload is never gated — it is the
+                            // undo, and it has to be able to land.
+                            state.loaded.lock().unwrap().remove(&model);
+                        } else {
+                            // HELD. When the test lets it through, the load
+                            // completes SERVER-SIDE regardless of whether Chord is
+                            // still waiting for the response. This is the exact
+                            // behaviour that makes "release returned" insufficient.
+                            if let Ok(p) = gate.acquire().await {
+                                p.forget();
+                            }
+                            state.loaded.lock().unwrap().insert(model.clone());
+                        }
+
+                        let _ = sock
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{\"ok\":true}",
+                            )
+                            .await;
+                        let _ = sock.flush().await;
+                    });
+                }
+            });
+        }
+
+        (
+            HeldOllama {
+                base: format!("http://{addr}"),
+                state,
+                gate,
+            },
+            rx,
+        )
+    }
+
+    /// Seam config with explicit release bounds.
+    fn seam_cfg_bounds(drain: Duration, grace: Duration) -> ResidentSetConfig {
+        ResidentSetConfig {
+            keep_alive: "24h".to_string(),
+            rewarm_debounce: Duration::ZERO,
+            release_drain: drain,
+            cancel_grace: grace,
+            ..Default::default()
+        }
+    }
+
+    /// **THE MISSING TEST.** A warm request that completes only AFTER the release.
+    ///
+    /// Two roles are already loaded and a third is still on the wire when the mode
+    /// swap lands. The generation guard alone would leave all three sitting in
+    /// VRAM with `keep_alive=24h` while Chord reported "released" — the GPU
+    /// starved for a day. What must happen instead: release WAITS for the pass
+    /// (bounded), the pass discards itself AND unloads every model it loaded, and
+    /// only then does release return, before the idle path's VRAM unload runs.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn production_release_undoes_warms_that_complete_after_it() {
+        let (ollama, mut entered) = start_held_ollama().await;
+        let state = seam_state(&ollama.base).await;
+        let set = Arc::new(ResidentSet::new(seam_cfg_bounds(
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+        )));
+
+        let (s, st) = (set.clone(), state.clone());
+        let warming = tokio::spawn(async move { s.warm(&st, "startup", true).await });
+
+        // Role 1 reaches the stub and is held there; let it through so it is
+        // genuinely LOADED, then let role 2 reach the stub and hold it.
+        assert_eq!(
+            entered.recv().await.as_deref(),
+            Some(SEAM_PERSONALITY_MODEL),
+            "the personality role warms first (declaration order is the priority)"
+        );
+        ollama.open(1);
+        assert_eq!(
+            entered.recv().await.as_deref(),
+            Some(SEAM_ROUTER_MODEL),
+            "the router role is now the one on the wire"
+        );
+
+        // ── the mode swap lands with a warm STILL IN FLIGHT ──────────────────
+        let (s, st) = (set.clone(), state.clone());
+        let releasing = tokio::spawn(async move { s.release(&st, "harmony-idle-lease").await });
+        settle().await;
+
+        // Ollama does what Ollama does: it finishes the loads anyway.
+        ollama.open(8);
+
+        let rel = releasing.await.unwrap();
+
+        // ── the guarantee, at the GPU layer, AT THE MOMENT RELEASE RETURNS ───
+        assert!(
+            rel.drained,
+            "release must have waited for the in-flight pass before returning: {rel:?}"
+        );
+        assert!(!rel.drain_timed_out, "the bounded wait was ample here: {rel:?}");
+        assert_eq!(
+            ollama.loaded(),
+            Vec::<String>::new(),
+            "NOTHING may still be loaded once release has returned — got {:?} (requests: {:?})",
+            ollama.loaded(),
+            ollama.requests()
+        );
+        assert_eq!(
+            rel.compensated, 3,
+            "every model the cancelled pass loaded must have been explicitly unloaded: {rel:?}"
+        );
+        let mut expected = vec![
+            SEAM_EMBED_MODEL.to_string(),
+            SEAM_PERSONALITY_MODEL.to_string(),
+            SEAM_ROUTER_MODEL.to_string(),
+        ];
+        expected.sort();
+        assert_eq!(
+            ollama.unloaded_models(),
+            expected,
+            "each role's compensating unload must go out: {:?}",
+            ollama.requests()
+        );
+        // The embedding unload must use the EMBED endpoint — a `/api/generate`
+        // unload for an embedding model silently misses.
+        let embed_unload = ollama
+            .requests()
+            .into_iter()
+            .find(|(_, m, ka)| m == SEAM_EMBED_MODEL && *ka == serde_json::json!(0))
+            .expect("an unload for the embedding model");
+        assert_eq!(embed_unload.0, "/api/embed");
+
+        assert!(
+            state
+                .model_registry
+                .lock()
+                .await
+                .residency_exempt()
+                .is_empty(),
+            "no exemption may survive the release"
+        );
+        assert!(!set.status().await.active);
+
+        let pass = warming.await.unwrap();
+        assert!(pass.discarded, "the pass itself must report as discarded");
+        assert_eq!(pass.compensated, 3);
+    }
+
+    /// **Production cancellation is real, not decorative.** With a held-open
+    /// warm that Ollama will never answer, release escalates to cancelling the
+    /// token — and [`AppStateEnv::warm_one`] must ABORT the HTTP request so the
+    /// pass settles and compensates INSIDE the bounded wait. If it merely ignored
+    /// the token the warm would sit there for its full 300s timeout, the grace
+    /// would expire, and release would have to fall back — which is exactly what
+    /// this asserts does NOT happen.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn production_cancellation_aborts_the_request_so_release_drains_in_time() {
+        let (ollama, mut entered) = start_held_ollama().await;
+        let state = seam_state(&ollama.base).await;
+        // Graceful phase expires at once (the stub will never answer, so no report
+        // can arrive during it); the grace is generous and is only ever consumed
+        // if cancellation does nothing.
+        let set = Arc::new(ResidentSet::new(seam_cfg_bounds(
+            Duration::ZERO,
+            Duration::from_secs(5),
+        )));
+
+        let (s, st) = (set.clone(), state.clone());
+        let warming = tokio::spawn(async move { s.warm(&st, "startup", true).await });
+        assert_eq!(
+            entered.recv().await.as_deref(),
+            Some(SEAM_PERSONALITY_MODEL),
+            "a warm is on the wire and the stub will never answer it"
+        );
+
+        // The gate is NEVER opened. Only cancellation can free this request.
+        let rel = set.release(&state, "mint-sweep").await;
+
+        assert!(
+            rel.drained,
+            "cancellation must free the in-flight warm so release drains: {rel:?}"
+        );
+        assert!(
+            !rel.drain_timed_out,
+            "the pass settled well inside the grace — no fallback needed: {rel:?}"
+        );
+        assert_eq!(
+            rel.compensated, 1,
+            "the one request that went out must still be compensated: {rel:?}"
+        );
+        assert!(
+            ollama
+                .unloaded_models()
+                .contains(&SEAM_PERSONALITY_MODEL.to_string()),
+            "the compensating unload must reach Ollama: {:?}",
+            ollama.requests()
+        );
+        assert!(
+            !ollama
+                .requests()
+                .iter()
+                .any(|(_, m, ka)| m == SEAM_ROUTER_MODEL && *ka != serde_json::json!(0)),
+            "a cancelled pass must not go on to issue the REMAINING roles' warms: {:?}",
+            ollama.requests()
+        );
+        assert!(
+            state
+                .model_registry
+                .lock()
+                .await
+                .residency_exempt()
+                .is_empty()
+        );
+
+        let pass = join_unblocked(warming, "the cancelled warm pass").await;
+        assert!(pass.discarded, "the cancelled pass discards: {pass:?}");
+        assert!(pass.cancelled >= 1, "the remaining roles were skipped: {pass:?}");
+    }
+
+    /// **POSITIVE CONTROL at the production seam.** With no release anywhere near
+    /// it, an ordinary warm must still load all three models and install the
+    /// exemption — and must issue NO unload. Without this, every assertion above
+    /// could be satisfied by a change that simply broke residency.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn production_ordinary_warm_loads_all_three_and_installs_the_exemption() {
+        let (ollama, _entered) = start_held_ollama().await;
+        // Nothing is held: every warm completes immediately.
+        ollama.open(64);
+        let state = seam_state(&ollama.base).await;
+        let set = ResidentSet::new(seam_cfg_bounds(
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+        ));
+
+        let report = set.warm(&state, "startup", true).await;
+
+        assert_eq!(report.warmed, 3, "all three roles warm: {report:?}");
+        assert!(!report.discarded);
+        assert_eq!(report.compensated, 0, "nothing to compensate: {report:?}");
+        assert_eq!(report.cancelled, 0);
+        let mut expected = vec![
+            SEAM_EMBED_MODEL.to_string(),
+            SEAM_PERSONALITY_MODEL.to_string(),
+            SEAM_ROUTER_MODEL.to_string(),
+        ];
+        expected.sort();
+        assert_eq!(
+            ollama.loaded(),
+            expected,
+            "all three models must actually be loaded: {:?}",
+            ollama.requests()
+        );
+        assert!(
+            ollama.unloaded_models().is_empty(),
+            "an ordinary warm must never unload anything: {:?}",
+            ollama.requests()
+        );
+        for (_, _, ka) in ollama.requests() {
+            assert_eq!(ka, serde_json::json!("24h"), "keep_alive must be threaded");
+        }
+        let mut exempt = state.model_registry.lock().await.residency_exempt();
+        exempt.sort();
+        assert_eq!(exempt, expected, "the registry exemption must be installed");
         assert!(set.status().await.active);
     }
 }
