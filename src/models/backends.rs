@@ -1,19 +1,26 @@
-//! Inference backends — first-class, hardware-tagged (GPU vs CPU).
+//! Inference backends — first-class, per-serving-process definitions.
 //!
 //! Chord historically forwarded every request to one `CHORD_LLM_URL`. P5 makes
-//! the real backends explicit so models can be **tagged** to the hardware they
-//! belong on and routed accordingly:
+//! the real backends explicit so models can be **tagged** to the serving
+//! process they belong on and routed accordingly:
 //!
-//!   - `ollama` / `ollama-cpu`  — Ollama HTTP (`/api/*`), CPU tier on this host
-//!     (Ollama's ROCm path does not engage on gfx1151 — it offloads 0 layers).
+//!   - `ollama`                 — Ollama HTTP (`/api/*`), the primary always-on
+//!     serve. On this host it runs on **unified GTT memory with ROCm engaged**
+//!     (the Ryzen AI Max+ 395 / gfx1151 APU shares one physical memory pool
+//!     between CPU and GPU — there is no separate "CPU tier" or GPU/CPU split;
+//!     the earlier `ollama-cpu` serve on :11435 is retired and removed).
 //!   - `lemonade-coder`         — a llama.cpp `llama-server` (OpenAI `/v1/*`)
-//!     pinned to one model on the **GPU**.
+//!     pinned to one coding model, lazy-started on demand and idle-stopped.
 //!   - `llama-gpu`              — a *generic* on-demand `llama-server` that loads
-//!     ANY requested model's Ollama blob on the GPU (`-m <blob> -ngl 999`).
+//!     ANY requested model's Ollama blob (`-m <blob> -ngl 999`).
 //!   - `vulkan`                 — a `llama-server` built with the Vulkan/RADV
 //!     (Mesa) backend (`-DGGML_VULKAN=ON`), a *driver-stable* alternative to the
 //!     ROCm-only lemonade build for dense large models when ROCm is unavailable
 //!     or unstable. Same generic on-demand shape as `llama-gpu`.
+//!
+//! These are distinct *serving processes*, not a CPU/GPU hardware split — under
+//! unified GTT they all draw on the same memory pool. The `Hardware` enum below
+//! is retained only for wire/serialization compatibility (see its docs).
 //!
 //! Backends are **demand-driven by tags**: an on-demand backend is only started
 //! when a model tagged for it is requested, and stopped when idle (see
@@ -27,11 +34,28 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-/// Hardware a backend runs on. Used to test/route a model on the right device.
+/// Serving-device label retained for wire/serialization compatibility.
+///
+/// Under unified GTT (the gfx1151 APU shares one memory pool between CPU and
+/// GPU, ROCm engaged), the historical "GPU vs CPU tier" distinction is a
+/// fiction — every local serve draws on the same unified memory. We no longer
+/// SEED any `Cpu` backend.
+///
+/// The variant itself is DEPRECATED but intentionally NOT removed: `Hardware`
+/// is serialized into `<path>/model-registry.json` and crosses the
+/// terminus-rs wire format, so deleting `Cpu` would break deserialization of
+/// existing on-disk registries and any peer still emitting `"cpu"`. Keep it;
+/// just don't produce it for any *local* serving backend. (The remote
+/// `openrouter` backend still tags itself `Cpu` purely as a "no local device
+/// cost" sentinel — that's a remote call, not a local CPU tier.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Hardware {
     Gpu,
+    /// DEPRECATED under unified GTT — kept only for backward-compatible
+    /// (de)serialization of existing registries / wire payloads, and as the
+    /// remote-backend "no local device cost" sentinel. Never seed it for a
+    /// local serve.
     Cpu,
 }
 
@@ -127,39 +151,27 @@ fn env_url(key: &str) -> Option<String> {
 
 /// Seed the default backend catalogue from the existing env vars, used the first
 /// time a registry is loaded without a `backends` section. Mirrors the live
-/// Inference host topology: two CPU Ollama instances, the dedicated GPU coder, and the
-/// generic on-demand GPU llama-server. Only backends whose URL/host is known are
-/// seeded; the generic `llama-gpu` is always offered (started on demand).
+/// Inference host topology: the primary always-on Ollama serve (unified GTT,
+/// ROCm engaged), the dedicated on-demand coder, the generic on-demand
+/// llama-server, the Vulkan serve, and OpenRouter. Only backends whose URL/host
+/// is known are seeded; the generic `llama-gpu`/`vulkan`/`openrouter` are always
+/// offered. NOTE: the retired `ollama-cpu` serve (:11435, `OLLAMA_CPU_URL`) is
+/// deliberately no longer seeded — it is a dead service and its "CPU tier" was a
+/// fiction under unified GTT.
 pub fn seed_from_env() -> HashMap<String, Backend> {
     let mut out: HashMap<String, Backend> = HashMap::new();
 
-    // Primary Ollama (lumina/general). CPU tier on gfx1151 (ROCm won't engage).
+    // Primary Ollama (lumina/general), always-on. Runs on the gfx1151 APU's
+    // unified GTT memory with ROCm engaged — not a CPU tier.
     if let Some(url) = env_url("OLLAMA_URL").or_else(|| env_url("OLLAMA_BASE_URL")) {
         out.insert(
             "ollama".into(),
             Backend {
                 name: "ollama".into(),
                 url,
-                hardware: Hardware::Cpu,
+                hardware: Hardware::Gpu,
                 kind: BackendKind::Ollama,
                 unit: Some("ollama.service".into()),
-                always_on: true,
-                idle_stop_secs: 0,
-                launch: None,
-                api_key_env: None,
-            },
-        );
-    }
-    // Resident CPU Ollama (embeddings / scheduled micro jobs).
-    if let Some(url) = env_url("OLLAMA_CPU_URL") {
-        out.insert(
-            "ollama-cpu".into(),
-            Backend {
-                name: "ollama-cpu".into(),
-                url,
-                hardware: Hardware::Cpu,
-                kind: BackendKind::Ollama,
-                unit: Some("ollama-cpu.service".into()),
                 always_on: true,
                 idle_stop_secs: 0,
                 launch: None,
@@ -206,12 +218,17 @@ pub fn seed_from_env() -> HashMap<String, Backend> {
             launch: Some(LaunchSpec {
                 bin: llama_bin,
                 args: vec![
-                    "-c".into(), "32768".into(),
-                    "-ngl".into(), "999".into(),
-                    "-fa".into(), "1".into(),
+                    "-c".into(),
+                    "32768".into(),
+                    "-ngl".into(),
+                    "999".into(),
+                    "-fa".into(),
+                    "1".into(),
                     "--no-mmap".into(),
-                    "--host".into(), "0.0.0.0".into(),
-                    "--port".into(), llama_port,
+                    "--host".into(),
+                    "0.0.0.0".into(),
+                    "--port".into(),
+                    llama_port,
                 ],
                 model_arg: "-m".into(),
                 model_from: default_model_from(),
@@ -254,12 +271,16 @@ pub fn seed_from_env() -> HashMap<String, Backend> {
                 // context in ~51GB VRAM. `--no-warmup` keeps cold-load ~13s.
                 bin: vk_bin,
                 args: vec![
-                    "-c".into(), "32768".into(),
-                    "-ngl".into(), "99".into(),
+                    "-c".into(),
+                    "32768".into(),
+                    "-ngl".into(),
+                    "99".into(),
                     "--no-mmap".into(),
                     "--no-warmup".into(),
-                    "--host".into(), "127.0.0.1".into(),
-                    "--port".into(), vk_port,
+                    "--host".into(),
+                    "127.0.0.1".into(),
+                    "--port".into(),
+                    vk_port,
                 ],
                 model_arg: "-m".into(),
                 model_from: default_model_from(),
@@ -372,7 +393,8 @@ pub fn is_vulkan_candidate(model: &str) -> bool {
         return false;
     };
     matches!(
-        tag.trim_end_matches("-instruct").trim_end_matches("-q4_k_m"),
+        tag.trim_end_matches("-instruct")
+            .trim_end_matches("-q4_k_m"),
         "70b" | "72b" | "32b" | "34b"
     )
 }
@@ -396,10 +418,16 @@ mod tests {
         };
         assert!(gpu.on_demand());
 
-        let primary = Backend { always_on: true, ..gpu.clone() };
+        let primary = Backend {
+            always_on: true,
+            ..gpu.clone()
+        };
         assert!(!primary.on_demand());
 
-        let daemon = Backend { kind: BackendKind::Daemon, ..gpu.clone() };
+        let daemon = Backend {
+            kind: BackendKind::Daemon,
+            ..gpu.clone()
+        };
         assert!(!daemon.on_demand());
     }
 
@@ -416,6 +444,41 @@ mod tests {
         assert_eq!(g.kind, BackendKind::LlamaServer);
         assert!(g.on_demand());
         assert!(g.launch.is_some());
+    }
+
+    #[test]
+    fn seed_from_env_never_seeds_dead_ollama_cpu() {
+        // Unified-GTT cleanup (Phase 2): the retired `ollama-cpu` serve (:11435)
+        // must NEVER be seeded, even when a stale `OLLAMA_CPU_URL` is still set
+        // in the environment. Its "CPU tier" was a fiction under unified GTT.
+        std::env::set_var("OLLAMA_URL", "http://127.0.0.1:11434");
+        std::env::set_var("OLLAMA_CPU_URL", "http://127.0.0.1:11435");
+        let b = seed_from_env();
+        assert!(
+            !b.contains_key("ollama-cpu"),
+            "ollama-cpu is a dead service and must not be seeded"
+        );
+        std::env::remove_var("OLLAMA_CPU_URL");
+        std::env::remove_var("OLLAMA_URL");
+    }
+
+    #[test]
+    fn seed_from_env_primary_ollama_is_not_cpu_labeled() {
+        // The primary Ollama serve runs on unified GTT with ROCm engaged — it is
+        // NOT a CPU-tier backend. It must be seeded and labeled `Gpu`.
+        std::env::set_var("OLLAMA_URL", "http://127.0.0.1:11434");
+        let b = seed_from_env();
+        let ollama = b
+            .get("ollama")
+            .expect("primary ollama is seeded when OLLAMA_URL is set");
+        assert_eq!(
+            ollama.hardware,
+            Hardware::Gpu,
+            "primary ollama runs on unified GTT (ROCm) — not the deprecated Cpu tier"
+        );
+        assert!(ollama.always_on);
+        assert_eq!(ollama.kind, BackendKind::Ollama);
+        std::env::remove_var("OLLAMA_URL");
     }
 
     #[test]
@@ -453,7 +516,10 @@ mod tests {
         assert!(o.launch.is_none());
         assert_eq!(o.url, "https://openrouter.ai/api");
         // Default env var name, never an actual key value.
-        assert_eq!(o.api_key_env.as_deref(), Some("OPENROUTER_API_KEY_CHORDHARMONY"));
+        assert_eq!(
+            o.api_key_env.as_deref(),
+            Some("OPENROUTER_API_KEY_CHORDHARMONY")
+        );
     }
 
     #[test]
