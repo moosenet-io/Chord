@@ -628,6 +628,29 @@ async fn main() {
         });
     }
 
+    // ── TRTR-07 assistant-mode resident set ──
+    // Warm the three role slots (personality / router / embedding) and hold them
+    // resident, so a tool turn no longer cold-loads several GB now that the tool
+    // router lives in Terminus and costs a Chord inference call per turn.
+    //
+    // Fired in the BACKGROUND on purpose: warming pulls models into VRAM and can
+    // take minutes on a cold host — it must never delay the listener coming up.
+    // Every failure mode inside (unresolvable alias, never-pulled model, Ollama
+    // unreachable, VRAM shortfall) degrades to a logged role state; nothing here
+    // can block startup or refuse a turn.
+    {
+        let resident_state = state.clone();
+        let refresh = chord_proxy::routing::resident_set::global().config().refresh;
+        tokio::spawn(async move {
+            let _ = chord_proxy::routing::resident_set::global()
+                .warm(&resident_state, "startup", true)
+                .await;
+            // Then reconcile periodically so a dynamic alias repoint mid-residency
+            // is picked up (new target warmed, old one dropped) without a restart.
+            chord_proxy::routing::resident_set::reconcile_loop(resident_state, refresh).await;
+        });
+    }
+
     let control_port = config.control_port;
     let control_router = chord_proxy::control::build_control_router(state.clone());
 
