@@ -580,31 +580,16 @@ async fn main() {
     // Every failure mode inside (unresolvable alias, never-pulled model, Ollama
     // unreachable, VRAM shortfall) degrades to a logged role state; nothing here
     // can block startup or refuse a turn.
+    //
+    // CHRD-PIN-01: the ORDER of warm → legacy-pin convergence → reconcile is a
+    // correctness property, not an arrangement of statements, so it lives in ONE
+    // named place (`startup_residency`) rather than being inlined here where a
+    // later edit could reorder or accidentally gate it. In particular convergence
+    // runs whether or not the resident set is enabled — see that function's docs.
     {
         let resident_state = state.clone();
-        let refresh = chord_proxy::routing::resident_set::global().config().refresh;
         tokio::spawn(async move {
-            let _ = chord_proxy::routing::resident_set::global()
-                .warm(&resident_state, "startup", true)
-                .await;
-            // CHRD-PIN-01: converge the RUNNING host. The retired keep-resident
-            // mechanism pinned models with an indefinite keep_alive, and deleting the
-            // code that issued those pins does not unpin what Ollama already holds —
-            // a restart alone would leave them stranded forever, outside every
-            // lifecycle. Sequenced AFTER the warm above so a model this set legitimately
-            // holds has already had its bounded keep_alive re-asserted and is skipped.
-            let converged =
-                chord_proxy::routing::resident_set::converge_legacy_pins(&resident_state).await;
-            if converged.found > 0 {
-                info!(
-                    found = converged.found,
-                    unpinned = converged.unpinned,
-                    "resident-set: released legacy indefinite VRAM pins at startup"
-                );
-            }
-            // Then reconcile periodically so a dynamic alias repoint mid-residency
-            // is picked up (new target warmed, old one dropped) without a restart.
-            chord_proxy::routing::resident_set::reconcile_loop(resident_state, refresh).await;
+            chord_proxy::routing::resident_set::startup_residency(resident_state).await;
         });
     }
 

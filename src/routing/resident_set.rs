@@ -1822,16 +1822,62 @@ impl ResidentSet {
 //     the resident set's own 24h — is never mistaken for a pin.
 //   - best-effort throughout: an unreachable Ollama logs and does nothing.
 
-/// `CHORD_RESIDENT_PIN_HORIZON_DAYS` (default 365). An `/api/ps` expiry further out
-/// than this is a legacy INDEFINITE pin, not a keep_alive. Ollama renders `-1` as a
-/// year-2318-style timestamp, so the horizon has enormous margin over any real
-/// keep_alive while never catching one.
+/// The default pin horizon, in days: **3650 days (10 years)**.
+///
+/// **This is a HEURISTIC, and the code says so on purpose.** Ollama's `/api/ps` does
+/// not report WHO loaded a model or WHETHER it was loaded with the indefinite
+/// sentinel — see [`PROVENANCE`] below for the measured field list. Expiry distance
+/// is the only signal available, so classification is inference, not fact.
+///
+/// **Why 10 years, measured against the live host (Ollama 0.22.1, 2026-07-31).**
+/// `keep_alive:-1` is rendered by Ollama as `now + i64::MAX nanoseconds` — a fixed
+/// **292.27 years**, observed on this host as four models all expiring
+/// `2318-11-10T13:14:31`. The resident set's own bounded residency is **24 hours**.
+/// So the two populations we must separate are ~24h apart from ~292 years, five
+/// orders of magnitude:
+///
+/// | | value | ratio to the 10y horizon |
+/// |---|---|---|
+/// | resident set's own keep_alive | 24 h | 3650x BELOW |
+/// | an absurdly long *deliberate* keep_alive (`8760h` = 1 year) | 1 y | 10x BELOW |
+/// | the `-1` sentinel | 292.27 y | 29.2x ABOVE |
+///
+/// The old 365-day default sat 1x from a one-year keep_alive — i.e. a deliberate
+/// `8760h` was a coin flip. Ten years cannot plausibly be a deliberate bounded
+/// keep_alive (Ollama keep_alive is a duration string; real ones are minutes to
+/// hours) while still clearing the sentinel by a factor of 29.
+///
+/// **Residual false-positive cost, stated plainly:** if someone really does set a
+/// bounded keep_alive longer than 10 years, convergence unloads it once at startup.
+/// That model is NOT deleted and NOT blocked — the next request reloads it on demand.
+/// The cost is one cold load; it is recoverable, and it is the deliberate trade
+/// against leaving tens of GB of VRAM pinned by nothing.
+pub const DEFAULT_PIN_HORIZON_DAYS: i64 = 3650;
+
+/// **Measured provenance evidence (Ollama 0.22.1, live host, 2026-07-31).** A
+/// `GET /api/ps` entry carries exactly:
+/// `name`, `model`, `size`, `digest`, `details{parent_model,format,family,families,
+/// parameter_size,quantization_level}`, `expires_at`, `size_vram`, `context_length`.
+///
+/// There is **no** `keep_alive`, no `indefinite`/`pinned` flag, no loader identity,
+/// and no session/owner field. `digest`/`details` identify WHAT is loaded, never HOW
+/// it was pinned or by WHOM — two models loaded with `24h` and with `-1` are
+/// byte-identical in every field except `expires_at`. So there is nothing cheaper or
+/// better than the expiry to key on, and the horizon below stays a heuristic by
+/// necessity, not by laziness. If a future Ollama exposes keep-alive provenance,
+/// prefer it and demote the horizon to a fallback.
+pub const PROVENANCE: &str = "ollama /api/ps 0.22.1 exposes no keep_alive/owner field; expiry distance is the only available signal";
+
+/// `CHORD_RESIDENT_PIN_HORIZON_DAYS` (default [`DEFAULT_PIN_HORIZON_DAYS`], 10 years).
+/// An `/api/ps` expiry further out than this is *inferred* to be a legacy INDEFINITE
+/// pin rather than a keep_alive. See [`DEFAULT_PIN_HORIZON_DAYS`] for the margins on
+/// each side and the false-positive cost.
 pub fn pin_horizon_days() -> i64 {
     std::env::var("CHORD_RESIDENT_PIN_HORIZON_DAYS")
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(365)
+        .unwrap_or(DEFAULT_PIN_HORIZON_DAYS)
 }
 
 /// Is this `/api/ps` `expires_at` an INDEFINITE pin (further out than `horizon_days`
@@ -1911,63 +1957,173 @@ async fn unload_untyped(client: &reqwest::Client, base: &str, model: &str) -> bo
     }
 }
 
-/// How many models a convergence pass released (returned for observability/tests).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ConvergeReport {
-    pub found: usize,
-    pub unpinned: usize,
+/// How a convergence pass ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvergeStatus {
+    /// No `OLLAMA_URL`: there is nothing to converge against and retrying cannot
+    /// change that. TERMINAL — never retried.
+    Unconfigured,
+    /// Ollama did not answer `/api/ps`. Transient by nature ⇒ worth a retry.
+    Unreachable,
+    /// The pass ran and nothing legacy-pinned is left. TERMINAL — the success case.
+    Settled,
+    /// The pass ran but at least one release did not land ⇒ worth a retry.
+    Stranded,
 }
 
-/// Run the startup convergence described above. Best-effort and idempotent.
-pub async fn converge_legacy_pins(state: &Arc<crate::routes::AppState>) -> ConvergeReport {
-    let Some(base) = crate::gpu_exclusive::ollama_base_from_env() else {
-        info!("resident-set: OLLAMA_URL unset — skipping legacy pin convergence (best-effort)");
-        return ConvergeReport::default();
-    };
-    let base = base.trim_end_matches('/').to_string();
-    let stats = crate::sweep_status::ollama::query_ollama_ps(&state.http_client, &base).await;
-    if !stats.available {
-        info!("resident-set: Ollama /api/ps unavailable — skipping legacy pin convergence");
-        return ConvergeReport::default();
+impl ConvergeStatus {
+    /// Is this a terminal outcome — i.e. must the bounded retry loop STOP here?
+    /// Only `Settled` (done) and `Unconfigured` (nothing a retry can fix) are.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, ConvergeStatus::Settled | ConvergeStatus::Unconfigured)
     }
-    let held: HashSet<String> = global()
-        .status()
-        .await
-        .roles
-        .into_iter()
-        .filter(|r| r.warm)
-        .filter_map(|r| r.model)
-        .collect();
-    let loaded: Vec<(String, Option<String>)> = stats
-        .models
-        .into_iter()
-        .map(|m| (m.name, m.expires_at))
-        .collect();
-    let targets = plan_unpin(
-        &loaded,
-        &held,
-        crate::gpu_exclusive::now_epoch() as i64,
-        pin_horizon_days(),
-    );
+}
+
+/// The outcome of one convergence pass (returned for observability/tests).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvergeReport {
+    pub status: ConvergeStatus,
+    /// Legacy pins this pass identified.
+    pub found: usize,
+    /// …of which it successfully released.
+    pub unpinned: usize,
+    /// …and the names it could NOT release, so a give-up log can name them.
+    pub stranded: Vec<String>,
+}
+
+impl ConvergeReport {
+    fn terminal(status: ConvergeStatus) -> Self {
+        ConvergeReport {
+            status,
+            found: 0,
+            unpinned: 0,
+            stranded: Vec::new(),
+        }
+    }
+}
+
+impl Default for ConvergeReport {
+    fn default() -> Self {
+        ConvergeReport::terminal(ConvergeStatus::Settled)
+    }
+}
+
+/// The seam convergence runs against, so the whole policy (including the retry
+/// loop) is testable without a real Ollama, a real `AppState`, or a network.
+#[async_trait]
+pub trait ConvergeEnv: Send + Sync {
+    /// Currently loaded models as `(name, expires_at)`, or why we cannot tell.
+    async fn loaded(&self) -> Result<Vec<(String, Option<String>)>, ConvergeStatus>;
+    /// The models the resident set currently HOLDS — never touched by convergence.
+    ///
+    /// Re-read on EVERY pass on purpose: a retry must see a model the set has
+    /// re-warmed in the meantime and leave it alone, so retrying can never fight a
+    /// legitimate re-warm.
+    async fn held(&self) -> HashSet<String>;
+    /// Release one model from VRAM. Returns whether it landed. Never errors.
+    async fn unload(&self, model: &str) -> bool;
+    /// Wall clock, epoch seconds (injected so tests are deterministic).
+    fn now_epoch_secs(&self) -> i64;
+}
+
+/// The production [`ConvergeEnv`]: the real Ollama + the live resident set.
+pub struct AppStateConvergeEnv<'a> {
+    state: &'a Arc<crate::routes::AppState>,
+}
+
+impl<'a> AppStateConvergeEnv<'a> {
+    pub fn new(state: &'a Arc<crate::routes::AppState>) -> Self {
+        AppStateConvergeEnv { state }
+    }
+    fn base(&self) -> Option<String> {
+        crate::gpu_exclusive::ollama_base_from_env()
+            .map(|b| b.trim_end_matches('/').to_string())
+    }
+}
+
+#[async_trait]
+impl<'a> ConvergeEnv for AppStateConvergeEnv<'a> {
+    async fn loaded(&self) -> Result<Vec<(String, Option<String>)>, ConvergeStatus> {
+        let Some(base) = self.base() else {
+            return Err(ConvergeStatus::Unconfigured);
+        };
+        let stats =
+            crate::sweep_status::ollama::query_ollama_ps(&self.state.http_client, &base).await;
+        if !stats.available {
+            return Err(ConvergeStatus::Unreachable);
+        }
+        Ok(stats
+            .models
+            .into_iter()
+            .map(|m| (m.name, m.expires_at))
+            .collect())
+    }
+
+    async fn held(&self) -> HashSet<String> {
+        global()
+            .status()
+            .await
+            .roles
+            .into_iter()
+            .filter(|r| r.warm)
+            .filter_map(|r| r.model)
+            .collect()
+    }
+
+    async fn unload(&self, model: &str) -> bool {
+        let Some(base) = self.base() else {
+            return false;
+        };
+        unload_untyped(&self.state.http_client, &base, model).await
+    }
+
+    fn now_epoch_secs(&self) -> i64 {
+        crate::gpu_exclusive::now_epoch() as i64
+    }
+}
+
+/// ONE convergence pass against an injected env. Best-effort and idempotent.
+pub async fn converge_once(env: &dyn ConvergeEnv) -> ConvergeReport {
+    let loaded = match env.loaded().await {
+        Ok(l) => l,
+        Err(ConvergeStatus::Unconfigured) => {
+            info!("resident-set: OLLAMA_URL unset — no legacy pin convergence possible (best-effort)");
+            return ConvergeReport::terminal(ConvergeStatus::Unconfigured);
+        }
+        Err(_) => {
+            info!("resident-set: Ollama /api/ps unavailable — legacy pin convergence deferred to a retry");
+            return ConvergeReport::terminal(ConvergeStatus::Unreachable);
+        }
+    };
+    let held = env.held().await;
+    let targets = plan_unpin(&loaded, &held, env.now_epoch_secs(), pin_horizon_days());
     let mut report = ConvergeReport {
+        status: ConvergeStatus::Settled,
         found: targets.len(),
         unpinned: 0,
+        stranded: Vec::new(),
     };
     for model in targets {
         warn!(
             model = %model,
-            "resident-set: found a LEGACY INDEFINITE VRAM pin owned by no lifecycle (retired keep-resident mechanism) — releasing it"
+            horizon_days = pin_horizon_days(),
+            heuristic = true,
+            "resident-set: expiry is past the pin horizon, so this is INFERRED to be a legacy indefinite VRAM pin owned by no lifecycle (retired keep-resident mechanism) — releasing it. Heuristic: Ollama exposes no keep-alive provenance; a false positive costs one on-demand reload, nothing is deleted"
         );
-        if unload_untyped(&state.http_client, &base, &model).await {
+        if env.unload(&model).await {
             report.unpinned += 1;
         } else {
             warn!(
                 model = %model,
-                "resident-set: legacy pin release did not land (best-effort, continuing)"
+                "resident-set: legacy pin release did not land — will retry (bounded)"
             );
+            report.stranded.push(model);
         }
     }
-    if report.found > 0 {
+    if !report.stranded.is_empty() {
+        report.status = ConvergeStatus::Stranded;
+    }
+    if report.found > 0 && report.status == ConvergeStatus::Settled {
         info!(
             found = report.found,
             unpinned = report.unpinned,
@@ -1975,6 +2131,218 @@ pub async fn converge_legacy_pins(state: &Arc<crate::routes::AppState>) -> Conve
         );
     }
     report
+}
+
+/// Run the startup convergence against the live host. Best-effort and idempotent.
+pub async fn converge_legacy_pins(state: &Arc<crate::routes::AppState>) -> ConvergeReport {
+    converge_once(&AppStateConvergeEnv::new(state)).await
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CHRD-PIN-01: BOUNDED convergence retry
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// A single best-effort pass strands a pin forever if Ollama happens to be down at
+// startup, or if one unload fails. So convergence retries — but STRICTLY BOUNDED:
+// a small number of attempts with exponential backoff, stopping the moment it
+// succeeds once (or hits an outcome no retry can fix). It is deliberately NOT a
+// background loop: nothing here can end up hammering Ollama for the process
+// lifetime. Every attempt re-reads what the resident set holds, so a retry can
+// never fight a legitimate re-warm.
+
+/// Bounded retry policy for startup convergence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConvergeRetryPolicy {
+    /// TOTAL attempts, including the first. Always >= 1 and hard-capped.
+    pub attempts: u32,
+    pub base_backoff: Duration,
+    pub max_backoff: Duration,
+}
+
+/// The hard ceiling on attempts, whatever the env says — the bound is not
+/// operator-defeatable.
+pub const CONVERGE_MAX_ATTEMPTS: u32 = 10;
+
+impl Default for ConvergeRetryPolicy {
+    fn default() -> Self {
+        // 5 attempts, 30s → 60s → 120s → 240s: bounded at ~7.5 minutes total.
+        ConvergeRetryPolicy {
+            attempts: 5,
+            base_backoff: Duration::from_secs(30),
+            max_backoff: Duration::from_secs(300),
+        }
+    }
+}
+
+impl ConvergeRetryPolicy {
+    pub fn from_env() -> Self {
+        let d = ConvergeRetryPolicy::default();
+        let attempts = std::env::var("CHORD_RESIDENT_PIN_CONVERGE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .map(|n| n.clamp(1, CONVERGE_MAX_ATTEMPTS))
+            .unwrap_or(d.attempts);
+        let base = std::env::var("CHORD_RESIDENT_PIN_CONVERGE_BACKOFF_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .map(Duration::from_secs)
+            .unwrap_or(d.base_backoff);
+        let max = std::env::var("CHORD_RESIDENT_PIN_CONVERGE_MAX_BACKOFF_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .map(Duration::from_secs)
+            .unwrap_or(d.max_backoff);
+        ConvergeRetryPolicy {
+            attempts,
+            base_backoff: base,
+            max_backoff: max.max(base),
+        }
+    }
+
+    /// Backoff before the attempt AFTER `attempt_index` (0-based): exponential from
+    /// `base_backoff`, capped at `max_backoff`. Pure.
+    pub fn backoff(&self, attempt_index: u32) -> Duration {
+        let shift = attempt_index.min(16);
+        let secs = self
+            .base_backoff
+            .as_secs()
+            .saturating_mul(1u64 << shift)
+            .min(self.max_backoff.as_secs());
+        Duration::from_secs(secs)
+    }
+}
+
+/// Drive [`converge_once`] under a BOUNDED retry policy. Returns the final report
+/// and how many attempts were spent. `attempt` and `sleep` are injected so the
+/// bound itself is unit-testable without wall-clock time.
+pub async fn converge_until_settled<A, AF, S, SF>(
+    policy: &ConvergeRetryPolicy,
+    mut attempt: A,
+    mut sleep: S,
+) -> (ConvergeReport, u32)
+where
+    A: FnMut() -> AF,
+    AF: std::future::Future<Output = ConvergeReport>,
+    S: FnMut(Duration) -> SF,
+    SF: std::future::Future<Output = ()>,
+{
+    let total = policy.attempts.clamp(1, CONVERGE_MAX_ATTEMPTS);
+    let mut report = ConvergeReport::terminal(ConvergeStatus::Unreachable);
+    for i in 0..total {
+        report = attempt().await;
+        if report.status.is_terminal() {
+            if i > 0 {
+                info!(
+                    attempts = i + 1,
+                    "resident-set: legacy pin convergence succeeded on retry"
+                );
+            }
+            return (report, i + 1);
+        }
+        if i + 1 < total {
+            sleep(policy.backoff(i)).await;
+        }
+    }
+    warn!(
+        attempts = total,
+        status = ?report.status,
+        still_pinned = %if report.stranded.is_empty() { "unknown (Ollama unreachable)".to_string() } else { report.stranded.join(", ") },
+        "resident-set: GIVING UP on legacy pin convergence after the bounded retry budget — the models named above are still holding VRAM that no lifecycle owns; an operator must unload them (ollama stop <model>) or restart Ollama"
+    );
+    (report, total)
+}
+
+/// Production convergence: bounded retries against the live host, real sleeps.
+pub async fn converge_legacy_pins_bounded(state: Arc<crate::routes::AppState>) -> ConvergeReport {
+    let policy = ConvergeRetryPolicy::from_env();
+    let (report, _attempts) = converge_until_settled(
+        &policy,
+        || {
+            let state = state.clone();
+            async move { converge_legacy_pins(&state).await }
+        },
+        |d| tokio::time::sleep(d),
+    )
+    .await;
+    if report.found > 0 {
+        info!(
+            found = report.found,
+            unpinned = report.unpinned,
+            "resident-set: released legacy indefinite VRAM pins at startup"
+        );
+    }
+    report
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CHRD-PIN-01: the startup residency task (EXPLICIT ordering)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The single startup entry point for residency. Owns the ORDER of the three
+/// startup concerns, explicitly, so none of it is incidental to how the calls
+/// happen to be arranged in `main`:
+///
+/// 1. **If the resident set is ENABLED**, its first warm runs to COMPLETION first.
+///    That re-asserts a bounded `keep_alive` on everything the set legitimately
+///    holds, so step 2 sees those models as bounded and skips them. This ordering
+///    is the reason convergence cannot unload the set's own models out from under it.
+/// 2. **Convergence runs UNCONDITIONALLY** — it is a MIGRATION concern, not a
+///    residency-feature concern. Gating it on `CHORD_RESIDENT_SET_ENABLED` would be
+///    exactly backwards: with the set OFF, nothing else in the process will ever
+///    release a stranded `keep_alive` pin, so that is precisely when convergence
+///    matters most. Disabled ⇒ the set holds nothing ⇒ everything that looks like a
+///    legacy pin converges.
+/// 3. **The reconcile loop** then runs for the life of the process (itself a no-op
+///    while the set is disabled or released).
+///
+/// Convergence is spawned rather than awaited so its bounded retry backoff can
+/// never delay the reconcile loop starting — but it is spawned only AFTER the warm
+/// in step 1 has returned, which is what makes the ordering a guarantee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartupPlan {
+    /// Warm the set (and therefore wait for that warm) BEFORE converging.
+    pub warm_first: bool,
+    /// Run legacy-pin convergence at all.
+    pub converge: bool,
+}
+
+/// The startup ordering, as DATA rather than as control flow buried in a spawn —
+/// so "convergence does not depend on resident-set enablement" is a property a test
+/// can assert directly instead of one a reader has to infer.
+pub fn plan_startup(resident_set_enabled: bool) -> StartupPlan {
+    StartupPlan {
+        // Only an ENABLED set has a warm to wait for.
+        warm_first: resident_set_enabled,
+        // ALWAYS. Migration concern, not a residency-feature concern.
+        converge: true,
+    }
+}
+
+pub async fn startup_residency(state: Arc<crate::routes::AppState>) {
+    let set = global();
+    let plan = plan_startup(set.config().enabled);
+
+    // Step 1 — ordering gate.
+    if plan.warm_first {
+        let _ = set.warm(&state, "startup", true).await;
+    } else {
+        info!(
+            "resident-set: DISABLED (CHORD_RESIDENT_SET_ENABLED=0) — no warm; legacy-pin convergence still runs, because with the set off nothing else would ever release a stranded pin"
+        );
+    }
+
+    // Step 2 — unconditional, and demonstrably after step 1.
+    if plan.converge {
+        let converge_state = state.clone();
+        tokio::spawn(async move {
+            converge_legacy_pins_bounded(converge_state).await;
+        });
+    }
+
+    // Step 3.
+    reconcile_loop(state, set.config().refresh).await;
 }
 
 /// Background loop: periodically reconcile the resident set so an alias repoint
@@ -2540,6 +2908,297 @@ mod tests {
             .to_rfc3339();
         let loaded = vec![("a:1b".to_string(), Some(soon))];
         assert!(plan_unpin(&loaded, &HashSet::new(), now, 365).is_empty());
+    }
+
+    // ── CHRD-PIN-01 round 2: horizon, enablement-independence, bounded retry ──
+
+    /// A fake [`ConvergeEnv`]: no Ollama, no `AppState`, no clock.
+    struct FakeConvergeEnv {
+        loaded: Result<Vec<(String, Option<String>)>, ConvergeStatus>,
+        held: HashSet<String>,
+        now: i64,
+        /// Models whose unload must FAIL (to exercise the stranded path).
+        fail_unload: HashSet<String>,
+        unloaded: StdMutex<Vec<String>>,
+    }
+
+    impl FakeConvergeEnv {
+        fn new(loaded: Vec<(String, Option<String>)>, held: &[&str], now: i64) -> Self {
+            FakeConvergeEnv {
+                loaded: Ok(loaded),
+                held: held.iter().map(|s| s.to_string()).collect(),
+                now,
+                fail_unload: HashSet::new(),
+                unloaded: StdMutex::new(Vec::new()),
+            }
+        }
+        fn unloaded(&self) -> Vec<String> {
+            self.unloaded.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ConvergeEnv for FakeConvergeEnv {
+        async fn loaded(&self) -> Result<Vec<(String, Option<String>)>, ConvergeStatus> {
+            self.loaded.clone()
+        }
+        async fn held(&self) -> HashSet<String> {
+            self.held.clone()
+        }
+        async fn unload(&self, model: &str) -> bool {
+            if self.fail_unload.contains(model) {
+                return false;
+            }
+            self.unloaded.lock().unwrap().push(model.to_string());
+            true
+        }
+        fn now_epoch_secs(&self) -> i64 {
+            self.now
+        }
+    }
+
+    /// Ollama renders `keep_alive:-1` as `now + i64::MAX ns` ≈ 292.27 years.
+    /// Measured live on Ollama 0.22.1 (2026-07-31) as `2318-11-10T13:14:31`.
+    const SENTINEL_SECS: i64 = 9_223_372_036; // i64::MAX nanoseconds, in seconds
+
+    fn at(now: i64, offset_secs: i64) -> String {
+        chrono::DateTime::from_timestamp(now + offset_secs, 0)
+            .unwrap()
+            .to_rfc3339()
+    }
+
+    // FINDING 1 — convergence must NOT depend on resident-set enablement.
+
+    #[test]
+    fn convergence_is_planned_whether_or_not_the_resident_set_is_enabled() {
+        // The whole point: disabling the set is precisely when nothing else will
+        // ever release a stranded pin, so convergence must still be planned.
+        assert!(plan_startup(false).converge);
+        assert!(plan_startup(true).converge);
+        // …and only an ENABLED set has a first warm to be sequenced after.
+        assert!(!plan_startup(false).warm_first);
+        assert!(plan_startup(true).warm_first);
+    }
+
+    #[tokio::test]
+    async fn convergence_runs_with_the_resident_set_disabled() {
+        // A disabled set holds nothing, so `held` is empty — and EVERYTHING that
+        // looks like a legacy pin must converge.
+        let now = 1_800_000_000i64;
+        let env = FakeConvergeEnv::new(
+            vec![
+                ("stranded:30b".to_string(), Some(at(now, SENTINEL_SECS))),
+                (
+                    "would-be-held:8b".to_string(),
+                    Some(at(now, SENTINEL_SECS)),
+                ),
+            ],
+            &[], // disabled ⇒ the set reports no warm role
+            now,
+        );
+        let report = converge_once(&env).await;
+        assert_eq!(report.status, ConvergeStatus::Settled);
+        assert_eq!(report.found, 2);
+        assert_eq!(report.unpinned, 2);
+        assert_eq!(env.unloaded(), vec!["stranded:30b", "would-be-held:8b"]);
+    }
+
+    #[tokio::test]
+    async fn convergence_still_skips_what_the_set_holds_when_enabled() {
+        // Positive control for the test above: the ONLY difference is that the
+        // enabled set holds `would-be-held:8b`, and that model is then untouched.
+        let now = 1_800_000_000i64;
+        let env = FakeConvergeEnv::new(
+            vec![
+                ("stranded:30b".to_string(), Some(at(now, SENTINEL_SECS))),
+                (
+                    "would-be-held:8b".to_string(),
+                    Some(at(now, SENTINEL_SECS)),
+                ),
+            ],
+            &["would-be-held:8b"],
+            now,
+        );
+        let report = converge_once(&env).await;
+        assert_eq!(report.found, 1);
+        assert_eq!(env.unloaded(), vec!["stranded:30b"]);
+    }
+
+    // FINDING 2 — the horizon must not confuse a long BOUNDED keep_alive with `-1`.
+
+    #[test]
+    fn the_pin_horizon_clears_the_sentinel_and_every_plausible_bounded_keep_alive() {
+        let now = 1_800_000_000i64;
+        let h = DEFAULT_PIN_HORIZON_DAYS;
+        // Margin ABOVE: the sentinel is ~29x further out than the horizon.
+        assert!(SENTINEL_SECS / (h * 86_400) >= 29);
+        assert!(is_indefinite_pin(Some(&at(now, SENTINEL_SECS)), now, h));
+        // Margin BELOW: an absurd but DELIBERATE bounded keep_alive of one year
+        // (`8760h`) is 10x inside the horizon and must never be unloaded…
+        assert_eq!(h / 365, 10);
+        assert!(!is_indefinite_pin(Some(&at(now, 365 * 86_400)), now, h));
+        // …including one deliberately LONGER than the old 365-day default, which
+        // is the exact misclassification this raise fixes.
+        let four_hundred_days = 400 * 86_400;
+        assert!(!is_indefinite_pin(Some(&at(now, four_hundred_days)), now, h));
+        assert!(
+            is_indefinite_pin(Some(&at(now, four_hundred_days)), now, 365),
+            "regression witness: the OLD 365-day horizon misclassified this bounded keep_alive"
+        );
+        // The set's own 24h residency is 3650x inside the horizon.
+        assert!(!is_indefinite_pin(Some(&at(now, 86_400)), now, h));
+    }
+
+    #[tokio::test]
+    async fn a_long_bounded_keep_alive_is_never_unloaded_but_the_sentinel_is() {
+        let now = 1_800_000_000i64;
+        let env = FakeConvergeEnv::new(
+            vec![
+                ("sentinel:30b".to_string(), Some(at(now, SENTINEL_SECS))),
+                (
+                    "long-bounded:8b".to_string(),
+                    Some(at(now, 400 * 86_400)),
+                ),
+                ("ordinary:1b".to_string(), Some(at(now, 86_400))),
+            ],
+            &[],
+            now,
+        );
+        let report = converge_once(&env).await;
+        assert_eq!(report.found, 1);
+        assert_eq!(env.unloaded(), vec!["sentinel:30b"]);
+    }
+
+    #[test]
+    fn ollama_ps_exposes_no_better_provenance_than_the_expiry() {
+        // Documents the measured evidence (0.22.1 live, 2026-07-31): every /api/ps
+        // field is about WHAT is loaded, never HOW it was pinned. The classifier is
+        // therefore a heuristic on purpose, and says so.
+        assert!(PROVENANCE.contains("no keep_alive"));
+        assert!(PROVENANCE.contains("only available signal"));
+    }
+
+    // FINDING 3 — bounded retry.
+
+    #[test]
+    fn the_retry_backoff_is_exponential_and_capped() {
+        let p = ConvergeRetryPolicy::default();
+        assert_eq!(p.backoff(0), Duration::from_secs(30));
+        assert_eq!(p.backoff(1), Duration::from_secs(60));
+        assert_eq!(p.backoff(2), Duration::from_secs(120));
+        assert_eq!(p.backoff(3), Duration::from_secs(240));
+        // Capped — it can never grow without bound.
+        assert_eq!(p.backoff(20), p.max_backoff);
+    }
+
+    #[tokio::test]
+    async fn a_failed_first_convergence_attempt_is_retried_and_succeeds() {
+        use std::cell::RefCell;
+        let calls = RefCell::new(0u32);
+        let sleeps: RefCell<Vec<Duration>> = RefCell::new(Vec::new());
+        let policy = ConvergeRetryPolicy::default();
+        let (report, attempts) = converge_until_settled(
+            &policy,
+            || async {
+                let mut c = calls.borrow_mut();
+                *c += 1;
+                if *c == 1 {
+                    // Ollama was down at startup.
+                    ConvergeReport {
+                        status: ConvergeStatus::Unreachable,
+                        found: 0,
+                        unpinned: 0,
+                        stranded: Vec::new(),
+                    }
+                } else {
+                    ConvergeReport {
+                        status: ConvergeStatus::Settled,
+                        found: 1,
+                        unpinned: 1,
+                        stranded: Vec::new(),
+                    }
+                }
+            },
+            |d| {
+                sleeps.borrow_mut().push(d);
+                async {}
+            },
+        )
+        .await;
+        assert_eq!(attempts, 2, "retried exactly once, then stopped on success");
+        assert_eq!(report.status, ConvergeStatus::Settled);
+        assert_eq!(*calls.borrow(), 2);
+        assert_eq!(sleeps.borrow().as_slice(), &[Duration::from_secs(30)]);
+    }
+
+    #[tokio::test]
+    async fn exhausted_retries_stop_bounded_and_report_what_is_still_pinned() {
+        use std::cell::RefCell;
+        let calls = RefCell::new(0u32);
+        let sleeps: RefCell<Vec<Duration>> = RefCell::new(Vec::new());
+        let policy = ConvergeRetryPolicy {
+            attempts: 3,
+            base_backoff: Duration::from_secs(10),
+            max_backoff: Duration::from_secs(15),
+        };
+        let (report, attempts) = converge_until_settled(
+            &policy,
+            || async {
+                *calls.borrow_mut() += 1;
+                ConvergeReport {
+                    status: ConvergeStatus::Stranded,
+                    found: 1,
+                    unpinned: 0,
+                    stranded: vec!["stuck:30b".to_string()],
+                }
+            },
+            |d| {
+                sleeps.borrow_mut().push(d);
+                async {}
+            },
+        )
+        .await;
+        assert_eq!(attempts, 3, "BOUNDED: never more than the budget");
+        assert_eq!(*calls.borrow(), 3);
+        // One fewer sleep than attempts — it never sleeps after giving up.
+        assert_eq!(
+            sleeps.borrow().as_slice(),
+            &[Duration::from_secs(10), Duration::from_secs(15)]
+        );
+        assert_eq!(report.stranded, vec!["stuck:30b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn an_unconfigured_ollama_is_terminal_and_never_retried() {
+        use std::cell::RefCell;
+        let calls = RefCell::new(0u32);
+        let (report, attempts) = converge_until_settled(
+            &ConvergeRetryPolicy::default(),
+            || async {
+                *calls.borrow_mut() += 1;
+                ConvergeReport {
+                    status: ConvergeStatus::Unconfigured,
+                    found: 0,
+                    unpinned: 0,
+                    stranded: Vec::new(),
+                }
+            },
+            |_| async {},
+        )
+        .await;
+        assert_eq!(attempts, 1);
+        assert_eq!(*calls.borrow(), 1);
+        assert_eq!(report.status, ConvergeStatus::Unconfigured);
+    }
+
+    #[test]
+    fn the_retry_budget_is_hard_capped_regardless_of_configuration() {
+        let p = ConvergeRetryPolicy {
+            attempts: 10_000,
+            ..ConvergeRetryPolicy::default()
+        };
+        // The driver clamps, so no env/config value can turn this into a loop.
+        assert!(p.attempts.clamp(1, CONVERGE_MAX_ATTEMPTS) <= CONVERGE_MAX_ATTEMPTS);
     }
 
     // ── The never-pulled guard ──────────────────────────────────────────────
