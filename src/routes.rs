@@ -2137,11 +2137,28 @@ pub async fn gpu_exclusive_acquire(
                 }
             }
             if new_grant {
-                tracing::info!(holder = %record.holder, "gpu-exclusive: granted — evicting resident models");
+                // Phase 1 (lumina resident mode): under the unified GTT the exclusive
+                // grant EXEMPTS the keep-resident working-set from eviction (default
+                // ON) so the assistant stays hot through a compiler/intake sweep. The
+                // exclusive lease itself is unaffected — the holder still owns the
+                // lock; we only narrow WHICH resident models the grant unloads.
+                let exempt: Vec<String> = if crate::config::gpu_exclusive_exempt_keep_resident() {
+                    crate::config::model_keep_resident()
+                } else {
+                    Vec::new()
+                };
+                tracing::info!(
+                    holder = %record.holder,
+                    exempt_count = exempt.len(),
+                    "gpu-exclusive: granted — evicting resident models (keep-resident set exempt)"
+                );
                 if let Some(base) = crate::gpu_exclusive::ollama_base_from_env() {
-                    let unloaded =
-                        crate::gpu_exclusive::evict_resident_models(&state.http_client, &base)
-                            .await;
+                    let unloaded = crate::gpu_exclusive::evict_resident_models(
+                        &state.http_client,
+                        &base,
+                        &exempt,
+                    )
+                    .await;
                     tracing::info!(holder = %record.holder, unloaded, "gpu-exclusive: acquire eviction complete");
                 }
                 // CHRD-DIFF-01: the managed DiffusionGemma daemon is not tracked
@@ -2200,6 +2217,27 @@ pub async fn gpu_exclusive_release(
     match crate::gpu_exclusive::GPU_EXCLUSIVE.release(&holder) {
         crate::gpu_exclusive::ReleaseOutcome::Released => {
             tracing::info!(holder = %holder, "gpu-exclusive: released — normal serving resumed");
+            // Phase 1: after an exclusive session ends, re-warm the keep-resident
+            // set so anything that DID get touched (e.g. exemption disabled, or a
+            // model unloaded by the sweep's own memory pressure) is pinned back to
+            // keep_alive:-1 promptly rather than waiting for the periodic timer.
+            // Best-effort / fail-soft; a no-op when the set is empty.
+            let keep_resident = crate::config::model_keep_resident();
+            if !keep_resident.is_empty() {
+                if let Some(base) = crate::gpu_exclusive::ollama_base_from_env() {
+                    let warmed = crate::gpu_exclusive::warm_keep_resident_models(
+                        &state.http_client,
+                        &base,
+                        &keep_resident,
+                    )
+                    .await;
+                    tracing::info!(
+                        holder = %holder,
+                        warmed,
+                        "[keep-resident] re-warmed working-set after exclusive release"
+                    );
+                }
+            }
             (
                 StatusCode::OK,
                 Json(serde_json::json!({ "status": "released" })),
@@ -2425,6 +2463,9 @@ mod tests {
             model_archive_path: "/var/lib/model-archive".into(),
             model_local_path: "/opt/ollama-models".into(),
             model_protected: vec![],
+            model_keep_resident: vec![],
+            model_keep_resident_rewarm_secs: 120,
+            gpu_exclusive_exempt_keep_resident: true,
             model_pull_timeout_secs: 600,
             model_registry_path: "<path>/model-registry.json".into(),
             model_disk_pressure_percent: 80,
@@ -2454,6 +2495,9 @@ mod tests {
                 model_archive_path: "/var/lib/model-archive".into(),
                 model_local_path: "/opt/ollama-models".into(),
                 model_protected: vec![],
+                model_keep_resident: vec![],
+                model_keep_resident_rewarm_secs: 120,
+                gpu_exclusive_exempt_keep_resident: true,
                 model_pull_timeout_secs: 600,
                 model_registry_path: "<path>/model-registry.json".into(),
                 model_disk_pressure_percent: 80,
@@ -2567,6 +2611,9 @@ mod tests {
             model_archive_path: "/var/lib/model-archive".into(),
             model_local_path: "/opt/ollama-models".into(),
             model_protected: vec![],
+            model_keep_resident: vec![],
+            model_keep_resident_rewarm_secs: 120,
+            gpu_exclusive_exempt_keep_resident: true,
             model_pull_timeout_secs: 600,
             model_registry_path: "<path>/model-registry.json".into(),
             model_disk_pressure_percent: 80,
@@ -2657,6 +2704,9 @@ mod tests {
             model_archive_path: "/var/lib/model-archive".into(),
             model_local_path: "/opt/ollama-models".into(),
             model_protected: vec![],
+            model_keep_resident: vec![],
+            model_keep_resident_rewarm_secs: 120,
+            gpu_exclusive_exempt_keep_resident: true,
             model_pull_timeout_secs: 600,
             model_registry_path: "<path>/model-registry.json".into(),
             model_disk_pressure_percent: 80,
@@ -2686,6 +2736,9 @@ mod tests {
                 model_archive_path: "/var/lib/model-archive".into(),
                 model_local_path: "/opt/ollama-models".into(),
                 model_protected: vec![],
+                model_keep_resident: vec![],
+                model_keep_resident_rewarm_secs: 120,
+                gpu_exclusive_exempt_keep_resident: true,
                 model_pull_timeout_secs: 600,
                 model_registry_path: "<path>/model-registry.json".into(),
                 model_disk_pressure_percent: 80,
@@ -2762,6 +2815,9 @@ mod tests {
             model_archive_path: "/var/lib/model-archive".into(),
             model_local_path: "/opt/ollama-models".into(),
             model_protected: vec![],
+            model_keep_resident: vec![],
+            model_keep_resident_rewarm_secs: 120,
+            gpu_exclusive_exempt_keep_resident: true,
             model_pull_timeout_secs: 600,
             model_registry_path: "<path>/model-registry.json".into(),
             model_disk_pressure_percent: 80,
@@ -2791,6 +2847,9 @@ mod tests {
                 model_archive_path: "/var/lib/model-archive".into(),
                 model_local_path: "/opt/ollama-models".into(),
                 model_protected: vec![],
+                model_keep_resident: vec![],
+                model_keep_resident_rewarm_secs: 120,
+                gpu_exclusive_exempt_keep_resident: true,
                 model_pull_timeout_secs: 600,
                 model_registry_path: "<path>/model-registry.json".into(),
                 model_disk_pressure_percent: 80,
@@ -2879,6 +2938,9 @@ mod tests {
             model_archive_path: "/var/lib/model-archive".into(),
             model_local_path: "/opt/ollama-models".into(),
             model_protected: vec![],
+            model_keep_resident: vec![],
+            model_keep_resident_rewarm_secs: 120,
+            gpu_exclusive_exempt_keep_resident: true,
             model_pull_timeout_secs: 600,
             model_registry_path: "<path>/model-registry.json".into(),
             model_disk_pressure_percent: 80,
@@ -2946,6 +3008,9 @@ mod tests {
             model_archive_path: "/var/lib/model-archive".into(),
             model_local_path: "/opt/ollama-models".into(),
             model_protected: vec![],
+            model_keep_resident: vec![],
+            model_keep_resident_rewarm_secs: 120,
+            gpu_exclusive_exempt_keep_resident: true,
             model_pull_timeout_secs: 600,
             model_registry_path: "<path>/model-registry.json".into(),
             model_disk_pressure_percent: 80,
@@ -2975,6 +3040,9 @@ mod tests {
                 model_archive_path: "/var/lib/model-archive".into(),
                 model_local_path: "/opt/ollama-models".into(),
                 model_protected: vec![],
+                model_keep_resident: vec![],
+                model_keep_resident_rewarm_secs: 120,
+                gpu_exclusive_exempt_keep_resident: true,
                 model_pull_timeout_secs: 600,
                 model_registry_path: "<path>/model-registry.json".into(),
                 model_disk_pressure_percent: 80,
@@ -3054,6 +3122,9 @@ mod tests {
             model_archive_path: "/var/lib/model-archive".into(),
             model_local_path: "/opt/ollama-models".into(),
             model_protected: vec![],
+            model_keep_resident: vec![],
+            model_keep_resident_rewarm_secs: 120,
+            gpu_exclusive_exempt_keep_resident: true,
             model_pull_timeout_secs: 600,
             model_registry_path: "<path>/model-registry.json".into(),
             model_disk_pressure_percent: 80,
@@ -3083,6 +3154,9 @@ mod tests {
                 model_archive_path: "/var/lib/model-archive".into(),
                 model_local_path: "/opt/ollama-models".into(),
                 model_protected: vec![],
+                model_keep_resident: vec![],
+                model_keep_resident_rewarm_secs: 120,
+                gpu_exclusive_exempt_keep_resident: true,
                 model_pull_timeout_secs: 600,
                 model_registry_path: "<path>/model-registry.json".into(),
                 model_disk_pressure_percent: 80,
@@ -3165,6 +3239,9 @@ mod tests {
             model_archive_path: "/var/lib/model-archive".into(),
             model_local_path: "/opt/ollama-models".into(),
             model_protected: vec![],
+            model_keep_resident: vec![],
+            model_keep_resident_rewarm_secs: 120,
+            gpu_exclusive_exempt_keep_resident: true,
             model_pull_timeout_secs: 600,
             model_registry_path: "<path>/model-registry.json".into(),
             model_disk_pressure_percent: 80,
@@ -3194,6 +3271,9 @@ mod tests {
                 model_archive_path: "/var/lib/model-archive".into(),
                 model_local_path: "/opt/ollama-models".into(),
                 model_protected: vec![],
+                model_keep_resident: vec![],
+                model_keep_resident_rewarm_secs: 120,
+                gpu_exclusive_exempt_keep_resident: true,
                 model_pull_timeout_secs: 600,
                 model_registry_path: "<path>/model-registry.json".into(),
                 model_disk_pressure_percent: 80,
@@ -4455,6 +4535,9 @@ mod tests {
             model_archive_path: "/var/lib/model-archive".into(),
             model_local_path: "/opt/ollama-models".into(),
             model_protected: vec![],
+            model_keep_resident: vec![],
+            model_keep_resident_rewarm_secs: 120,
+            gpu_exclusive_exempt_keep_resident: true,
             model_pull_timeout_secs: 600,
             model_registry_path: "<path>/model-registry.json".into(),
             model_disk_pressure_percent: 80,
@@ -4930,6 +5013,9 @@ mod tests {
             model_archive_path: "/var/lib/model-archive".into(),
             model_local_path: "/opt/ollama-models".into(),
             model_protected: vec![],
+            model_keep_resident: vec![],
+            model_keep_resident_rewarm_secs: 120,
+            gpu_exclusive_exempt_keep_resident: true,
             model_pull_timeout_secs: 600,
             model_registry_path: "<path>/model-registry.json".into(),
             model_disk_pressure_percent: 80,
@@ -5041,6 +5127,9 @@ mod tests {
             model_archive_path: "/var/lib/model-archive".into(),
             model_local_path: "/opt/ollama-models".into(),
             model_protected: vec![],
+            model_keep_resident: vec![],
+            model_keep_resident_rewarm_secs: 120,
+            gpu_exclusive_exempt_keep_resident: true,
             model_pull_timeout_secs: 600,
             model_registry_path: "<path>/model-registry.json".into(),
             model_disk_pressure_percent: 80,

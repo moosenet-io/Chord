@@ -1060,7 +1060,11 @@ pub async fn enter_idle(
         //    unset). This is the real "release the GPU + the RAM the models held".
         let models_unloaded = match crate::gpu_exclusive::ollama_base_from_env() {
             Some(base) => {
-                crate::gpu_exclusive::evict_resident_models(&state.http_client, &base).await
+                // Idle-mode is a WHOLE-GPU release (the fleet is idle, the assistant
+                // included) — unload EVERYTHING, no keep-resident exemption here. The
+                // Phase 1 keep-resident exemption applies only to the gpu-EXCLUSIVE
+                // grant path (a sweep running WHILE the assistant should stay hot).
+                crate::gpu_exclusive::evict_resident_models(&state.http_client, &base, &[]).await
             }
             None => {
                 info!("idle-mode: OLLAMA_URL unset — skipping VRAM eviction (best-effort)");
