@@ -2296,7 +2296,7 @@ pub async fn infer(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Method, Request};
@@ -2409,7 +2409,7 @@ mod tests {
         Arc::new(Mutex::new(None))
     }
 
-    fn test_state(mcp_url: String) -> Arc<AppState> {
+    pub(crate) fn test_state(mcp_url: String) -> Arc<AppState> {
         let mut reg = FallbackRegistry::new();
         reg.register(Box::new(PingTool));
         let config = Config {

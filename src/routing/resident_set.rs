@@ -1967,4 +1967,481 @@ mod tests {
         assert!(!r.changed);
         assert!(env.warm_calls().is_empty());
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // TRTR-07c: PRODUCTION-SEAM tests — prove the models actually get warmed.
+    //
+    // Every test above drives `ResidentSet` against `FakeEnv`, so all of them
+    // prove the MANAGER's behaviour: that it calls `warm_one` and then installs
+    // an exemption. NONE of them prove that the production
+    // [`AppStateEnv::warm_one`] causes Ollama to load and RETAIN anything. A
+    // regression that made it a no-op, hit the wrong endpoint or HTTP path,
+    // omitted `keep_alive` (so Ollama loads the model and then drops it on its
+    // own default timer), or sent a chat-shaped request for the embedding model
+    // would leave every test above GREEN while residency quietly degraded into
+    // pure bookkeeping — the exemption set says the models are resident, the
+    // assistant still cold-starts, and nothing detects it. The `ResidentEnv`
+    // seam that made the concurrency tests deterministic is exactly what opens
+    // that hole, so it has to be closed from the other side.
+    //
+    // These tests therefore run the REAL `AppStateEnv` (and the real public
+    // `warm`/`release` entry points) against a STUB OLLAMA — `httpmock`, the
+    // repo's existing HTTP test facility, already used by `session.rs`,
+    // `mcp_proxy.rs`, `embeddings.rs` and `slm_router.rs` — and assert the
+    // ACTUAL REQUEST CONTENT that goes out: method, path, the resolved model
+    // name, and the PRESENCE AND VALUE of `keep_alive`.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Every request the stub Ollama received, in arrival order:
+    /// `(method, path, parsed JSON body)`.
+    ///
+    /// A process `static` because httpmock's `MockMatcherFunction` is a plain
+    /// `fn` pointer and cannot capture an environment. That is fine here: every
+    /// seam test is `#[serial_test::serial]` anyway, because they all share the
+    /// process-global `OLLAMA_URL` that `AppStateEnv::warm_one` reads.
+    static OLLAMA_SEEN: once_cell::sync::Lazy<StdMutex<Vec<(String, String, serde_json::Value)>>> =
+        once_cell::sync::Lazy::new(|| StdMutex::new(Vec::new()));
+
+    /// httpmock matcher that RECORDS the request and always matches, so a single
+    /// catch-all mock captures the exact bytes every warm actually sent.
+    fn record_ollama_request(req: &httpmock::prelude::HttpMockRequest) -> bool {
+        let body = req
+            .body
+            .as_deref()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+            .unwrap_or(serde_json::Value::Null);
+        OLLAMA_SEEN
+            .lock()
+            .unwrap()
+            .push((req.method.clone(), req.path.clone(), body));
+        true
+    }
+
+    /// Drain and return everything the stub Ollama has seen since the last drain.
+    fn seen_requests() -> Vec<(String, String, serde_json::Value)> {
+        std::mem::take(&mut *OLLAMA_SEEN.lock().unwrap())
+    }
+
+    /// Placeholder model names — never a real fleet model.
+    const SEAM_PERSONALITY_MODEL: &str = "test-personality-model:8b";
+    const SEAM_ROUTER_MODEL: &str = "test-router-model:3b";
+    const SEAM_EMBED_MODEL: &str = "test-embed-model:0.6b";
+
+    /// A production `AppState` pointed at a stub Ollama on `base` (loopback),
+    /// with all three role aliases resolving and all three models present in the
+    /// registry (so the never-pulled guard does not skip them).
+    async fn seam_state(base: &str) -> Arc<crate::routes::AppState> {
+        std::env::set_var("OLLAMA_URL", base);
+        // No VRAM counter configured ⇒ `free_vram_gb()` is `None` ⇒ the planner
+        // fails SOFT and attempts every role. That keeps the plan deterministic
+        // instead of depending on the build host's real free VRAM.
+        std::env::remove_var("CHORD_VRAM_FREE_SYSFS_PATH");
+        let state = crate::routes::tests::test_state("http://mcp.invalid:3200".to_string());
+        state
+            .lumina_aliases
+            .set("lumina-deep", SEAM_PERSONALITY_MODEL.to_string());
+        state
+            .lumina_aliases
+            .set("lumina-fast", SEAM_ROUTER_MODEL.to_string());
+        state
+            .lumina_aliases
+            .set("lumina-embed", SEAM_EMBED_MODEL.to_string());
+        {
+            let mut reg = state.model_registry.lock().await;
+            for m in [
+                SEAM_PERSONALITY_MODEL,
+                SEAM_ROUTER_MODEL,
+                SEAM_EMBED_MODEL,
+            ] {
+                // 1 byte: present in the registry, and effectively free, so the
+                // VRAM budget can never be what decides these tests.
+                reg.register_external(m, "test", Some("/nonexistent/local".to_string()), None, 1);
+            }
+        }
+        let _ = seen_requests();
+        state
+    }
+
+    /// Config whose roles are the three real alias keys, so a full production
+    /// pass resolves through `AppStateEnv::resolve`. `reassert` is left at its
+    /// default (far longer than any test) — a re-warm after a RELEASE still
+    /// re-issues, because release clears `warmed_at`.
+    fn seam_cfg(keep_alive: &str) -> ResidentSetConfig {
+        ResidentSetConfig {
+            keep_alive: keep_alive.to_string(),
+            rewarm_debounce: Duration::from_secs(0),
+            ..Default::default()
+        }
+    }
+
+    fn body_of<'a>(
+        seen: &'a [(String, String, serde_json::Value)],
+        model: &str,
+    ) -> &'a (String, String, serde_json::Value) {
+        seen.iter()
+            .find(|(_, _, b)| b.get("model").and_then(|m| m.as_str()) == Some(model))
+            .unwrap_or_else(|| {
+                panic!("no warm request named model {model}; saw {seen:?}")
+            })
+    }
+
+    /// **The core seam test.** All three roles must produce a real HTTP warm
+    /// request, and the EMBEDDING role's request must be shaped differently from
+    /// the chat-style personality/router ones (an embedding model cannot serve
+    /// `/api/generate`, so a regression that sent it a chat-shaped request is a
+    /// realistic silent failure).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn production_warm_one_issues_a_role_shaped_ollama_request_per_role() {
+        let server = httpmock::MockServer::start_async().await;
+        let stub = server
+            .mock_async(|when, then| {
+                when.matches(record_ollama_request);
+                then.status(200).json_body(serde_json::json!({"ok": true}));
+            })
+            .await;
+        let state = seam_state(&server.base_url()).await;
+        let env = AppStateEnv::new(&state, Duration::from_secs(10));
+
+        assert!(
+            env.warm_one(Role::Personality, SEAM_PERSONALITY_MODEL, "24h")
+                .await
+                .is_ok(),
+            "the personality warm must succeed against a 200 Ollama"
+        );
+        assert!(
+            env.warm_one(Role::Router, SEAM_ROUTER_MODEL, "24h")
+                .await
+                .is_ok(),
+            "the router warm must succeed against a 200 Ollama"
+        );
+        assert!(
+            env.warm_one(Role::Embedding, SEAM_EMBED_MODEL, "24h")
+                .await
+                .is_ok(),
+            "the embedding warm must succeed against a 200 Ollama"
+        );
+
+        assert_eq!(
+            stub.hits_async().await,
+            3,
+            "three roles ⇒ three real HTTP warm requests; a no-op `warm_one` sends none"
+        );
+        let seen = seen_requests();
+        assert_eq!(
+            seen.len(),
+            3,
+            "every role must actually put a request on the wire — otherwise residency is pure bookkeeping. saw: {seen:?}"
+        );
+
+        // ── personality: chat-style load on /api/generate ────────────────────
+        let (method, path, body) = body_of(&seen, SEAM_PERSONALITY_MODEL);
+        assert_eq!(method, "POST", "the personality warm must be a POST");
+        assert_eq!(
+            path, "/api/generate",
+            "the personality role loads through Ollama's generate endpoint"
+        );
+        assert_eq!(
+            body["model"],
+            serde_json::json!(SEAM_PERSONALITY_MODEL),
+            "the request must name the RESOLVED personality model"
+        );
+        assert_eq!(
+            body.get("keep_alive"),
+            Some(&serde_json::json!("24h")),
+            "keep_alive must be PRESENT and carry the configured value — without it Ollama loads the model and then drops it on its own default timer, which is exactly the silent no-op residency cannot survive"
+        );
+        assert!(
+            body.get("input").is_none(),
+            "a chat-style warm must not carry an embedding `input` field: {body}"
+        );
+
+        // ── router: same chat-style shape, its own model ─────────────────────
+        let (method, path, body) = body_of(&seen, SEAM_ROUTER_MODEL);
+        assert_eq!(method, "POST", "the router warm must be a POST");
+        assert_eq!(
+            path, "/api/generate",
+            "the router role loads through Ollama's generate endpoint"
+        );
+        assert_eq!(
+            body["model"],
+            serde_json::json!(SEAM_ROUTER_MODEL),
+            "the request must name the RESOLVED router model"
+        );
+        assert_eq!(
+            body.get("keep_alive"),
+            Some(&serde_json::json!("24h")),
+            "the router warm must carry keep_alive"
+        );
+
+        // ── embedding: DIFFERENT call shape ──────────────────────────────────
+        let (method, path, body) = body_of(&seen, SEAM_EMBED_MODEL);
+        assert_eq!(method, "POST", "the embedding warm must be a POST");
+        assert_eq!(
+            path, "/api/embed",
+            "an embedding model cannot serve /api/generate — it must be loaded through the embed endpoint"
+        );
+        assert_ne!(
+            path, "/api/generate",
+            "sending the chat-shaped warm for the embedding role is a realistic regression and must be caught"
+        );
+        assert_eq!(
+            body["model"],
+            serde_json::json!(SEAM_EMBED_MODEL),
+            "the request must name the RESOLVED embedding model"
+        );
+        assert_eq!(
+            body.get("keep_alive"),
+            Some(&serde_json::json!("24h")),
+            "the embedding warm must carry keep_alive too"
+        );
+        assert!(
+            body.get("input").is_some(),
+            "an /api/embed warm must carry the `input` field the endpoint requires: {body}"
+        );
+
+        // No two roles may collapse onto the same request shape+model.
+        let paths: HashSet<&str> = seen.iter().map(|(_, p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths.len(),
+            2,
+            "exactly two distinct endpoints are expected (generate for chat roles, embed for the embedding role); saw {paths:?}"
+        );
+    }
+
+    /// `keep_alive` is THREADED from config, not a literal: a non-default value
+    /// must appear verbatim in all three requests. This is the assertion that
+    /// bites when someone drops the field or hardcodes a short default.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn production_warm_one_threads_the_configured_long_keep_alive() {
+        let server = httpmock::MockServer::start_async().await;
+        let _stub = server
+            .mock_async(|when, then| {
+                when.matches(record_ollama_request);
+                then.status(200).json_body(serde_json::json!({"ok": true}));
+            })
+            .await;
+        let state = seam_state(&server.base_url()).await;
+        let env = AppStateEnv::new(&state, Duration::from_secs(10));
+
+        // Deliberately NOT the default "24h", so a hardcoded literal fails.
+        for (role, model) in [
+            (Role::Personality, SEAM_PERSONALITY_MODEL),
+            (Role::Router, SEAM_ROUTER_MODEL),
+            (Role::Embedding, SEAM_EMBED_MODEL),
+        ] {
+            assert!(env.warm_one(role, model, "17h").await.is_ok());
+        }
+
+        let seen = seen_requests();
+        assert_eq!(seen.len(), 3);
+        for (_, path, body) in &seen {
+            assert_eq!(
+                body.get("keep_alive"),
+                Some(&serde_json::json!("17h")),
+                "the CONFIGURED keep_alive must reach the wire for {path} — a missing or hardcoded value means the model is loaded and then silently dropped: {body}"
+            );
+        }
+    }
+
+    /// A non-2xx response is surfaced as a warm FAILURE for that role (and the
+    /// error message carries no infrastructure detail, per S77).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn production_warm_one_surfaces_a_non_2xx_as_a_warm_failure() {
+        let server = httpmock::MockServer::start_async().await;
+        let _stub = server
+            .mock_async(|when, then| {
+                when.matches(record_ollama_request);
+                then.status(503).body("upstream unavailable");
+            })
+            .await;
+        let state = seam_state(&server.base_url()).await;
+        let env = AppStateEnv::new(&state, Duration::from_secs(10));
+
+        let err = env
+            .warm_one(Role::Personality, SEAM_PERSONALITY_MODEL, "24h")
+            .await
+            .expect_err("a 503 must NOT be reported as a successful warm");
+        assert!(
+            err.contains("503"),
+            "the failure must name the rejecting status: {err}"
+        );
+        assert!(
+            !err.contains(&server.base_url()),
+            "S77: the genericized error must not leak the endpoint: {err}"
+        );
+        assert_eq!(
+            seen_requests().len(),
+            1,
+            "the request was still issued — it was the RESPONSE that failed"
+        );
+    }
+
+    /// A connection error (nothing listening) is a warm failure, not a success.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn production_warm_one_surfaces_a_connection_error_as_a_warm_failure() {
+        // Loopback port 1: nothing listens there. No real infrastructure.
+        let state = seam_state("http://127.0.0.1:1").await;
+        let env = AppStateEnv::new(&state, Duration::from_secs(5));
+
+        let err = env
+            .warm_one(Role::Router, SEAM_ROUTER_MODEL, "24h")
+            .await
+            .expect_err("an unreachable Ollama must NOT be reported as a successful warm");
+        assert!(
+            !err.contains("127.0.0.1"),
+            "S77: the genericized error must not leak the endpoint: {err}"
+        );
+    }
+
+    /// The FULL production wiring: a failing Ollama must land every role in
+    /// `WarmFailed` with NO eviction exemption installed — a role that never
+    /// actually loaded must never be reported warm.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn production_warm_pass_reports_failed_roles_as_warm_failed_and_exempts_nothing() {
+        let server = httpmock::MockServer::start_async().await;
+        let _stub = server
+            .mock_async(|when, then| {
+                when.matches(record_ollama_request);
+                then.status(500).body("boom");
+            })
+            .await;
+        let state = seam_state(&server.base_url()).await;
+        let set = ResidentSet::new(seam_cfg("24h"));
+
+        let report = set.warm(&state, "seam-failure", true).await;
+
+        assert_eq!(
+            report.warmed, 0,
+            "no role loaded, so none may be counted warm"
+        );
+        assert_eq!(report.failed, 3, "all three roles must be reported failed");
+        assert_eq!(
+            seen_requests().len(),
+            3,
+            "all three warm requests were genuinely attempted"
+        );
+        let status = set.status().await;
+        assert!(
+            status.roles.iter().all(|r| r.state == RoleState::WarmFailed),
+            "every role must land in warm-failed: {:?}",
+            status.roles
+        );
+        assert!(
+            status.exempt.is_empty(),
+            "a model that never loaded must NOT be pinned into the eviction exemption: {:?}",
+            status.exempt
+        );
+        assert!(
+            state
+                .model_registry
+                .lock()
+                .await
+                .residency_exempt()
+                .is_empty(),
+            "the REGISTRY exemption must be empty too"
+        );
+    }
+
+    /// **Release/re-warm through the production wiring is genuinely
+    /// re-driveable.** After a mode-swap release, a subsequent warm must issue
+    /// the requests AGAIN — the production side must not be latched (an
+    /// "already warmed, skip" regression would leave the fleet cold after every
+    /// Harmony/MINT idle lease and no existing test would notice).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn production_release_then_rewarm_reissues_the_ollama_requests() {
+        let server = httpmock::MockServer::start_async().await;
+        let stub = server
+            .mock_async(|when, then| {
+                when.matches(record_ollama_request);
+                then.status(200).json_body(serde_json::json!({"ok": true}));
+            })
+            .await;
+        let state = seam_state(&server.base_url()).await;
+        let set = ResidentSet::new(seam_cfg("24h"));
+
+        // ── first warm ───────────────────────────────────────────────────────
+        let first = set.warm(&state, "startup", true).await;
+        assert_eq!(first.warmed, 3, "the startup pass must warm all three roles");
+        let first_seen = seen_requests();
+        assert_eq!(first_seen.len(), 3, "three real requests on the wire");
+        let mut first_models: Vec<String> = first_seen
+            .iter()
+            .map(|(_, _, b)| b["model"].as_str().unwrap_or_default().to_string())
+            .collect();
+        first_models.sort();
+        assert_eq!(
+            first_models,
+            vec![
+                SEAM_EMBED_MODEL.to_string(),
+                SEAM_PERSONALITY_MODEL.to_string(),
+                SEAM_ROUTER_MODEL.to_string(),
+            ],
+            "each resolved role model must be warmed exactly once"
+        );
+        let mut exempt = state.model_registry.lock().await.residency_exempt();
+        exempt.sort();
+        assert_eq!(
+            exempt,
+            vec![
+                SEAM_EMBED_MODEL.to_string(),
+                SEAM_PERSONALITY_MODEL.to_string(),
+                SEAM_ROUTER_MODEL.to_string(),
+            ],
+            "the registry exemption must hold exactly the warmed models"
+        );
+
+        // ── release (mode swap) ──────────────────────────────────────────────
+        let rel = set.release(&state, "harmony-idle-lease").await;
+        assert!(rel.changed);
+        assert_eq!(rel.released, 3);
+        assert!(
+            state
+                .model_registry
+                .lock()
+                .await
+                .residency_exempt()
+                .is_empty(),
+            "release must clear the REGISTRY exemption so the idle path can reclaim the VRAM"
+        );
+        assert!(
+            seen_requests().is_empty(),
+            "a release issues no Ollama warm requests"
+        );
+
+        // ── re-warm ──────────────────────────────────────────────────────────
+        let again = set.rewarm(&state, "activate").await;
+        assert_eq!(
+            again.warmed, 3,
+            "a post-release re-warm must genuinely re-warm, not report a latched success"
+        );
+        assert_eq!(again.retained, 0, "nothing may be retained across a release");
+        let second_seen = seen_requests();
+        assert_eq!(
+            second_seen.len(),
+            3,
+            "the production side must RE-ISSUE the warm requests after a release; saw {second_seen:?}"
+        );
+        for (_, _, body) in &second_seen {
+            assert_eq!(
+                body.get("keep_alive"),
+                Some(&serde_json::json!("24h")),
+                "the re-warm must carry keep_alive as well: {body}"
+            );
+        }
+        assert_eq!(
+            stub.hits_async().await,
+            6,
+            "3 warm + 3 re-warm requests reached the stub Ollama"
+        );
+        let mut exempt = state.model_registry.lock().await.residency_exempt();
+        exempt.sort();
+        assert_eq!(exempt.len(), 3, "the exemption is restored by the re-warm");
+        assert!(set.status().await.active);
+    }
 }
