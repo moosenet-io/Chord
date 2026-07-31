@@ -372,7 +372,10 @@ impl GpuExclusive {
                 ReleaseOutcome::Released
             }
             ReleaseDecision::Mismatch { .. } => {
-                let record = guard.as_ref().expect("mismatch implies a live lock").clone();
+                let record = guard
+                    .as_ref()
+                    .expect("mismatch implies a live lock")
+                    .clone();
                 ReleaseOutcome::Mismatch { record }
             }
         }
@@ -485,7 +488,10 @@ pub async fn evict_resident_models(
         }
     }
     if unloaded > 0 {
-        info!(count = unloaded, "gpu-exclusive: resident models evicted for exclusive holder");
+        info!(
+            count = unloaded,
+            "gpu-exclusive: resident models evicted for exclusive holder"
+        );
     }
     unloaded
 }
@@ -500,11 +506,90 @@ pub fn keep_resident_warm_body(model: &str) -> serde_json::Value {
     serde_json::json!({ "model": model, "prompt": "", "keep_alive": -1 })
 }
 
+/// Phase 1.1: the request body that PINS an **embedding** model VRAM-resident via
+/// Ollama's `/api/embeddings` endpoint — `keep_alive:-1` (indefinite) with an
+/// empty prompt. Embedding models (e.g. `qwen3-embedding:0.6b`) reject
+/// `/api/generate` with a 400 "does not support generate" and so can never be
+/// pinned by [`keep_resident_warm_body`]; this is the fallback that durably pins
+/// them. Pure/testable (asserts the `-1` sentinel).
+pub fn keep_resident_embed_warm_body(model: &str) -> serde_json::Value {
+    serde_json::json!({ "model": model, "prompt": "", "keep_alive": -1 })
+}
+
+/// Phase 1.1: heuristic for "this model name is an embedding model" — a cheap
+/// pre-check so we can go straight to the `/api/embeddings` warm path instead of
+/// wasting a doomed `/api/generate` round trip. The `/api/generate` 400
+/// "does not support generate" response is still handled as a second signal (see
+/// [`warm_keep_resident_models`]) for embedding models whose name doesn't match.
+pub fn is_embedding_model(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("embed")
+}
+
+/// Phase 1.1: whether a 400 response body from `/api/generate` is the specific
+/// "this model can't generate, it's an embedder" rejection — as opposed to some
+/// *other* 400 (bad options, malformed request, etc.). Ollama returns a body
+/// like `{"error":"\"nomic-embed-text\" does not support generate"}` for an
+/// embedding model, so we key on that exact phrase (case-insensitive). This is
+/// what keeps the `/api/embeddings` fallback scoped to embedding models only —
+/// a non-embedding model 400'd for any other reason must NOT be re-warmed as an
+/// embedder.
+pub fn is_generate_unsupported_rejection(body: &str) -> bool {
+    body.to_ascii_lowercase()
+        .contains("does not support generate")
+}
+
+/// Phase 1.1: pin one embedding model VRAM-resident via `/api/embeddings` with
+/// `keep_alive:-1`. Best-effort / fail-SOFT: returns `true` only on a 2xx,
+/// logging and returning `false` otherwise (never errors/panics).
+async fn warm_embed_keep_resident(client: &reqwest::Client, base: &str, model: &str) -> bool {
+    let url = format!("{base}/api/embeddings");
+    let body = keep_resident_embed_warm_body(model);
+    match client
+        .post(&url)
+        .json(&body)
+        .timeout(Duration::from_secs(180))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => {
+            info!(model = %model, "[keep-resident] pinned EMBEDDING model VRAM-resident via /api/embeddings (keep_alive=-1)");
+            true
+        }
+        Ok(r) => {
+            warn!(
+                model = %model,
+                status = r.status().as_u16(),
+                "[keep-resident] embed warm request rejected (best-effort, continuing)"
+            );
+            false
+        }
+        Err(e) => {
+            warn!(
+                model = %model,
+                error = %e,
+                "[keep-resident] embed warm request failed (best-effort, continuing)"
+            );
+            false
+        }
+    }
+}
+
 /// Phase 1: pin each `models` name VRAM-resident by issuing a tiny `keep_alive:-1`
 /// warm request. Best-effort / fail-SOFT by construction: a warm failure for one
 /// model logs and moves on — it NEVER errors or panics (so a startup pre-warm or a
 /// periodic re-warm can't take Chord down). Returns the count successfully warmed.
 /// An empty `models` (the default keep-resident set) is a no-op.
+///
+/// Phase 1.1: embedding models (e.g. `qwen3-embedding:0.6b`) do NOT support
+/// `/api/generate` — Ollama rejects the warm with a 400 "does not support
+/// generate", so they would never get durably pinned. For those we FALL BACK to
+/// a `/api/embeddings` warm (also `keep_alive:-1`). The fallback fires either
+/// when the name looks like an embedding model ([`is_embedding_model`]) — a
+/// cheap pre-check that skips the doomed `/api/generate` — or when `/api/generate`
+/// returns a 400 whose body is specifically the "does not support generate"
+/// embedder rejection ([`is_generate_unsupported_rejection`]). A 400 for ANY
+/// OTHER reason (bad request/options) is NOT treated as an embedder and is just
+/// logged — the fallback stays scoped to embedding models.
 pub async fn warm_keep_resident_models(
     client: &reqwest::Client,
     ollama_base: &str,
@@ -515,6 +600,14 @@ pub async fn warm_keep_resident_models(
     let mut warmed = 0usize;
     for model in models {
         if model.is_empty() {
+            continue;
+        }
+        // Phase 1.1: known embedding models skip the doomed /api/generate and go
+        // straight to the /api/embeddings warm path.
+        if is_embedding_model(model) {
+            if warm_embed_keep_resident(client, base, model).await {
+                warmed += 1;
+            }
             continue;
         }
         let body = keep_resident_warm_body(model);
@@ -531,6 +624,30 @@ pub async fn warm_keep_resident_models(
             Ok(r) if r.status().is_success() => {
                 info!(model = %model, "[keep-resident] pinned model VRAM-resident (keep_alive=-1)");
                 warmed += 1;
+            }
+            // Phase 1.1: a 400 from /api/generate MIGHT be the "does not support
+            // generate" embedder rejection for an embedding model whose name
+            // didn't match the heuristic — but only if the body says so. Read the
+            // body and fall back to /api/embeddings ONLY for that specific
+            // rejection; any other 400 is just logged (fallback stays scoped to
+            // embedding models).
+            Ok(r) if r.status() == reqwest::StatusCode::BAD_REQUEST => {
+                let body_txt = r.text().await.unwrap_or_default();
+                if is_generate_unsupported_rejection(&body_txt) {
+                    info!(
+                        model = %model,
+                        "[keep-resident] /api/generate rejected as an embedder (does not support generate) — falling back to /api/embeddings warm"
+                    );
+                    if warm_embed_keep_resident(client, base, model).await {
+                        warmed += 1;
+                    }
+                } else {
+                    warn!(
+                        model = %model,
+                        status = 400u16,
+                        "[keep-resident] warm request rejected with a non-embedder 400 (best-effort, continuing)"
+                    );
+                }
             }
             Ok(r) => warn!(
                 model = %model,
@@ -588,7 +705,10 @@ mod tests {
 
     #[test]
     fn acquire_when_free_grants_new() {
-        assert_eq!(decide_acquire(None, "sweep", 10, 600), AcquireDecision::GrantNew);
+        assert_eq!(
+            decide_acquire(None, "sweep", 10, 600),
+            AcquireDecision::GrantNew
+        );
     }
 
     #[test]
@@ -689,7 +809,7 @@ mod tests {
         // Heartbeat at 500 keeps it live well past the original 600 window.
         gpu.acquire("sweep", 500);
         assert!(gpu.active_holder(1000).is_some()); // 500s since last heartbeat
-        // But no further heartbeat ⇒ expires 600s after the last one (500).
+                                                    // But no further heartbeat ⇒ expires 600s after the last one (500).
         assert!(gpu.active_holder(1101).is_none());
     }
 
@@ -710,7 +830,7 @@ mod tests {
         let gpu = GpuExclusive::new(600);
         gpu.acquire("sweep", 0);
         assert!(gpu.active_holder(601).is_none()); // abandoned
-        // A new holder takes over cleanly.
+                                                   // A new holder takes over cleanly.
         match gpu.acquire("other", 601) {
             AcquireOutcome::Granted { new_grant, .. } => assert!(new_grant),
             other => panic!("expected takeover grant, got {other:?}"),
@@ -835,6 +955,147 @@ mod tests {
         assert_eq!(body["prompt"], "");
     }
 
+    // ── Phase 1.1: embed-model keep-resident fallback ────────────────────────
+
+    #[test]
+    fn embed_warm_body_pins_indefinitely() {
+        // The embed keep-resident warm must also issue keep_alive:-1.
+        let body = keep_resident_embed_warm_body("qwen3-embedding:0.6b");
+        assert_eq!(body["model"], "qwen3-embedding:0.6b");
+        assert_eq!(body["keep_alive"], -1);
+        assert_eq!(body["prompt"], "");
+    }
+
+    #[test]
+    fn is_embedding_model_matches_embed_substring() {
+        assert!(is_embedding_model("qwen3-embedding:0.6b"));
+        assert!(is_embedding_model("mxbai-embed-large:latest"));
+        assert!(is_embedding_model("nomic-embed-text"));
+        assert!(!is_embedding_model("granite4.1:8b"));
+        assert!(!is_embedding_model("qwen3-coder:30b"));
+    }
+
+    #[tokio::test]
+    async fn embed_model_uses_embeddings_endpoint_with_keep_alive_minus_one() {
+        // A model whose name marks it as an embedding model must be warmed via
+        // /api/embeddings with keep_alive:-1 — NOT /api/generate.
+        let server = httpmock::MockServer::start_async().await;
+        let embed_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/api/embeddings")
+                .body_contains(r#""keep_alive":-1"#)
+                .body_contains(r#""model":"qwen3-embedding:0.6b""#);
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .json_body(serde_json::json!({ "embedding": [0.0] }));
+        });
+        // /api/generate must NOT be hit for a name-matched embedding model.
+        let generate_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/api/generate");
+            then.status(200).body("");
+        });
+
+        let client = reqwest::Client::new();
+        let models = vec!["qwen3-embedding:0.6b".to_string()];
+        let warmed = warm_keep_resident_models(&client, &server.base_url(), &models).await;
+
+        assert_eq!(
+            warmed, 1,
+            "embedding model should be pinned via /api/embeddings"
+        );
+        embed_mock.assert();
+        assert_eq!(
+            generate_mock.hits(),
+            0,
+            "/api/generate must be skipped for embed models"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_400_falls_back_to_embeddings_warm() {
+        // A model whose name does NOT look like an embedding model but which
+        // Ollama rejects from /api/generate with a 400 ("does not support
+        // generate") must fall back to the /api/embeddings warm.
+        let server = httpmock::MockServer::start_async().await;
+        let generate_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/api/generate");
+            then.status(400).json_body(
+                serde_json::json!({ "error": "\"embedder\" does not support generate" }),
+            );
+        });
+        let embed_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/api/embeddings")
+                .body_contains(r#""keep_alive":-1"#);
+            then.status(200)
+                .json_body(serde_json::json!({ "embedding": [0.0] }));
+        });
+
+        let client = reqwest::Client::new();
+        // Name has no "embed" substring → hits /api/generate first, gets 400,
+        // then falls back to /api/embeddings.
+        let models = vec!["mystery-vectorizer:latest".to_string()];
+        let warmed = warm_keep_resident_models(&client, &server.base_url(), &models).await;
+
+        assert_eq!(
+            warmed, 1,
+            "400 from /api/generate should trigger embed fallback"
+        );
+        generate_mock.assert();
+        embed_mock.assert();
+    }
+
+    #[test]
+    fn is_generate_unsupported_rejection_matches_only_the_embedder_error() {
+        // The exact Ollama embedder rejection (case-insensitive).
+        assert!(is_generate_unsupported_rejection(
+            r#"{"error":"\"nomic-embed-text\" does not support generate"}"#
+        ));
+        assert!(is_generate_unsupported_rejection(
+            "MODEL DOES NOT SUPPORT GENERATE"
+        ));
+        // Other 400 bodies must NOT be treated as an embedder rejection.
+        assert!(!is_generate_unsupported_rejection(
+            r#"{"error":"invalid options: num_ctx"}"#
+        ));
+        assert!(!is_generate_unsupported_rejection(
+            r#"{"error":"model 'foo' not found"}"#
+        ));
+        assert!(!is_generate_unsupported_rejection(""));
+    }
+
+    #[tokio::test]
+    async fn non_embedder_400_does_not_fall_back_to_embeddings() {
+        // A NON-embedding model 400'd for some OTHER reason (bad options, etc.)
+        // must NOT be re-warmed via /api/embeddings — the fallback is scoped to
+        // the "does not support generate" embedder rejection only.
+        let server = httpmock::MockServer::start_async().await;
+        let generate_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/api/generate");
+            then.status(400)
+                .json_body(serde_json::json!({ "error": "invalid options: num_ctx must be > 0" }));
+        });
+        let embed_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/api/embeddings");
+            then.status(200)
+                .json_body(serde_json::json!({ "embedding": [0.0] }));
+        });
+
+        let client = reqwest::Client::new();
+        // Name has no "embed" substring → hits /api/generate, gets a NON-embedder
+        // 400 → must be logged, NOT retried as an embedding.
+        let models = vec!["granite4.1:8b".to_string()];
+        let warmed = warm_keep_resident_models(&client, &server.base_url(), &models).await;
+
+        assert_eq!(warmed, 0, "a non-embedder 400 must not count as warmed");
+        generate_mock.assert();
+        assert_eq!(
+            embed_mock.hits(),
+            0,
+            "/api/embeddings must NOT be hit for a non-embedder 400"
+        );
+    }
+
     // ── RESIL-01: durable lease persistence ──────────────────────────────────
 
     #[test]
@@ -846,7 +1107,10 @@ mod tests {
         let gpu = GpuExclusive::with_state(600, Some(path.clone()), 0);
         assert!(matches!(
             gpu.acquire("sweep", 10),
-            AcquireOutcome::Granted { new_grant: true, .. }
+            AcquireOutcome::Granted {
+                new_grant: true,
+                ..
+            }
         ));
         assert!(path.exists(), "lease file should be written on acquire");
 
@@ -873,7 +1137,10 @@ mod tests {
         // And a fresh holder can take over cleanly.
         assert!(matches!(
             restarted.acquire("other", 700),
-            AcquireOutcome::Granted { new_grant: true, .. }
+            AcquireOutcome::Granted {
+                new_grant: true,
+                ..
+            }
         ));
     }
 
@@ -888,7 +1155,10 @@ mod tests {
         // Still fully functional after ignoring the corrupt file.
         assert!(matches!(
             gpu.acquire("sweep", 0),
-            AcquireOutcome::Granted { new_grant: true, .. }
+            AcquireOutcome::Granted {
+                new_grant: true,
+                ..
+            }
         ));
     }
 
@@ -939,7 +1209,10 @@ mod tests {
         let gpu = GpuExclusive::new(600);
         assert!(matches!(
             gpu.acquire("sweep", 0),
-            AcquireOutcome::Granted { new_grant: true, .. }
+            AcquireOutcome::Granted {
+                new_grant: true,
+                ..
+            }
         ));
         assert_eq!(gpu.active_holder(1).unwrap().holder, "sweep");
         assert_eq!(gpu.release("sweep"), ReleaseOutcome::Released);
