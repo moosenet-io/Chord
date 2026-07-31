@@ -481,22 +481,32 @@ pub async fn evict_resident_models(client: &reqwest::Client, ollama_base: &str) 
 //
 // The two pure embedder heuristics below SURVIVE the removal: they are how any
 // role-agnostic Ollama call (notably the CHRD-PIN-01 startup pin convergence)
-// addresses an embedding model, which cannot be reached through `/api/generate`.
+// addresses an embedding model on an Ollama build that refuses it on
+// `/api/generate`.
+//
+// MEASURED CORRECTION (live Ollama 0.22.1, 2026-07-31): an embedding model is NOT
+// universally rejected by `/api/generate`. On 0.22.1, `POST /api/generate` with
+// `{"model":"<embedding model>","prompt":"","keep_alive":0}` returns 200 and really
+// unloads it. The rejection these helpers key on is VERSION-DEPENDENT, so treat
+// them as defensive portability across Ollama versions — not as evidence that an
+// embedder can never be addressed through `/api/generate`.
 
 /// Heuristic for "this model name is an embedding model" — a cheap pre-check so a
-/// role-agnostic call can go straight to the embeddings endpoint instead of wasting
-/// a doomed `/api/generate` round trip. The `/api/generate` 400 "does not support
-/// generate" response is the second signal, for embedders the name misses
-/// ([`is_generate_unsupported_rejection`]).
+/// role-agnostic call can go straight to the embeddings endpoint rather than depend
+/// on how this Ollama build answers `/api/generate` for an embedder (0.22.1: 200;
+/// older builds: a 400 "does not support generate", the second signal, for embedders
+/// the name misses — [`is_generate_unsupported_rejection`]).
 pub fn is_embedding_model(name: &str) -> bool {
     name.to_ascii_lowercase().contains("embed")
 }
 
 /// Phase 1.1: whether a 400 response body from `/api/generate` is the specific
 /// "this model can't generate, it's an embedder" rejection — as opposed to some
-/// *other* 400 (bad options, malformed request, etc.). Ollama returns a body
-/// like `{"error":"\"nomic-embed-text\" does not support generate"}` for an
-/// embedding model, so we key on that exact phrase (case-insensitive). This is
+/// *other* 400 (bad options, malformed request, etc.). Ollama builds that DO reject
+/// an embedder return a body like
+/// `{"error":"\"nomic-embed-text\" does not support generate"}`, so we key on that
+/// exact phrase (case-insensitive). Whether that 400 happens at all is
+/// version-dependent — 0.22.1 answers 200 instead (see the note above). This is
 /// what keeps the embeddings-endpoint fallback scoped to embedding models only —
 /// a non-embedding model 400'd for any other reason must NOT be re-warmed as an
 /// embedder.

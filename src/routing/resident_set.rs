@@ -20,13 +20,22 @@
 //! Each role names a Chord **alias key** (default: personality → `lumina-fast` —
 //! the INTERACTIVE tier, see [`Role::default_alias`] — router → `lumina-fast`, the
 //! alias Terminus's router already asks for via `TERMINUS_ROUTER_MODEL` — embedding
-//! → `lumina-embed`, which falls back to the configured `EMBED_LOCAL_MODEL` when
-//! that alias is absent, see [`resolve_role_target`]), overridable per role by env. The alias is resolved through the dynamic [`LuminaAliasStore`] first and
-//! the static `CHORD_MODEL_ALIASES` map second. A role whose alias resolves to
-//! nothing is [`RoleState::Unresolved`] and simply degrades — the resident set
-//! NEVER hard-wires a model name, because Chord owns model selection (north-star
-//! Module Contract clause 1) and the dynamic alias updater must stay free to
-//! repoint a role under us.
+//! → `lumina-embed`), overridable per role by env. The alias is resolved through
+//! the dynamic [`LuminaAliasStore`] first and the static `CHORD_MODEL_ALIASES` map
+//! second. The resident set NEVER hard-wires a model name, because Chord owns model
+//! selection (north-star Module Contract clause 1) and the dynamic alias updater
+//! must stay free to repoint a role under us.
+//!
+//! ## An unresolved alias degrades LOUDLY and pins NOTHING — uniformly, every role
+//! A role whose alias resolves to nothing is [`RoleState::Unresolved`]: it is
+//! WARNED about by name (role, the alias that failed, and what to set — see
+//! [`unresolved_alias_remedy`]) and then holds nothing. There is no per-role
+//! fallback, and deliberately so. A fallback that quietly substitutes a DIFFERENT
+//! model than the operator configured re-creates the exact defect CHRD-PIN-01
+//! exists to remove: a second, implicit source of residency truth. If a role
+//! should hold a model, that belongs in config, where it is visible — set the
+//! alias (`CHORD_MODEL_ALIASES`) or repoint the role
+//! (`CHORD_RESIDENT_ROLE_*`), not in a code fallback.
 //!
 //! ## Presence is VERIFIED, never assumed
 //! This fleet has already been bitten by "protecting" a model that had never been
@@ -277,11 +286,12 @@ impl Role {
             // it with personality is not a degradation — `plan_warm` holds a shared
             // model ONCE (`WarmDecision::Shared`) and both roles read it warm.
             Role::Router => "lumina-fast",
-            // Engram memory. There is deliberately no `lumina-embed` alias on this
-            // fleet; rather than degrade to nothing, an unresolved embedding role
-            // falls back to the CONFIGURED local embedding model
-            // (`EMBED_LOCAL_MODEL` — the exact model `/v1/embeddings` serves). See
-            // [`embedding_fallback_target`].
+            // Engram memory. Like every other role this is an ALIAS KEY and gets no
+            // code-level fallback: if `lumina-embed` is not configured, the role
+            // warns and holds nothing. The operator sets the alias (normally to the
+            // same model `EMBED_LOCAL_MODEL` names, so `/v1/embeddings` and the
+            // resident set cannot disagree about which model Engram's vectors come
+            // from) — visible config, not an implicit second source of truth.
             Role::Embedding => "lumina-embed",
         }
     }
@@ -487,52 +497,21 @@ pub fn resolve_alias(
         .filter(|s| !s.is_empty())
 }
 
-/// Where a role's concrete target came from — reported so a fallback is visible
-/// in the log rather than looking like a normal alias resolution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TargetSource {
-    /// The role's alias key resolved (dynamic store or static map).
-    Alias,
-    /// The alias resolved to nothing and a CONFIGURED default was used instead.
-    /// Only the embedding role has one (`EMBED_LOCAL_MODEL`).
-    ConfiguredDefault,
-    /// Nothing resolved — the role degrades.
-    None,
-}
-
-/// CHRD-PIN-01 (Task B): resolve a role's concrete target, with the ONE sanctioned
-/// fallback.
+/// The ACTIONABLE half of the unresolved-alias warning: what the operator should
+/// actually do, named concretely for THIS role and THIS alias key.
 ///
-/// The rule is deliberately narrow. A role whose alias resolves to nothing normally
-/// degrades LOUDLY and holds nothing — falling back to a guess would be exactly the
-/// hard-wiring this module forbids. But the embedding role is different: Chord
-/// ALREADY has a configured, authoritative answer to "which local embedding model do
-/// we serve" — `EMBED_LOCAL_MODEL`, the model `/v1/embeddings` actually calls. Using
-/// it is not a guess and not a hard-wired name; it is reading the config that is
-/// already the source of truth, and it keeps the two from disagreeing about which
-/// model Engram's memory vectors come from. Every other role has no such config, so
-/// it gets no fallback.
-///
-/// `embedding_default` is passed in (never read from env here) so this stays pure.
-pub fn resolve_role_target(
-    role: Role,
-    alias: &str,
-    dynamic: &LuminaAliasStore,
-    statics: &HashMap<String, String>,
-    embedding_default: Option<&str>,
-) -> (Option<String>, TargetSource) {
-    if let Some(model) = resolve_alias(alias, dynamic, statics) {
-        return (Some(model), TargetSource::Alias);
-    }
-    if role == Role::Embedding {
-        if let Some(d) = embedding_default
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-        {
-            return (Some(d.to_string()), TargetSource::ConfiguredDefault);
-        }
-    }
-    (None, TargetSource::None)
+/// Pure and public so the wording is a tested artifact rather than an incidental
+/// string inside a macro. Every role gets the same treatment — there is no role
+/// with a code-level fallback, so there is no role that degrades quietly.
+pub fn unresolved_alias_remedy(role: Role, alias: &str) -> String {
+    format!(
+        "point the Chord alias '{alias}' at a pulled model (add it to CHORD_MODEL_ALIASES, \
+         or let the dynamic lumina alias updater own it), or repoint this role with {env}; \
+         until then the {id} role holds nothing and Chord pins nothing for it",
+        alias = alias,
+        env = role.alias_env(),
+        id = role.id(),
+    )
 }
 
 /// A role's resolution outcome, before any VRAM budgeting.
@@ -708,8 +687,23 @@ impl<'a> AppStateEnv<'a> {
 
 /// Build the role-shaped Ollama request. `keep_alive` is a JSON value so the same
 /// builder serves both the warm (`"24h"`) and the TRTR-07d compensating unload
-/// (`0`) — the two must hit the SAME endpoint per role or the undo silently misses
-/// (an embedding model cannot be addressed through `/api/generate`).
+/// (`0`), and both hit the SAME endpoint for a given role, so the undo is always
+/// the exact inverse of the load.
+///
+/// **Measured, not assumed (verified against the live Ollama 0.22.1, 2026-07-31).**
+/// An embedding model is NOT rejected by `/api/generate`: `POST /api/generate` with
+/// `{"model":"<an embedding model>","prompt":"","keep_alive":0}` returns **200** and
+/// genuinely unloads the model (`/api/ps` drops it). `POST /api/embed` and the older
+/// `POST /api/embeddings` with a `keep_alive` also return 200. So on 0.22.1 the
+/// generate endpoint would work for every role.
+///
+/// The role shaping is kept anyway, as DEFENSIVE PORTABILITY, not a requirement:
+/// older Ollama builds do answer `/api/generate` for an embedder with a 400
+/// `"does not support generate"` (which is why
+/// [`crate::gpu_exclusive::is_generate_unsupported_rejection`] exists), addressing a
+/// model through the endpoint that actually serves it is the better-defined call,
+/// and it costs nothing. Do NOT "simplify" this by asserting the 400 behaviour as
+/// current fact — it is version-dependent and false on 0.22.1.
 fn ollama_role_request(
     base: &str,
     role: Role,
@@ -739,27 +733,20 @@ fn ollama_role_request(
 impl<'a> ResidentEnv for AppStateEnv<'a> {
     async fn resolve(&self, aliases: &[(Role, String)]) -> Vec<Resolved> {
         let state = self.state;
-        // The configured local embedding model — the same value `/v1/embeddings`
-        // serves. Read once per pass, never hard-wired.
-        let embedding_default = crate::embeddings::EmbeddingsConfig::from_env().local_model;
         let targets: Vec<(Role, String, Option<String>)> = aliases
             .iter()
             .map(|(role, alias)| {
-                let (model, source) = resolve_role_target(
-                    *role,
-                    alias,
-                    &state.lumina_aliases,
-                    &state.model_aliases,
-                    Some(embedding_default.as_str()),
-                );
-                if source == TargetSource::ConfiguredDefault {
-                    // LOUD on purpose: the role is serviceable, but the operator
-                    // should know the alias is missing and a config default stood in.
+                let model = resolve_alias(alias, &state.lumina_aliases, &state.model_aliases);
+                if model.is_none() {
+                    // ONE code path, EVERY role: an alias that resolves to nothing
+                    // degrades LOUDLY and pins nothing. No role has a fallback, so
+                    // no role degrades silently — the warning names the role, the
+                    // alias that failed, and the fix.
                     warn!(
                         role = role.id(),
                         alias = %alias,
-                        model = model.as_deref().unwrap_or(""),
-                        "resident-set: role alias resolves to no target — falling back to the CONFIGURED local embedding model (set the alias to silence this)"
+                        remedy = %unresolved_alias_remedy(*role, alias),
+                        "resident-set: role alias resolves to NO target — this role is DEGRADED and holds nothing"
                     );
                 }
                 (*role, alias.clone(), model)
@@ -797,11 +784,13 @@ impl<'a> ResidentEnv for AppStateEnv<'a> {
 
     /// Issue the actual Ollama warm call for one role.
     ///
-    /// Role-shaped: an embedding model is loaded through `/api/embed` (it cannot
-    /// serve `/api/generate`), everything else through `/api/generate` with no
-    /// prompt — Ollama's documented "load this model and hold it for keep_alive"
-    /// call. Never fatal: every failure is a genericized `Err` string (S77 — no
-    /// infrastructure in the message) the caller logs and degrades on.
+    /// Role-shaped: an embedding model is loaded through `/api/embed`, everything
+    /// else through `/api/generate` with no prompt — Ollama's documented "load this
+    /// model and hold it for keep_alive" call. The shaping is defensive
+    /// portability, not a hard requirement: on Ollama 0.22.1 `/api/generate` accepts
+    /// an embedding model too (measured — see [`ollama_role_request`]). Never fatal:
+    /// every failure is a genericized `Err` string (S77 — no infrastructure in the
+    /// message) the caller logs and degrades on.
     ///
     /// TRTR-07d: the send future is raced against `cancel`. Dropping a `reqwest`
     /// send future tears the connection down, so a cancelled warm genuinely stops
@@ -1386,10 +1375,16 @@ impl ResidentSet {
                         }
                         _ => {
                             report.skipped += 1;
-                            info!(
+                            // Same posture as the two branches above: a role that is
+                            // not held is WARNED about, never whispered. The
+                            // resolution step already emitted the actionable remedy
+                            // (`unresolved_alias_remedy`); this records the outcome
+                            // of the pass itself.
+                            warn!(
                                 role = role.id(),
                                 alias = %r.alias,
-                                "resident-set: role alias resolves to no target — running degraded"
+                                state = ?st,
+                                "resident-set: role holds nothing this pass — running degraded"
                             );
                         }
                     }
@@ -1870,9 +1865,17 @@ pub fn plan_unpin(
 }
 
 /// Unload one arbitrary (role-unknown) model: `/api/generate` with `keep_alive: 0`,
-/// falling back to the embeddings endpoint for an embedding model, which cannot be
-/// addressed through `/api/generate` at all. Best-effort — returns whether it
-/// landed, never errors.
+/// using the embeddings endpoint for a model whose name says it is an embedder.
+/// Best-effort — returns whether it landed, never errors.
+///
+/// **Measured (live Ollama 0.22.1, 2026-07-31):** `/api/generate` +
+/// `keep_alive: 0` DOES unload an embedding model — 200, and `/api/ps` drops it. So
+/// on this version the name pre-check and the 400-retry below are belt-and-braces,
+/// not correctness requirements. They are retained because the 400
+/// `"does not support generate"` rejection is real on older Ollama builds, and this
+/// path runs once at startup against whatever version the host happens to have. The
+/// 400 branch is therefore version-conditional, not dead: it cannot fire on 0.22.1
+/// and is the only thing that makes convergence work where it can.
 async fn unload_untyped(client: &reqwest::Client, base: &str, model: &str) -> bool {
     async fn post(client: &reqwest::Client, url: &str, body: serde_json::Value) -> Option<(u16, String)> {
         let r = client
@@ -2059,91 +2062,276 @@ mod tests {
         assert!(!a.contains(':') && !a.contains('/'));
     }
 
+    /// CHRD-PIN-01 review FINDING 1: NO role has a code-level fallback.
+    ///
+    /// The earlier revision fell back to the configured `EMBED_LOCAL_MODEL` for the
+    /// embedding role. That made an UNRESOLVED role warm and exempt a model anyway —
+    /// a special-case lifecycle target, and a second implicit source of residency
+    /// truth substituting a different model than the operator configured. It is
+    /// gone: resolution is `resolve_alias` and nothing else, for every role.
     #[test]
-    fn embedding_role_falls_back_to_the_configured_local_embedding_model() {
+    fn no_role_has_a_code_level_fallback_when_its_alias_is_unresolved() {
         let statics = HashMap::new();
         let dynamic = LuminaAliasStore::empty();
-        // The alias does not exist (as on the live fleet) — but Chord already knows
-        // which local embedding model it serves, so the role is served, not degraded.
-        let (model, source) = resolve_role_target(
-            Role::Embedding,
-            "lumina-embed",
-            &dynamic,
-            &statics,
-            Some("configured-embed-model:0.6b"),
-        );
-        assert_eq!(model.as_deref(), Some("configured-embed-model:0.6b"));
-        assert_eq!(source, TargetSource::ConfiguredDefault);
-    }
-
-    #[test]
-    fn a_resolvable_alias_always_wins_over_the_configured_default() {
-        let mut statics = HashMap::new();
-        statics.insert("lumina-embed".to_string(), "alias-model:1b".to_string());
-        let dynamic = LuminaAliasStore::empty();
-        let (model, source) = resolve_role_target(
-            Role::Embedding,
-            "lumina-embed",
-            &dynamic,
-            &statics,
-            Some("configured-embed-model:0.6b"),
-        );
-        assert_eq!(model.as_deref(), Some("alias-model:1b"));
-        assert_eq!(source, TargetSource::Alias);
-    }
-
-    #[test]
-    fn only_the_embedding_role_has_a_configured_fallback() {
-        let statics = HashMap::new();
-        let dynamic = LuminaAliasStore::empty();
-        for role in [Role::Personality, Role::Router] {
-            let (model, source) = resolve_role_target(
-                role,
-                "no-such-alias",
-                &dynamic,
-                &statics,
-                Some("configured-embed-model:0.6b"),
+        for role in Role::PRIORITY {
+            assert_eq!(
+                resolve_alias(role.default_alias(), &dynamic, &statics),
+                None,
+                "{} must resolve to NOTHING — no role gets a substituted model",
+                role.id()
             );
-            assert_eq!(model, None, "{} must NOT inherit a fallback", role.id());
-            assert_eq!(source, TargetSource::None);
         }
-        // …and an embedding role with no configured default degrades too, rather
-        // than inventing a name.
-        for empty in [None, Some(""), Some("   ")] {
-            let (model, source) =
-                resolve_role_target(Role::Embedding, "lumina-embed", &dynamic, &statics, empty);
-            assert_eq!(model, None);
-            assert_eq!(source, TargetSource::None);
+    }
+
+    /// The actionable half of the loud warning is UNIFORM: every role's remedy names
+    /// that role, the alias that failed, and the env var that repoints it.
+    #[test]
+    fn the_unresolved_alias_remedy_is_actionable_for_every_role() {
+        for role in Role::PRIORITY {
+            let alias = role.default_alias();
+            let msg = unresolved_alias_remedy(role, alias);
+            assert!(
+                msg.contains(alias),
+                "{}: remedy must name the alias that failed: {msg}",
+                role.id()
+            );
+            assert!(
+                msg.contains(role.id()),
+                "{}: remedy must name the role: {msg}",
+                role.id()
+            );
+            assert!(
+                msg.contains(role.alias_env()),
+                "{}: remedy must name the env var that repoints the role: {msg}",
+                role.id()
+            );
+            assert!(
+                msg.contains("CHORD_MODEL_ALIASES"),
+                "{}: remedy must say where the alias is configured: {msg}",
+                role.id()
+            );
+            assert!(
+                msg.contains("holds nothing"),
+                "{}: remedy must state the consequence — nothing is pinned: {msg}",
+                role.id()
+            );
         }
+    }
+
+    /// Positive control for the removal: a RESOLVED alias still resolves normally,
+    /// dynamic-store-first, for every role.
+    #[test]
+    fn a_resolved_alias_still_resolves_for_every_role() {
+        let mut statics = HashMap::new();
+        // Keyed by ALIAS, not by role — personality and router deliberately share
+        // `lumina-fast`, and a shared alias must resolve identically for both.
+        for role in Role::PRIORITY {
+            let alias = role.default_alias();
+            statics.insert(alias.to_string(), format!("static-{alias}:1b"));
+        }
+        let dynamic = LuminaAliasStore::from_static(&statics);
+        for role in Role::PRIORITY {
+            let alias = role.default_alias();
+            assert_eq!(
+                resolve_alias(alias, &dynamic, &statics).as_deref(),
+                Some(format!("static-{alias}:1b").as_str()),
+                "{} must still resolve through its alias",
+                role.id()
+            );
+        }
+        // …and a runtime repoint still wins over the static map.
+        dynamic.set("lumina-embed", "dynamic-embed:1b".to_string());
+        assert_eq!(
+            resolve_alias("lumina-embed", &dynamic, &statics).as_deref(),
+            Some("dynamic-embed:1b"),
+            "a runtime repoint must still win"
+        );
     }
 
     // ── CHRD-PIN-01 Task A: no indefinite pin survives ──────────────────────
+    //
+    // The load-bearing invariant, asserted against the SOURCE TREE rather than a
+    // behavior: no code path anywhere in this crate may ask Ollama for an indefinite
+    // `keep_alive`. A behavioral test can only cover the paths it knows about; the
+    // failure mode being guarded is a NEW (or resurrected) path nobody wired a test
+    // to — which is exactly how the retired keep-resident pass coexisted with the
+    // resident set in the first place.
+    //
+    // ⚠ WHAT THIS GUARD IS AND IS NOT (read before trusting it).
+    // It is a cheap LEXICAL scanner over the crate's `.rs` files, not a dataflow
+    // analysis. It catches three shapes:
+    //   1. the direct one — `keep_alive` and a `-1` on the same non-comment line;
+    //   2. an INDIRECTION — a `-1` bound to a named constant/binding/field anywhere
+    //      in the crate (`const FOREVER: i64 = -1;`, `let forever = -1;`,
+    //      `some_field: -1,`), where that name later appears on a `keep_alive` line;
+    //   3. a KEEP_ALIVE-NAMED binding or field assigned `-1` even with no literal
+    //      `keep_alive` token on the line (`let keepAlive = -1;`).
+    // It does NOT and CANNOT catch: a value computed at runtime (`0 - 1`,
+    // `i64::MIN`, a parsed env var/config value), a `-1` passed through a function
+    // parameter or a generic wrapper before reaching the request, a pin assembled
+    // in a data structure many statements away with no shared name, a pin issued
+    // from OUTSIDE this crate, or a pin issued by hand against the live Ollama.
+    // Those residuals are real. This guard raises the cost of re-introducing the
+    // retired mechanism; it is NOT a proof that no indefinite pin can exist. The
+    // GPU-side backstop for everything it misses is `converge_legacy_pins`, which
+    // reads what Ollama actually holds and unpins by observation rather than by
+    // reading code.
+    //
+    // A genuinely bounded, explicitly-released phase may opt out by putting the
+    // marker `RESIDENCY-PIN-ALLOWED` on the line, which makes the exception
+    // deliberate, greppable, and reviewable instead of silent.
 
-    /// The load-bearing invariant, asserted against the SOURCE TREE rather than a
-    /// behavior: **no code path anywhere in this crate may ask Ollama for an
-    /// indefinite `keep_alive`.** A behavioral test can only cover the paths it
-    /// knows about; the failure mode being guarded is a NEW (or resurrected) path
-    /// nobody wired a test to — which is exactly how the retired keep-resident pass
-    /// coexisted with the resident set in the first place.
-    ///
-    /// A genuinely bounded, explicitly-released phase may opt out by putting the
-    /// marker `RESIDENCY-PIN-ALLOWED` on the line, which makes the exception
-    /// deliberate, greppable, and reviewable instead of silent.
-    #[test]
-    fn no_code_path_pins_a_model_indefinitely() {
-        // Built at runtime so this guard cannot match its own source.
-        let key: String = ["keep", "_alive"].concat();
-        let indefinite: String = ["-", "1"].concat();
-        let allow = ["RESIDENCY", "-PIN-ALLOWED"].concat();
+    /// The three needles, assembled at runtime so the guard can never match its own
+    /// source. `(keep_alive, -1, RESIDENCY-PIN-ALLOWED)`.
+    fn pin_needles() -> (String, String, String) {
+        (
+            ["keep", "_alive"].concat(),
+            ["-", "1"].concat(),
+            ["RESIDENCY", "-PIN-ALLOWED"].concat(),
+        )
+    }
 
-        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    /// Is this line prose (a doc/comment) or explicitly opted out? Such lines may
+    /// freely DISCUSS the retired mechanism.
+    fn pin_scan_skips(line: &str, allow: &str) -> bool {
+        let t = line.trim_start();
+        t.starts_with("//") || t.starts_with("*") || line.contains(allow)
+    }
+
+    /// A `-1` that is a standalone numeric literal here, not the tail of `-100` or
+    /// part of an identifier/date. Returns the byte offsets at which one starts.
+    fn negative_one_positions(line: &str, neg: &str) -> Vec<usize> {
+        let bytes = line.as_bytes();
+        let mut out = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = line[from..].find(neg) {
+            let at = from + rel;
+            let after = bytes.get(at + neg.len()).copied();
+            let is_bare = match after {
+                None => true,
+                Some(c) => !(c as char).is_ascii_alphanumeric() && c != b'_' && c != b'.',
+            };
+            if is_bare {
+                out.push(at);
+            }
+            from = at + 1;
+        }
+        out
+    }
+
+    /// Names bound to a bare `-1` on this line: `const FOREVER: i64 = -1;`,
+    /// `let forever = -1;`, `field: -1,`. Cheap and deliberately shallow — it takes
+    /// the identifier immediately left of the `=`/`:` that introduces the literal.
+    fn pin_constant_names(line: &str) -> Vec<String> {
+        let (_, neg, allow) = pin_needles();
+        if pin_scan_skips(line, &allow) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for at in negative_one_positions(line, &neg) {
+            let mut head = line[..at].trim_end();
+            // Step back over the introducer.
+            if let Some(h) = head.strip_suffix('=') {
+                head = h.trim_end();
+                // `let x: i64 = -1` — drop the type annotation.
+                if let Some((lhs, _ty)) = head.rsplit_once(':') {
+                    if !lhs.trim_end().ends_with(':') {
+                        head = lhs.trim_end();
+                    }
+                }
+            } else if let Some(h) = head.strip_suffix(':') {
+                head = h.trim_end();
+            } else {
+                continue;
+            }
+            let name: String = head
+                .chars()
+                .rev()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let name = name.trim_matches('"').to_string();
+            if name.len() >= 2 && !matches!(name.as_str(), "let" | "const" | "static" | "mut") {
+                out.push(name);
+            }
+        }
+        out
+    }
+
+    /// Does `line` reference `name` as a whole identifier token?
+    fn mentions_ident(line: &str, name: &str) -> bool {
+        let bytes = line.as_bytes();
+        let mut from = 0usize;
+        while let Some(rel) = line[from..].find(name) {
+            let at = from + rel;
+            let before_ok = at == 0 || {
+                let c = bytes[at - 1];
+                !(c as char).is_ascii_alphanumeric() && c != b'_'
+            };
+            let after = bytes.get(at + name.len()).copied();
+            let after_ok = match after {
+                None => true,
+                Some(c) => !(c as char).is_ascii_alphanumeric() && c != b'_',
+            };
+            if before_ok && after_ok {
+                return true;
+            }
+            from = at + 1;
+        }
+        false
+    }
+
+    /// `keep_alive` modulo case and separators — so `keepAlive`/`KEEP_ALIVE` count.
+    fn is_keep_alive_named(name: &str) -> bool {
+        let flat: String = name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        flat.contains(&["keep", "alive"].concat())
+    }
+
+    /// The pure scanner. `pinned_names` are identifiers the crate binds to `-1`
+    /// (from [`pin_constant_names`], collected crate-wide first so an indirection
+    /// across files is still caught). Returns `(line_number_1_based, trimmed_line)`.
+    fn indefinite_pin_offenders(
+        text: &str,
+        pinned_names: &HashSet<String>,
+    ) -> Vec<(usize, String)> {
+        let (key, neg, allow) = pin_needles();
+        let mut out = Vec::new();
+        for (n, line) in text.lines().enumerate() {
+            if pin_scan_skips(line, &allow) {
+                continue;
+            }
+            // (1) direct: keep_alive and a -1 on the same line. Kept LOOSE (a plain
+            // substring `-1`) so a stringly-typed `"keep_alive": "-1"` is caught too.
+            let direct = line.contains(&key) && line.contains(&neg);
+            // (2) indirection: a keep_alive line that names a binding the crate
+            // bound to -1 somewhere else.
+            let via_const = line.contains(&key)
+                && pinned_names.iter().any(|c| mentions_ident(line, c));
+            // (3) a keep_alive-NAMED binding/field assigned -1, even if the literal
+            // token `keep_alive` never appears (`let keepAlive = -1;`).
+            let named = pin_constant_names(line).iter().any(|c| is_keep_alive_named(c));
+            if direct || via_const || named {
+                out.push((n + 1, line.trim_start().to_string()));
+            }
+        }
+        out
+    }
+
+    fn crate_rs_files() -> Vec<std::path::PathBuf> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             let Ok(entries) = std::fs::read_dir(dir) else {
                 return;
             };
             for e in entries.flatten() {
                 let p = e.path();
                 if p.is_dir() {
-                    rs_files(&p, out);
+                    walk(&p, out);
                 } else if p.extension().and_then(|s| s.to_str()) == Some("rs") {
                     out.push(p);
                 }
@@ -2151,26 +2339,34 @@ mod tests {
         }
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = Vec::new();
-        rs_files(&root, &mut files);
+        walk(&root, &mut files);
+        files
+    }
+
+    #[test]
+    fn no_code_path_pins_a_model_indefinitely() {
+        let files = crate_rs_files();
         assert!(files.len() > 10, "source scan found suspiciously few files");
 
-        let mut offenders = Vec::new();
-        for f in files {
-            let Ok(text) = std::fs::read_to_string(&f) else {
+        // Pass 1, crate-wide: every identifier bound to a bare -1.
+        let mut pinned_names: HashSet<String> = HashSet::new();
+        for f in &files {
+            let Ok(text) = std::fs::read_to_string(f) else {
                 continue;
             };
-            for (n, line) in text.lines().enumerate() {
-                let t = line.trim_start();
-                // Prose (docs/comments) may DISCUSS the retired mechanism.
-                if t.starts_with("//") || t.starts_with("*") {
-                    continue;
-                }
-                if line.contains(&allow) {
-                    continue;
-                }
-                if line.contains(&key) && line.contains(&indefinite) {
-                    offenders.push(format!("{}:{}: {}", f.display(), n + 1, t));
-                }
+            for line in text.lines() {
+                pinned_names.extend(pin_constant_names(line));
+            }
+        }
+
+        // Pass 2: flag the three shapes.
+        let mut offenders = Vec::new();
+        for f in &files {
+            let Ok(text) = std::fs::read_to_string(f) else {
+                continue;
+            };
+            for (n, line) in indefinite_pin_offenders(&text, &pinned_names) {
+                offenders.push(format!("{}:{}: {}", f.display(), n, line));
             }
         }
         assert!(
@@ -2180,6 +2376,109 @@ mod tests {
              instead. Offending lines:\n{}",
             offenders.join("\n")
         );
+    }
+
+    /// The guard's own unit tests: it must catch the direct shape, the two
+    /// indirections, and NOT fire on prose, on the opt-out marker, or on a bounded
+    /// keep_alive. Without these the guard is untested code asserting a property.
+    #[test]
+    fn the_pin_guard_catches_direct_and_indirect_shapes() {
+        let none: HashSet<String> = HashSet::new();
+        // Fixtures are ASSEMBLED at runtime for the same reason the needles are:
+        // a literal `keep_alive` + `-1` written here would make this test file its
+        // own offender under the crate-wide scan.
+        let (ka, neg, _) = pin_needles();
+
+        // (1) direct — the original case.
+        let direct = format!("    let body = json!({{ \"{ka}\": {neg} }});");
+        assert_eq!(indefinite_pin_offenders(&direct, &none).len(), 1);
+        // …including the stringly-typed variant.
+        let stringly = format!("    let body = json!({{ \"{ka}\": \"{neg}\" }});");
+        assert_eq!(indefinite_pin_offenders(&stringly, &none).len(), 1);
+
+        // (2) indirection through a named constant, ACROSS statements.
+        let defs = format!("const FOREVER: i64 = {neg};");
+        let names: HashSet<String> = pin_constant_names(&defs).into_iter().collect();
+        assert!(names.contains("FOREVER"), "the -1 constant must be learned");
+        let use_line = format!("    body.insert(\"{ka}\", FOREVER);");
+        assert_eq!(
+            indefinite_pin_offenders(&use_line, &names).len(),
+            1,
+            "a pin constant reaching a keep-alive line must be caught"
+        );
+        // …and with no such constant learned, that same line is clean (so the
+        // detection genuinely comes from the constant, not from the word alone).
+        assert!(indefinite_pin_offenders(&use_line, &none).is_empty());
+
+        // (3) a keep_alive-NAMED binding assigned -1, with no keep_alive literal
+        // in the request line. Case/separator-insensitive, so `keepAlive` counts.
+        let named = format!("    let {}Alive = {neg};", "keep");
+        assert_eq!(indefinite_pin_offenders(&named, &none).len(), 1);
+
+        // Negatives.
+        let bounded = format!("    let body = json!({{ \"{ka}\": \"24h\" }});");
+        assert!(indefinite_pin_offenders(&bounded, &none).is_empty());
+        let unload = format!("    let body = json!({{ \"{ka}\": 0 }});");
+        assert!(indefinite_pin_offenders(&unload, &none).is_empty());
+        let prose = format!("    // the retired path used \"{ka}\": {neg} forever");
+        assert!(indefinite_pin_offenders(&prose, &none).is_empty());
+        // `-1` as the tail of a larger literal is not a -1.
+        let bigger = format!("    let timeout_ms = {neg}000;");
+        assert!(pin_constant_names(&bigger).is_empty());
+    }
+
+    /// The documented escape hatch still works, and works for the NEW shapes too —
+    /// otherwise a future bounded phase could not opt out of them.
+    #[test]
+    fn the_pin_guard_opt_out_marker_still_works() {
+        let none: HashSet<String> = HashSet::new();
+        let (ka, neg, marker) = pin_needles();
+
+        let direct = format!("    json!({{ \"{ka}\": {neg} }}); // {marker}: bounded phase");
+        assert!(
+            indefinite_pin_offenders(&direct, &none).is_empty(),
+            "the opt-out must still exempt the direct shape"
+        );
+
+        let def = format!("const FOREVER: i64 = {neg}; // {marker}");
+        assert!(
+            pin_constant_names(&def).is_empty(),
+            "an opted-out constant must not be learned as a pin source"
+        );
+
+        let named = format!("    let {}Alive = {neg}; // {marker}", "keep");
+        assert!(
+            indefinite_pin_offenders(&named, &none).is_empty(),
+            "the opt-out must exempt the keep_alive-named-binding shape"
+        );
+    }
+
+    /// The guard's honesty test: it is lexical, and these shapes get through. This
+    /// exists so nobody reads the guard as a total guarantee — if a future change
+    /// makes one of these detectable, DELETE the corresponding line here rather
+    /// than leaving a false claim of weakness. The GPU-side backstop for all of
+    /// them is `converge_legacy_pins`.
+    #[test]
+    fn the_pin_guard_documents_what_it_cannot_catch() {
+        let none: HashSet<String> = HashSet::new();
+        let (ka, _neg, _) = pin_needles();
+
+        // A runtime-computed -1: no literal anywhere.
+        let computed = format!("    let v = zero - one; json!({{ \"{ka}\": v }});");
+        assert!(
+            indefinite_pin_offenders(&computed, &none).is_empty(),
+            "documented residual: a computed -1 is invisible to a lexical scan"
+        );
+
+        // A -1 routed through a function parameter with an unrelated name.
+        let routed = format!("    warm(model, forever_value); // reaches {ka} inside warm()");
+        assert!(indefinite_pin_offenders(&routed, &none).is_empty());
+
+        // A value read from config/env at runtime.
+        let from_env = format!(
+            "    let v = std::env::var(\"X\").unwrap(); json!({{ \"{ka}\": v }});"
+        );
+        assert!(indefinite_pin_offenders(&from_env, &none).is_empty());
     }
 
     #[test]
@@ -3235,9 +3534,14 @@ mod tests {
 
     /// **The core seam test.** All three roles must produce a real HTTP warm
     /// request, and the EMBEDDING role's request must be shaped differently from
-    /// the chat-style personality/router ones (an embedding model cannot serve
-    /// `/api/generate`, so a regression that sent it a chat-shaped request is a
-    /// realistic silent failure).
+    /// the chat-style personality/router ones.
+    ///
+    /// This asserts the DELIBERATE role shaping, not a claim that `/api/generate`
+    /// would fail: measured on live Ollama 0.22.1 (2026-07-31) `/api/generate`
+    /// accepts an embedding model and its `keep_alive:0` really unloads it. The
+    /// shaping is defensive portability across Ollama versions (older builds 400
+    /// with "does not support generate"), and this test pins it so it is not
+    /// dropped by accident.
     #[tokio::test]
     #[serial_test::serial]
     async fn production_warm_one_issues_a_role_shaped_ollama_request_per_role() {
@@ -3327,11 +3631,11 @@ mod tests {
         assert_eq!(method, "POST", "the embedding warm must be a POST");
         assert_eq!(
             path, "/api/embed",
-            "an embedding model cannot serve /api/generate — it must be loaded through the embed endpoint"
+            "the embedding role is deliberately addressed through the embed endpoint (defensive portability across Ollama versions — 0.22.1 would also accept /api/generate)"
         );
         assert_ne!(
             path, "/api/generate",
-            "sending the chat-shaped warm for the embedding role is a realistic regression and must be caught"
+            "silently collapsing the embedding role onto the chat-shaped warm drops that portability and must be caught"
         );
         assert_eq!(
             body["model"],
@@ -3493,6 +3797,150 @@ mod tests {
                 .is_empty(),
             "the REGISTRY exemption must be empty too"
         );
+    }
+
+    // ── CHRD-PIN-01 review FINDINGS 1+2: unresolved ⇒ LOUD, and PIN NOTHING ──
+
+    /// A `tracing` writer that captures emitted events into a buffer, so "degrades
+    /// LOUDLY" is asserted as an observed log record rather than assumed from the
+    /// presence of a `warn!` in the source.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<StdMutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).to_string()
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for LogCapture {
+        type Writer = LogCapture;
+        fn make_writer(&'w self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A `seam_state` whose three role aliases resolve to NOTHING (the alias keys
+    /// are simply not configured, dynamically or statically).
+    async fn unresolved_seam_state(base: &str) -> Arc<crate::routes::AppState> {
+        std::env::set_var("OLLAMA_URL", base);
+        std::env::remove_var("CHORD_VRAM_FREE_SYSFS_PATH");
+        // The retired fallback read this. It is asserted here precisely because a
+        // resurrection of the fallback would make this test pass a model through.
+        std::env::set_var("EMBED_LOCAL_MODEL", "configured-embed-model:0.6b");
+        let state = crate::routes::tests::test_state("http://mcp.invalid:3200".to_string());
+        // Deliberately NO lumina_aliases.set(...) and no static alias map entries.
+        let _ = seen_requests();
+        state
+    }
+
+    /// **FINDING 1 + FINDING 2, end to end through the production wiring.** With
+    /// every role's alias unresolved: every role must WARN by name, and the pass
+    /// must warm nothing, exempt nothing, and put NO request on the wire — for the
+    /// embedding role exactly as for the other two. The removed fallback made the
+    /// embedding role warm and exempt a model anyway; a resurrection of it fails
+    /// here (`EMBED_LOCAL_MODEL` is set, so the old code path would find a target).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn production_unresolved_alias_warns_for_every_role_and_pins_nothing() {
+        let server = httpmock::MockServer::start_async().await;
+        let _stub = server
+            .mock_async(|when, then| {
+                when.matches(record_ollama_request);
+                then.status(200).json_body(serde_json::json!({"ok": true}));
+            })
+            .await;
+        let state = unresolved_seam_state(&server.base_url()).await;
+        let set = ResidentSet::new(seam_cfg("24h"));
+
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let report = {
+            // `#[tokio::test]` is a current-thread runtime, so the thread-local
+            // default subscriber stays installed across the awaits below.
+            let _guard = tracing::subscriber::set_default(subscriber);
+            set.warm(&state, "seam-unresolved", true).await
+        };
+
+        assert_eq!(report.warmed, 0, "an unresolved role must warm NOTHING");
+        assert_eq!(report.failed, 0, "unresolved is not a warm failure");
+        assert_eq!(report.skipped, 3, "all three roles must be skipped");
+        assert!(
+            seen_requests().is_empty(),
+            "no Ollama request may be issued for a role with no target"
+        );
+
+        let status = set.status().await;
+        assert!(
+            status.roles.iter().all(|r| r.state == RoleState::Unresolved),
+            "every role must land in unresolved: {:?}",
+            status.roles
+        );
+        assert!(
+            status.roles.iter().all(|r| r.model.is_none()),
+            "no role may acquire a substituted model: {:?}",
+            status.roles
+        );
+        assert!(
+            status.exempt.is_empty(),
+            "nothing may be exempted: {:?}",
+            status.exempt
+        );
+        assert!(
+            state
+                .model_registry
+                .lock()
+                .await
+                .residency_exempt()
+                .is_empty(),
+            "the REGISTRY exemption must be empty too"
+        );
+
+        // …and it was LOUD, uniformly, naming role + alias + remedy.
+        let logged = capture.text();
+        for (role, alias) in [
+            (Role::Personality, "lumina-deep"),
+            (Role::Router, "lumina-fast"),
+            (Role::Embedding, "lumina-embed"),
+        ] {
+            assert!(
+                logged.contains(role.id()),
+                "the {} role must be named in the warning:\n{logged}",
+                role.id()
+            );
+            assert!(
+                logged.contains(alias),
+                "the failed alias {alias} must be named in the warning:\n{logged}"
+            );
+            assert!(
+                logged.contains(role.alias_env()),
+                "the warning must carry the actionable remedy for {}:\n{logged}",
+                role.id()
+            );
+        }
+        assert!(
+            logged.contains("WARN"),
+            "the degradation must be at WARN level, not whispered:\n{logged}"
+        );
+        assert!(
+            !logged.contains("configured-embed-model"),
+            "the retired EMBED_LOCAL_MODEL fallback must not reappear:\n{logged}"
+        );
+        std::env::remove_var("EMBED_LOCAL_MODEL");
     }
 
     /// **Release/re-warm through the production wiring is genuinely
