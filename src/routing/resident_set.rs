@@ -162,6 +162,7 @@
 //! degrade to a logged, observable role state. A cold turn is slower, not broken.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1989,6 +1990,11 @@ pub struct ConvergeReport {
     pub unpinned: usize,
     /// …and the names it could NOT release, so a give-up log can name them.
     pub stranded: Vec<String>,
+    /// …and the names it deliberately did NOT attempt, because the resident set
+    /// had taken them over between the plan snapshot and that model's turn in the
+    /// unload loop. A normal, expected outcome — NOT a failure, and never a reason
+    /// to leave the pass non-terminal.
+    pub skipped_held: Vec<String>,
 }
 
 impl ConvergeReport {
@@ -1998,6 +2004,7 @@ impl ConvergeReport {
             found: 0,
             unpinned: 0,
             stranded: Vec::new(),
+            skipped_held: Vec::new(),
         }
     }
 }
@@ -2016,9 +2023,10 @@ pub trait ConvergeEnv: Send + Sync {
     async fn loaded(&self) -> Result<Vec<(String, Option<String>)>, ConvergeStatus>;
     /// The models the resident set currently HOLDS — never touched by convergence.
     ///
-    /// Re-read on EVERY pass on purpose: a retry must see a model the set has
-    /// re-warmed in the meantime and leave it alone, so retrying can never fight a
-    /// legitimate re-warm.
+    /// Re-read on every pass AND **immediately before every individual unload** —
+    /// see `converge_once` for why the batch snapshot alone is a TOCTOU. Implementations
+    /// must therefore be cheap enough to call once per unload target (the production
+    /// impl reads in-process resident-set state, no network).
     async fn held(&self) -> HashSet<String>;
     /// Release one model from VRAM. Returns whether it landed. Never errors.
     async fn unload(&self, model: &str) -> bool;
@@ -2083,6 +2091,34 @@ impl<'a> ConvergeEnv for AppStateConvergeEnv<'a> {
 }
 
 /// ONE convergence pass against an injected env. Best-effort and idempotent.
+///
+/// **The held-set is re-read immediately before EVERY individual unload, not once
+/// for the batch.** The plan is computed from one `/api/ps` read plus one `held()`
+/// snapshot, but issuing the unloads takes real time (each is an HTTP round-trip to
+/// Ollama, up to 60s), and a resident-set warm or lifecycle transition can land in
+/// the middle of that. Checking `held()` once for the batch means a model that the
+/// set legitimately took over WHILE the loop was running would still be unloaded by
+/// the very cleanup meant to protect the set's own residency — the worst possible
+/// victim. So each target is re-checked at the last moment before its own unload,
+/// and a model that has since become held is SKIPPED and logged at INFO (a normal,
+/// expected race outcome, not a warning, and not a failure of the pass).
+///
+/// **The reverse ordering is deliberately NOT chased.** A model that was held at
+/// snapshot time and is released before the loop reaches it stays untouched this
+/// pass: it was excluded from `targets` by `plan_unpin` and is never re-planned
+/// mid-loop. That is safe and intentional. (a) Unloading it would be harmless —
+/// it is genuinely unpinned and reloads on demand — so there is no correctness
+/// pressure to widen the batch. (b) Widening it WOULD mean re-planning against a
+/// held-set read that can race the other way, turning a conservative snapshot into
+/// one that can grow the unload set from a momentary observation — exactly the
+/// hazard the per-unload re-check exists to remove. The two directions are
+/// asymmetric: missing a target costs at most one more pass (convergence is
+/// idempotent, and the reconcile re-attempt below re-runs it while a pass is
+/// non-terminal), while unloading a wrongly-included one costs a live role its
+/// VRAM residency. We accept the miss and refuse the over-reach. In practice the
+/// case is close to vacuous anyway: a held model has the set's own BOUNDED 24h
+/// keep_alive re-asserted on it, so it does not look like an indefinite pin at all
+/// unless it also carries a past-horizon expiry.
 pub async fn converge_once(env: &dyn ConvergeEnv) -> ConvergeReport {
     let loaded = match env.loaded().await {
         Ok(l) => l,
@@ -2102,8 +2138,19 @@ pub async fn converge_once(env: &dyn ConvergeEnv) -> ConvergeReport {
         found: targets.len(),
         unpinned: 0,
         stranded: Vec::new(),
+        skipped_held: Vec::new(),
     };
     for model in targets {
+        // TOCTOU close: the snapshot above may be stale by now. Re-read the held
+        // set for THIS model, immediately before its unload.
+        if env.held().await.contains(&model) {
+            info!(
+                model = %model,
+                "resident-set: model became held by the resident set after the convergence plan was taken — skipping its release (expected race; the set now owns its bounded lifecycle)"
+            );
+            report.skipped_held.push(model);
+            continue;
+        }
         warn!(
             model = %model,
             horizon_days = pin_horizon_days(),
@@ -2127,6 +2174,7 @@ pub async fn converge_once(env: &dyn ConvergeEnv) -> ConvergeReport {
         info!(
             found = report.found,
             unpinned = report.unpinned,
+            skipped_held = report.skipped_held.len(),
             "resident-set: legacy pin convergence complete — residency now has a single owner"
         );
     }
@@ -2254,6 +2302,156 @@ where
     (report, total)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CHRD-PIN-01: the reconcile-tick RE-ATTEMPT (what happens after the burst gives up)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The startup burst above must stay BOUNDED — an unbounded retry loop hammering
+// Ollama would be its own outage. But permanently giving up after one burst is
+// also wrong: a host whose Ollama was briefly unavailable at startup keeps tens of
+// GB pinned indefinitely, with nothing but a log line to say so.
+//
+// So a non-terminal burst ARMS the existing reconcile loop to re-attempt
+// convergence — **at most one attempt per reconcile tick, with no inner retry
+// loop of any kind** — until convergence settles once, after which it is disarmed
+// forever. Terminal outcomes (`Settled`, `Unconfigured`) never arm it at all.
+//
+// Why this cannot become a hot loop, structurally:
+//   * the ONLY caller is the reconcile loop body, which is gated by that loop's own
+//     `sleep(interval)` — so attempts are rate-limited by the reconcile interval,
+//     not by anything convergence does;
+//   * [`converge_reattempt_tick`] takes an `FnOnce` and contains no loop: one call
+//     ⇒ at most one `converge_once`;
+//   * the gate state machine is MONOTONE — `Pending → Armed → Done` — and `Done`
+//     is absorbing, so the number of attempts after the first terminal outcome is
+//     exactly zero, forever.
+//
+// Worst-case convergence latency is therefore: the bounded startup burst (default
+// 5 attempts, 30/60/120/240s backoff ⇒ ~7.5 min) plus up to one reconcile interval
+// (`CHORD_RESIDENT_REFRESH_SECS`, default 300s) per subsequent attempt, for as long
+// as the host stays broken — one probe every 5 minutes, which is strictly cheaper
+// than the reconcile tick it rides on.
+
+/// The three states of the reconcile re-attempt gate. Monotone: it only ever moves
+/// forward, and `Done` is absorbing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvergeGateState {
+    /// The startup burst has not reported yet — the reconcile loop must NOT also
+    /// be converging, or the two would run concurrently against the same host.
+    Pending,
+    /// The burst ended non-terminal (`Unreachable`/`Stranded`): re-attempt once per
+    /// reconcile tick.
+    Armed,
+    /// Convergence settled (or is unfixable). Never attempt again.
+    Done,
+}
+
+const GATE_PENDING: u8 = 0;
+const GATE_ARMED: u8 = 1;
+const GATE_DONE: u8 = 2;
+
+/// Shared, lock-free state deciding whether a reconcile tick should also try to
+/// converge. One per process, created by [`startup_residency`].
+#[derive(Debug)]
+pub struct ConvergeGate {
+    state: AtomicU8,
+}
+
+impl Default for ConvergeGate {
+    fn default() -> Self {
+        ConvergeGate::new()
+    }
+}
+
+impl ConvergeGate {
+    pub fn new() -> Self {
+        ConvergeGate {
+            state: AtomicU8::new(GATE_PENDING),
+        }
+    }
+
+    pub fn state(&self) -> ConvergeGateState {
+        match self.state.load(AtomicOrdering::SeqCst) {
+            GATE_ARMED => ConvergeGateState::Armed,
+            GATE_DONE => ConvergeGateState::Done,
+            _ => ConvergeGateState::Pending,
+        }
+    }
+
+    /// Should this reconcile tick attempt a convergence? Only when ARMED.
+    pub fn should_attempt(&self) -> bool {
+        self.state() == ConvergeGateState::Armed
+    }
+
+    fn advance(&self, status: ConvergeStatus) {
+        let next = if status.is_terminal() {
+            GATE_DONE
+        } else {
+            GATE_ARMED
+        };
+        // `Done` is absorbing: never step back from it.
+        let _ = self.state.fetch_update(
+            AtomicOrdering::SeqCst,
+            AtomicOrdering::SeqCst,
+            |cur| {
+                if cur == GATE_DONE || cur == next {
+                    None
+                } else {
+                    Some(next)
+                }
+            },
+        );
+    }
+
+    /// The startup burst finished with `status`. Non-terminal ⇒ arm the reconcile
+    /// re-attempt; terminal ⇒ close the gate permanently.
+    pub fn record_startup_outcome(&self, status: ConvergeStatus) {
+        self.advance(status);
+        if self.state() == ConvergeGateState::Armed {
+            info!(
+                status = ?status,
+                "resident-set: startup convergence did not settle — re-attempting once per reconcile tick until it does (no retry storm; one attempt per tick)"
+            );
+        }
+    }
+
+    /// A reconcile-tick attempt finished with `status`.
+    pub fn record_attempt(&self, status: ConvergeStatus) {
+        let was = self.state();
+        self.advance(status);
+        if was != ConvergeGateState::Done && self.state() == ConvergeGateState::Done {
+            info!("resident-set: legacy pin convergence settled on a reconcile re-attempt — no further attempts will be made");
+        }
+    }
+}
+
+/// One reconcile tick's worth of convergence: **at most one attempt**, and only
+/// while the gate is armed. `FnOnce` + no loop is the structural guarantee that a
+/// tick can never turn into a retry storm. Returns `None` when the gate is not
+/// armed (nothing ran).
+pub async fn converge_reattempt_tick<A, AF>(
+    gate: &ConvergeGate,
+    attempt: A,
+) -> Option<ConvergeReport>
+where
+    A: FnOnce() -> AF,
+    AF: std::future::Future<Output = ConvergeReport>,
+{
+    if !gate.should_attempt() {
+        return None;
+    }
+    let report = attempt().await;
+    if !report.status.is_terminal() {
+        warn!(
+            status = ?report.status,
+            still_pinned = %if report.stranded.is_empty() { "unknown (Ollama unreachable)".to_string() } else { report.stranded.join(", ") },
+            "resident-set: reconcile re-attempt of legacy pin convergence did not settle — the models named above are still holding VRAM that no lifecycle owns; will try again on the next reconcile tick"
+        );
+    }
+    gate.record_attempt(report.status);
+    Some(report)
+}
+
 /// Production convergence: bounded retries against the live host, real sleeps.
 pub async fn converge_legacy_pins_bounded(state: Arc<crate::routes::AppState>) -> ConvergeReport {
     let policy = ConvergeRetryPolicy::from_env();
@@ -2334,21 +2532,37 @@ pub async fn startup_residency(state: Arc<crate::routes::AppState>) {
     }
 
     // Step 2 — unconditional, and demonstrably after step 1.
+    // The gate starts PENDING so the reconcile loop (step 3, which starts while
+    // this burst is still running) never converges concurrently with it.
+    let gate = Arc::new(ConvergeGate::new());
     if plan.converge {
         let converge_state = state.clone();
+        let converge_gate = gate.clone();
         tokio::spawn(async move {
-            converge_legacy_pins_bounded(converge_state).await;
+            let report = converge_legacy_pins_bounded(converge_state).await;
+            // A non-terminal burst hands the problem to the reconcile loop rather
+            // than leaving ~60GB pinned until an operator notices.
+            converge_gate.record_startup_outcome(report.status);
         });
     }
 
     // Step 3.
-    reconcile_loop(state, set.config().refresh).await;
+    reconcile_loop(state, set.config().refresh, gate).await;
 }
 
 /// Background loop: periodically reconcile the resident set so an alias repoint
 /// or a drifted keep_alive is corrected without a restart. Best-effort and
 /// no-op while released — it never contends with a mode swap.
-pub async fn reconcile_loop(state: Arc<crate::routes::AppState>, interval: Duration) {
+///
+/// It also carries the convergence RE-ATTEMPT (see [`ConvergeGate`]): if the
+/// bounded startup burst ended non-terminal, each tick makes exactly ONE further
+/// convergence attempt until it settles, then stops forever. The tick's own
+/// `sleep(interval)` is what rate-limits it — there is no inner retry loop here.
+pub async fn reconcile_loop(
+    state: Arc<crate::routes::AppState>,
+    interval: Duration,
+    converge_gate: Arc<ConvergeGate>,
+) {
     info!(
         interval_secs = interval.as_secs(),
         "resident-set reconcile loop started"
@@ -2356,6 +2570,12 @@ pub async fn reconcile_loop(state: Arc<crate::routes::AppState>, interval: Durat
     loop {
         tokio::time::sleep(interval).await;
         let _ = global().reconcile(&state).await;
+        // At most one convergence attempt per tick, and only while armed.
+        let _ = converge_reattempt_tick(&converge_gate, || {
+            let state = state.clone();
+            async move { converge_legacy_pins(&state).await }
+        })
+        .await;
     }
 }
 
@@ -2518,9 +2738,10 @@ mod tests {
 
     // ── CHRD-PIN-01 Task A: no indefinite pin survives ──────────────────────
     //
-    // The load-bearing invariant, asserted against the SOURCE TREE rather than a
-    // behavior: no code path anywhere in this crate may ask Ollama for an indefinite
-    // `keep_alive`. A behavioral test can only cover the paths it knows about; the
+    // The load-bearing RULE this guard enforces (a scoped, best-effort enforcement
+    // against the SOURCE TREE — NOT a proof of the absolute invariant; see the ⚠
+    // block below): no code path anywhere in this crate may ask Ollama for an
+    // indefinite `keep_alive`. A behavioral test can only cover the paths it knows about; the
     // failure mode being guarded is a NEW (or resurrected) path nobody wired a test
     // to — which is exactly how the retired keep-resident pass coexisted with the
     // resident set in the first place.
@@ -3109,6 +3330,7 @@ mod tests {
                         found: 0,
                         unpinned: 0,
                         stranded: Vec::new(),
+                        skipped_held: Vec::new(),
                     }
                 } else {
                     ConvergeReport {
@@ -3116,6 +3338,7 @@ mod tests {
                         found: 1,
                         unpinned: 1,
                         stranded: Vec::new(),
+                        skipped_held: Vec::new(),
                     }
                 }
             },
@@ -3150,6 +3373,7 @@ mod tests {
                     found: 1,
                     unpinned: 0,
                     stranded: vec!["stuck:30b".to_string()],
+                    skipped_held: Vec::new(),
                 }
             },
             |d| {
@@ -3181,6 +3405,7 @@ mod tests {
                     found: 0,
                     unpinned: 0,
                     stranded: Vec::new(),
+                    skipped_held: Vec::new(),
                 }
             },
             |_| async {},
@@ -3189,6 +3414,305 @@ mod tests {
         assert_eq!(attempts, 1);
         assert_eq!(*calls.borrow(), 1);
         assert_eq!(report.status, ConvergeStatus::Unconfigured);
+    }
+
+    // ── CHRD-PIN-01 round 4: the held-set TOCTOU, and the reconcile re-attempt ──
+
+    /// A [`ConvergeEnv`] whose `held()` answer CHANGES between calls, so the window
+    /// between the plan snapshot and each individual unload is directly testable.
+    /// `held_script[0]` is what the snapshot sees; `held_script[i]` answers the i-th
+    /// later call; the last entry repeats forever.
+    struct ScriptedHeldEnv {
+        loaded: Vec<(String, Option<String>)>,
+        held_script: Vec<HashSet<String>>,
+        held_calls: std::sync::atomic::AtomicUsize,
+        now: i64,
+        unloaded: StdMutex<Vec<String>>,
+    }
+
+    impl ScriptedHeldEnv {
+        fn new(loaded: Vec<(String, Option<String>)>, script: &[&[&str]], now: i64) -> Self {
+            ScriptedHeldEnv {
+                loaded,
+                held_script: script
+                    .iter()
+                    .map(|step| step.iter().map(|s| s.to_string()).collect())
+                    .collect(),
+                held_calls: std::sync::atomic::AtomicUsize::new(0),
+                now,
+                unloaded: StdMutex::new(Vec::new()),
+            }
+        }
+        fn unloaded(&self) -> Vec<String> {
+            self.unloaded.lock().unwrap().clone()
+        }
+        fn held_calls(&self) -> usize {
+            self.held_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ConvergeEnv for ScriptedHeldEnv {
+        async fn loaded(&self) -> Result<Vec<(String, Option<String>)>, ConvergeStatus> {
+            Ok(self.loaded.clone())
+        }
+        async fn held(&self) -> HashSet<String> {
+            let i = self.held_calls.fetch_add(1, Ordering::SeqCst);
+            self.held_script[i.min(self.held_script.len() - 1)].clone()
+        }
+        async fn unload(&self, model: &str) -> bool {
+            self.unloaded.lock().unwrap().push(model.to_string());
+            true
+        }
+        fn now_epoch_secs(&self) -> i64 {
+            self.now
+        }
+    }
+
+    /// FIX 1 — the TOCTOU. The batch snapshot said nobody held `taken-over:8b`, but
+    /// the resident set warmed it into a role while the loop was busy unloading the
+    /// model ahead of it. Re-checking `held()` per-unload is the only thing that
+    /// stops convergence from evicting a model a live role is holding.
+    #[tokio::test]
+    async fn a_model_that_becomes_held_between_the_snapshot_and_its_unload_is_not_unloaded() {
+        let now = 1_800_000_000i64;
+        let env = ScriptedHeldEnv::new(
+            vec![
+                ("stranded:30b".to_string(), Some(at(now, SENTINEL_SECS))),
+                ("taken-over:8b".to_string(), Some(at(now, SENTINEL_SECS))),
+            ],
+            // snapshot: nothing held → BOTH are planned. Then the set warms
+            // `taken-over:8b` into a role before the loop reaches it.
+            &[&[], &["taken-over:8b"]],
+            now,
+        );
+        let report = converge_once(&env).await;
+
+        assert_eq!(
+            report.found, 2,
+            "both were legitimately planned at snapshot time"
+        );
+        assert_eq!(
+            env.unloaded(),
+            vec!["stranded:30b"],
+            "the model the resident set took over mid-loop must NOT be unloaded"
+        );
+        assert_eq!(report.unpinned, 1);
+        assert_eq!(report.skipped_held, vec!["taken-over:8b".to_string()]);
+        assert!(report.stranded.is_empty(), "a skip is not a failure");
+        assert_eq!(
+            report.status,
+            ConvergeStatus::Settled,
+            "losing a target to a legitimate warm is a normal, TERMINAL outcome"
+        );
+        // 1 snapshot + 1 per target: the re-check is PER UNLOAD, not per batch.
+        assert_eq!(env.held_calls(), 3);
+    }
+
+    /// FIX 1, the reverse ordering — chosen behaviour, stated: a model that was held
+    /// at snapshot time and is RELEASED before the loop reaches it is left alone this
+    /// pass. It was excluded from the plan and is never re-planned mid-loop.
+    /// Unloading it would be harmless, but re-planning to catch it would mean growing
+    /// the unload set from a momentary read — the exact hazard the per-unload
+    /// re-check exists to remove. Missing it costs one more (idempotent) pass;
+    /// over-reaching costs a live role its VRAM. We take the miss.
+    #[tokio::test]
+    async fn a_model_released_from_held_after_the_snapshot_is_left_for_a_later_pass_not_unloaded() {
+        let now = 1_800_000_000i64;
+        let env = ScriptedHeldEnv::new(
+            vec![
+                ("stranded:30b".to_string(), Some(at(now, SENTINEL_SECS))),
+                ("was-held:8b".to_string(), Some(at(now, SENTINEL_SECS))),
+            ],
+            // snapshot: `was-held:8b` is held → excluded from the plan. It is then
+            // released, but the loop does not go back for it.
+            &[&["was-held:8b"], &[]],
+            now,
+        );
+        let report = converge_once(&env).await;
+
+        assert_eq!(report.found, 1, "only the unheld model was planned");
+        assert_eq!(
+            env.unloaded(),
+            vec!["stranded:30b"],
+            "a model released AFTER the snapshot is not chased mid-loop"
+        );
+        assert!(report.skipped_held.is_empty());
+        assert_eq!(report.status, ConvergeStatus::Settled);
+        // …and a later pass picks it up, because convergence is idempotent.
+        let env2 = ScriptedHeldEnv::new(
+            vec![("was-held:8b".to_string(), Some(at(now, SENTINEL_SECS)))],
+            &[&[]],
+            now,
+        );
+        assert_eq!(converge_once(&env2).await.unpinned, 1);
+    }
+
+    /// Positive control for FIX 1: with a stable held set, the per-unload re-check
+    /// changes nothing — an ordinary settled pass still unloads EXACTLY the
+    /// sentinel-pinned, unheld models and nothing else.
+    #[tokio::test]
+    async fn an_ordinary_settled_convergence_still_unloads_exactly_the_sentinel_pinned_unheld_models(
+    ) {
+        let now = 1_800_000_000i64;
+        let env = ScriptedHeldEnv::new(
+            vec![
+                ("sentinel-a:30b".to_string(), Some(at(now, SENTINEL_SECS))),
+                ("held-sentinel:8b".to_string(), Some(at(now, SENTINEL_SECS))),
+                ("long-bounded:8b".to_string(), Some(at(now, 400 * 86_400))),
+                ("ordinary:1b".to_string(), Some(at(now, 86_400))),
+                ("sentinel-b:1b".to_string(), Some(at(now, SENTINEL_SECS))),
+                ("no-expiry:1b".to_string(), None),
+            ],
+            &[&["held-sentinel:8b"]], // stable for the whole pass
+            now,
+        );
+        let report = converge_once(&env).await;
+        assert_eq!(report.status, ConvergeStatus::Settled);
+        assert_eq!(report.found, 2);
+        assert_eq!(report.unpinned, 2);
+        assert!(report.skipped_held.is_empty());
+        assert!(report.stranded.is_empty());
+        assert_eq!(env.unloaded(), vec!["sentinel-a:30b", "sentinel-b:1b"]);
+    }
+
+    // FIX 2 — the reconcile-tick re-attempt.
+
+    fn report_with(status: ConvergeStatus) -> ConvergeReport {
+        ConvergeReport {
+            status,
+            found: 0,
+            unpinned: 0,
+            stranded: Vec::new(),
+            skipped_held: Vec::new(),
+        }
+    }
+
+    /// A non-terminal startup burst hands the problem to the reconcile loop: the
+    /// gate arms, each tick makes ONE attempt, and it stops the moment one settles.
+    #[tokio::test]
+    async fn a_non_terminal_startup_outcome_re_attempts_on_the_reconcile_tick_and_stops_once_settled(
+    ) {
+        for burst in [ConvergeStatus::Unreachable, ConvergeStatus::Stranded] {
+            let gate = ConvergeGate::new();
+            // While the burst is still running the gate is PENDING — the reconcile
+            // loop must not converge concurrently with it.
+            assert_eq!(gate.state(), ConvergeGateState::Pending);
+            assert!(converge_reattempt_tick(&gate, || async {
+                panic!("must not attempt while the startup burst is still in flight")
+            })
+            .await
+            .is_none());
+
+            gate.record_startup_outcome(burst);
+            assert_eq!(gate.state(), ConvergeGateState::Armed, "burst {burst:?}");
+
+            // Tick 1: Ollama is still down.
+            let calls = std::cell::RefCell::new(0u32);
+            let r = converge_reattempt_tick(&gate, || async {
+                *calls.borrow_mut() += 1;
+                report_with(ConvergeStatus::Unreachable)
+            })
+            .await;
+            assert_eq!(r.map(|r| r.status), Some(ConvergeStatus::Unreachable));
+            assert_eq!(gate.state(), ConvergeGateState::Armed, "still not settled");
+
+            // Tick 2: Ollama is back — it settles.
+            let r = converge_reattempt_tick(&gate, || async {
+                *calls.borrow_mut() += 1;
+                report_with(ConvergeStatus::Settled)
+            })
+            .await;
+            assert_eq!(r.map(|r| r.status), Some(ConvergeStatus::Settled));
+            assert_eq!(gate.state(), ConvergeGateState::Done);
+            assert_eq!(*calls.borrow(), 2);
+
+            // Tick 3+: never again, forever.
+            for _ in 0..100 {
+                assert!(converge_reattempt_tick(&gate, || async {
+                    panic!("a settled convergence must never be re-attempted")
+                })
+                .await
+                .is_none());
+            }
+        }
+    }
+
+    /// A TERMINAL startup outcome must never arm the reconcile re-attempt: there is
+    /// nothing left to do (`Settled`) or nothing a retry could fix (`Unconfigured`).
+    #[tokio::test]
+    async fn a_terminal_startup_outcome_never_re_arms_the_reconcile_re_attempt() {
+        for terminal in [ConvergeStatus::Settled, ConvergeStatus::Unconfigured] {
+            let gate = ConvergeGate::new();
+            gate.record_startup_outcome(terminal);
+            assert_eq!(gate.state(), ConvergeGateState::Done, "{terminal:?}");
+            assert!(!gate.should_attempt());
+            for _ in 0..50 {
+                assert!(converge_reattempt_tick(&gate, || async {
+                    panic!("a terminal startup outcome must never be re-attempted: {terminal:?}")
+                })
+                .await
+                .is_none());
+            }
+            // And `Done` is ABSORBING — a stray non-terminal report cannot re-arm it.
+            gate.record_attempt(ConvergeStatus::Unreachable);
+            gate.record_startup_outcome(ConvergeStatus::Stranded);
+            assert_eq!(gate.state(), ConvergeGateState::Done);
+            assert!(!gate.should_attempt());
+        }
+    }
+
+    /// NO STORM: however many ticks pass while convergence keeps failing, each tick
+    /// costs EXACTLY ONE attempt — the rate limit is the reconcile interval itself,
+    /// and there is no inner retry loop.
+    #[tokio::test]
+    async fn the_reconcile_re_attempt_makes_at_most_one_convergence_attempt_per_tick() {
+        let gate = ConvergeGate::new();
+        gate.record_startup_outcome(ConvergeStatus::Stranded);
+        let calls = std::cell::RefCell::new(0u32);
+        for tick in 1..=25u32 {
+            converge_reattempt_tick(&gate, || async {
+                *calls.borrow_mut() += 1;
+                report_with(ConvergeStatus::Stranded)
+            })
+            .await;
+            assert_eq!(
+                *calls.borrow(),
+                tick,
+                "tick {tick} must cost exactly one convergence attempt, never a burst"
+            );
+        }
+        assert_eq!(gate.state(), ConvergeGateState::Armed);
+    }
+
+    /// The two halves compose: the bounded burst is still bounded, and what it
+    /// hands to the reconcile loop is bounded per tick. Worst case = burst budget +
+    /// one attempt per reconcile interval, never a hot loop.
+    #[tokio::test]
+    async fn the_startup_burst_stays_bounded_and_the_reconcile_re_attempt_takes_over() {
+        use std::cell::RefCell;
+        let burst_calls = RefCell::new(0u32);
+        let policy = ConvergeRetryPolicy::default();
+        let (report, attempts) = converge_until_settled(
+            &policy,
+            || async {
+                *burst_calls.borrow_mut() += 1;
+                report_with(ConvergeStatus::Unreachable)
+            },
+            |_| async {},
+        )
+        .await;
+        assert_eq!(attempts, policy.attempts, "the burst is BOUNDED, as before");
+        assert_eq!(*burst_calls.borrow(), policy.attempts);
+
+        // …and giving up no longer means giving up permanently.
+        let gate = ConvergeGate::new();
+        gate.record_startup_outcome(report.status);
+        assert!(gate.should_attempt());
+        let r = converge_reattempt_tick(&gate, || async { report_with(ConvergeStatus::Settled) })
+            .await;
+        assert_eq!(r.map(|r| r.status), Some(ConvergeStatus::Settled));
+        assert_eq!(gate.state(), ConvergeGateState::Done);
     }
 
     #[test]
