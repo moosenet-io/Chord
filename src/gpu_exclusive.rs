@@ -408,57 +408,33 @@ pub fn ollama_base_from_env() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Phase 1 (lumina resident mode): is `name` in the keep-resident `exempt` set?
-/// Pure/testable — exact-match against the operator's `MODEL_KEEP_RESIDENT` names
-/// (same names Ollama reports in `/api/ps` and that the warm path pins). An empty
-/// `exempt` (the default) never matches, so eviction behaves exactly as before.
-pub fn is_keep_resident(name: &str, exempt: &[String]) -> bool {
-    exempt.iter().any(|e| e == name)
-}
+// CHRD-PIN-01: `is_keep_resident` / `partition_evictable` were REMOVED with the
+// `MODEL_KEEP_RESIDENT` pinning mechanism. A GPU-exclusive grant no longer
+// "exempts" a privately-pinned working set from eviction — it is a MODE SWAP, so
+// the route handler RELEASES `crate::routing::resident_set` (the single residency
+// owner) first and then evicts everything. One owner, one lifecycle.
 
-/// Phase 1: split a list of resident model names into `(to_evict, kept)` given the
-/// keep-resident `exempt` set. Pure — the eviction policy in one testable place,
-/// no network. `kept` is the keep-resident models that were resident and are being
-/// left loaded (for `[keep-resident]` logging).
-pub fn partition_evictable(resident: &[String], exempt: &[String]) -> (Vec<String>, Vec<String>) {
-    let mut to_evict = Vec::new();
-    let mut kept = Vec::new();
-    for name in resident {
-        if name.is_empty() {
-            continue;
-        }
-        if is_keep_resident(name, exempt) {
-            kept.push(name.clone());
-        } else {
-            to_evict.push(name.clone());
-        }
-    }
-    (to_evict, kept)
-}
-
-/// Best-effort: unload the models Ollama currently has resident so the GPU is clear
-/// for the exclusive holder — EXCEPT any name in `exempt` (the Phase 1 keep-resident
-/// working-set), which is left loaded so the assistant stays hot through a sweep.
-/// Pass `&[]` to unload everything (idle-mode's whole-GPU release keeps that shape).
+/// Best-effort: unload EVERY model Ollama currently has resident, so the GPU is
+/// clear for the exclusive holder / the idle lease. There is no exemption list:
+/// residency is owned by `crate::routing::resident_set`, and every caller of this
+/// function RELEASES that set first (which is what drops its registry exemption and
+/// re-asserts the models' unload), so an exemption here would only fight it.
 /// Non-fatal by construction — a missing `OLLAMA_URL`, an unreachable Ollama, or
 /// nothing loaded all yield `0` with a log line, never an error. Reuses the harness's
 /// own `/api/ps` poll shape. Returns the count actually unloaded.
-pub async fn evict_resident_models(
-    client: &reqwest::Client,
-    ollama_base: &str,
-    exempt: &[String],
-) -> usize {
+pub async fn evict_resident_models(client: &reqwest::Client, ollama_base: &str) -> usize {
     let base = ollama_base.trim_end_matches('/');
     let stats = crate::sweep_status::ollama::query_ollama_ps(client, base).await;
     if !stats.available {
         info!("gpu-exclusive: Ollama /api/ps unavailable — nothing to evict (best-effort)");
         return 0;
     }
-    let resident: Vec<String> = stats.models.into_iter().map(|m| m.name).collect();
-    let (to_evict, kept) = partition_evictable(&resident, exempt);
-    for name in &kept {
-        info!(model = %name, "[keep-resident] gpu-exclusive: exempting model from eviction (staying VRAM-resident)");
-    }
+    let to_evict: Vec<String> = stats
+        .models
+        .into_iter()
+        .map(|m| m.name)
+        .filter(|n| !n.is_empty())
+        .collect();
     let mut unloaded = 0usize;
     for name in to_evict {
         // Ollama unloads a resident model when handed keep_alive:0.
@@ -496,175 +472,47 @@ pub async fn evict_resident_models(
     unloaded
 }
 
-/// Phase 1: the request body that PINS a model VRAM-resident — `keep_alive:-1`
-/// (indefinite) with an empty prompt, so Ollama loads the model (if cold) and sets
-/// its keep_alive so a normal request can't let it drift to the 2h default and out
-/// of VRAM. Pure/testable (asserts the `-1` sentinel). The `/api/generate` empty-
-/// prompt "just load / set keep_alive" shape is the mirror of the `keep_alive:0`
-/// unload used above.
-pub fn keep_resident_warm_body(model: &str) -> serde_json::Value {
-    serde_json::json!({ "model": model, "prompt": "", "keep_alive": -1 })
-}
+// CHRD-PIN-01: `keep_resident_warm_body` / `keep_resident_embed_warm_body` /
+// `warm_embed_keep_resident` / `warm_keep_resident_models` — the whole
+// `keep_alive:-1` INDEFINITE-PIN path — were REMOVED. Nothing in Chord may pin a
+// model indefinitely any more: a pin that is never reaped sits outside every
+// lifecycle, so a Harmony/MINT mode swap could not reclaim the GPU from it. The
+// bounded, releasable equivalent lives in `crate::routing::resident_set`.
+//
+// The two pure embedder heuristics below SURVIVE the removal: they are how any
+// role-agnostic Ollama call (notably the CHRD-PIN-01 startup pin convergence)
+// addresses an embedding model on an Ollama build that refuses it on
+// `/api/generate`.
+//
+// MEASURED CORRECTION (live Ollama 0.22.1, 2026-07-31): an embedding model is NOT
+// universally rejected by `/api/generate`. On 0.22.1, `POST /api/generate` with
+// `{"model":"<embedding model>","prompt":"","keep_alive":0}` returns 200 and really
+// unloads it. The rejection these helpers key on is VERSION-DEPENDENT, so treat
+// them as defensive portability across Ollama versions — not as evidence that an
+// embedder can never be addressed through `/api/generate`.
 
-/// Phase 1.1: the request body that PINS an **embedding** model VRAM-resident via
-/// Ollama's `/api/embeddings` endpoint — `keep_alive:-1` (indefinite) with an
-/// empty prompt. Embedding models (e.g. `qwen3-embedding:0.6b`) reject
-/// `/api/generate` with a 400 "does not support generate" and so can never be
-/// pinned by [`keep_resident_warm_body`]; this is the fallback that durably pins
-/// them. Pure/testable (asserts the `-1` sentinel).
-pub fn keep_resident_embed_warm_body(model: &str) -> serde_json::Value {
-    serde_json::json!({ "model": model, "prompt": "", "keep_alive": -1 })
-}
-
-/// Phase 1.1: heuristic for "this model name is an embedding model" — a cheap
-/// pre-check so we can go straight to the `/api/embeddings` warm path instead of
-/// wasting a doomed `/api/generate` round trip. The `/api/generate` 400
-/// "does not support generate" response is still handled as a second signal (see
-/// [`warm_keep_resident_models`]) for embedding models whose name doesn't match.
+/// Heuristic for "this model name is an embedding model" — a cheap pre-check so a
+/// role-agnostic call can go straight to the embeddings endpoint rather than depend
+/// on how this Ollama build answers `/api/generate` for an embedder (0.22.1: 200;
+/// older builds: a 400 "does not support generate", the second signal, for embedders
+/// the name misses — [`is_generate_unsupported_rejection`]).
 pub fn is_embedding_model(name: &str) -> bool {
     name.to_ascii_lowercase().contains("embed")
 }
 
 /// Phase 1.1: whether a 400 response body from `/api/generate` is the specific
 /// "this model can't generate, it's an embedder" rejection — as opposed to some
-/// *other* 400 (bad options, malformed request, etc.). Ollama returns a body
-/// like `{"error":"\"nomic-embed-text\" does not support generate"}` for an
-/// embedding model, so we key on that exact phrase (case-insensitive). This is
-/// what keeps the `/api/embeddings` fallback scoped to embedding models only —
+/// *other* 400 (bad options, malformed request, etc.). Ollama builds that DO reject
+/// an embedder return a body like
+/// `{"error":"\"nomic-embed-text\" does not support generate"}`, so we key on that
+/// exact phrase (case-insensitive). Whether that 400 happens at all is
+/// version-dependent — 0.22.1 answers 200 instead (see the note above). This is
+/// what keeps the embeddings-endpoint fallback scoped to embedding models only —
 /// a non-embedding model 400'd for any other reason must NOT be re-warmed as an
 /// embedder.
 pub fn is_generate_unsupported_rejection(body: &str) -> bool {
     body.to_ascii_lowercase()
         .contains("does not support generate")
-}
-
-/// Phase 1.1: pin one embedding model VRAM-resident via `/api/embeddings` with
-/// `keep_alive:-1`. Best-effort / fail-SOFT: returns `true` only on a 2xx,
-/// logging and returning `false` otherwise (never errors/panics).
-async fn warm_embed_keep_resident(client: &reqwest::Client, base: &str, model: &str) -> bool {
-    let url = format!("{base}/api/embeddings");
-    let body = keep_resident_embed_warm_body(model);
-    match client
-        .post(&url)
-        .json(&body)
-        .timeout(Duration::from_secs(180))
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => {
-            info!(model = %model, "[keep-resident] pinned EMBEDDING model VRAM-resident via /api/embeddings (keep_alive=-1)");
-            true
-        }
-        Ok(r) => {
-            warn!(
-                model = %model,
-                status = r.status().as_u16(),
-                "[keep-resident] embed warm request rejected (best-effort, continuing)"
-            );
-            false
-        }
-        Err(e) => {
-            warn!(
-                model = %model,
-                error = %e,
-                "[keep-resident] embed warm request failed (best-effort, continuing)"
-            );
-            false
-        }
-    }
-}
-
-/// Phase 1: pin each `models` name VRAM-resident by issuing a tiny `keep_alive:-1`
-/// warm request. Best-effort / fail-SOFT by construction: a warm failure for one
-/// model logs and moves on — it NEVER errors or panics (so a startup pre-warm or a
-/// periodic re-warm can't take Chord down). Returns the count successfully warmed.
-/// An empty `models` (the default keep-resident set) is a no-op.
-///
-/// Phase 1.1: embedding models (e.g. `qwen3-embedding:0.6b`) do NOT support
-/// `/api/generate` — Ollama rejects the warm with a 400 "does not support
-/// generate", so they would never get durably pinned. For those we FALL BACK to
-/// a `/api/embeddings` warm (also `keep_alive:-1`). The fallback fires either
-/// when the name looks like an embedding model ([`is_embedding_model`]) — a
-/// cheap pre-check that skips the doomed `/api/generate` — or when `/api/generate`
-/// returns a 400 whose body is specifically the "does not support generate"
-/// embedder rejection ([`is_generate_unsupported_rejection`]). A 400 for ANY
-/// OTHER reason (bad request/options) is NOT treated as an embedder and is just
-/// logged — the fallback stays scoped to embedding models.
-pub async fn warm_keep_resident_models(
-    client: &reqwest::Client,
-    ollama_base: &str,
-    models: &[String],
-) -> usize {
-    let base = ollama_base.trim_end_matches('/');
-    let url = format!("{base}/api/generate");
-    let mut warmed = 0usize;
-    for model in models {
-        if model.is_empty() {
-            continue;
-        }
-        // Phase 1.1: known embedding models skip the doomed /api/generate and go
-        // straight to the /api/embeddings warm path.
-        if is_embedding_model(model) {
-            if warm_embed_keep_resident(client, base, model).await {
-                warmed += 1;
-            }
-            continue;
-        }
-        let body = keep_resident_warm_body(model);
-        match client
-            .post(&url)
-            .json(&body)
-            // A cold model can take a while to load into VRAM; give the warm a
-            // generous bound but still cap it so a wedged Ollama never hangs the
-            // re-warm timer forever.
-            .timeout(Duration::from_secs(180))
-            .send()
-            .await
-        {
-            Ok(r) if r.status().is_success() => {
-                info!(model = %model, "[keep-resident] pinned model VRAM-resident (keep_alive=-1)");
-                warmed += 1;
-            }
-            // Phase 1.1: a 400 from /api/generate MIGHT be the "does not support
-            // generate" embedder rejection for an embedding model whose name
-            // didn't match the heuristic — but only if the body says so. Read the
-            // body and fall back to /api/embeddings ONLY for that specific
-            // rejection; any other 400 is just logged (fallback stays scoped to
-            // embedding models).
-            Ok(r) if r.status() == reqwest::StatusCode::BAD_REQUEST => {
-                let body_txt = r.text().await.unwrap_or_default();
-                if is_generate_unsupported_rejection(&body_txt) {
-                    info!(
-                        model = %model,
-                        "[keep-resident] /api/generate rejected as an embedder (does not support generate) — falling back to /api/embeddings warm"
-                    );
-                    if warm_embed_keep_resident(client, base, model).await {
-                        warmed += 1;
-                    }
-                } else {
-                    warn!(
-                        model = %model,
-                        status = 400u16,
-                        "[keep-resident] warm request rejected with a non-embedder 400 (best-effort, continuing)"
-                    );
-                }
-            }
-            Ok(r) => warn!(
-                model = %model,
-                status = r.status().as_u16(),
-                "[keep-resident] warm request rejected (best-effort, continuing)"
-            ),
-            Err(e) => warn!(
-                model = %model,
-                error = %e,
-                "[keep-resident] warm request failed (best-effort, continuing)"
-            ),
-        }
-    }
-    if warmed > 0 {
-        info!(count = warmed, "[keep-resident] re-warm pass complete");
-    }
-    warmed
 }
 
 #[cfg(test)]
@@ -869,102 +717,19 @@ mod tests {
 
     // ── Phase 1: keep-resident exemption + warm ──────────────────────────────
 
-    #[test]
-    fn keep_resident_membership() {
-        let exempt = vec!["granite4.1:8b".to_string(), "lumina:latest".to_string()];
-        assert!(is_keep_resident("granite4.1:8b", &exempt));
-        assert!(is_keep_resident("lumina:latest", &exempt));
-        assert!(!is_keep_resident("qwen3-coder:30b", &exempt));
-        // Empty exempt set (the default) never matches → today's behavior.
-        assert!(!is_keep_resident("granite4.1:8b", &[]));
-    }
-
-    #[test]
-    fn partition_exempts_keep_resident_only() {
-        // granite/embedding are keep-resident; the qwen coder is a sweep model
-        // (→ evict); the empty name is dropped entirely.
-        let resident = vec![
-            "granite4.1:8b".to_string(),
-            "qwen3-coder:30b".to_string(),
-            "qwen3-embedding:0.6b".to_string(),
-            "".to_string(),
-        ];
-        let exempt = vec![
-            "granite4.1:8b".to_string(),
-            "qwen3-embedding:0.6b".to_string(),
-        ];
-        let (to_evict, kept) = partition_evictable(&resident, &exempt);
-        // The keep-resident models are NOT in the evict list...
-        assert_eq!(to_evict, vec!["qwen3-coder:30b".to_string()]);
-        // ...and the non-resident sweep model IS.
-        assert!(to_evict.contains(&"qwen3-coder:30b".to_string()));
-        assert!(!to_evict.contains(&"granite4.1:8b".to_string()));
-        assert!(!to_evict.contains(&"qwen3-embedding:0.6b".to_string()));
-        assert_eq!(
-            kept,
-            vec![
-                "granite4.1:8b".to_string(),
-                "qwen3-embedding:0.6b".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn partition_empty_exempt_evicts_everything() {
-        // Default (empty exempt) preserves the original "unload all" behavior.
-        let resident = vec!["a".to_string(), "b".to_string()];
-        let (to_evict, kept) = partition_evictable(&resident, &[]);
-        assert_eq!(to_evict, vec!["a".to_string(), "b".to_string()]);
-        assert!(kept.is_empty());
-    }
-
-    #[tokio::test]
-    async fn warm_is_fail_soft_on_unreachable_ollama() {
-        // A warm against an unreachable Ollama must return 0 and NEVER panic/error
-        // (a startup pre-warm or periodic re-warm can't be allowed to take Chord down).
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(200))
-            .build()
-            .unwrap();
-        let models = vec!["granite4.1:8b".to_string()];
-        // Reserved-for-docs TEST-NET-1 (RFC 5737) → connection fails fast.
-        let warmed = warm_keep_resident_models(&client, "http://192.0.2.1:65535", &models).await;
-        assert_eq!(warmed, 0);
-    }
-
     #[tokio::test]
     async fn evict_is_fail_soft_on_unreachable_ollama() {
         // Same fail-soft guarantee for the eviction path (Ollama /api/ps unavailable
-        // → 0, no error), with a keep-resident exempt set passed through.
+        // → 0, no error).
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(200))
             .build()
             .unwrap();
-        let exempt = vec!["granite4.1:8b".to_string()];
-        let unloaded = evict_resident_models(&client, "http://192.0.2.1:65535", &exempt).await;
+        let unloaded = evict_resident_models(&client, "http://192.0.2.1:65535").await;
         assert_eq!(unloaded, 0);
     }
 
-    #[test]
-    fn warm_body_pins_indefinitely() {
-        // The re-warm logic must issue keep_alive:-1 (indefinite residency).
-        let body = keep_resident_warm_body("granite4.1:8b");
-        assert_eq!(body["model"], "granite4.1:8b");
-        assert_eq!(body["keep_alive"], -1);
-        // Empty prompt: load / set keep_alive without generating.
-        assert_eq!(body["prompt"], "");
-    }
-
-    // ── Phase 1.1: embed-model keep-resident fallback ────────────────────────
-
-    #[test]
-    fn embed_warm_body_pins_indefinitely() {
-        // The embed keep-resident warm must also issue keep_alive:-1.
-        let body = keep_resident_embed_warm_body("qwen3-embedding:0.6b");
-        assert_eq!(body["model"], "qwen3-embedding:0.6b");
-        assert_eq!(body["keep_alive"], -1);
-        assert_eq!(body["prompt"], "");
-    }
+    // ── Embedder heuristics (used by the pin-convergence unload path) ────────
 
     #[test]
     fn is_embedding_model_matches_embed_substring() {
@@ -973,76 +738,6 @@ mod tests {
         assert!(is_embedding_model("nomic-embed-text"));
         assert!(!is_embedding_model("granite4.1:8b"));
         assert!(!is_embedding_model("qwen3-coder:30b"));
-    }
-
-    #[tokio::test]
-    async fn embed_model_uses_embeddings_endpoint_with_keep_alive_minus_one() {
-        // A model whose name marks it as an embedding model must be warmed via
-        // /api/embeddings with keep_alive:-1 — NOT /api/generate.
-        let server = httpmock::MockServer::start_async().await;
-        let embed_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST)
-                .path("/api/embeddings")
-                .body_contains(r#""keep_alive":-1"#)
-                .body_contains(r#""model":"qwen3-embedding:0.6b""#);
-            then.status(200)
-                .header("Content-Type", "application/json")
-                .json_body(serde_json::json!({ "embedding": [0.0] }));
-        });
-        // /api/generate must NOT be hit for a name-matched embedding model.
-        let generate_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST).path("/api/generate");
-            then.status(200).body("");
-        });
-
-        let client = reqwest::Client::new();
-        let models = vec!["qwen3-embedding:0.6b".to_string()];
-        let warmed = warm_keep_resident_models(&client, &server.base_url(), &models).await;
-
-        assert_eq!(
-            warmed, 1,
-            "embedding model should be pinned via /api/embeddings"
-        );
-        embed_mock.assert();
-        assert_eq!(
-            generate_mock.hits(),
-            0,
-            "/api/generate must be skipped for embed models"
-        );
-    }
-
-    #[tokio::test]
-    async fn generate_400_falls_back_to_embeddings_warm() {
-        // A model whose name does NOT look like an embedding model but which
-        // Ollama rejects from /api/generate with a 400 ("does not support
-        // generate") must fall back to the /api/embeddings warm.
-        let server = httpmock::MockServer::start_async().await;
-        let generate_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST).path("/api/generate");
-            then.status(400).json_body(
-                serde_json::json!({ "error": "\"embedder\" does not support generate" }),
-            );
-        });
-        let embed_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST)
-                .path("/api/embeddings")
-                .body_contains(r#""keep_alive":-1"#);
-            then.status(200)
-                .json_body(serde_json::json!({ "embedding": [0.0] }));
-        });
-
-        let client = reqwest::Client::new();
-        // Name has no "embed" substring → hits /api/generate first, gets 400,
-        // then falls back to /api/embeddings.
-        let models = vec!["mystery-vectorizer:latest".to_string()];
-        let warmed = warm_keep_resident_models(&client, &server.base_url(), &models).await;
-
-        assert_eq!(
-            warmed, 1,
-            "400 from /api/generate should trigger embed fallback"
-        );
-        generate_mock.assert();
-        embed_mock.assert();
     }
 
     #[test]
@@ -1062,38 +757,6 @@ mod tests {
             r#"{"error":"model 'foo' not found"}"#
         ));
         assert!(!is_generate_unsupported_rejection(""));
-    }
-
-    #[tokio::test]
-    async fn non_embedder_400_does_not_fall_back_to_embeddings() {
-        // A NON-embedding model 400'd for some OTHER reason (bad options, etc.)
-        // must NOT be re-warmed via /api/embeddings — the fallback is scoped to
-        // the "does not support generate" embedder rejection only.
-        let server = httpmock::MockServer::start_async().await;
-        let generate_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST).path("/api/generate");
-            then.status(400)
-                .json_body(serde_json::json!({ "error": "invalid options: num_ctx must be > 0" }));
-        });
-        let embed_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST).path("/api/embeddings");
-            then.status(200)
-                .json_body(serde_json::json!({ "embedding": [0.0] }));
-        });
-
-        let client = reqwest::Client::new();
-        // Name has no "embed" substring → hits /api/generate, gets a NON-embedder
-        // 400 → must be logged, NOT retried as an embedding.
-        let models = vec!["granite4.1:8b".to_string()];
-        let warmed = warm_keep_resident_models(&client, &server.base_url(), &models).await;
-
-        assert_eq!(warmed, 0, "a non-embedder 400 must not count as warmed");
-        generate_mock.assert();
-        assert_eq!(
-            embed_mock.hits(),
-            0,
-            "/api/embeddings must NOT be hit for a non-embedder 400"
-        );
     }
 
     // ── RESIL-01: durable lease persistence ──────────────────────────────────
