@@ -14,7 +14,7 @@
 //! dependency for a single struct field, timestamps here are `Option<i64>`
 //! holding epoch seconds. This is a conscious, documented deviation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -142,6 +142,18 @@ pub struct ModelRegistry {
     protected: Vec<String>,
     local_path: PathBuf,
     archive_path: PathBuf,
+    /// TRTR-07: RUNTIME-ONLY residency exemption — the model names currently held
+    /// resident by the assistant-mode resident set (embedding / router /
+    /// personality roles).
+    ///
+    /// Deliberately **never persisted** and never written into a record's
+    /// `protected` flag: the whole point is that a mode swap (Harmony's BLD-11
+    /// idle lease, a MINT sweep entering idle) can drop the exemption and make
+    /// every one of these models *immediately* reclaimable again. Persisting it —
+    /// or folding it into `protected` — would leave a stale pin behind after a
+    /// crash, exactly the failure mode `MODEL_PROTECTED` already bit this fleet
+    /// with (a name pinned in config that had never even been pulled).
+    residency_exempt: HashSet<String>,
 }
 
 /// On-disk registry file shape (P5). The legacy format was a bare
@@ -334,6 +346,7 @@ impl ModelRegistry {
             protected,
             local_path,
             archive_path,
+            residency_exempt: HashSet::new(),
         }
     }
 
@@ -371,6 +384,10 @@ impl ModelRegistry {
             protected,
             local_path,
             archive_path,
+            // Runtime-only: a restart always starts with an EMPTY exemption set,
+            // so nothing stays pinned across a crash. The resident set re-applies
+            // it when it warms at startup.
+            residency_exempt: HashSet::new(),
         }
     }
 
@@ -1225,13 +1242,54 @@ impl ModelRegistry {
             .count()
     }
 
-    /// Whether a model is protected (never auto-archived). Consults both the
-    /// record flag and the configured protected list.
+    /// Whether a model is protected (never auto-archived). Consults the record
+    /// flag, the configured protected list, and — TRTR-07 — the runtime residency
+    /// exemption held by the assistant-mode resident set.
+    ///
+    /// Every eviction path (`evict_to_archive`, the TIER-03 disk-pressure pass,
+    /// the TIER-04 cooldown pass, `evictable_warm_models`, `set_tier`'s
+    /// demote-guard) already routes through this one predicate, so a resident
+    /// role's model is skipped by the sweep for exactly as long as the resident
+    /// set holds it — and becomes reclaimable the instant it is released.
     pub fn is_protected(&self, name: &str) -> bool {
         if self.protected.iter().any(|p| p == name) {
             return true;
         }
+        if self.residency_exempt.contains(name) {
+            return true;
+        }
         self.records.get(name).map(|r| r.protected).unwrap_or(false)
+    }
+
+    /// TRTR-07: replace the runtime residency-exemption set with `names`.
+    ///
+    /// Wholesale replacement (not a union) so a re-warm after an alias repoint
+    /// cannot leave a stale exemption behind for a model no longer held. Runtime
+    /// only — never persisted, never touches any record's `protected` flag.
+    pub fn set_residency_exempt<I>(&mut self, names: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        self.residency_exempt = names.into_iter().collect();
+    }
+
+    /// TRTR-07: drop the whole residency exemption (the mode-swap RELEASE).
+    /// Idempotent — clearing an already-empty set is a no-op. After this, every
+    /// previously-held model is immediately reclaimable by the eviction sweep.
+    pub fn clear_residency_exempt(&mut self) {
+        self.residency_exempt.clear();
+    }
+
+    /// Whether `name` is currently held by the resident set (TRTR-07).
+    pub fn is_residency_exempt(&self, name: &str) -> bool {
+        self.residency_exempt.contains(name)
+    }
+
+    /// The current residency exemption, sorted (observability / status).
+    pub fn residency_exempt(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.residency_exempt.iter().cloned().collect();
+        v.sort();
+        v
     }
 }
 
@@ -1742,6 +1800,66 @@ mod tests {
             reg.get("pinned:1").unwrap().protected,
             "MODEL_PROTECTED must be re-applied authoritatively on every reconcile"
         );
+    }
+
+    // ── TRTR-07: runtime residency exemption ────────────────────────────────
+
+    #[test]
+    fn residency_exemption_protects_then_releases_immediately() {
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        write_manifest(&base.join("local"), "registry.ollama.ai", "library", "voice", "1", 1, &[1]);
+        let mut reg = reg_at(base, vec![]);
+        reg.reconcile();
+        assert!(!reg.is_protected("voice:1"), "not protected before residency");
+
+        reg.set_residency_exempt(["voice:1".to_string()]);
+        assert!(reg.is_residency_exempt("voice:1"));
+        assert!(reg.is_protected("voice:1"), "resident model is skipped by eviction");
+        assert!(
+            !reg.warm_eviction_candidates().iter().any(|(n, _, _)| n == "voice:1"),
+            "a resident model must never be an eviction candidate"
+        );
+
+        // RELEASE: immediately reclaimable again — this is what makes a mode swap
+        // actually hand the VRAM/disk back.
+        reg.clear_residency_exempt();
+        assert!(!reg.is_protected("voice:1"));
+        assert!(reg.warm_eviction_candidates().iter().any(|(n, _, _)| n == "voice:1"));
+        // Idempotent.
+        reg.clear_residency_exempt();
+        assert!(!reg.is_protected("voice:1"));
+    }
+
+    #[test]
+    fn residency_exemption_is_replaced_not_unioned_and_never_persisted() {
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        write_manifest(&base.join("local"), "registry.ollama.ai", "library", "a", "1", 1, &[1]);
+        write_manifest(&base.join("local"), "registry.ollama.ai", "library", "b", "1", 1, &[2]);
+        let mut reg = reg_at(base, vec![]);
+        reg.reconcile();
+
+        reg.set_residency_exempt(["a:1".to_string()]);
+        // An alias repoint swaps the held target: the OLD one must not linger.
+        reg.set_residency_exempt(["b:1".to_string()]);
+        assert!(!reg.is_residency_exempt("a:1"), "stale exemption must be dropped");
+        assert!(reg.is_residency_exempt("b:1"));
+        assert_eq!(reg.residency_exempt(), vec!["b:1".to_string()]);
+
+        // The exemption is runtime-only: it never leaks into the persisted record
+        // flag, so a restart can never resurrect a stale pin.
+        assert!(!reg.get("b:1").unwrap().protected);
+        reg.save().unwrap();
+        let reloaded = ModelRegistry::load_or_new(
+            base.join("registry.json"),
+            base.join("local"),
+            base.join("archive"),
+            vec![],
+        );
+        assert!(reloaded.get("b:1").is_some(), "record round-tripped");
+        assert!(!reloaded.is_residency_exempt("b:1"), "exemption must not survive a restart");
+        assert!(!reloaded.is_protected("b:1"));
     }
 
     #[test]

@@ -1056,6 +1056,25 @@ pub async fn enter_idle(
             info!("idle-mode: stopped managed DiffusionGemma daemon");
         }
 
+        // 4c. TRTR-07: RELEASE the assistant-mode resident set (embedding /
+        //     router / personality). Sequenced deliberately:
+        //       - AFTER the closed-world drain in step 1, so an in-flight turn
+        //         always finishes — we never yank a model out from under a live
+        //         request mid-generation;
+        //       - BEFORE the VRAM unload in step 5, because the release is what
+        //         drops the eviction exemption; without it step 5's unload would
+        //         be immediately undone by the sweep re-protecting these models.
+        //     Idempotent and best-effort: an already-released set is a no-op.
+        let resident_released = crate::routing::resident_set::global()
+            .release(state, reason)
+            .await;
+        if resident_released.changed {
+            info!(
+                released = resident_released.released,
+                "idle-mode: assistant resident set released for the mode swap"
+            );
+        }
+
         // 5. Unload every resident model from VRAM (best-effort; skipped if OLLAMA_URL
         //    unset). This is the real "release the GPU + the RAM the models held".
         let models_unloaded = match crate::gpu_exclusive::ollama_base_from_env() {
@@ -1149,12 +1168,41 @@ pub async fn enter_idle(
     (EnterOutcome::Entered(stored), Some(report))
 }
 
-/// Leave idle and resume normal serving. Idempotent, CAS-guarded. Models reload
-/// LAZILY on their next request (Ollama/llama-server cold-load on demand), so there
-/// is no async release work on this path — hence `Activating` is a nanosecond
-/// window and activate is effectively a single atomic transition.
+/// Leave idle and resume normal serving. Idempotent, CAS-guarded. Ordinary models
+/// reload LAZILY on their next request (Ollama/llama-server cold-load on demand),
+/// so the state transition itself is effectively atomic — `Activating` is a
+/// nanosecond window.
+///
+/// TRTR-07: the ONE eager step is the assistant-mode resident set. The idle lease
+/// that just ended is the mode swap back to assistant mode, so the three role
+/// models (personality / router / embedding) are re-warmed here rather than
+/// waiting to be cold-loaded by the human's next turn. It is debounced (a rapid
+/// lease acquire/release cycle must not thrash-warm), best-effort, and fired
+/// AFTER the transition completes so a slow warm can never widen the `Activating`
+/// window or fail the activate.
 pub async fn activate(state: &Arc<crate::routes::AppState>, reason: &str) -> ActivateOutcome {
-    let _ = state; // reserved: a future eager pre-warm could use the registry/client.
+    let outcome = activate_inner(state, reason).await;
+    if matches!(outcome, ActivateOutcome::Activated(_)) {
+        let report = crate::routing::resident_set::global()
+            .rewarm(state, reason)
+            .await;
+        if report.changed {
+            info!(
+                reason,
+                warmed = report.warmed,
+                dropped = report.dropped,
+                failed = report.failed,
+                "idle-mode: assistant resident set re-warmed after the mode swap"
+            );
+        }
+    }
+    outcome
+}
+
+/// The state-machine half of [`activate`], with no resident-set side effect —
+/// kept separate so the transition stays a tight, testable CAS.
+async fn activate_inner(state: &Arc<crate::routes::AppState>, reason: &str) -> ActivateOutcome {
+    let _ = state;
     match IDLE_MODE.begin_activate_inner() {
         Ok((m, generation)) => {
             // (restore side effects would go here; lazy reload means none today.) Disk

@@ -368,6 +368,40 @@ pub async fn protect_model(
     .into_response()
 }
 
+// ── GET /admin/resident-set ──────────────────────────────────────────────────
+
+/// TRTR-07: report the assistant-mode resident set so residency is OBSERVABLE
+/// rather than inferred.
+///
+/// Per role (`personality` / `router` / `embedding`, reported in that degradation
+/// priority order): the alias key it resolves through, the model that alias
+/// currently points at, its state (`warm` / `released` / `unresolved` / `missing`
+/// / `warm-failed` / `dropped-vram` / `disabled`), `warm`, `last_used`, and the
+/// registry size. Plus the set-level `active` flag (false between a mode-swap
+/// release and the next re-warm) and the residency exemption in force.
+///
+/// Read-only and auth-gated with the same posture as `/admin/idle`.
+pub async fn resident_set_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = auth_check(&headers, &state.jwt_secret) {
+        return auth_error_response(e);
+    }
+    let status = crate::routing::resident_set::global().status().await;
+    // Cross-check the set's own view against the registry's live exemption so a
+    // drift between the two is visible instead of silently believed.
+    let registry_exempt = state.model_registry.lock().await.residency_exempt();
+    let mut body = serde_json::to_value(&status).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "registry_exempt".to_string(),
+            serde_json::json!(registry_exempt),
+        );
+    }
+    Json(body).into_response()
+}
+
 // ── GET /api/storage ─────────────────────────────────────────────────────────
 
 fn disk_usage(probe: &dyn DiskSpaceProbe, path: &std::path::Path) -> DiskUsage {
@@ -1091,6 +1125,12 @@ pub fn build_control_router(state: Arc<AppState>) -> axum::Router {
             "/admin/activity",
             get(crate::admin::idle::admin_activity_status),
         )
+        // TRTR-07: assistant-mode resident-set state — per role (embedding /
+        // router / personality): the alias it resolves through, the model that
+        // alias currently points at, whether it is warm, and when it was last
+        // used. Residency is OBSERVABLE rather than inferred from `/api/models`.
+        // Same JWT auth as every route above (checked inside the handler).
+        .route("/admin/resident-set", get(resident_set_status))
         // SNAP observability routes (additive; distinct paths, same JWT auth):
         // /api/vram, /api/activity, /api/inventory, /api/analytics/*.
         .merge(crate::snap::api::snap_routes())
@@ -1722,6 +1762,51 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
     }
 
+    // ── TRTR-07: GET /admin/resident-set ────────────────────────────────────────
+
+    /// The report must expose EVERY role slot (in priority order) with its alias,
+    /// state, and warm flag — residency observable, not inferred. Auth disabled
+    /// (empty secret) so this exercises the handler, not the gate.
+    #[tokio::test]
+    async fn resident_set_report_lists_every_role() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let registry = Arc::new(Mutex::new(reg_at(base, vec![])));
+        let state = control_state_with_secret(registry, base.join("local"), "");
+        let app = build_control_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/admin/resident-set")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let roles = v.get("roles").and_then(|r| r.as_array()).unwrap();
+        assert_eq!(roles.len(), 3);
+        let ids: Vec<&str> = roles
+            .iter()
+            .map(|r| r.get("role").and_then(|x| x.as_str()).unwrap())
+            .collect();
+        assert_eq!(ids, vec!["personality", "router", "embedding"]);
+        for r in roles {
+            assert!(r.get("alias").and_then(|x| x.as_str()).is_some());
+            assert!(r.get("state").is_some());
+            assert!(r.get("warm").and_then(|x| x.as_bool()).is_some());
+            assert!(r.get("last_used").is_some(), "last_used reported (may be null)");
+        }
+        assert!(v.get("active").is_some());
+        assert!(v.get("registry_exempt").and_then(|x| x.as_array()).is_some());
+    }
+
     // ── MSM-04: /api/models/reconcile, /api/storage/gc ─────────────────────────
 
     // ── BLD-09: /admin/idle, /admin/activate ────────────────────────────────────
@@ -1742,6 +1827,8 @@ mod tests {
             (Method::GET, "/admin/idle"),
             (Method::POST, "/admin/activate"),
             (Method::GET, "/admin/activity"),
+            // TRTR-07: the resident-set report is auth-gated the same way.
+            (Method::GET, "/admin/resident-set"),
         ] {
             let resp = app
                 .clone()

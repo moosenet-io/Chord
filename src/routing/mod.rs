@@ -10,3 +10,4 @@
 
 pub mod assistant_profile;
 pub mod lumina_alias;
+pub mod resident_set;
