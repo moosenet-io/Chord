@@ -525,6 +525,19 @@ pub fn is_embedding_model(name: &str) -> bool {
     name.to_ascii_lowercase().contains("embed")
 }
 
+/// Phase 1.1: whether a 400 response body from `/api/generate` is the specific
+/// "this model can't generate, it's an embedder" rejection — as opposed to some
+/// *other* 400 (bad options, malformed request, etc.). Ollama returns a body
+/// like `{"error":"\"nomic-embed-text\" does not support generate"}` for an
+/// embedding model, so we key on that exact phrase (case-insensitive). This is
+/// what keeps the `/api/embeddings` fallback scoped to embedding models only —
+/// a non-embedding model 400'd for any other reason must NOT be re-warmed as an
+/// embedder.
+pub fn is_generate_unsupported_rejection(body: &str) -> bool {
+    body.to_ascii_lowercase()
+        .contains("does not support generate")
+}
+
 /// Phase 1.1: pin one embedding model VRAM-resident via `/api/embeddings` with
 /// `keep_alive:-1`. Best-effort / fail-SOFT: returns `true` only on a 2xx,
 /// logging and returning `false` otherwise (never errors/panics).
@@ -573,7 +586,10 @@ async fn warm_embed_keep_resident(client: &reqwest::Client, base: &str, model: &
 /// a `/api/embeddings` warm (also `keep_alive:-1`). The fallback fires either
 /// when the name looks like an embedding model ([`is_embedding_model`]) — a
 /// cheap pre-check that skips the doomed `/api/generate` — or when `/api/generate`
-/// itself returns a 400 (the "does not support generate"-class signal).
+/// returns a 400 whose body is specifically the "does not support generate"
+/// embedder rejection ([`is_generate_unsupported_rejection`]). A 400 for ANY
+/// OTHER reason (bad request/options) is NOT treated as an embedder and is just
+/// logged — the fallback stays scoped to embedding models.
 pub async fn warm_keep_resident_models(
     client: &reqwest::Client,
     ollama_base: &str,
@@ -609,16 +625,28 @@ pub async fn warm_keep_resident_models(
                 info!(model = %model, "[keep-resident] pinned model VRAM-resident (keep_alive=-1)");
                 warmed += 1;
             }
-            // Phase 1.1: a 400 from /api/generate is the "does not support
-            // generate"-class signal for an embedding model whose name didn't
-            // match the heuristic — fall back to the /api/embeddings warm.
+            // Phase 1.1: a 400 from /api/generate MIGHT be the "does not support
+            // generate" embedder rejection for an embedding model whose name
+            // didn't match the heuristic — but only if the body says so. Read the
+            // body and fall back to /api/embeddings ONLY for that specific
+            // rejection; any other 400 is just logged (fallback stays scoped to
+            // embedding models).
             Ok(r) if r.status() == reqwest::StatusCode::BAD_REQUEST => {
-                info!(
-                    model = %model,
-                    "[keep-resident] /api/generate rejected (400) — falling back to /api/embeddings warm"
-                );
-                if warm_embed_keep_resident(client, base, model).await {
-                    warmed += 1;
+                let body_txt = r.text().await.unwrap_or_default();
+                if is_generate_unsupported_rejection(&body_txt) {
+                    info!(
+                        model = %model,
+                        "[keep-resident] /api/generate rejected as an embedder (does not support generate) — falling back to /api/embeddings warm"
+                    );
+                    if warm_embed_keep_resident(client, base, model).await {
+                        warmed += 1;
+                    }
+                } else {
+                    warn!(
+                        model = %model,
+                        status = 400u16,
+                        "[keep-resident] warm request rejected with a non-embedder 400 (best-effort, continuing)"
+                    );
                 }
             }
             Ok(r) => warn!(
@@ -1015,6 +1043,57 @@ mod tests {
         );
         generate_mock.assert();
         embed_mock.assert();
+    }
+
+    #[test]
+    fn is_generate_unsupported_rejection_matches_only_the_embedder_error() {
+        // The exact Ollama embedder rejection (case-insensitive).
+        assert!(is_generate_unsupported_rejection(
+            r#"{"error":"\"nomic-embed-text\" does not support generate"}"#
+        ));
+        assert!(is_generate_unsupported_rejection(
+            "MODEL DOES NOT SUPPORT GENERATE"
+        ));
+        // Other 400 bodies must NOT be treated as an embedder rejection.
+        assert!(!is_generate_unsupported_rejection(
+            r#"{"error":"invalid options: num_ctx"}"#
+        ));
+        assert!(!is_generate_unsupported_rejection(
+            r#"{"error":"model 'foo' not found"}"#
+        ));
+        assert!(!is_generate_unsupported_rejection(""));
+    }
+
+    #[tokio::test]
+    async fn non_embedder_400_does_not_fall_back_to_embeddings() {
+        // A NON-embedding model 400'd for some OTHER reason (bad options, etc.)
+        // must NOT be re-warmed via /api/embeddings — the fallback is scoped to
+        // the "does not support generate" embedder rejection only.
+        let server = httpmock::MockServer::start_async().await;
+        let generate_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/api/generate");
+            then.status(400)
+                .json_body(serde_json::json!({ "error": "invalid options: num_ctx must be > 0" }));
+        });
+        let embed_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/api/embeddings");
+            then.status(200)
+                .json_body(serde_json::json!({ "embedding": [0.0] }));
+        });
+
+        let client = reqwest::Client::new();
+        // Name has no "embed" substring → hits /api/generate, gets a NON-embedder
+        // 400 → must be logged, NOT retried as an embedding.
+        let models = vec!["granite4.1:8b".to_string()];
+        let warmed = warm_keep_resident_models(&client, &server.base_url(), &models).await;
+
+        assert_eq!(warmed, 0, "a non-embedder 400 must not count as warmed");
+        generate_mock.assert();
+        assert_eq!(
+            embed_mock.hits(),
+            0,
+            "/api/embeddings must NOT be hit for a non-embedder 400"
+        );
     }
 
     // ── RESIL-01: durable lease persistence ──────────────────────────────────
