@@ -1789,6 +1789,27 @@ impl ResidentSet {
     /// one — the bookkeeping is still repaired, the exemption is left exactly as
     /// the release left it.
     ///
+    /// **No `env` call happens under `inner`.** The repair decides everything —
+    /// which slots are false, whether this pass still owns the exemption, and what
+    /// the exemption should be — under the lock, then RELEASES it and installs the
+    /// exemption outside. Applying it under the lock would put `status`, `release`
+    /// and every coalescing lifecycle operation behind an await against an
+    /// *injected* trait, which is the same objection this header raises to holding
+    /// the lock across `unload_one`; it applies to `set_exempt` verbatim.
+    ///
+    /// **Two properties a future reader should not have to re-derive.**
+    /// (a) A role that re-holds the model AFTER its repair and before the pass ends
+    /// would leave the same false claim behind. That interleaving is unreachable
+    /// in-tree while this loop retains `in_flight` — `admit` joins rather than
+    /// starts, so no pass can install slots — and the deliberate bar here is the
+    /// structural repair plus this disclosure, not an absolute guarantee under
+    /// interleavings the design does not admit.
+    /// (b) A release can supersede the generation between the re-check and the
+    /// request, so an unload can go out on behalf of a superseded pass. That is
+    /// benign: a release wants that model released anyway, and because it has
+    /// already marked every slot `Released`, the repair that follows finds nothing
+    /// to fix and leaves the exemption to the release.
+    ///
     /// The two OTHER unload sites (`commit`'s discard path and
     /// `compensate_pending`) deliberately do NOT call this: both run only after a
     /// release has already marked every slot `Released`, and no pass can be
@@ -1801,51 +1822,89 @@ impl ResidentSet {
         generation: u64,
         model: &str,
     ) -> usize {
-        let mut inner = self.inner.lock().await;
+        // PHASE 1 — repair, and DECIDE the exemption, entirely under the lock.
+        // Nothing in this block touches `env`.
+        let (repaired, exempt) = {
+            let mut inner = self.inner.lock().await;
 
-        let mut repaired = 0usize;
-        for (role, slot) in inner.slots.iter_mut() {
-            if slot.state.is_held() && slot.model.as_deref() == Some(model) {
-                slot.state = RoleState::Released;
-                slot.warmed_at = None;
-                repaired += 1;
-                warn!(
-                    role = role.id(),
-                    model = %model,
-                    "resident-set: STALE residency repaired — this role came to claim the model this pass was already unloading; marking it not-resident so it is re-warmed rather than believed resident"
-                );
+            let mut repaired = 0usize;
+            for (role, slot) in inner.slots.iter_mut() {
+                if slot.state.is_held() && slot.model.as_deref() == Some(model) {
+                    slot.state = RoleState::Released;
+                    slot.warmed_at = None;
+                    repaired += 1;
+                    warn!(
+                        role = role.id(),
+                        model = %model,
+                        "resident-set: STALE residency repaired — this role came to claim the model this pass was already unloading; marking it not-resident so it is re-warmed rather than believed resident"
+                    );
+                }
             }
-        }
 
-        if repaired == 0 {
-            return 0;
-        }
+            if repaired == 0 {
+                return 0;
+            }
 
-        if inner.generation != generation {
-            // A release owns the exemption now. Repairing the bookkeeping above is
-            // still right (the claim was false either way); re-applying an
-            // exemption here would resurrect a pin the release just dropped.
+            if inner.generation != generation {
+                // A release owns the exemption now. Repairing the bookkeeping above
+                // is still right (the claim was false either way); re-applying an
+                // exemption here would resurrect a pin the release just dropped.
+                warn!(
+                    pass_generation = generation,
+                    current_generation = inner.generation,
+                    model = %model,
+                    "resident-set: stale residency repaired under a superseded generation — leaving the exemption to the release that owns it"
+                );
+                return repaired;
+            }
+
+            // The exemption must track what we actually hold, so recompute it from
+            // the REPAIRED slots — under the same lock acquisition and the same
+            // generation check that authorised the repair. That is what makes the
+            // list safe to install after the lock is dropped: every slot claiming
+            // `model` was just marked `Released` a few lines up, and no new pass
+            // can install slots while this loop retains `in_flight` (GUARD 3), so
+            // `model` cannot appear in this list whenever the call lands. Dropping
+            // the lock therefore cannot make the exemption stale in the one way
+            // that would matter — it can never resurrect residency for the model
+            // this pass just unloaded.
+            let mut held: Vec<String> = inner
+                .slots
+                .iter()
+                .filter(|(_, s)| s.state.is_held())
+                .filter_map(|(_, s)| s.model.clone())
+                .collect();
+            held.sort();
+            held.dedup();
+            (repaired, held)
+        };
+
+        // PHASE 2 — install it with the lock RELEASED, so an injected or slow
+        // `set_exempt` stalls nothing else.
+        env.set_exempt(&exempt).await;
+
+        // PHASE 3 — the one thing dropping the lock actually costs, closed. The
+        // ONLY writer that can act in this window is `release_with` (a warm pass
+        // cannot be admitted while `in_flight` is retained), and what it does is
+        // bump the generation and CLEAR the exemption. Neither side can impose an
+        // ordering on the two `env` calls, so if the release landed while ours was
+        // in flight we may have just re-installed a pin it dropped. Re-check, and
+        // if the generation moved, re-assert the release's intent — outside the
+        // lock, again. Clearing is idempotent, and it cannot clobber a legitimate
+        // later exemption: the only code that installs one is a warm commit, and
+        // none can run until this pass drops `in_flight`.
+        let superseded = {
+            let inner = self.inner.lock().await;
+            inner.generation != generation
+        };
+        if superseded {
             warn!(
                 pass_generation = generation,
-                current_generation = inner.generation,
                 model = %model,
-                "resident-set: stale residency repaired under a superseded generation — leaving the exemption to the release that owns it"
+                "resident-set: a release landed while the repaired exemption was being applied — clearing it again so the release, not this pass, owns the exemption"
             );
-            return repaired;
+            env.clear_exempt().await;
         }
-
-        // The exemption must track what we actually hold, so re-apply it from the
-        // repaired slots. Same order as the commit and as `release_with`: inside
-        // the lock, so no warm pass can observe a half-applied exemption.
-        let mut held: Vec<String> = inner
-            .slots
-            .iter()
-            .filter(|(_, s)| s.state.is_held())
-            .filter_map(|(_, s)| s.model.clone())
-            .collect();
-        held.sort();
-        held.dedup();
-        env.set_exempt(&held).await;
 
         repaired
     }
@@ -5163,6 +5222,162 @@ mod tests {
             fake.exempt().is_empty(),
             "the superseded pass must NOT resurrect the registry exemption the release dropped: {:?}",
             fake.exempt()
+        );
+    }
+
+    /// Wraps [`RaceEnv`] and, once armed, additionally parks inside `set_exempt`.
+    /// That opens the window the repair now has BY CONSTRUCTION: it decides the
+    /// exemption under `inner`, DROPS the lock, and only then applies it. A test
+    /// can therefore land a release strictly between the drop and the install.
+    struct ExemptRaceEnv {
+        inner: Arc<RaceEnv>,
+        entered_exempt: mpsc::UnboundedSender<Vec<String>>,
+        gate: Semaphore,
+        park: AtomicBool,
+    }
+
+    impl ExemptRaceEnv {
+        fn new(inner: Arc<RaceEnv>) -> (Arc<ExemptRaceEnv>, mpsc::UnboundedReceiver<Vec<String>>) {
+            let (tx, rx) = mpsc::unbounded_channel();
+            (
+                Arc::new(ExemptRaceEnv {
+                    inner,
+                    entered_exempt: tx,
+                    gate: Semaphore::new(0),
+                    park: AtomicBool::new(false),
+                }),
+                rx,
+            )
+        }
+        /// Park the NEXT `set_exempt` only — the commit's wholesale install has
+        /// already happened by the time a test arms this.
+        fn arm_exempt(&self) {
+            self.park.store(true, Ordering::SeqCst);
+        }
+        fn open_exempt(&self) {
+            self.gate.add_permits(1);
+        }
+    }
+
+    #[async_trait]
+    impl ResidentEnv for ExemptRaceEnv {
+        async fn resolve(&self, a: &[(Role, String)]) -> Vec<Resolved> {
+            self.inner.resolve(a).await
+        }
+        fn free_vram_gb(&self) -> Option<f64> {
+            self.inner.free_vram_gb()
+        }
+        async fn warm_one(
+            &self,
+            role: Role,
+            model: &str,
+            ka: &str,
+            c: &CancelToken,
+        ) -> Result<(), String> {
+            self.inner.warm_one(role, model, ka, c).await
+        }
+        async fn unload_one(&self, role: Role, model: &str) -> Result<(), String> {
+            self.inner.unload_one(role, model).await
+        }
+        async fn set_exempt(&self, models: &[String]) {
+            if self.park.swap(false, Ordering::SeqCst) {
+                let _ = self.entered_exempt.send(models.to_vec());
+                self.gate.acquire().await.expect("exempt gate").forget();
+            }
+            self.inner.set_exempt(models).await;
+        }
+        async fn clear_exempt(&self) {
+            self.inner.clear_exempt().await;
+        }
+    }
+
+    /// **THE LOCK-DROP TEST.** The repair applies its recomputed exemption with
+    /// `inner` RELEASED — that is the whole point of the shape (no await against
+    /// an injected trait under the lock). This test asserts the window that opens
+    /// is closed: a release lands *while the install is in flight*, and the pass
+    /// must still not leave behind an exemption the release dropped.
+    ///
+    /// It also pins down the property the recompute gets for free: the list the
+    /// repair installs is computed from the already-repaired slots, so it can
+    /// never carry the unloaded model no matter when it lands.
+    #[tokio::test]
+    async fn a_release_during_the_repairs_exemption_install_still_wins() {
+        let (set, fake, race, mut unload_rx, mut released_rx) = armed_repoint_race().await;
+        let (env, mut exempt_rx) = ExemptRaceEnv::new(race.clone());
+
+        let (s, e) = (set.clone(), env.clone());
+        let pass = tokio::spawn(async move { s.reconcile_with(&*e).await });
+
+        let parked = unload_rx.recv().await.expect("parked inside the unload");
+        assert_eq!(parked, "granite:30b");
+
+        // A warm re-holds the outgoing model (and re-exempts it, as a commit
+        // would), so the repair has something real to fix and a real exemption to
+        // recompute.
+        {
+            let mut inner = set.inner.lock().await;
+            let (_, slot) = inner
+                .slots
+                .iter_mut()
+                .find(|(r, _)| *r == Role::Personality)
+                .expect("personality slot");
+            slot.model = Some("granite:30b".to_string());
+            slot.state = RoleState::Warm;
+        }
+        fake.set_exempt(&[
+            "embed:1".to_string(),
+            "granite:30b".to_string(),
+            "granite:8b".to_string(),
+        ])
+        .await;
+
+        env.arm_exempt();
+        race.open_unload();
+
+        // The repair has repaired the slots, dropped the lock, and is now INSIDE
+        // `set_exempt`. This is the exact instant the old shape could not reach,
+        // because it held `inner` across this await.
+        let installing = exempt_rx.recv().await.expect("parked inside set_exempt");
+        assert_eq!(
+            installing,
+            vec!["embed:1".to_string(), "granite:8b".to_string()],
+            "the list is computed from the REPAIRED slots, so it cannot carry the unloaded model: {installing:?}"
+        );
+
+        // THE WINDOW. A mode-swap release lands while that install is in flight.
+        let (s2, e2) = (set.clone(), race.clone());
+        let rel = tokio::spawn(async move { s2.release_with(&*e2, "idle-lease").await });
+        released_rx.recv().await.expect("the release landed");
+        env.open_exempt();
+
+        let report = join_unblocked(pass, "the reconcile pass").await;
+        let release = join_unblocked(rel, "the release").await;
+
+        assert!(release.generation > 0, "the release bumped the generation");
+        assert_eq!(
+            report.repaired, 1,
+            "the stale residency claim was still repaired: {report:?}"
+        );
+        assert_claims_no_residency_for_unloaded(&set, &["granite:30b".to_string()]).await;
+
+        let status = set.status().await;
+        assert!(!status.active, "the release wins: the set is not active");
+        assert!(
+            status.roles.iter().all(|r| !r.warm),
+            "no role is held after a release: {:?}",
+            status.roles
+        );
+        assert!(
+            fake.exempt().is_empty(),
+            "dropping the lock before set_exempt must NOT let a superseded pass leave an exemption \
+             the release dropped: {:?}",
+            fake.exempt()
+        );
+        assert_eq!(
+            fake.exempt_ops().last().map(String::as_str),
+            Some("clear"),
+            "the release, not the repair, must own the final word on the exemption: {:?}",
+            fake.exempt_ops()
         );
     }
 
