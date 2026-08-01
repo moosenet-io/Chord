@@ -235,38 +235,78 @@ impl NetnsConfig {
 /// "do not launch unisolated" (unless the explicit operator override is set).
 ///
 /// The actual privileged create/configure runs only under `#[cfg(target_os =
-/// "linux")]` AND when the capability probe passes; the non-Linux / unprivileged
-/// builds (including this CI) take the fail-closed branch. The integration tests
-/// that exercise the real namespace are `#[ignore]`d so they only run on a
-/// privileged host under ISO-04.
+/// "linux")]` AND when the capability probe passes. The integration tests that
+/// exercise the real namespace are `#[ignore]`d so they only run on a privileged
+/// host under ISO-04.
+///
+/// ## CHRD-77: why the capability probe is injectable
+/// The fail-closed DECISION ("no capability => [`NetnsError::CapabilityUnavailable`],
+/// and NOTHING is created") used to be testable only by running the unit tests on a
+/// host that happened to LACK `CAP_NET_ADMIN`. Chord's build/test host runs as root,
+/// so that precondition was silently false: the unit test drove the REAL privileged
+/// path, created a live namespace on the build host, leaked it, and then failed —
+/// meaning the guard it claims to cover was never actually exercised anywhere. The
+/// probe is now injected through [`prepare_with_probe`] so the decision is provable
+/// on ANY host with zero side effects; [`prepare`] itself is behaviorally unchanged.
 pub fn prepare(slot_token: &str, posture: &EgressPosture) -> Result<NetnsHandle, NetnsError> {
-    let cfg = NetnsConfig::from_posture(posture);
-    let name = namespace_name(slot_token);
-
     #[cfg(target_os = "linux")]
     {
-        if !has_net_admin() {
-            return Err(NetnsError::CapabilityUnavailable);
-        }
-        configure_namespace(&name, &cfg)?;
-        tracing::info!(
-            target: "chord.supervisor.netns",
-            ns = %name,
-            egress_path = cfg.egress_path,
-            allow_hosts = cfg.allow_list.len(),
-            "prepared isolated network namespace for runtime launch (ISO-02)"
-        );
-        Ok(NetnsHandle {
-            name,
-            posture: posture.clone(),
-        })
+        prepare_with_probe(slot_token, posture, has_net_admin, configure_namespace)
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (&cfg, &name);
+        let _ = (slot_token, posture);
         Err(NetnsError::Unsupported)
     }
+}
+
+/// [`prepare`] with BOTH privileged-path seams passed in (CHRD-77).
+///
+/// Two things are injected, and they serve different purposes:
+///
+/// * `has_cap` — the `CAP_NET_ADMIN` probe. Injecting it makes the fail-closed
+///   DECISION provable without privilege, on any host.
+/// * `create_ns` — the namespace-CREATING operation. Injecting it makes the
+///   *structural* guarantee testable: a test can assert the create path was never
+///   ENTERED, which is the actual invariant, instead of inspecting `/run/netns`
+///   afterwards and inferring it from filesystem state (a proxy that reads live host
+///   state and can be confounded by an unrelated concurrent run).
+///
+/// When `has_cap()` is `false` this returns [`NetnsError::CapabilityUnavailable`]
+/// **before touching the kernel or the `ip` binary**, so no namespace can be created
+/// and no handle can escape. Production always passes [`has_net_admin`] and
+/// [`configure_namespace`], so `prepare`'s behavior is unchanged.
+#[cfg(target_os = "linux")]
+fn prepare_with_probe<F, G>(
+    slot_token: &str,
+    posture: &EgressPosture,
+    has_cap: F,
+    create_ns: G,
+) -> Result<NetnsHandle, NetnsError>
+where
+    F: FnOnce() -> bool,
+    G: FnOnce(&str, &NetnsConfig) -> Result<(), NetnsError>,
+{
+    let cfg = NetnsConfig::from_posture(posture);
+    let name = namespace_name(slot_token);
+
+    // FAIL CLOSED, before any privileged syscall or userspace invocation.
+    if !has_cap() {
+        return Err(NetnsError::CapabilityUnavailable);
+    }
+    create_ns(&name, &cfg)?;
+    tracing::info!(
+        target: "chord.supervisor.netns",
+        ns = %name,
+        egress_path = cfg.egress_path,
+        allow_hosts = cfg.allow_list.len(),
+        "prepared isolated network namespace for runtime launch (ISO-02)"
+    );
+    Ok(NetnsHandle {
+        name,
+        posture: posture.clone(),
+    })
 }
 
 /// Derive a stable, unique, non-infra namespace name from a slot token. Hashed so
@@ -462,24 +502,144 @@ mod tests {
 
     // ── fail-closed: prepare on a host without the capability ──────────────────
 
+    /// NEGATIVE TEST — the load-bearing fail-closed guard (CHRD-77).
+    ///
+    /// It asserts that when the `CAP_NET_ADMIN` probe reports NO capability,
+    /// `prepare` returns `CapabilityUnavailable` and **never** hands back a handle
+    /// the launcher could use to spawn a runtime with full host egress.
+    ///
+    /// **Why the probe AND the create operation are injected.**
+    /// Until CHRD-77 this test called the real `prepare()` and asserted an `Err`,
+    /// relying on the build host lacking `CAP_NET_ADMIN`. Chord's build/test host
+    /// runs as ROOT, so that precondition was false: `prepare()` took the privileged
+    /// branch, actually created `/run/netns/chord-<hash>` (and leaked it), returned
+    /// `Ok` on a clean host — and on every subsequent run `ip netns add` failed
+    /// EEXIST, so the test failed with `ConfigureFailed`. Either way the guard was
+    /// NEVER exercised: a genuine fail-open regression would have looked identical
+    /// to that red. Injecting the probe makes the decision provable on every host,
+    /// with no privileged syscall and no host-state mutation.
+    ///
+    /// The create operation is injected for a second, separate reason: the guarantee
+    /// "nothing was created" is asserted STRUCTURALLY — the namespace-creating
+    /// operation is never INVOKED — rather than by comparing `/run/netns/<name>`
+    /// before and after. The earlier filesystem comparison was honest but it read
+    /// live host state, so its result depended on the host and could be confounded by
+    /// an unrelated concurrent run; "the create path was not entered" is the actual
+    /// invariant, and it is fully deterministic.
+    ///
+    /// The real privileged create/configure path stays covered by the `#[ignore]`d
+    /// `tests/netns_integration.rs` suite, run under ISO-04 on a privileged host.
+    #[cfg(target_os = "linux")]
     #[test]
     fn prepare_fails_closed_without_capability_never_returns_unisolated_handle() {
-        // NEGATIVE TEST. On this unprivileged build prepare() must return an Err
-        // (CapabilityUnavailable on Linux, Unsupported elsewhere) — it must NEVER
-        // return Ok with a handle that would let the launcher spawn unisolated.
-        let res = prepare("test-slot", &EgressPosture::Denied);
+        use std::cell::Cell;
+
+        let probe_calls = Cell::new(0u32);
+        let create_calls = Cell::new(0u32);
+        let slot = "chrd77-failclosed-slot";
+        let res = prepare_with_probe(
+            slot,
+            &EgressPosture::Denied,
+            || {
+                probe_calls.set(probe_calls.get() + 1);
+                false
+            },
+            |_name, _cfg| {
+                // Deliberately reports SUCCESS: if the guard ever fails open, the
+                // call reaches here and `prepare` goes on to return Ok(handle) —
+                // so the fail-open regression shows up as a handle escaping, not
+                // as an incidental error from a stubbed-out failure.
+                create_calls.set(create_calls.get() + 1);
+                Ok(())
+            },
+        );
+
+        // CONDITION-DETECTION SELF-CHECK: the guard must actually CONSULT the
+        // capability probe. If a future refactor stops calling it, this test would
+        // otherwise keep passing for the wrong reason.
+        assert_eq!(
+            probe_calls.get(),
+            1,
+            "the capability probe MUST be consulted exactly once by prepare — a guard \
+             that never asks is not a guard"
+        );
+
         assert!(
             res.is_err(),
-            "prepare must FAIL CLOSED on a host without CAP_NET_ADMIN, never return a handle"
+            "prepare must FAIL CLOSED without CAP_NET_ADMIN, never return a handle"
         );
         let err = res.unwrap_err();
         assert!(
-            matches!(err, NetnsError::CapabilityUnavailable | NetnsError::Unsupported),
-            "fail-closed error must be the capability/unsupported category, got {err:?}"
+            matches!(err, NetnsError::CapabilityUnavailable),
+            "fail-closed error must be the capability category, got {err:?}"
         );
+
+        // And NOTHING was created — asserted structurally: the namespace-creating
+        // operation was never entered. This is the invariant itself, not a
+        // filesystem proxy for it, and it holds identically on every host.
+        assert_eq!(
+            create_calls.get(),
+            0,
+            "a fail-closed prepare must never enter the namespace-creating path"
+        );
+
         // And the error string carries no infra.
         let s = err.to_string();
         assert!(!s.contains("192.168.") && !s.contains("/run/netns"));
+    }
+
+    /// Non-Linux counterpart: netns is a Linux primitive, so `prepare` must return
+    /// a clear `Unsupported` error rather than a silent no-op that looks isolated.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn prepare_fails_closed_without_capability_never_returns_unisolated_handle() {
+        let res = prepare("chrd77-failclosed-slot", &EgressPosture::Denied);
+        let err = res.expect_err("prepare must FAIL CLOSED on a non-Linux host");
+        assert!(matches!(err, NetnsError::Unsupported), "got {err:?}");
+    }
+
+    /// CHRD-77 condition-detection guard for the *real* probe.
+    ///
+    /// `has_net_admin()` is what production feeds into the fail-closed decision, so
+    /// a probe stuck at a constant is a silent failure mode. This cross-checks it
+    /// against an INDEPENDENT observation — `CapEff` in `/proc/self/status`, bit 12
+    /// (`CAP_NET_ADMIN`) — which does not go through `fork`/`unshare` at all.
+    ///
+    /// The check is deliberately one-directional: *having* the capability
+    /// definitively implies `unshare(CLONE_NEWNET)` works, so the probe MUST report
+    /// true. The converse is not asserted because an unprivileged user namespace can
+    /// also permit `CLONE_NEWNET`. When we cannot make a definitive statement the
+    /// test prints a greppable marker rather than passing silently.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capability_probe_agrees_with_the_kernels_effective_capability_set() {
+        const CAP_NET_ADMIN_BIT: u64 = 12;
+
+        let status = std::fs::read_to_string("/proc/self/status")
+            .expect("/proc/self/status must be readable on Linux");
+        let cap_eff = status
+            .lines()
+            .find_map(|l| l.strip_prefix("CapEff:"))
+            .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+            .expect("CapEff must be present and hex-parseable in /proc/self/status");
+
+        if cap_eff & (1 << CAP_NET_ADMIN_BIT) != 0 {
+            eprintln!("CHRD77-NETNS-CAPABILITY-DETECTED=present");
+            assert!(
+                has_net_admin(),
+                "this process holds CAP_NET_ADMIN (CapEff={cap_eff:#x}) but the probe \
+                 reported false — the probe is broken and prepare() would refuse every \
+                 launch"
+            );
+        } else {
+            // Cannot prove the negative direction here (user namespaces), so say so
+            // loudly instead of pretending this run verified the probe.
+            eprintln!(
+                "CHRD77-NETNS-CAPABILITY-DETECTED=absent (probe reported {}); the \
+                 probe-vs-kernel agreement check is NOT verified on this host",
+                has_net_admin()
+            );
+        }
     }
 
     // ── command wrapping (pure data transform) ─────────────────────────────────

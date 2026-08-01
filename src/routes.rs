@@ -5209,15 +5209,84 @@ pub(crate) mod tests {
         assert!(resp["id"].as_str().unwrap().starts_with("chatcmpl-"));
     }
 
-    /// End-to-end through the real `chat_completions` handler: a diffusion
-    /// model request must NEVER reach `CHORD_LLM_URL` (proving the old
-    /// raw-forward-to-a-nonexistent-endpoint bug is gone — the diffusion
-    /// branch now returns its own structured 503 from `ensure_running`
-    /// failing in this sandbox, where no real daemon binary/process exists,
-    /// rather than falling through to any other upstream).
+    // ── CHRD-77: the diffusion routing guard, with the daemon seam INJECTED ──
+    //
+    // ## What was wrong with the previous shape
+    // This guard used to be a single test whose branch-specific assertion was
+    // chosen by a `GET /health` probe against the configured diffusion port:
+    // health OK ⇒ demand `200`, health not OK ⇒ demand `503`. That is not a
+    // sound condition detector. A failed probe only proves the daemon was not
+    // reachable *at that instant*; it does not prove `ensure_running()` cannot
+    // START or ADOPT one. On a host where the daemon is stopped but launchable,
+    // the probe says "absent", the test demands a diffusion-specific `503`, and
+    // a perfectly valid `200` fails it. The converse is just as weak: a healthy
+    // probe does not establish that the handler will use *that* daemon, or that
+    // it survives until the request executes.
+    //
+    // So the branch-specific assertions still rested on an unstated
+    // environmental precondition — the same class of defect CHRD-77 exists to
+    // fix: a check that reports without testing what it claims.
+    //
+    // ## The fix (option (a) — control the condition, don't observe it)
+    // The diffusion start/adoption seam is now INJECTED, exactly as
+    // `netns::prepare_with_probe`'s `has_cap` / `create_ns` seams are on this
+    // same branch. `crate::diffusion::install_test_manager` (a `#[cfg(test)]`
+    // seam — it does not exist in a production build) supplies the
+    // `DiffusionManager` that `chat_completions` dispatches through, pointed at
+    // a mock daemon this test owns. The test therefore DECIDES whether a daemon
+    // is available instead of guessing from the host.
+    //
+    // ## Determinism across the three host environments
+    // Because the manager is supplied, the ambient DiffusionGemma daemon is not
+    // consulted at all: the injected config's port is the mock daemon's port,
+    // and its `bin` is a path that cannot exist. These tests therefore behave
+    // IDENTICALLY whether the real daemon is running, stopped-but-launchable, or
+    // absent/unlaunchable — the host state is not an input. They also never
+    // touch the real daemon or the shared GPU.
+    //
+    // The two tests below pin the two outcomes the routing branch can produce,
+    // each driven by an injected condition rather than an observed one:
+    //   * a daemon IS available (adopted)      ⇒ `200`, served via `/generate`;
+    //   * no daemon and none can be spawned    ⇒ the diffusion branch's OWN `503`.
+    // Both assert the decisive invariant — `CHORD_LLM_URL` was never hit —
+    // unconditionally, before any fallible parsing.
+
+    /// Build a `DiffusionManager` whose daemon endpoint is `port` and whose
+    /// binary path cannot exist, and install it as the manager
+    /// `chat_completions` dispatches through for the lifetime of the returned
+    /// guard.
+    ///
+    /// The unspawnable `bin` is deliberate: it means the ONLY way a request can
+    /// be served is by adopting whatever answers `/health` on `port` — the mock
+    /// daemon the test controls. If a regression ever bypassed adoption and
+    /// tried to spawn, the spawn would fail loudly rather than silently reaching
+    /// a real daemon on the host.
+    fn install_mock_diffusion_daemon(port: u16) -> crate::diffusion::TestManagerGuard {
+        let cfg = crate::diffusion::DiffusionConfig {
+            model_id: "diffusion-gemma".to_string(),
+            bin: "/nonexistent/chrd77/llama-diffusion-daemon".to_string(),
+            bind: "127.0.0.1".to_string(),
+            port,
+            // Never reached (spawn fails first), but keep it small so a future
+            // change cannot turn this into a multi-minute health poll.
+            start_timeout_secs: 1,
+            generate_timeout_secs: 10,
+            ..crate::diffusion::DiffusionConfig::default()
+        };
+        crate::diffusion::install_test_manager(crate::diffusion::DiffusionManager::new(cfg))
+    }
+
+    /// End-to-end through the real `chat_completions` handler, with a diffusion
+    /// daemon the test PROVIDES: the request must be served through the
+    /// diffusion path and must NEVER reach `CHORD_LLM_URL`.
+    ///
+    /// A regression that fell through to the P5 / `CHORD_LLM_URL` path for a
+    /// diffusion model would silently answer with the WRONG (non-diffusion)
+    /// model. That is the bug this guards.
     #[tokio::test]
     #[serial(gpu_gate)]
     async fn test_chat_completions_diffusion_model_never_forwards_to_chord_llm_url() {
+        // The upstream that must NEVER be hit.
         let server = httpmock::MockServer::start_async().await;
         let mock = server.mock(|when, then| {
             when.method(httpmock::Method::POST)
@@ -5226,35 +5295,178 @@ pub(crate) mod tests {
         });
         let llm_url = format!("{}/v1/chat/completions", server.base_url());
 
+        // The diffusion daemon the test OWNS. `/health` succeeds, so
+        // `ensure_running` adopts it; `/generate` answers the real dgem
+        // contract. This makes "a daemon is available" an injected fact.
+        let daemon = httpmock::MockServer::start_async().await;
+        let health = daemon.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/health");
+            then.status(200).body("ok");
+        });
+        let generate = daemon.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/generate");
+            then.status(200).json_body(serde_json::json!({
+                "text": "CHRD77-FROM-THE-INJECTED-DIFFUSION-DAEMON",
+                "time_ms": 1,
+                "model_load_ms": 0,
+                "input_tokens": 2,
+                "tokens": 3,
+                "blocks": 1,
+            }));
+        });
+        let _guard = install_mock_diffusion_daemon(daemon.port());
+
+        // ── Anti-vacuity: the model name under test really IS the configured
+        // diffusion model. Without this the whole test could pass by simply not
+        // being a diffusion request at all.
+        let dcfg = crate::diffusion::global().config();
+        assert!(
+            crate::diffusion::is_diffusion_model(dcfg, "diffusion-gemma"),
+            "test model must be the configured diffusion model id ({}) or this test \
+             proves nothing",
+            dcfg.model_id
+        );
+
         let state = test_state_with_llm(Some(llm_url));
         let app = build_router(state);
+        // `max_tokens` kept tiny on principle: this path is a generation call,
+        // and nothing in this test may ever tie up the shared GPU.
+        let body = serde_json::json!({
+            "model": "diffusion-gemma",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false,
+            "max_tokens": 16,
+        })
+        .to_string();
         let req = Request::builder()
             .method(Method::POST)
             .uri("/v1/chat/completions")
             .header("Content-Type", "application/json")
-            .body(Body::from(chat_request_body("diffusion-gemma", false)))
+            .body(Body::from(body))
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        // No real llama-diffusion-daemon binary in this sandbox ⇒
-        // `ensure_running` fails to spawn ⇒ structured 503 from the
-        // diffusion branch itself.
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // ── THE DECISIVE ASSERTION, before any body consumption or parsing.
+        // Nothing that can panic may sit between obtaining the response and this
+        // assertion: a malformed body from an unintended path would otherwise
+        // panic in `unwrap()` first, bypassing the one assertion whose entire
+        // job is to catch that class of failure.
+        mock.assert_hits_async(0).await;
+
+        let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an available diffusion daemon must be served through the diffusion \
+             path; got {status}: {json}"
+        );
+        assert_eq!(json["object"], "chat.completion", "got: {json}");
+        assert_eq!(json["model"], "diffusion-gemma", "got: {json}");
+        // Positive proof of PROVENANCE: the content is the exact text only the
+        // injected daemon produces. The `CHORD_LLM_URL` mock answers with an
+        // empty `choices` array and could never produce this.
+        assert_eq!(
+            json["choices"][0]["message"]["content"], "CHRD77-FROM-THE-INJECTED-DIFFUSION-DAEMON",
+            "got: {json}"
+        );
+
+        // ── STRUCTURAL proof that the diffusion branch was ENTERED and that the
+        // INJECTED seam is what drove the outcome — not an ambient daemon, not a
+        // fallthrough. This is what makes a bypass of the routing predicate go
+        // red even if some other path happened to return a plausible 200.
+        health.assert_hits_async(1).await;
+        generate.assert_hits_async(1).await;
+    }
+
+    /// The same routing invariant with the OPPOSITE injected condition: no
+    /// daemon is reachable and none can be spawned. The diffusion branch must
+    /// return its OWN structured `503` and must still never fall through to
+    /// `CHORD_LLM_URL` — a fallthrough here is exactly the silently-wrong-model
+    /// bug, and it would otherwise look like a successful request.
+    #[tokio::test]
+    #[serial(gpu_gate)]
+    async fn test_chat_completions_diffusion_model_never_forwards_when_daemon_unavailable() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/chat/completions");
+            then.status(200).json_body(serde_json::json!({"choices": []}));
+        });
+        let llm_url = format!("{}/v1/chat/completions", server.base_url());
+
+        // A daemon endpoint that is listening but NOT healthy ⇒ the adoption
+        // probe fails deterministically (rather than depending on a closed port,
+        // which another process could race us for). The manager then tries to
+        // spawn its `bin`, which cannot exist ⇒ `ensure_running` returns Err.
+        let daemon = httpmock::MockServer::start_async().await;
+        let health = daemon.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/health");
+            then.status(503).body("down");
+        });
+        let generate = daemon.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/generate");
+            then.status(200)
+                .json_body(serde_json::json!({"text": "must never be served"}));
+        });
+        let _guard = install_mock_diffusion_daemon(daemon.port());
+
+        let dcfg = crate::diffusion::global().config();
         assert!(
-            json["error"].as_str().unwrap().contains("diffusion"),
+            crate::diffusion::is_diffusion_model(dcfg, "diffusion-gemma"),
+            "test model must be the configured diffusion model id ({}) or this test \
+             proves nothing",
+            dcfg.model_id
+        );
+
+        let state = test_state_with_llm(Some(llm_url));
+        let app = build_router(state);
+        let body = serde_json::json!({
+            "model": "diffusion-gemma",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false,
+            "max_tokens": 16,
+        })
+        .to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+
+        // Decisive assertion first, before anything fallible.
+        mock.assert_hits_async(0).await;
+
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "with no diffusion daemon reachable or spawnable, the diffusion branch \
+             must return its OWN structured 503, never fall through; got {status}: {json}"
+        );
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("diffusion")),
             "expected a diffusion-specific error, got: {json}"
         );
-        // The decisive assertion: CHORD_LLM_URL was NEVER hit. This is the
-        // bug this fix closes — the old code, on a diffusion-branch failure,
-        // still couldn't reach CHORD_LLM_URL either (it returned its own
-        // 503), but a regression that fell through to the P5/CHORD_LLM_URL
-        // path for a diffusion model would silently answer with the WRONG
-        // (non-diffusion) model — this guards against ever reintroducing
-        // that.
-        mock.assert_hits_async(0).await;
+
+        // Structural: the adoption probe WAS consulted (so the diffusion branch
+        // really ran), and nothing was ever generated.
+        health.assert_hits_async(1).await;
+        generate.assert_hits_async(0).await;
     }
 }

@@ -627,7 +627,67 @@ impl DiffusionManager {
 pub static DIFFUSION: Lazy<DiffusionManager> =
     Lazy::new(|| DiffusionManager::new(DiffusionConfig::from_env()));
 
+/// CHRD-77 test-only seam: an override for [`global`].
+///
+/// ## Why this exists
+/// `chat_completions`'s diffusion branch dispatches through the process-global
+/// [`DIFFUSION`] singleton, which is built once from the real process
+/// environment. That made the end-to-end routing test's outcome a function of
+/// *the host it ran on*: on a host where the DiffusionGemma daemon happens to be
+/// live, `ensure_running` adopts the ambient daemon and the request is served
+/// (200); on a host where it is not, the spawn fails and the branch returns its
+/// own structured 503. The test could observe that state but never CONTROL it —
+/// and a `/health` probe cannot even observe it reliably, because "nothing
+/// answered health at this instant" does not imply "`ensure_running` cannot
+/// start or adopt a daemon", nor does a healthy probe imply the daemon is still
+/// there a moment later when the handler runs.
+///
+/// This override lets a test SUPPLY the manager, so the start/adoption outcome
+/// is decided by the test rather than discovered from the host. It is
+/// `#[cfg(test)]`, so it does not exist at all in a production build — the
+/// release `global()` is byte-identical to what it was before.
+///
+/// Follows the same test-only-seam convention already used in this crate
+/// (`Config::test_default`, `IdleController::set_last_activity_for_test`,
+/// `RateLimiter::backdate_for_test`).
+#[cfg(test)]
+static TEST_MANAGER: std::sync::RwLock<Option<&'static DiffusionManager>> =
+    std::sync::RwLock::new(None);
+
+/// RAII installer for [`TEST_MANAGER`]. Restores the previous value on drop, so
+/// a panicking test cannot leave the override installed for the rest of the run.
+#[cfg(test)]
+pub struct TestManagerGuard(Option<&'static DiffusionManager>);
+
+#[cfg(test)]
+impl Drop for TestManagerGuard {
+    fn drop(&mut self) {
+        *TEST_MANAGER.write().unwrap_or_else(|e| e.into_inner()) = self.0.take();
+    }
+}
+
+/// Install `mgr` as the manager [`global`] returns, until the returned guard is
+/// dropped. Test-only.
+///
+/// The manager is leaked to `&'static` because [`global`]'s signature is
+/// `&'static DiffusionManager` (it normally hands out a reference into a
+/// process-lifetime `Lazy`). A handful of leaked test managers is bounded and
+/// intentional.
+#[cfg(test)]
+pub fn install_test_manager(mgr: DiffusionManager) -> TestManagerGuard {
+    let leaked: &'static DiffusionManager = Box::leak(Box::new(mgr));
+    let mut slot = TEST_MANAGER.write().unwrap_or_else(|e| e.into_inner());
+    let prev = slot.replace(leaked);
+    TestManagerGuard(prev)
+}
+
 pub fn global() -> &'static DiffusionManager {
+    #[cfg(test)]
+    {
+        if let Some(mgr) = *TEST_MANAGER.read().unwrap_or_else(|e| e.into_inner()) {
+            return mgr;
+        }
+    }
     &DIFFUSION
 }
 
