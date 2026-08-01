@@ -131,6 +131,17 @@ pub const LUMINA_ALIAS_KEYS: [&str; 2] = ["lumina-fast", "lumina-deep"];
 #[derive(Clone)]
 pub struct LuminaAliasStore {
     inner: Arc<ArcSwap<HashMap<String, String>>>,
+    /// CQH-01 (F1/F2): a shared serialization point between an alias PUBLICATION
+    /// ([`set`](Self::set)) and a consumer that must read the current targets and
+    /// then commit an action atomically w.r.t. any repoint. The hot read path
+    /// ([`resolve`](Self::resolve)) stays lock-free (`ArcSwap::load`) — this lock
+    /// is taken ONLY on the rare write (`set`, a promotion event) and by a consumer
+    /// that explicitly brackets a read+commit with [`publish_guard`](Self::publish_guard).
+    /// Holding a plain registry mutex cannot order against a lock-free `ArcSwap`
+    /// publish, so the cold-quota pruner acquires THIS lock around its delete-time
+    /// keep-set re-check + record-drop; a repoint therefore cannot land between the
+    /// pruner's `current()` read and its `remove_record()`.
+    publish_lock: Arc<std::sync::Mutex<()>>,
 }
 
 impl LuminaAliasStore {
@@ -146,6 +157,7 @@ impl LuminaAliasStore {
         }
         LuminaAliasStore {
             inner: Arc::new(ArcSwap::from_pointee(seed)),
+            publish_lock: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -154,6 +166,7 @@ impl LuminaAliasStore {
     pub fn empty() -> Self {
         LuminaAliasStore {
             inner: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            publish_lock: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -176,11 +189,32 @@ impl LuminaAliasStore {
     /// atomically swaps the new `Arc` in — concurrent readers see either the old
     /// or the new map, never a torn state.
     pub fn set(&self, key: &str, target: String) {
+        // CQH-01 (F1/F2): serialize the publish against a consumer holding
+        // `publish_guard()` (the cold-quota prune commit), so a repoint cannot land
+        // between that consumer's `resolve`/`snapshot` read and its commit. Writes
+        // are rare (promotion events); readers stay lock-free (`resolve`). The guard
+        // scopes ONLY the `ArcSwap` publish — no `.await`, no other lock nested.
+        let _publish = self
+            .publish_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.inner.rcu(|current| {
             let mut next: HashMap<String, String> = (**current).clone();
             next.insert(key.to_string(), target.clone());
             next
         });
+    }
+
+    /// CQH-01 (F1/F2): acquire the alias-publish-vs-consumer serialization lock.
+    /// A consumer (the cold-quota pruner) holds this guard across a
+    /// `snapshot`/`resolve` read AND the action it commits from that read, so the
+    /// read+commit are atomic w.r.t. any concurrent [`set`](Self::set). The guard
+    /// scopes a SHORT, await-free critical section only. Poison is recovered (the
+    /// lock guards no invariant beyond serialization).
+    pub fn publish_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.publish_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// A snapshot of all current lumina targets (for tests / diagnostics).

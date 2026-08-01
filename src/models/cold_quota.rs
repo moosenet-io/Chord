@@ -813,10 +813,25 @@ pub trait LiveKeepSet: Send + Sync {
     /// lumina proxy target(s) + the VRAM keep-resident pins. Cheap enough to call
     /// once per candidate delete.
     fn current(&self) -> HashSet<String>;
+
+    /// CQH-01 (F1/F2): read the LIVE keep set and run `commit` while holding the
+    /// alias-publish serialization lock, so the read AND the caller's commit
+    /// (the registry record-drop) are ATOMIC w.r.t. any concurrent alias repoint.
+    /// A plain registry mutex cannot order against the lock-free `ArcSwap` publish
+    /// inside [`LuminaAliasStore::set`]; both `set` and this method take the SAME
+    /// dedicated lock, closing the window where a repoint lands between the read
+    /// and the commit. `commit` MUST be short and MUST NOT `.await` (it runs inside
+    /// a `std::sync::Mutex` critical section). The default impl has no publisher to
+    /// race (e.g. a frozen `HashSet`), so it simply reads and commits.
+    fn commit_under_publish_lock(&self, commit: &mut dyn FnMut(&HashSet<String>)) {
+        let keep = self.current();
+        commit(&keep);
+    }
 }
 
 /// A frozen set is trivially a (constant) live set — lets existing callers/tests
-/// pass a plain `HashSet` and keeps the pure-planner fixtures unchanged.
+/// pass a plain `HashSet` and keeps the pure-planner fixtures unchanged. No
+/// publisher can race it, so the default `commit_under_publish_lock` is correct.
 impl LiveKeepSet for HashSet<String> {
     fn current(&self) -> HashSet<String> {
         self.clone()
@@ -862,6 +877,19 @@ impl LiveKeepSet for LuminaResidentKeepSet {
             &self.statics,
         ));
         set
+    }
+
+    /// CQH-01 (F1/F2): hold the alias-publish lock across the keep-set read AND the
+    /// commit. `LuminaAliasStore::set` takes the SAME lock, so a repoint (of a
+    /// dynamic lumina target OR a resident-role alias resolved from the dynamic
+    /// store) cannot interleave between `current()` and the record-drop. The
+    /// registry lock the caller already holds handles the protect-toggle path
+    /// (`set_protected` takes the registry mutex); this closes the alias/ArcSwap
+    /// path the registry mutex cannot order against.
+    fn commit_under_publish_lock(&self, commit: &mut dyn FnMut(&HashSet<String>)) {
+        let _publish = self.dynamic.publish_guard();
+        let keep = self.current();
+        commit(&keep);
     }
 }
 
@@ -1103,41 +1131,54 @@ pub async fn run_cold_quota_pass_at(
             continue;
         }
 
+        // `committed` ⇒ the record was dropped (proceed to fs delete);
+        // `min_keep_stop` ⇒ the live floor was hit (stop the whole loop).
+        let mut committed = false;
+        let mut min_keep_stop = false;
         {
             let mut reg = registry.lock().await;
             if reg.cold_count() <= cfg.min_keep {
-                drop(reg);
-                info!("[cold-quota] live cold count at min-keep floor mid-pass; stopping");
-                break;
-            }
-            // F2: re-query the LIVE keep set under the lock (dynamic alias repoints
-            // + resident pins), so a mid-pass repoint to THIS model protects it.
-            let live_keep = keep.current();
-            let still_eligible = reg
-                .get(&item.name)
-                .map(|r| r.tier == StorageTier::Cold)
-                .unwrap_or(false)
-                && !reg.is_protected(&item.name)
-                && !live_keep.contains(&item.name);
-            if !still_eligible {
-                drop(reg);
-                warn!(
-                    model = %item.name,
-                    "[cold-quota] item no longer eligible at delete time (promoted/protected/kept) — skipping"
-                );
-                continue;
-            }
-            // COMMIT the decision atomically: drop the Chord registry record while
-            // still holding the lock (the Terminus discovery/catalog row is NEVER
-            // touched → the model stays re-pullable). The fs delete follows below.
-            reg.remove_record(&item.name);
-            if let Err(e) = reg.save() {
-                warn!(
-                    "[cold-quota] failed to persist registry after pruning {}: {e}",
-                    item.name
-                );
+                min_keep_stop = true;
+            } else {
+                // CQH-01 (F1/F2): the keep-set read AND the record-drop run inside
+                // `commit_under_publish_lock`, which holds the alias-publish lock
+                // that `LuminaAliasStore::set` also takes — so an alias repoint
+                // cannot land between the read and the drop. The registry lock (held
+                // here) additionally serializes the protect-toggle path. Together:
+                // an item that became protected / promoted to Warm / a LIVE keep or
+                // resident target is skipped; otherwise we drop the record (the
+                // Terminus discovery/catalog row is NEVER touched → re-pullable).
+                keep.commit_under_publish_lock(&mut |live_keep| {
+                    let still_eligible = reg
+                        .get(&item.name)
+                        .map(|r| r.tier == StorageTier::Cold)
+                        .unwrap_or(false)
+                        && !reg.is_protected(&item.name)
+                        && !live_keep.contains(&item.name);
+                    if still_eligible {
+                        reg.remove_record(&item.name);
+                        if let Err(e) = reg.save() {
+                            warn!(
+                                "[cold-quota] failed to persist registry after pruning {}: {e}",
+                                item.name
+                            );
+                        }
+                        committed = true;
+                    }
+                });
             }
             drop(reg);
+        }
+        if min_keep_stop {
+            info!("[cold-quota] live cold count at min-keep floor mid-pass; stopping");
+            break;
+        }
+        if !committed {
+            warn!(
+                model = %item.name,
+                "[cold-quota] item no longer eligible at delete time (promoted/protected/kept) — skipping"
+            );
+            continue;
         }
 
         match remover.remove(&item.name).await {
@@ -2465,5 +2506,215 @@ mod tests {
             reg.get("prunable:1").is_none(),
             "the non-resident candidate is the one pruned"
         );
+    }
+
+    // ── CQH-01 (F1/F2 review round 2): the alias-publish serialization lock ─────
+
+    #[test]
+    fn publish_lock_serializes_set_against_prune_commit_guard() {
+        // The core of the fix: `LuminaAliasStore::set` and a consumer holding
+        // `publish_guard()` are MUTUALLY EXCLUSIVE. While the prune commit holds the
+        // guard, a concurrent repoint cannot publish — so a repoint can never land
+        // between the pruner's keep read and its record-drop (both under the guard).
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let mut statics = HashMap::new();
+        statics.insert("lumina-fast".to_string(), "old:1".to_string());
+        let store = LuminaAliasStore::from_static(&statics);
+
+        let guard = store.publish_guard(); // pruner "in the critical section"
+        let done = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let store = store.clone();
+            let done = done.clone();
+            std::thread::spawn(move || {
+                store.set("lumina-fast", "new:1".to_string()); // must block on the guard
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+
+        // While the guard is held, the repoint must NOT complete and must NOT be
+        // observable (no torn publish).
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "set() must block while the prune-commit publish guard is held"
+        );
+        assert_eq!(
+            store.resolve("lumina-fast").as_deref(),
+            Some("old:1"),
+            "no repoint may be observed while the publish guard is held"
+        );
+
+        drop(guard); // pruner releases → repoint may now publish
+        handle.join().unwrap();
+        assert!(done.load(Ordering::SeqCst));
+        assert_eq!(
+            store.resolve("lumina-fast").as_deref(),
+            Some("new:1"),
+            "repoint applies once the guard is released"
+        );
+    }
+
+    /// A keep-set that reproduces the PRODUCTION locking and, on entering the
+    /// guarded critical section, fires a repoint that contends on the SAME publish
+    /// lock — modeling a repoint that races into the check→commit window. Because
+    /// `set` and the guarded read share the lock, the repoint is serialized AHEAD of
+    /// the guarded read (it runs before the guard is acquired — acquiring the guard
+    /// and then calling `set` on the same store would self-deadlock, which is
+    /// exactly the mutual exclusion the fix provides), so the commit-time read
+    /// observes it and the now-live target is protected.
+    struct WindowRepointKeepSet {
+        dynamic: LuminaAliasStore,
+        statics: HashMap<String, String>,
+        resident_cfg: ResidentSetConfig,
+        repoint_key: String,
+        repoint_target: String,
+    }
+    impl LiveKeepSet for WindowRepointKeepSet {
+        fn current(&self) -> HashSet<String> {
+            let mut set: HashSet<String> = self.dynamic.snapshot().into_values().collect();
+            set.extend(resident_exempt_models(
+                &self.resident_cfg,
+                &self.dynamic,
+                &self.statics,
+            ));
+            set
+        }
+        fn commit_under_publish_lock(&self, commit: &mut dyn FnMut(&HashSet<String>)) {
+            // Repoint races into the window; the shared lock serializes it ahead of
+            // our guarded read (must precede acquiring the guard on this store).
+            self.dynamic
+                .set(&self.repoint_key, self.repoint_target.clone());
+            let _publish = self.dynamic.publish_guard();
+            let keep = self.current();
+            commit(&keep);
+        }
+    }
+
+    #[tokio::test]
+    async fn alias_repoint_in_commit_interval_protects_target() {
+        // F2: a lumina-alias repoint that lands in the delete-time check→commit
+        // window (serialized by the shared publish lock) is observed by the
+        // commit-time re-read, so the now-live target is NOT deleted.
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        let archive = base.join("archive");
+        make_archive_model(&archive, "target", "1", &[100]);
+        make_archive_model(&archive, "other", "1", &[100]);
+        let mut reg = reg_with(base, vec![]);
+        reg.reconcile();
+        reg.set_last_requested_for_test("target:1", 1000);
+        reg.set_last_requested_for_test("other:1", 1000);
+        let registry = Arc::new(Mutex::new(reg));
+        let mut scores = QualificationScores::default();
+        scores.assistant_avg_value.insert("target:1".into(), 1.0); // ranked first
+        scores.assistant_avg_value.insert("other:1".into(), 2.0);
+
+        // Dynamic store empty at PLAN time (so target:1 is planned); the repoint
+        // fires only once the commit critical section is entered.
+        let keep = WindowRepointKeepSet {
+            dynamic: LuminaAliasStore::empty(),
+            statics: HashMap::new(),
+            resident_cfg: ResidentSetConfig {
+                enabled: false, // isolate the F2 dynamic-lumina-target path
+                ..ResidentSetConfig::default()
+            },
+            repoint_key: "lumina-fast".to_string(),
+            repoint_target: "target:1".to_string(),
+        };
+
+        let free = Arc::new(std::sync::atomic::AtomicU64::new(0)); // maximally over
+        let probe = FixedProbe { total: 1000, free };
+        let remover = FsColdArchiveRemover::new(archive.clone());
+        let lock = new_disk_op_lock();
+
+        run_cold_quota_pass_at(
+            &registry,
+            &archive,
+            &probe,
+            &scores,
+            &keep,
+            &remover,
+            &armed_cfg(),
+            &lock,
+            NOW,
+        )
+        .await;
+
+        let reg = registry.lock().await;
+        assert!(
+            reg.get("target:1").is_some(),
+            "a target that became a LIVE alias target in the commit interval must NOT be deleted"
+        );
+        assert!(
+            archive
+                .join("manifests/registry.ollama.ai/library/target/1")
+                .is_file(),
+            "its archive must survive"
+        );
+        assert!(reg.get("other:1").is_none(), "the non-protected candidate is pruned");
+    }
+
+    #[tokio::test]
+    async fn resident_alias_repoint_in_commit_interval_protects_target() {
+        // F4 + F1/F2: a repoint of a RESIDENT-role alias (resolved through the
+        // dynamic store) that lands in the check→commit window is likewise observed
+        // atomically, so the newly-resident target is NOT deleted.
+        use crate::routing::resident_set::Role;
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        let archive = base.join("archive");
+        make_archive_model(&archive, "restarget", "1", &[100]);
+        make_archive_model(&archive, "other", "1", &[100]);
+        let mut reg = reg_with(base, vec![]);
+        reg.reconcile();
+        reg.set_last_requested_for_test("restarget:1", 1000);
+        reg.set_last_requested_for_test("other:1", 1000);
+        let registry = Arc::new(Mutex::new(reg));
+        let mut scores = QualificationScores::default();
+        scores.assistant_avg_value.insert("restarget:1".into(), 1.0); // ranked first
+        scores.assistant_avg_value.insert("other:1".into(), 2.0);
+
+        // Resident Embedding role → "lumina-embed"; the repoint points that alias at
+        // restarget:1 during the commit interval, so resident_exempt_models resolves
+        // it live under the shared lock.
+        let keep = WindowRepointKeepSet {
+            dynamic: LuminaAliasStore::empty(),
+            statics: HashMap::new(),
+            resident_cfg: ResidentSetConfig {
+                enabled: true,
+                aliases: vec![(Role::Embedding, "lumina-embed".to_string())],
+                ..ResidentSetConfig::default()
+            },
+            repoint_key: "lumina-embed".to_string(),
+            repoint_target: "restarget:1".to_string(),
+        };
+
+        let free = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let probe = FixedProbe { total: 1000, free };
+        let remover = FsColdArchiveRemover::new(archive.clone());
+        let lock = new_disk_op_lock();
+
+        run_cold_quota_pass_at(
+            &registry,
+            &archive,
+            &probe,
+            &scores,
+            &keep,
+            &remover,
+            &armed_cfg(),
+            &lock,
+            NOW,
+        )
+        .await;
+
+        let reg = registry.lock().await;
+        assert!(
+            reg.get("restarget:1").is_some(),
+            "a model that became a LIVE resident target in the commit interval must NOT be deleted"
+        );
+        assert!(reg.get("other:1").is_none());
     }
 }
