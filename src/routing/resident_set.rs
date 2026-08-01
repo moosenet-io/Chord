@@ -935,6 +935,21 @@ pub struct WarmReport {
     /// TRTR-07d: models this pass had put a warm request on the wire for and then
     /// explicitly UNLOADED again, because a release invalidated the pass.
     pub compensated: usize,
+    /// CHRD-83: OUTGOING models this pass unloaded because a role's target
+    /// CHANGED and no remaining role held the old one. An alias repoint used to
+    /// drop the outgoing model's residency exemption without unloading it, so it
+    /// sat in VRAM at full size, held by nobody, until its bounded `keep_alive`
+    /// expired (24h by default). Bounded is not free on a shared GPU.
+    pub orphaned: usize,
+    /// CHRD-83, GUARD 5: role slots whose residency claim was REPAIRED because
+    /// the model they claimed had just been unloaded by this pass. The orphan
+    /// decision is taken under the lock and the unload is issued outside it, so
+    /// the decision can go stale in that window; rather than leave the set
+    /// believing it holds a model that is no longer in VRAM — precisely the
+    /// bookkeeping/GPU divergence TRTR-07d exists to eliminate — the slot is
+    /// marked not-resident so the next pass re-warms it. Expected to be 0 on
+    /// every steady-state tick.
+    pub repaired: usize,
 }
 
 /// Outcome of a release (logged + returned for observability).
@@ -1497,6 +1512,9 @@ impl ResidentSet {
 
         let mut new_slots: Vec<(Role, Slot)> = Vec::with_capacity(outcomes.len());
         let mut held: Vec<String> = Vec::new();
+        // CHRD-83: models a role is MOVING OFF. Deliberately narrow — see the
+        // filter below the loop for why.
+        let mut outgoing: Vec<(Role, String)> = Vec::new();
 
         for out in outcomes {
             let prev = inner
@@ -1538,6 +1556,33 @@ impl ResidentSet {
                 }
             }
 
+            // CHRD-83: this role was holding a model and is now holding a
+            // DIFFERENT one. Note how narrow the condition is, on purpose:
+            //
+            //   * the role must have been held BEFORE (`p.state.is_held()`), so
+            //     the outgoing model really is one this set loaded and owned;
+            //   * the role must be held NOW on a different model — i.e. the new
+            //     target is already confirmed warm. Doing this only on a
+            //     SUCCESSFUL takeover is what keeps us from ever fighting an
+            //     in-flight warm for the new target, and means a role that merely
+            //     failed to resolve or failed to warm falls back to exactly the
+            //     old behaviour (a bounded keep_alive expiry), never worse.
+            //
+            // A role that goes held → not-held is therefore NOT an orphan here:
+            // that is the release/mode-swap path, which has its own compensating
+            // unload and its own generation ownership.
+            if state.is_held() {
+                if let (Some(p), Some(new_model)) = (prev.as_ref(), out.model.as_ref()) {
+                    if p.state.is_held() {
+                        if let Some(old_model) = p.model.as_ref() {
+                            if old_model != new_model {
+                                outgoing.push((out.role, old_model.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+
             new_slots.push((
                 out.role,
                 Slot {
@@ -1557,14 +1602,133 @@ impl ResidentSet {
         held.dedup();
         env.set_exempt(&held).await;
 
+        // CHRD-83: dropping the exemption is only the BOOKKEEPING half of a
+        // repoint — exactly the same asymmetry TRTR-07d found on the release
+        // path. The outgoing model keeps the 24h `keep_alive` this set gave it,
+        // so it stays in VRAM at full size held by NOBODY until that expires.
+        // Bounded, but the promoter repoints on its own schedule with no human
+        // involved, so two large repoints can occupy most of a card for a day.
+        //
+        // DELIBERATE NON-FEATURE — we do NOT also shorten the outgoing model's
+        // keep_alive as a belt-and-braces backstop. It looks free and is not:
+        // shortening means issuing the SAME role-shaped request to the SAME
+        // endpoint with a small `keep_alive` instead of `0`, so it fails in
+        // exactly the circumstances the unload fails (Ollama unreachable or
+        // refusing) — it buys nothing against the correlated failure it is meant
+        // to hedge. Worse, it is not idempotent the way an unload is: if the
+        // model has already left VRAM (the unload landed, or the eviction sweep
+        // got there first), a keep_alive request RE-LOADS it, so a hedge against
+        // a rare failed unload would routinely reload a 24 GB model for its own
+        // short timer. The bounded expiry the model already carries is the
+        // backstop, and it is the one we are strictly improving on.
+        //
+        // GUARD 1 — a shared target must survive one role moving off it.
+        // personality and router share an alias in the live configuration, so
+        // this filter is the one that matters most: only unload a model that NO
+        // remaining role holds.
+        let orphans: Vec<(Role, String)> = {
+            let mut seen: HashSet<String> = HashSet::new();
+            outgoing
+                .into_iter()
+                .filter(|(_, m)| !held.iter().any(|h| h == m))
+                .filter(|(_, m)| seen.insert(m.clone()))
+                .collect()
+        };
+
         inner.slots = new_slots;
         inner.active = true;
         inner.last_warm = Some(Instant::now());
         // The pass committed: nothing is owed a compensating unload.
         inner.pending.clear();
-        if let Some(tx) = inner.in_flight.take() {
-            let _ = tx.send(report.clone());
+
+        if orphans.is_empty() {
+            if let Some(tx) = inner.in_flight.take() {
+                let _ = tx.send(report.clone());
+            }
+        } else {
+            // NOTE: `in_flight` is deliberately NOT taken yet — the same trick the
+            // discard path uses. Holding it keeps any concurrent caller COALESCED
+            // onto this pass, so no NEW warm can start and race these unloads.
+            // GUARD 3, first half.
+            drop(inner);
+
+            for (role, model) in &orphans {
+                // GUARD 2 — re-check immediately before each unload, per model,
+                // exactly as `converge_legacy_pins` does. Between the decision
+                // above and this await a warm could have made the model held
+                // again. GUARD 3, second half — a newer generation means a
+                // release owns the decision now, and it has its own compensation;
+                // stop rather than issue an unload against a superseded pass.
+                //
+                // This check is necessary but NOT sufficient: it is taken under
+                // the lock and the lock is dropped to issue the request, so the
+                // decision can still go stale in the window between the two.
+                // GUARD 5 below closes that window.
+                {
+                    let inner = self.inner.lock().await;
+                    if inner.generation != generation {
+                        info!(
+                            trigger,
+                            pass_generation = generation,
+                            current_generation = inner.generation,
+                            model = %model,
+                            "resident-set: orphan unload skipped — a mode-swap release superseded this pass and owns the decision now"
+                        );
+                        break;
+                    }
+                    if inner
+                        .slots
+                        .iter()
+                        .any(|(_, s)| s.state.is_held() && s.model.as_deref() == Some(model.as_str()))
+                    {
+                        info!(
+                            trigger,
+                            role = role.id(),
+                            model = %model,
+                            "resident-set: orphan unload skipped — the outgoing model is held again"
+                        );
+                        continue;
+                    }
+                }
+                // GUARD 4 — soft. A failed unload costs us the OLD behaviour (the
+                // model still has a bounded expiry), never a wedged reconcile.
+                let outcome = env.unload_one(*role, model).await;
+
+                // GUARD 5 — REVALIDATE AND REPAIR. The check above was taken
+                // under the lock and then the lock was DROPPED to issue the
+                // request, so the decision is only known-good at the moment it
+                // was taken, not at the moment it lands. Re-validate now, when
+                // the request has actually landed, and repair rather than
+                // assume: see `repair_stale_residency` for why this is the shape
+                // of the fix and not "hold the lock across the unload".
+                report.repaired += self.repair_stale_residency(env, generation, model).await;
+
+                match outcome {
+                    Ok(()) => {
+                        report.orphaned += 1;
+                        info!(
+                            trigger,
+                            role = role.id(),
+                            model = %model,
+                            "resident-set: outgoing model unloaded — the role repointed and no remaining role holds it"
+                        );
+                    }
+                    Err(reason) => warn!(
+                        trigger,
+                        role = role.id(),
+                        model = %model,
+                        reason = %reason,
+                        "resident-set: outgoing model could not be unloaded — it keeps its bounded keep_alive and the eviction sweep is the backstop"
+                    ),
+                }
+            }
+
+            let mut inner = self.inner.lock().await;
+            if let Some(tx) = inner.in_flight.take() {
+                let _ = tx.send(report.clone());
+            }
         }
+
         info!(
             trigger,
             warmed = report.warmed,
@@ -1574,10 +1738,175 @@ impl ResidentSet {
             failed = report.failed,
             skipped = report.skipped,
             preserved = report.preserved,
+            orphaned = report.orphaned,
+            repaired = report.repaired,
             held = held.len(),
             "resident-set: warm pass complete"
         );
         report
+    }
+
+    /// CHRD-83 GUARD 5 — make an orphan unload's decision valid at the moment the
+    /// request LANDED, not merely at the moment it was taken.
+    ///
+    /// The orphan loop takes its decision under `inner` and then DROPS the lock to
+    /// issue the unload. That window is real: a `release` can bump the generation
+    /// in it, and a slot can come to claim the very model being unloaded. Retaining
+    /// `in_flight` across the loop (GUARD 3) coalesces new warm PASSES, but it is a
+    /// guarantee about one caller path, not an invariant of the data structure — so
+    /// the set claiming residency for a model it just unloaded rests on an argument
+    /// rather than on a check. This makes it a check.
+    ///
+    /// **Why repair-after rather than holding the lock across the unload.** The
+    /// production unload is a bounded `keep_alive:0` POST (`AppStateEnv::unload_one`
+    /// sets `.timeout(warm_timeout)`), so serializing it would *usually* be fine —
+    /// but `ResidentEnv` is an injected trait and the bound is the implementation's
+    /// promise, not the type's. Holding `inner` across it would put `status`,
+    /// `release` and every coalescing warm behind an await this code cannot bound,
+    /// which is the outage `release`'s own bounded-wait design exists to refuse.
+    /// So the lock stays off the await and the pass repairs afterwards instead.
+    ///
+    /// **What "repair" means.** Any slot still claiming to HOLD the model we just
+    /// unloaded is claiming residency for something no longer in VRAM. It is marked
+    /// not-resident (`Released`, `warmed_at` cleared) so the next pass sees it as
+    /// absent and re-warms it — the alias comparison in `reconcile_with` sees a
+    /// slot pointing at the outgoing model while the alias points at the new one,
+    /// so that reconcile forces past the debounce and the role is re-warmed on the
+    /// very next tick. Erring this way is deliberate: a spurious repair costs one
+    /// keep_alive re-assert against a model that is already loaded, while a missed
+    /// one is exactly the bookkeeping/GPU divergence TRTR-07d spent several rounds
+    /// eliminating.
+    ///
+    /// Repair runs whether the unload reported success or failure. A transport
+    /// error or a timeout cannot tell us whether the request landed, so the only
+    /// answer that is safe under every interleaving is to stop claiming residency
+    /// we can no longer vouch for.
+    ///
+    /// **A release still wins (TRTR-07d).** A release marks every held slot
+    /// `Released` before we get here, so there is normally nothing to repair. The
+    /// generation check below is what makes that unconditional: once the generation
+    /// has moved, the release owns the exemption and this pass must never re-apply
+    /// one — the bookkeeping is still repaired, the exemption is left exactly as
+    /// the release left it.
+    ///
+    /// **No `env` call happens under `inner`.** The repair decides everything —
+    /// which slots are false, whether this pass still owns the exemption, and what
+    /// the exemption should be — under the lock, then RELEASES it and installs the
+    /// exemption outside. Applying it under the lock would put `status`, `release`
+    /// and every coalescing lifecycle operation behind an await against an
+    /// *injected* trait, which is the same objection this header raises to holding
+    /// the lock across `unload_one`; it applies to `set_exempt` verbatim.
+    ///
+    /// **Two properties a future reader should not have to re-derive.**
+    /// (a) A role that re-holds the model AFTER its repair and before the pass ends
+    /// would leave the same false claim behind. That interleaving is unreachable
+    /// in-tree while this loop retains `in_flight` — `admit` joins rather than
+    /// starts, so no pass can install slots — and the deliberate bar here is the
+    /// structural repair plus this disclosure, not an absolute guarantee under
+    /// interleavings the design does not admit.
+    /// (b) A release can supersede the generation between the re-check and the
+    /// request, so an unload can go out on behalf of a superseded pass. That is
+    /// benign: a release wants that model released anyway, and because it has
+    /// already marked every slot `Released`, the repair that follows finds nothing
+    /// to fix and leaves the exemption to the release.
+    ///
+    /// The two OTHER unload sites (`commit`'s discard path and
+    /// `compensate_pending`) deliberately do NOT call this: both run only after a
+    /// release has already marked every slot `Released`, and no pass can be
+    /// admitted while `in_flight` is retained, so neither can end with the set
+    /// claiming residency at all. This loop is the only one that runs on a
+    /// COMMITTED pass with freshly-held slots installed.
+    async fn repair_stale_residency(
+        &self,
+        env: &dyn ResidentEnv,
+        generation: u64,
+        model: &str,
+    ) -> usize {
+        // PHASE 1 — repair, and DECIDE the exemption, entirely under the lock.
+        // Nothing in this block touches `env`.
+        let (repaired, exempt) = {
+            let mut inner = self.inner.lock().await;
+
+            let mut repaired = 0usize;
+            for (role, slot) in inner.slots.iter_mut() {
+                if slot.state.is_held() && slot.model.as_deref() == Some(model) {
+                    slot.state = RoleState::Released;
+                    slot.warmed_at = None;
+                    repaired += 1;
+                    warn!(
+                        role = role.id(),
+                        model = %model,
+                        "resident-set: STALE residency repaired — this role came to claim the model this pass was already unloading; marking it not-resident so it is re-warmed rather than believed resident"
+                    );
+                }
+            }
+
+            if repaired == 0 {
+                return 0;
+            }
+
+            if inner.generation != generation {
+                // A release owns the exemption now. Repairing the bookkeeping above
+                // is still right (the claim was false either way); re-applying an
+                // exemption here would resurrect a pin the release just dropped.
+                warn!(
+                    pass_generation = generation,
+                    current_generation = inner.generation,
+                    model = %model,
+                    "resident-set: stale residency repaired under a superseded generation — leaving the exemption to the release that owns it"
+                );
+                return repaired;
+            }
+
+            // The exemption must track what we actually hold, so recompute it from
+            // the REPAIRED slots — under the same lock acquisition and the same
+            // generation check that authorised the repair. That is what makes the
+            // list safe to install after the lock is dropped: every slot claiming
+            // `model` was just marked `Released` a few lines up, and no new pass
+            // can install slots while this loop retains `in_flight` (GUARD 3), so
+            // `model` cannot appear in this list whenever the call lands. Dropping
+            // the lock therefore cannot make the exemption stale in the one way
+            // that would matter — it can never resurrect residency for the model
+            // this pass just unloaded.
+            let mut held: Vec<String> = inner
+                .slots
+                .iter()
+                .filter(|(_, s)| s.state.is_held())
+                .filter_map(|(_, s)| s.model.clone())
+                .collect();
+            held.sort();
+            held.dedup();
+            (repaired, held)
+        };
+
+        // PHASE 2 — install it with the lock RELEASED, so an injected or slow
+        // `set_exempt` stalls nothing else.
+        env.set_exempt(&exempt).await;
+
+        // PHASE 3 — the one thing dropping the lock actually costs, closed. The
+        // ONLY writer that can act in this window is `release_with` (a warm pass
+        // cannot be admitted while `in_flight` is retained), and what it does is
+        // bump the generation and CLEAR the exemption. Neither side can impose an
+        // ordering on the two `env` calls, so if the release landed while ours was
+        // in flight we may have just re-installed a pin it dropped. Re-check, and
+        // if the generation moved, re-assert the release's intent — outside the
+        // lock, again. Clearing is idempotent, and it cannot clobber a legitimate
+        // later exemption: the only code that installs one is a warm commit, and
+        // none can run until this pass drops `in_flight`.
+        let superseded = {
+            let inner = self.inner.lock().await;
+            inner.generation != generation
+        };
+        if superseded {
+            warn!(
+                pass_generation = generation,
+                model = %model,
+                "resident-set: a release landed while the repaired exemption was being applied — clearing it again so the release, not this pass, owns the exemption"
+            );
+            env.clear_exempt().await;
+        }
+
+        repaired
     }
 
     /// RELEASE the whole set for a mode swap: drop the eviction exemption so every
@@ -4249,6 +4578,902 @@ mod tests {
             env.unloads()
         );
         assert!(!set.status().await.active);
+    }
+
+    // ── CHRD-83: an alias repoint must not ORPHAN the outgoing model ────────
+    //
+    // Live, not hypothetical: within 20 minutes of the CHRD-PIN-01 deploy the
+    // promoter repointed `lumina-fast` from a 24.64 GB model to a 9.59 GB one.
+    // personality and router correctly followed; the 24.64 GB model stayed
+    // LOADED, held by no role, carrying the 24h keep_alive the set had given it —
+    // VRAM went 31.7 GB → 41.3 GB and stayed there.
+
+    /// Personality and router BOTH move off the old model ⇒ nothing holds it
+    /// afterwards ⇒ it is unloaded. This is the live failure verbatim.
+    #[tokio::test]
+    async fn alias_repoint_unloads_the_outgoing_model_when_no_role_still_holds_it() {
+        let set = ResidentSet::new(live_cfg());
+        // The live shape: personality + router SHARE one model, embedding is its own.
+        let shared = vec![
+            resolved(Role::Personality, Some("granite:30b"), Some(24.64), true),
+            resolved(Role::Router, Some("granite:30b"), Some(24.64), true),
+            resolved(Role::Embedding, Some("embed:1"), Some(1.0), true),
+        ];
+        let (env, _entered) = FakeEnv::new(shared, Some(96.0));
+
+        let first = set.warm_with(&*env, "startup", true, None).await;
+        assert_eq!(
+            first.warmed, 2,
+            "the shared model is warmed ONCE (+ the embedder): {first:?}"
+        );
+        assert_eq!(first.shared, 1, "router shares personality's model");
+        assert_eq!(first.orphaned, 0, "nothing was outgoing on the first pass");
+        assert_eq!(env.exempt(), vec!["embed:1".to_string(), "granite:30b".to_string()]);
+
+        // The promoter repoints `lumina-fast`: BOTH roles follow.
+        {
+            let mut r = env.resolved.lock().unwrap();
+            r[0].model = Some("granite:8b".to_string());
+            r[0].size_gb = Some(9.59);
+            r[1].model = Some("granite:8b".to_string());
+            r[1].size_gb = Some(9.59);
+        }
+
+        let report = set.reconcile_with(&*env).await;
+
+        assert_eq!(report.warmed, 1, "the new target is warmed: {report:?}");
+        assert_eq!(
+            report.orphaned, 1,
+            "the outgoing model must be unloaded, not left to a 24h expiry: {report:?}"
+        );
+        assert_eq!(
+            env.unloads(),
+            vec!["granite:30b".to_string()],
+            "exactly the outgoing model, exactly once: {:?}",
+            env.unloads()
+        );
+        assert_eq!(
+            env.exempt(),
+            vec!["embed:1".to_string(), "granite:8b".to_string()],
+            "and the exemption follows the new target"
+        );
+        let status = set.status().await;
+        assert!(
+            status.roles.iter().all(|r| r.warm),
+            "every role must still be held after the repoint: {:?}",
+            status.roles
+        );
+    }
+
+    /// **The regression this is most likely to grow.** personality and router
+    /// share a model in the LIVE configuration. When only ONE of them repoints,
+    /// the other still holds the old model — it must NOT be unloaded out from
+    /// under the role that is still using it.
+    #[tokio::test]
+    async fn a_repoint_never_unloads_a_model_another_role_still_holds() {
+        let set = ResidentSet::new(live_cfg());
+        let shared = vec![
+            resolved(Role::Personality, Some("granite:30b"), Some(24.64), true),
+            resolved(Role::Router, Some("granite:30b"), Some(24.64), true),
+            resolved(Role::Embedding, Some("embed:1"), Some(1.0), true),
+        ];
+        let (env, _entered) = FakeEnv::new(shared, Some(96.0));
+
+        set.warm_with(&*env, "startup", true, None).await;
+
+        // ONLY personality repoints. Router stays on the big model.
+        {
+            let mut r = env.resolved.lock().unwrap();
+            r[0].model = Some("granite:8b".to_string());
+            r[0].size_gb = Some(9.59);
+        }
+
+        let report = set.reconcile_with(&*env).await;
+
+        assert_eq!(
+            report.orphaned, 0,
+            "a model another role still holds is NOT an orphan: {report:?}"
+        );
+        assert!(
+            env.unloads().is_empty(),
+            "unloading a still-held model would tear residency out from under the router: {:?}",
+            env.unloads()
+        );
+        let mut want = vec!["embed:1".to_string(), "granite:30b".to_string(), "granite:8b".to_string()];
+        want.sort();
+        assert_eq!(env.exempt(), want, "both models stay exempt");
+        let status = set.status().await;
+        assert!(status.roles.iter().all(|r| r.warm));
+    }
+
+    /// The outgoing model becomes HELD AGAIN between the decision and the
+    /// unload ⇒ that unload is SKIPPED (logged at INFO), not treated as an error
+    /// and not issued.
+    ///
+    /// Driven deterministically without sleeps or races: three roles repoint at
+    /// once, so there are three orphans processed in order, and the env flips the
+    /// SECOND orphan back to held from inside the FIRST orphan's unload call —
+    /// which is precisely the window the per-model re-check exists to cover
+    /// (`commit` holds no lock across an unload, so a warm genuinely can land
+    /// there). The env then delegates, so if the re-check were removed the
+    /// delegate would record the unload and this test would fail.
+    #[tokio::test]
+    async fn an_outgoing_model_that_becomes_held_again_is_skipped_not_unloaded() {
+        struct HeldAgainEnv {
+            inner: Arc<FakeEnv>,
+            set: StdMutex<Option<Arc<ResidentSet>>>,
+        }
+
+        #[async_trait]
+        impl ResidentEnv for HeldAgainEnv {
+            async fn resolve(&self, a: &[(Role, String)]) -> Vec<Resolved> {
+                self.inner.resolve(a).await
+            }
+            fn free_vram_gb(&self) -> Option<f64> {
+                self.inner.free_vram_gb()
+            }
+            async fn warm_one(
+                &self,
+                role: Role,
+                model: &str,
+                ka: &str,
+                c: &CancelToken,
+            ) -> Result<(), String> {
+                self.inner.warm_one(role, model, ka, c).await
+            }
+            async fn unload_one(&self, role: Role, model: &str) -> Result<(), String> {
+                // Fire exactly once, from inside the FIRST orphan unload: make
+                // the NEXT orphan held again before its re-check runs.
+                let set = self.set.lock().unwrap().take();
+                if let Some(set) = set {
+                    let mut inner = set.inner.lock().await;
+                    if let Some((_, slot)) = inner
+                        .slots
+                        .iter_mut()
+                        .find(|(r, _)| *r == Role::Personality)
+                    {
+                        slot.model = Some("router:1".to_string());
+                        slot.state = RoleState::Warm;
+                    }
+                }
+                self.inner.unload_one(role, model).await
+            }
+            async fn set_exempt(&self, models: &[String]) {
+                self.inner.set_exempt(models).await;
+            }
+            async fn clear_exempt(&self) {
+                self.inner.clear_exempt().await;
+            }
+        }
+
+        let set = Arc::new(ResidentSet::new(live_cfg()));
+        let (fake, _entered) = FakeEnv::new(three_roles(), Some(96.0));
+
+        let plain = HeldAgainEnv {
+            inner: fake.clone(),
+            set: StdMutex::new(None),
+        };
+        let first = set.warm_with(&plain, "startup", true, None).await;
+        assert_eq!(first.warmed, 3);
+
+        // All three roles repoint at once ⇒ three outgoing models.
+        {
+            let mut r = fake.resolved.lock().unwrap();
+            r[0].model = Some("voice:2".to_string());
+            r[1].model = Some("router:2".to_string());
+            r[2].model = Some("embed:2".to_string());
+        }
+
+        let armed = HeldAgainEnv {
+            inner: fake.clone(),
+            set: StdMutex::new(Some(set.clone())),
+        };
+        let report = set.reconcile_with(&armed).await;
+
+        assert!(
+            !fake.unloads().contains(&"router:1".to_string()),
+            "a model that became held again between the decision and the unload must be SKIPPED: {:?}",
+            fake.unloads()
+        );
+        assert_eq!(
+            fake.unloads(),
+            vec!["voice:1".to_string(), "embed:1".to_string()],
+            "the other orphans are still unloaded, in order: {:?}",
+            fake.unloads()
+        );
+        assert_eq!(
+            report.orphaned, 2,
+            "a skipped orphan is not counted as reaped: {report:?}"
+        );
+        // A skip is not an error: the pass completed normally.
+        assert!(!report.discarded, "a skipped orphan unload is not a failure");
+        assert_eq!(report.warmed, 3, "and every new target was still warmed");
+    }
+
+    /// An unload that FAILS is soft: logged, the reconcile completes normally,
+    /// and role state is still correct (the roles follow the new target).
+    #[tokio::test]
+    async fn a_failed_orphan_unload_is_soft_and_does_not_wedge_the_reconcile() {
+        struct FailingUnloadEnv(Arc<FakeEnv>);
+
+        #[async_trait]
+        impl ResidentEnv for FailingUnloadEnv {
+            async fn resolve(&self, a: &[(Role, String)]) -> Vec<Resolved> {
+                self.0.resolve(a).await
+            }
+            fn free_vram_gb(&self) -> Option<f64> {
+                self.0.free_vram_gb()
+            }
+            async fn warm_one(
+                &self,
+                role: Role,
+                model: &str,
+                ka: &str,
+                c: &CancelToken,
+            ) -> Result<(), String> {
+                self.0.warm_one(role, model, ka, c).await
+            }
+            async fn unload_one(&self, role: Role, model: &str) -> Result<(), String> {
+                let _ = self.0.unload_one(role, model).await;
+                Err("unload request failed".to_string())
+            }
+            async fn set_exempt(&self, models: &[String]) {
+                self.0.set_exempt(models).await;
+            }
+            async fn clear_exempt(&self) {
+                self.0.clear_exempt().await;
+            }
+        }
+
+        let set = ResidentSet::new(live_cfg());
+        let shared = vec![
+            resolved(Role::Personality, Some("granite:30b"), Some(24.64), true),
+            resolved(Role::Router, Some("granite:30b"), Some(24.64), true),
+            resolved(Role::Embedding, Some("embed:1"), Some(1.0), true),
+        ];
+        let (fake, _entered) = FakeEnv::new(shared, Some(96.0));
+        let env = FailingUnloadEnv(fake.clone());
+
+        set.warm_with(&env, "startup", true, None).await;
+        {
+            let mut r = fake.resolved.lock().unwrap();
+            r[0].model = Some("granite:8b".to_string());
+            r[1].model = Some("granite:8b".to_string());
+        }
+
+        let report = set.reconcile_with(&env).await;
+
+        assert!(
+            fake.unloads().contains(&"granite:30b".to_string()),
+            "the unload must have been ATTEMPTED: {:?}",
+            fake.unloads()
+        );
+        assert_eq!(
+            report.orphaned, 0,
+            "a failed unload is not counted as an orphan reaped: {report:?}"
+        );
+        assert!(!report.discarded, "a failed unload must not discard the pass");
+        assert_eq!(report.warmed, 1, "the new target was still warmed");
+        let status = set.status().await;
+        assert!(
+            status.active && status.roles.iter().all(|r| r.warm),
+            "role state must still be correct after a failed unload: {status:?}"
+        );
+        assert_eq!(
+            status.exempt,
+            vec!["embed:1".to_string(), "granite:8b".to_string()],
+            "and the exemption still follows the new target"
+        );
+    }
+
+    /// **POSITIVE CONTROL.** A reconcile with NO target change must unload
+    /// nothing and stay the steady-state no-op three consecutive live ticks
+    /// currently show (`warmed=0 retained=N dropped=0`). If CHRD-83 ever turns
+    /// the steady state into a churn loop, this is what catches it.
+    #[tokio::test]
+    async fn a_reconcile_with_no_target_change_stays_a_no_op_and_unloads_nothing() {
+        let set = ResidentSet::new(live_cfg());
+        let shared = vec![
+            resolved(Role::Personality, Some("granite:30b"), Some(24.64), true),
+            resolved(Role::Router, Some("granite:30b"), Some(24.64), true),
+            resolved(Role::Embedding, Some("embed:1"), Some(1.0), true),
+        ];
+        let (env, _entered) = FakeEnv::new(shared, Some(96.0));
+
+        set.warm_with(&*env, "startup", true, None).await;
+        let after_startup = env.warm_calls().len();
+
+        for tick in 0..3 {
+            let report = set.reconcile_with(&*env).await;
+            assert_eq!(report.warmed, 0, "tick {tick}: no re-warm: {report:?}");
+            assert_eq!(report.dropped, 0, "tick {tick}: nothing dropped: {report:?}");
+            assert_eq!(report.failed, 0, "tick {tick}: nothing failed: {report:?}");
+            assert_eq!(report.orphaned, 0, "tick {tick}: nothing orphaned: {report:?}");
+            assert_eq!(report.repaired, 0, "tick {tick}: nothing repaired: {report:?}");
+            assert_eq!(
+                report.retained + report.shared,
+                3,
+                "tick {tick}: every role retained/shared: {report:?}"
+            );
+            assert!(
+                env.unloads().is_empty(),
+                "tick {tick}: a steady-state tick must never unload: {:?}",
+                env.unloads()
+            );
+            assert_eq!(
+                env.warm_calls().len(),
+                after_startup,
+                "tick {tick}: a steady-state tick must issue NO warm requests"
+            );
+        }
+        assert_eq!(
+            env.exempt(),
+            vec!["embed:1".to_string(), "granite:30b".to_string()],
+            "and residency is unchanged throughout"
+        );
+    }
+
+    // ── CHRD-83 GUARD 5: the CHECK-TO-REQUEST window ────────────────────────
+    //
+    // The orphan decision is taken under `inner` and the lock is DROPPED before
+    // `unload_one` is awaited, so the decision is only known-good at the moment
+    // it was TAKEN. The tests below drive that exact window deterministically —
+    // no sleeps, no probabilistic looping: the env parks INSIDE the unload it is
+    // told to intercept, signals that it is parked, and waits for the test to
+    // land the interfering transition and open a gate.
+    //
+    // The existing `an_outgoing_model_..._is_skipped_not_unloaded` test does NOT
+    // cover this: it flips the SECOND orphan back to held from inside the FIRST
+    // orphan's unload, so the transition is always observed by a LATER
+    // iteration's re-check. Here the transition lands against the model whose
+    // unload is already on the wire.
+
+    /// An env that parks inside `unload_one` for ONE named model, so a test can
+    /// land a transition strictly between the orphan check and the unload
+    /// request. Every other call delegates to the [`FakeEnv`] underneath.
+    struct RaceEnv {
+        inner: Arc<FakeEnv>,
+        target: String,
+        entered_unload: mpsc::UnboundedSender<String>,
+        /// Fired from `clear_exempt` — i.e. from INSIDE `release_with`'s lock
+        /// section, after the generation bump and after every held slot has been
+        /// marked released. That is what makes "the release has landed" an
+        /// observable event rather than a sleep.
+        released: mpsc::UnboundedSender<()>,
+        gate: Semaphore,
+        intercept: AtomicBool,
+        /// Make the intercepted unload REPORT failure after it has been released.
+        fail_target: AtomicBool,
+    }
+
+    impl RaceEnv {
+        #[allow(clippy::type_complexity)]
+        fn new(
+            inner: Arc<FakeEnv>,
+            target: &str,
+        ) -> (
+            Arc<RaceEnv>,
+            mpsc::UnboundedReceiver<String>,
+            mpsc::UnboundedReceiver<()>,
+        ) {
+            let (utx, urx) = mpsc::unbounded_channel();
+            let (rtx, rrx) = mpsc::unbounded_channel();
+            (
+                Arc::new(RaceEnv {
+                    inner,
+                    target: target.to_string(),
+                    entered_unload: utx,
+                    released: rtx,
+                    gate: Semaphore::new(0),
+                    intercept: AtomicBool::new(false),
+                    fail_target: AtomicBool::new(false),
+                }),
+                urx,
+                rrx,
+            )
+        }
+        /// Arm the interception. Off during the startup warm so only the pass
+        /// under test is ever parked.
+        fn arm(&self) {
+            self.intercept.store(true, Ordering::SeqCst);
+        }
+        fn open_unload(&self) {
+            self.gate.add_permits(1);
+        }
+        fn fail_target_unload(&self) {
+            self.fail_target.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl ResidentEnv for RaceEnv {
+        async fn resolve(&self, a: &[(Role, String)]) -> Vec<Resolved> {
+            self.inner.resolve(a).await
+        }
+        fn free_vram_gb(&self) -> Option<f64> {
+            self.inner.free_vram_gb()
+        }
+        async fn warm_one(
+            &self,
+            role: Role,
+            model: &str,
+            ka: &str,
+            c: &CancelToken,
+        ) -> Result<(), String> {
+            self.inner.warm_one(role, model, ka, c).await
+        }
+        async fn unload_one(&self, role: Role, model: &str) -> Result<(), String> {
+            if self.intercept.load(Ordering::SeqCst) && model == self.target {
+                // We are now strictly BETWEEN the orphan re-check (which passed)
+                // and the request landing.
+                let _ = self.entered_unload.send(model.to_string());
+                self.gate.acquire().await.expect("unload gate").forget();
+                if self.fail_target.load(Ordering::SeqCst) {
+                    // Record the ATTEMPT, then report failure — the shape of a
+                    // transport error or a timeout, where whether the request
+                    // landed is exactly what we do not know.
+                    let _ = self.inner.unload_one(role, model).await;
+                    return Err("unload request failed".to_string());
+                }
+            }
+            self.inner.unload_one(role, model).await
+        }
+        async fn set_exempt(&self, models: &[String]) {
+            self.inner.set_exempt(models).await;
+        }
+        async fn clear_exempt(&self) {
+            self.inner.clear_exempt().await;
+            let _ = self.released.send(());
+        }
+    }
+
+    /// The live shape (personality + router share the big model), warmed, then
+    /// BOTH repointed — so `granite:30b` is the single orphan and the env is
+    /// armed to park inside its unload.
+    #[allow(clippy::type_complexity)]
+    async fn armed_repoint_race() -> (
+        Arc<ResidentSet>,
+        Arc<FakeEnv>,
+        Arc<RaceEnv>,
+        mpsc::UnboundedReceiver<String>,
+        mpsc::UnboundedReceiver<()>,
+    ) {
+        let set = Arc::new(ResidentSet::new(live_cfg()));
+        let shared = vec![
+            resolved(Role::Personality, Some("granite:30b"), Some(24.64), true),
+            resolved(Role::Router, Some("granite:30b"), Some(24.64), true),
+            resolved(Role::Embedding, Some("embed:1"), Some(1.0), true),
+        ];
+        let (fake, _entered) = FakeEnv::new(shared, Some(96.0));
+        let (env, unload_rx, released_rx) = RaceEnv::new(fake.clone(), "granite:30b");
+
+        let first = set.warm_with(&*env, "startup", true, None).await;
+        assert_eq!(first.orphaned, 0, "nothing outgoing on the first pass");
+        assert_eq!(first.repaired, 0, "nothing to repair on the first pass");
+
+        {
+            let mut r = fake.resolved.lock().unwrap();
+            r[0].model = Some("granite:8b".to_string());
+            r[0].size_gb = Some(9.59);
+            r[1].model = Some("granite:8b".to_string());
+            r[1].size_gb = Some(9.59);
+        }
+        env.arm();
+        (set, fake, env, unload_rx, released_rx)
+    }
+
+    /// REQUIREMENT 1 as an assertion: after the pass, no role may claim
+    /// residency for a model the pass unloaded, and no such model may still
+    /// carry the residency exemption.
+    async fn assert_claims_no_residency_for_unloaded(set: &ResidentSet, unloaded: &[String]) {
+        let status = set.status().await;
+        for r in status.roles.iter() {
+            if !r.warm {
+                continue;
+            }
+            if let Some(m) = r.model.as_deref() {
+                assert!(
+                    !unloaded.iter().any(|u| u == m),
+                    "role {:?} still CLAIMS residency for {m}, which this pass unloaded — \
+                     the resident set and the GPU now disagree until the next reconcile: {:?}",
+                    r.role,
+                    status.roles
+                );
+            }
+        }
+        for m in unloaded {
+            assert!(
+                !status.exempt.iter().any(|e| e == m),
+                "{m} was unloaded but is still eviction-exempt: {:?}",
+                status.exempt
+            );
+        }
+    }
+
+    /// **THE RACE TEST.** A warm makes the outgoing model HELD AGAIN strictly
+    /// between the orphan re-check and the unload landing. The unload is already
+    /// on the wire and cannot be recalled, so the only correct outcome is that
+    /// the set does not end the pass believing it holds it.
+    ///
+    /// Fails against the pre-fix branch: there the re-check is the last word, so
+    /// the slot keeps claiming `granite:30b` after that model has been unloaded.
+    #[tokio::test]
+    async fn a_rehold_between_the_check_and_the_unload_never_leaves_a_false_residency() {
+        let (set, fake, env, mut unload_rx, _released_rx) = armed_repoint_race().await;
+
+        let (s, e) = (set.clone(), env.clone());
+        let pass = tokio::spawn(async move { s.reconcile_with(&*e).await });
+
+        let parked = unload_rx.recv().await.expect("parked inside the unload");
+        assert_eq!(parked, "granite:30b");
+
+        // THE WINDOW. A warm has landed and this role now claims the very model
+        // whose unload is in flight — the same mutation the sibling test uses,
+        // aimed at the model already being unloaded rather than the next one.
+        {
+            let mut inner = set.inner.lock().await;
+            let (_, slot) = inner
+                .slots
+                .iter_mut()
+                .find(|(r, _)| *r == Role::Personality)
+                .expect("personality slot");
+            slot.model = Some("granite:30b".to_string());
+            slot.state = RoleState::Warm;
+        }
+        // A warm that re-held the model would also have re-exempted it (the
+        // commit applies the exemption wholesale from what it holds), so model
+        // that too — otherwise the repair's exemption recompute would be
+        // vacuously correct here and the test could not tell whether it ran.
+        fake.set_exempt(&[
+            "embed:1".to_string(),
+            "granite:30b".to_string(),
+            "granite:8b".to_string(),
+        ])
+        .await;
+        env.open_unload();
+
+        let report = join_unblocked(pass, "the reconcile pass").await;
+
+        assert_eq!(
+            fake.unloads(),
+            vec!["granite:30b".to_string()],
+            "the unload really did land — this is a genuine race, not a skip: {:?}",
+            fake.unloads()
+        );
+        assert_eq!(
+            report.repaired, 1,
+            "the stale residency claim must be REPAIRED: {report:?}"
+        );
+        assert_claims_no_residency_for_unloaded(&set, &["granite:30b".to_string()]).await;
+        assert_eq!(
+            fake.exempt(),
+            vec!["embed:1".to_string(), "granite:8b".to_string()],
+            "the registry exemption tracks the repaired slots, not the unloaded model: {:?}",
+            fake.exempt()
+        );
+
+        // And the repair must leave the role RE-WARMABLE, not wedged: the next
+        // reconcile sees a slot pointing at the outgoing model while the alias
+        // points at the new one, so it forces past the debounce and the role is
+        // held again on the very next tick.
+        let after = set.reconcile_with(&*fake).await;
+        assert!(!after.discarded, "the follow-up tick ran: {after:?}");
+        let status = set.status().await;
+        assert!(
+            status.roles.iter().all(|r| r.warm),
+            "every role is held again after the next tick: {:?}",
+            status.roles
+        );
+        assert_eq!(
+            fake.unloads(),
+            vec!["granite:30b".to_string()],
+            "and the repair does not itself cause churn — no second unload: {:?}",
+            fake.unloads()
+        );
+    }
+
+    /// **THE RACE TEST, release edition.** A `release` bumps the generation
+    /// strictly between the orphan re-check and the unload landing. Release must
+    /// still WIN (TRTR-07d): the set ends released, nothing claims residency for
+    /// the unloaded model, and — the part a careless fix gets wrong — the pass
+    /// must NOT re-apply an exemption the release just dropped.
+    #[tokio::test]
+    async fn a_release_between_the_check_and_the_unload_still_wins() {
+        let (set, fake, env, mut unload_rx, mut released_rx) = armed_repoint_race().await;
+
+        let (s, e) = (set.clone(), env.clone());
+        let pass = tokio::spawn(async move { s.reconcile_with(&*e).await });
+
+        let parked = unload_rx.recv().await.expect("parked inside the unload");
+        assert_eq!(parked, "granite:30b");
+
+        // THE WINDOW. A mode-swap release lands. `clear_exempt` fires from inside
+        // its lock section, so waiting on that receiver is a deterministic
+        // "the generation has been bumped and the slots are released".
+        let (s2, e2) = (set.clone(), env.clone());
+        let rel = tokio::spawn(async move { s2.release_with(&*e2, "idle-lease").await });
+        released_rx.recv().await.expect("the release landed");
+        env.open_unload();
+
+        let report = join_unblocked(pass, "the reconcile pass").await;
+        let release = join_unblocked(rel, "the release").await;
+
+        assert!(release.generation > 0, "the release bumped the generation");
+        assert_eq!(
+            fake.unloads(),
+            vec!["granite:30b".to_string()],
+            "the in-flight unload still landed: {:?}",
+            fake.unloads()
+        );
+        assert_eq!(
+            report.repaired, 0,
+            "a release marks every slot released, so there is no false claim to repair: {report:?}"
+        );
+        assert_claims_no_residency_for_unloaded(&set, &["granite:30b".to_string()]).await;
+
+        let status = set.status().await;
+        assert!(!status.active, "the release wins: the set is not active");
+        assert!(
+            status.roles.iter().all(|r| !r.warm),
+            "no role is held after a release: {:?}",
+            status.roles
+        );
+        assert!(
+            fake.exempt().is_empty(),
+            "the superseded pass must NOT resurrect the registry exemption the release dropped: {:?}",
+            fake.exempt()
+        );
+    }
+
+    /// Wraps [`RaceEnv`] and, once armed, additionally parks inside `set_exempt`.
+    /// That opens the window the repair now has BY CONSTRUCTION: it decides the
+    /// exemption under `inner`, DROPS the lock, and only then applies it. A test
+    /// can therefore land a release strictly between the drop and the install.
+    struct ExemptRaceEnv {
+        inner: Arc<RaceEnv>,
+        entered_exempt: mpsc::UnboundedSender<Vec<String>>,
+        gate: Semaphore,
+        park: AtomicBool,
+    }
+
+    impl ExemptRaceEnv {
+        fn new(inner: Arc<RaceEnv>) -> (Arc<ExemptRaceEnv>, mpsc::UnboundedReceiver<Vec<String>>) {
+            let (tx, rx) = mpsc::unbounded_channel();
+            (
+                Arc::new(ExemptRaceEnv {
+                    inner,
+                    entered_exempt: tx,
+                    gate: Semaphore::new(0),
+                    park: AtomicBool::new(false),
+                }),
+                rx,
+            )
+        }
+        /// Park the NEXT `set_exempt` only — the commit's wholesale install has
+        /// already happened by the time a test arms this.
+        fn arm_exempt(&self) {
+            self.park.store(true, Ordering::SeqCst);
+        }
+        fn open_exempt(&self) {
+            self.gate.add_permits(1);
+        }
+    }
+
+    #[async_trait]
+    impl ResidentEnv for ExemptRaceEnv {
+        async fn resolve(&self, a: &[(Role, String)]) -> Vec<Resolved> {
+            self.inner.resolve(a).await
+        }
+        fn free_vram_gb(&self) -> Option<f64> {
+            self.inner.free_vram_gb()
+        }
+        async fn warm_one(
+            &self,
+            role: Role,
+            model: &str,
+            ka: &str,
+            c: &CancelToken,
+        ) -> Result<(), String> {
+            self.inner.warm_one(role, model, ka, c).await
+        }
+        async fn unload_one(&self, role: Role, model: &str) -> Result<(), String> {
+            self.inner.unload_one(role, model).await
+        }
+        async fn set_exempt(&self, models: &[String]) {
+            if self.park.swap(false, Ordering::SeqCst) {
+                let _ = self.entered_exempt.send(models.to_vec());
+                self.gate.acquire().await.expect("exempt gate").forget();
+            }
+            self.inner.set_exempt(models).await;
+        }
+        async fn clear_exempt(&self) {
+            self.inner.clear_exempt().await;
+        }
+    }
+
+    /// **THE LOCK-DROP TEST.** The repair applies its recomputed exemption with
+    /// `inner` RELEASED — that is the whole point of the shape (no await against
+    /// an injected trait under the lock). This test asserts the window that opens
+    /// is closed: a release lands *while the install is in flight*, and the pass
+    /// must still not leave behind an exemption the release dropped.
+    ///
+    /// It also pins down the property the recompute gets for free: the list the
+    /// repair installs is computed from the already-repaired slots, so it can
+    /// never carry the unloaded model no matter when it lands.
+    #[tokio::test]
+    async fn a_release_during_the_repairs_exemption_install_still_wins() {
+        let (set, fake, race, mut unload_rx, mut released_rx) = armed_repoint_race().await;
+        let (env, mut exempt_rx) = ExemptRaceEnv::new(race.clone());
+
+        let (s, e) = (set.clone(), env.clone());
+        let pass = tokio::spawn(async move { s.reconcile_with(&*e).await });
+
+        let parked = unload_rx.recv().await.expect("parked inside the unload");
+        assert_eq!(parked, "granite:30b");
+
+        // A warm re-holds the outgoing model (and re-exempts it, as a commit
+        // would), so the repair has something real to fix and a real exemption to
+        // recompute.
+        {
+            let mut inner = set.inner.lock().await;
+            let (_, slot) = inner
+                .slots
+                .iter_mut()
+                .find(|(r, _)| *r == Role::Personality)
+                .expect("personality slot");
+            slot.model = Some("granite:30b".to_string());
+            slot.state = RoleState::Warm;
+        }
+        fake.set_exempt(&[
+            "embed:1".to_string(),
+            "granite:30b".to_string(),
+            "granite:8b".to_string(),
+        ])
+        .await;
+
+        env.arm_exempt();
+        race.open_unload();
+
+        // The repair has repaired the slots, dropped the lock, and is now INSIDE
+        // `set_exempt`. This is the exact instant the old shape could not reach,
+        // because it held `inner` across this await.
+        let installing = exempt_rx.recv().await.expect("parked inside set_exempt");
+        assert_eq!(
+            installing,
+            vec!["embed:1".to_string(), "granite:8b".to_string()],
+            "the list is computed from the REPAIRED slots, so it cannot carry the unloaded model: {installing:?}"
+        );
+
+        // THE WINDOW. A mode-swap release lands while that install is in flight.
+        let (s2, e2) = (set.clone(), race.clone());
+        let rel = tokio::spawn(async move { s2.release_with(&*e2, "idle-lease").await });
+        released_rx.recv().await.expect("the release landed");
+        env.open_exempt();
+
+        let report = join_unblocked(pass, "the reconcile pass").await;
+        let release = join_unblocked(rel, "the release").await;
+
+        assert!(release.generation > 0, "the release bumped the generation");
+        assert_eq!(
+            report.repaired, 1,
+            "the stale residency claim was still repaired: {report:?}"
+        );
+        assert_claims_no_residency_for_unloaded(&set, &["granite:30b".to_string()]).await;
+
+        let status = set.status().await;
+        assert!(!status.active, "the release wins: the set is not active");
+        assert!(
+            status.roles.iter().all(|r| !r.warm),
+            "no role is held after a release: {:?}",
+            status.roles
+        );
+        assert!(
+            fake.exempt().is_empty(),
+            "dropping the lock before set_exempt must NOT let a superseded pass leave an exemption \
+             the release dropped: {:?}",
+            fake.exempt()
+        );
+        assert_eq!(
+            fake.exempt_ops().last().map(String::as_str),
+            Some("clear"),
+            "the release, not the repair, must own the final word on the exemption: {:?}",
+            fake.exempt_ops()
+        );
+    }
+
+    /// The repair does NOT wait for the unload to report success. A transport
+    /// error or a timeout cannot tell us whether the request landed, so the only
+    /// answer safe under every interleaving is to stop claiming a residency we
+    /// can no longer vouch for. The cost of being wrong here is one keep_alive
+    /// re-assert against a model that is still loaded; the cost of the other
+    /// choice is the divergence TRTR-07d eliminated.
+    ///
+    /// This test exists because it is the ONLY thing separating the shipped
+    /// behaviour from the tempting narrower `if outcome.is_ok()` version.
+    #[tokio::test]
+    async fn a_rehold_is_repaired_even_when_the_unload_reports_failure() {
+        let (set, fake, env, mut unload_rx, _released_rx) = armed_repoint_race().await;
+        env.fail_target_unload();
+
+        let (s, e) = (set.clone(), env.clone());
+        let pass = tokio::spawn(async move { s.reconcile_with(&*e).await });
+
+        assert_eq!(
+            unload_rx.recv().await.expect("parked inside the unload"),
+            "granite:30b"
+        );
+        {
+            let mut inner = set.inner.lock().await;
+            let (_, slot) = inner
+                .slots
+                .iter_mut()
+                .find(|(r, _)| *r == Role::Personality)
+                .expect("personality slot");
+            slot.model = Some("granite:30b".to_string());
+            slot.state = RoleState::Warm;
+        }
+        env.open_unload();
+
+        let report = join_unblocked(pass, "the reconcile pass").await;
+
+        assert_eq!(
+            report.orphaned, 0,
+            "a failed unload is still not counted as an orphan reaped: {report:?}"
+        );
+        assert_eq!(
+            report.repaired, 1,
+            "the stale claim is repaired regardless of what the unload REPORTED: {report:?}"
+        );
+        assert_claims_no_residency_for_unloaded(&set, &["granite:30b".to_string()]).await;
+        assert!(
+            !report.discarded,
+            "and a failed unload still does not wedge the pass: {report:?}"
+        );
+        assert!(
+            fake.unloads().contains(&"granite:30b".to_string()),
+            "the unload was attempted: {:?}",
+            fake.unloads()
+        );
+    }
+
+    /// **POSITIVE CONTROL, through the same seam.** The gate is already open, so
+    /// the unload runs with no concurrent transition at all: the orphan is still
+    /// unloaded, nothing is repaired, and the remaining roles stay held.
+    #[tokio::test]
+    async fn an_orphan_unload_with_no_concurrent_transition_still_unloads_and_holds() {
+        let (set, fake, env, mut unload_rx, _released_rx) = armed_repoint_race().await;
+        env.open_unload();
+
+        let report = set.reconcile_with(&*env).await;
+
+        assert_eq!(
+            unload_rx.recv().await.expect("the seam was exercised"),
+            "granite:30b",
+            "the control must go through the SAME intercepted path"
+        );
+        assert_eq!(report.warmed, 1, "the new target is warmed: {report:?}");
+        assert_eq!(report.orphaned, 1, "the orphan is unloaded: {report:?}");
+        assert_eq!(
+            report.repaired, 0,
+            "with no concurrent transition there is nothing to repair: {report:?}"
+        );
+        assert_eq!(
+            fake.unloads(),
+            vec!["granite:30b".to_string()],
+            "exactly the outgoing model, exactly once: {:?}",
+            fake.unloads()
+        );
+        let status = set.status().await;
+        assert!(
+            status.active && status.roles.iter().all(|r| r.warm),
+            "every remaining role is still held: {status:?}"
+        );
+        assert_eq!(
+            fake.exempt(),
+            vec!["embed:1".to_string(), "granite:8b".to_string()],
+            "and the exemption follows the new target: {:?}",
+            fake.exempt()
+        );
     }
 
     /// Two concurrent warms for the same roles must COALESCE into one pass — one
