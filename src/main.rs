@@ -224,6 +224,9 @@ async fn main() {
         // lumina targets (keep-set) + the archive probe.
         let cold_score_source = cold_score_source.clone();
         let lumina_aliases_sweep = lumina_aliases.clone();
+        // CQH-01 (F4): the static alias map is needed to resolve the resident-set
+        // (VRAM keep-resident) pins into the cold-quota exempt set.
+        let static_aliases_sweep = model_aliases.clone();
         let cold_archive_path = archive_path.clone();
         if cooldown_hours == 0 {
             warn!("MODEL_WARM_COOLDOWN_HOURS=0; cooldown eviction (warm→cold after inactivity) is DISABLED");
@@ -294,14 +297,20 @@ async fn main() {
                 // lumina targets so a live proxy target is never pruned.
                 {
                     let cold_cfg = chord_proxy::models::cold_quota::ColdQuotaConfig::from_env();
-                    let keep_set: std::collections::HashSet<String> =
-                        lumina_aliases_sweep.snapshot().into_values().collect();
+                    // CQH-01 (F2/F4): a LIVE keep set — the current dynamic lumina
+                    // targets are re-queried at delete time (not a stale snapshot),
+                    // unioned with the VRAM keep-resident pins.
+                    let keep = chord_proxy::models::cold_quota::LuminaResidentKeepSet::new(
+                        lumina_aliases_sweep.clone(),
+                        static_aliases_sweep.clone(),
+                        chord_proxy::routing::resident_set::ResidentSetConfig::from_env(),
+                    );
                     chord_proxy::models::cold_quota::run_cold_quota_pass_with_source(
                         &registry,
                         &cold_archive_path,
                         &probe,
                         &cold_score_source,
-                        &keep_set,
+                        &keep,
                         &cold_cfg,
                         &lock,
                     )

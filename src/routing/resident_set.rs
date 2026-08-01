@@ -498,6 +498,30 @@ pub fn resolve_alias(
         .filter(|s| !s.is_empty())
 }
 
+/// CQH-01 (F4): the set of MODEL NAMES the resident set currently pins in VRAM —
+/// each role's configured alias key resolved through the live dynamic store then
+/// the static aliases (exactly the resolution the warm planner uses). This is the
+/// current, single-owner successor to the retired `MODEL_KEEP_RESIDENT` env set
+/// (CHRD-PIN-01 removed that config; VRAM residency is owned solely by this
+/// module). The cold-quota tier folds these into its keep/exempt set so a
+/// keep-resident model can never be pruned from the archive even if it somehow
+/// lands in Cold. Returns an empty set when the resident set is disabled (nothing
+/// is pinned) — never a code-level fallback model name. Pure (no I/O); safe to
+/// call every pass.
+pub fn resident_exempt_models(
+    cfg: &ResidentSetConfig,
+    dynamic: &LuminaAliasStore,
+    statics: &HashMap<String, String>,
+) -> HashSet<String> {
+    if !cfg.enabled {
+        return HashSet::new();
+    }
+    cfg.aliases
+        .iter()
+        .filter_map(|(_, alias)| resolve_alias(alias, dynamic, statics))
+        .collect()
+}
+
 /// The ACTIONABLE half of the unresolved-alias warning: what the operator should
 /// actually do, named concretely for THIS role and THIS alias key.
 ///
