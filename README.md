@@ -79,12 +79,24 @@ cargo build --release
 # The two root binaries
 ./target/release/chord-proxy --version
 ./target/release/batch-report --help
+
+# Validate the hand-edited alias config BEFORE restarting the service (CHRD-82).
+# Exits 0 when clean, 1 on unparseable JSON or on any dropped entry.
+set -a; . /path/to/the/chord/env/file; set +a
+./target/release/chord-proxy --check-config
+
+# On a DEPLOYED host the same binary is installed as <path>/harmony-chord
+# (OCI_INSTALL=( "chord-proxy:<path>/harmony-chord:chord.service" )):
+<path>/harmony-chord --check-config
 ```
+
+`--check-config` parses `CHORD_MODEL_ALIASES` exactly as the service will and prints the aliases that would load (names only — it never echoes any other environment value). Because one env value backs *every* alias on the host, a typo there used to disable all of them silently; it is now loud at startup, reported on `/health` (`model_aliases.status`), and catchable with this flag before the restart. The runtime error message quotes the **absolute deployed path** (`<path>/harmony-chord --check-config`) rather than a bare binary name, because the cargo bin (`chord-proxy`) and the installed binary (`harmony-chord`) have different names and neither is on `PATH` — the person reading that message is on the deployed host with every alias dark, and needs something they can paste.
 
 `chord-proxy` binds two listeners: the proxy port (`CHORD_PROXY_PORT`, default 9099) and the control port (`CHORD_CONTROL_PORT`, default 8090). Minimum useful configuration, by key name (values come from the vault at runtime, never inlined):
 
 - `CHORD_JWT_SECRET` — Bearer-JWT auth for both listeners (empty disables auth for trusted single-tenant use)
 - `CHORD_LLM_URL` — upstream LLM backend; unset means `/v1/chat/completions` returns 503
+- `CHORD_MODEL_ALIASES` — a JSON object of alias → real model name (`lumina-fast`, `lumina-deep`, `lumina-embed`, `coder-*`, …). **One value backs every alias on the host, and it is hand-edited, so a parse failure is treated as a first-class fault (CHRD-82):** wholly-unparseable JSON logs an `ERROR` naming the variable and the parse position, states that all aliasing is disabled, and says explicitly that this is a config-parse failure rather than a residency/model bug (the symptom — every resident role reporting "alias resolves to no target" — otherwise points at the wrong subsystem). A well-formed object with a bad *entry* keeps every other alias and drops just that one at `WARN`, naming it — including a whitespace-padded alias *name* (`{" lumina-fast ": …}`), which is **rejected rather than trimmed**, since lookups match literally (so a padded key was never reachable) and trimming would let `{"foo":"a", " foo ":"b"}` silently collapse to one iteration-order-dependent entry while reporting a clean parse. Padded *values* are still trimmed: they are emitted, not looked up, so they have no collision domain. Either way `/health` reports `model_aliases: {status, loaded, reason}` and lists `model_aliases` under `degraded`; the top-level `status` stays `ok` because the service is still serving (so a config typo cannot fail the deploy health-gate into a rollback). Startup is deliberately **not** aborted — validate with `--check-config` *before* restarting instead
 - `MCP_BACKEND_URL` / `MCP_BACKEND_TOKEN` — MCP tool backend (Rust fallback tools still serve without it)
 - `MODEL_LOCAL_PATH` / `MODEL_ARCHIVE_PATH` / `MODEL_REGISTRY_PATH` — the storage-tiering roots
 - Cold-archive quota (TIER-05, score-based pruning of the cold NFS archive):

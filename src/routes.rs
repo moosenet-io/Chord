@@ -1882,14 +1882,60 @@ pub async fn embeddings(
 
 // ── /health ───────────────────────────────────────────────────────────────────
 
+/// CHRD-82: render the `model_aliases` block of `/health` from the recorded
+/// alias-config outcome. Split out as a pure function so the degraded rendering is
+/// unit-testable without a live process-global.
+///
+/// `status` is `"ok"` or `"degraded"`; a degraded block also carries `reason`. The
+/// TOP-LEVEL `"status"` stays `"ok"` on purpose (see [`health`]).
+pub fn alias_health_block(
+    recorded: Option<(crate::config::AliasConfigStatus, usize)>,
+) -> serde_json::Value {
+    match recorded {
+        None => serde_json::json!({ "status": "unknown" }),
+        Some((status, loaded)) => match status.detail() {
+            None => serde_json::json!({ "status": "ok", "loaded": loaded }),
+            Some(reason) => serde_json::json!({
+                "status": "degraded",
+                "loaded": loaded,
+                "reason": reason,
+            }),
+        },
+    }
+}
+
+/// GET /health.
+///
+/// CHRD-82: reports how `CHORD_MODEL_ALIASES` parsed under `model_aliases`, so a
+/// config typo that disables aliasing is visible from a plain `curl /health` rather
+/// than only in a startup log line that has long since scrolled away.
+///
+/// The top-level `"status"` deliberately stays `"ok"` when aliasing is degraded: the
+/// service IS serving, and this endpoint is the deploy health-gate the nightly
+/// constellation-updater uses — flipping it would turn a hand-edited env typo into a
+/// failed deploy plus an automatic rollback, which is the same "config mistake
+/// becomes an outage" trade rejected when choosing not to abort startup. The
+/// `degraded` array is the machine-readable signal to alert on.
 pub async fn health() -> impl IntoResponse {
-    Json(serde_json::json!({
+    let aliases = alias_health_block(crate::config::alias_config_health());
+    let degraded = aliases
+        .get("status")
+        .and_then(|s| s.as_str())
+        .map(|s| s == "degraded")
+        .unwrap_or(false);
+
+    let mut body = serde_json::json!({
         "status": "ok",
         "service": "chord-proxy",
         "version": crate::version::version(),
         "commit": crate::version::commit(),
         "terminus_rs": terminus_rs::VERSION,
-    }))
+        "model_aliases": aliases,
+    });
+    if degraded {
+        body["degraded"] = serde_json::json!(["model_aliases"]);
+    }
+    Json(body)
 }
 
 // ── /v1/audit/summary ─────────────────────────────────────────────────────────
@@ -3317,6 +3363,50 @@ pub(crate) mod tests {
         assert!(body.get("commit").is_some(), "commit field present");
         assert_eq!(body["status"], "ok");
         assert_eq!(body["service"], "chord-proxy");
+    }
+
+    // ── CHRD-82: degraded aliasing is visible on /health ─────────────────────
+
+    #[test]
+    fn test_alias_health_block_reports_degraded_with_a_reason() {
+        use crate::config::AliasConfigStatus;
+
+        // Clean parse → ok + count, no reason.
+        let ok = alias_health_block(Some((AliasConfigStatus::Ok, 9)));
+        assert_eq!(ok["status"], "ok");
+        assert_eq!(ok["loaded"], 9);
+        assert!(ok.get("reason").is_none());
+
+        // Wholly-unparseable → degraded, with an explanation naming the env var.
+        let bad = alias_health_block(Some((
+            AliasConfigStatus::Unparseable {
+                error: "expected value at line 1 column 30".to_string(),
+            },
+            0,
+        )));
+        assert_eq!(bad["status"], "degraded", "a broken map must not read as ok");
+        assert_eq!(bad["loaded"], 0);
+        let reason = bad["reason"].as_str().unwrap_or_default();
+        assert!(reason.contains("CHORD_MODEL_ALIASES"), "{reason}");
+        assert!(reason.contains("line 1 column 30"), "{reason}");
+
+        // Partially-degraded → degraded, but the surviving count is reported.
+        let partial = alias_health_block(Some((
+            AliasConfigStatus::EntriesDropped {
+                dropped: vec!["\"lumina-embed\": target is not a JSON string (found a number)".into()],
+            },
+            8,
+        )));
+        assert_eq!(partial["status"], "degraded");
+        assert_eq!(partial["loaded"], 8);
+        assert!(partial["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("lumina-embed"));
+
+        // Never recorded (e.g. a process that built no Config) → explicitly unknown,
+        // never silently "ok".
+        assert_eq!(alias_health_block(None)["status"], "unknown");
     }
 
     #[tokio::test]

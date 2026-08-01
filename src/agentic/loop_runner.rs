@@ -275,12 +275,23 @@ enum LlmResponse {
 
 // ── Stub / live LLM call ──────────────────────────────────────────────────────
 
-/// Read and parse the `CHORD_MODEL_ALIASES` env var into an alias map. A missing,
-/// empty, or malformed value yields an empty map (no alias rewriting). The agentic
-/// executor has no `Config` handle, so it reads the env directly — same source the
+/// Read and parse the `CHORD_MODEL_ALIASES` env var into an alias map. A missing or
+/// empty value yields an empty map (no alias rewriting). The agentic executor has no
+/// `Config` handle, so it reads the env directly — same source the
 /// `/v1/chat/completions` proxy uses via `Config::from_env`.
+///
+/// CHRD-82: a malformed value is no longer swallowed. This runs on every agentic LLM
+/// turn, so the loud log is emitted AT MOST ONCE per process (the env is read-only at
+/// runtime, so repeating it per request would only be noise) — startup has already
+/// shouted about the same value via `Config::from_env`, and `/health` carries the
+/// standing degraded flag.
 fn model_aliases_from_env() -> std::collections::HashMap<String, String> {
-    crate::config::parse_model_aliases(std::env::var("CHORD_MODEL_ALIASES").ok())
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    let cfg = crate::config::parse_model_aliases(std::env::var("CHORD_MODEL_ALIASES").ok());
+    if cfg.status.is_degraded() {
+        WARNED.call_once(|| cfg.log_if_degraded("agentic executor"));
+    }
+    cfg.aliases
 }
 
 /// CHRD-91390429: resolve a model name for an agentic turn EXACTLY like the chat

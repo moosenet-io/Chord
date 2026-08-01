@@ -25,6 +25,27 @@ async fn main() {
         return;
     }
 
+    // CHRD-82: config validation flag — same early-exit shape as --version, handled
+    // before logging/secrets/service startup so it is safe to run against a live
+    // host. Validates the hand-edited `CHORD_MODEL_ALIASES` value the way the
+    // service will read it and exits non-zero on anything degraded, so an operator
+    // can catch a typo BEFORE restarting instead of after every alias has gone dark:
+    //
+    //   set -a; . <the chord service's env file>; set +a
+    //   <path>/harmony-chord --check-config; echo "rc=$?"
+    //
+    // Reports alias names only — it never echoes any other environment value.
+    if std::env::args().any(|a| a == "--check-config") {
+        let (report, code) =
+            chord_proxy::config::check_config_report(std::env::var("CHORD_MODEL_ALIASES").ok());
+        if code == 0 {
+            println!("{report}");
+        } else {
+            eprintln!("{report}");
+        }
+        std::process::exit(code);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
