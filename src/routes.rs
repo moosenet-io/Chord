@@ -5283,15 +5283,19 @@ pub(crate) mod tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
+
+        // ── THE DECISIVE ASSERTION, checked in EVERY environment and BEFORE any
+        // body consumption or parsing. Nothing that can panic may sit between
+        // obtaining the response and this assertion: a malformed body from an
+        // unintended path would otherwise panic in `unwrap()` first, bypassing the
+        // one assertion whose entire job is to catch that class of failure.
+        mock.assert_hits_async(0).await;
+
         let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
-
-        // ── THE DECISIVE ASSERTION, checked first and in EVERY environment:
-        // CHORD_LLM_URL was never hit.
-        mock.assert_hits_async(0).await;
 
         // ── And the response must be the one the DETECTED condition requires.
         if daemon_live {

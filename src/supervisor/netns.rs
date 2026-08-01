@@ -251,7 +251,7 @@ impl NetnsConfig {
 pub fn prepare(slot_token: &str, posture: &EgressPosture) -> Result<NetnsHandle, NetnsError> {
     #[cfg(target_os = "linux")]
     {
-        prepare_with_probe(slot_token, posture, has_net_admin)
+        prepare_with_probe(slot_token, posture, has_net_admin, configure_namespace)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -261,18 +261,33 @@ pub fn prepare(slot_token: &str, posture: &EgressPosture) -> Result<NetnsHandle,
     }
 }
 
-/// [`prepare`] with the `CAP_NET_ADMIN` probe passed in (CHRD-77).
+/// [`prepare`] with BOTH privileged-path seams passed in (CHRD-77).
 ///
-/// This is the seam that makes the fail-closed guard verifiable without privilege:
-/// when `has_cap()` is `false` this returns [`NetnsError::CapabilityUnavailable`]
+/// Two things are injected, and they serve different purposes:
+///
+/// * `has_cap` — the `CAP_NET_ADMIN` probe. Injecting it makes the fail-closed
+///   DECISION provable without privilege, on any host.
+/// * `create_ns` — the namespace-CREATING operation. Injecting it makes the
+///   *structural* guarantee testable: a test can assert the create path was never
+///   ENTERED, which is the actual invariant, instead of inspecting `/run/netns`
+///   afterwards and inferring it from filesystem state (a proxy that reads live host
+///   state and can be confounded by an unrelated concurrent run).
+///
+/// When `has_cap()` is `false` this returns [`NetnsError::CapabilityUnavailable`]
 /// **before touching the kernel or the `ip` binary**, so no namespace can be created
-/// and no handle can escape. Production always passes [`has_net_admin`].
+/// and no handle can escape. Production always passes [`has_net_admin`] and
+/// [`configure_namespace`], so `prepare`'s behavior is unchanged.
 #[cfg(target_os = "linux")]
-fn prepare_with_probe<F: FnOnce() -> bool>(
+fn prepare_with_probe<F, G>(
     slot_token: &str,
     posture: &EgressPosture,
     has_cap: F,
-) -> Result<NetnsHandle, NetnsError> {
+    create_ns: G,
+) -> Result<NetnsHandle, NetnsError>
+where
+    F: FnOnce() -> bool,
+    G: FnOnce(&str, &NetnsConfig) -> Result<(), NetnsError>,
+{
     let cfg = NetnsConfig::from_posture(posture);
     let name = namespace_name(slot_token);
 
@@ -280,7 +295,7 @@ fn prepare_with_probe<F: FnOnce() -> bool>(
     if !has_cap() {
         return Err(NetnsError::CapabilityUnavailable);
     }
-    configure_namespace(&name, &cfg)?;
+    create_ns(&name, &cfg)?;
     tracing::info!(
         target: "chord.supervisor.netns",
         ns = %name,
@@ -493,7 +508,7 @@ mod tests {
     /// `prepare` returns `CapabilityUnavailable` and **never** hands back a handle
     /// the launcher could use to spawn a runtime with full host egress.
     ///
-    /// **Why the probe is injected rather than "just run this unprivileged".**
+    /// **Why the probe AND the create operation are injected.**
     /// Until CHRD-77 this test called the real `prepare()` and asserted an `Err`,
     /// relying on the build host lacking `CAP_NET_ADMIN`. Chord's build/test host
     /// runs as ROOT, so that precondition was false: `prepare()` took the privileged
@@ -504,6 +519,14 @@ mod tests {
     /// to that red. Injecting the probe makes the decision provable on every host,
     /// with no privileged syscall and no host-state mutation.
     ///
+    /// The create operation is injected for a second, separate reason: the guarantee
+    /// "nothing was created" is asserted STRUCTURALLY — the namespace-creating
+    /// operation is never INVOKED — rather than by comparing `/run/netns/<name>`
+    /// before and after. The earlier filesystem comparison was honest but it read
+    /// live host state, so its result depended on the host and could be confounded by
+    /// an unrelated concurrent run; "the create path was not entered" is the actual
+    /// invariant, and it is fully deterministic.
+    ///
     /// The real privileged create/configure path stays covered by the `#[ignore]`d
     /// `tests/netns_integration.rs` suite, run under ISO-04 on a privileged host.
     #[cfg(target_os = "linux")]
@@ -512,16 +535,24 @@ mod tests {
         use std::cell::Cell;
 
         let probe_calls = Cell::new(0u32);
+        let create_calls = Cell::new(0u32);
         let slot = "chrd77-failclosed-slot";
-        // Observe host state before/after rather than asserting absolute absence,
-        // so a stale namespace left by an unrelated run cannot make this red for
-        // the wrong reason — what matters is that THIS call created nothing.
-        let ns_path = std::path::Path::new("/run/netns").join(namespace_name(slot));
-        let existed_before = ns_path.exists();
-        let res = prepare_with_probe(slot, &EgressPosture::Denied, || {
-            probe_calls.set(probe_calls.get() + 1);
-            false
-        });
+        let res = prepare_with_probe(
+            slot,
+            &EgressPosture::Denied,
+            || {
+                probe_calls.set(probe_calls.get() + 1);
+                false
+            },
+            |_name, _cfg| {
+                // Deliberately reports SUCCESS: if the guard ever fails open, the
+                // call reaches here and `prepare` goes on to return Ok(handle) —
+                // so the fail-open regression shows up as a handle escaping, not
+                // as an incidental error from a stubbed-out failure.
+                create_calls.set(create_calls.get() + 1);
+                Ok(())
+            },
+        );
 
         // CONDITION-DETECTION SELF-CHECK: the guard must actually CONSULT the
         // capability probe. If a future refactor stops calling it, this test would
@@ -543,11 +574,13 @@ mod tests {
             "fail-closed error must be the capability category, got {err:?}"
         );
 
-        // And NOTHING was created: the refusal happens before any privileged step.
+        // And NOTHING was created — asserted structurally: the namespace-creating
+        // operation was never entered. This is the invariant itself, not a
+        // filesystem proxy for it, and it holds identically on every host.
         assert_eq!(
-            ns_path.exists(),
-            existed_before,
-            "a fail-closed prepare must create no namespace at all"
+            create_calls.get(),
+            0,
+            "a fail-closed prepare must never enter the namespace-creating path"
         );
 
         // And the error string carries no infra.
