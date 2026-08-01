@@ -91,7 +91,10 @@ pub struct Config {
     /// (a JSON object, e.g. `{"lumina-fast":"gpt-oss:20b","lumina-deep":"gpt-oss:120b"}`).
     /// Used to rewrite the `model` field before forwarding to Ollama so that
     /// lumina-core's `lumina-fast`/`lumina-deep` aliases resolve to real models.
-    /// An unset, empty, or malformed value yields an empty map (no rewriting).
+    /// An unset or empty value yields an empty map (no rewriting). CHRD-82: a
+    /// MALFORMED value no longer fails silently — it is logged loudly, reported on
+    /// `/health`, and (for a partially-valid map) only the bad entries are dropped.
+    /// See [`parse_model_aliases`].
     pub model_aliases: HashMap<String, String>,
     /// Archive (e.g. NFS) root that holds cold-tier Ollama models.
     /// Reads MODEL_ARCHIVE_PATH (default `/var/lib/model-archive`).
@@ -257,14 +260,292 @@ pub fn parse_protected_models(raw: &str) -> Vec<String> {
 // `crate::routing::resident_set` alone, on a bounded keep_alive with an explicit
 // mode-swap release.
 
-/// Parse a raw `CHORD_MODEL_ALIASES` value (a JSON object of string→string) into a
-/// map. A missing, empty, whitespace-only, or malformed value yields an empty map
-/// so a bad config never aborts startup — it just disables alias rewriting.
-pub fn parse_model_aliases(raw: Option<String>) -> HashMap<String, String> {
+// ── CHRD-82: CHORD_MODEL_ALIASES parsing (fails LOUD, never silently empty) ───
+//
+// `CHORD_MODEL_ALIASES` is a single hand-edited env value that backs EVERY alias
+// on the host (`lumina-fast`, `lumina-deep`, `lumina-embed`, `coder-*`, `laguna`,
+// `122b`, `llama`, `lumina-search`, …). Before CHRD-82 a parse error was swallowed
+// with `unwrap_or_default()`, so one typo silently disabled all of them at once and
+// the symptom surfaced far away — every resident role logging "alias resolves to no
+// target", every alias caller missing — which reads as a residency/model bug and
+// sends the investigation into `crate::routing::resident_set` instead of at config
+// parsing. That misdirection was the real cost, not the lost rewriting.
+//
+// The posture now (same shape the fleet already uses for its other JSON-in-env
+// config; see terminus-rs `AllowlistPolicy::from_env` / `PrincipalResolver::from_env`):
+//   * The parse itself is PURE — it returns a structured [`AliasConfig`] carrying
+//     both the map and a [`AliasConfigStatus`]; it never logs and never panics, so
+//     it stays trivially unit-testable.
+//   * Callers must handle the status. Startup logs a loud `ERROR` naming the env
+//     var and the parse position, states the blast radius in the message, and says
+//     in so many words that this is a CONFIG failure rather than a residency bug.
+//   * The degraded state is visible on `/health` (`model_aliases.status`), so it is
+//     discoverable without reading logs.
+//   * A validation path (`--check-config`) lets an operator catch the typo BEFORE
+//     restarting the service — see [`check_config_report`].
+//
+// Why degrade-and-shout rather than refuse to start: this fleet restarts services
+// routinely (the nightly constellation-updater health-gates and restarts every
+// module), so making a hand-edited env typo abort startup converts a config mistake
+// into a Chord outage plus an updater rollback cycle. A loud, health-visible,
+// pre-checkable degradation keeps inference serving while making the fault
+// impossible to misattribute.
+
+/// What happened while parsing `CHORD_MODEL_ALIASES`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AliasConfigStatus {
+    /// Parsed cleanly. This INCLUDES the legitimately-unset case (no env var at
+    /// all ⇒ zero aliases, which is a valid configuration, not a fault).
+    Ok,
+    /// The value was a well-formed JSON object, but individual entries were
+    /// unusable and were dropped. The remaining entries are live. Each element is
+    /// an operator-readable description of one dropped entry.
+    EntriesDropped { dropped: Vec<String> },
+    /// The value could not be parsed as a JSON object at all — no alias survived.
+    /// `error` is serde's message, which carries the line/column of the fault.
+    Unparseable { error: String },
+}
+
+impl AliasConfigStatus {
+    /// `true` for anything other than a clean parse.
+    pub fn is_degraded(&self) -> bool {
+        !matches!(self, AliasConfigStatus::Ok)
+    }
+
+    /// A single-line, operator-facing explanation. `None` when not degraded.
+    /// Never includes the raw env value — only the parse position and the names
+    /// of the entries that were dropped.
+    pub fn detail(&self) -> Option<String> {
+        match self {
+            AliasConfigStatus::Ok => None,
+            AliasConfigStatus::EntriesDropped { dropped } => Some(format!(
+                "CHORD_MODEL_ALIASES: {} malformed entr{} dropped ({}); the remaining aliases ARE live",
+                dropped.len(),
+                if dropped.len() == 1 { "y was" } else { "ies were" },
+                dropped.join("; ")
+            )),
+            AliasConfigStatus::Unparseable { error } => Some(format!(
+                "CHORD_MODEL_ALIASES is not a valid JSON object ({error}) — ALL model alias \
+                 rewriting is DISABLED for this process (0 aliases loaded). Every alias \
+                 (lumina-fast/lumina-deep/lumina-embed/coder-*/…) will MISS and every resident \
+                 role will report that its alias resolves to no target. This is a CONFIG PARSE \
+                 failure, NOT a residency/model/backend bug — fix the JSON in the service's \
+                 environment file and restart. Validate it BEFORE restarting with: \
+                 `harmony-chord --check-config`"
+            )),
+        }
+    }
+}
+
+/// The parsed alias map plus how the parse went. See the module-level CHRD-82 note.
+#[derive(Debug, Clone)]
+pub struct AliasConfig {
+    /// The usable alias → backend-model map. Empty only when nothing was
+    /// configured or nothing survived parsing (see `status` to tell those apart).
+    pub aliases: HashMap<String, String>,
+    pub status: AliasConfigStatus,
+}
+
+impl AliasConfig {
+    /// Emit the loud operator-facing log for a degraded parse. A no-op when the
+    /// parse was clean. `source` names the call site (e.g. `"startup"`) so a
+    /// duplicated warning from a second reader is attributable.
+    ///
+    /// A wholly-unparseable value is an `ERROR` (every alias lost); dropped
+    /// individual entries are a `WARN` (the rest still work).
+    pub fn log_if_degraded(&self, source: &str) {
+        match &self.status {
+            AliasConfigStatus::Ok => {}
+            AliasConfigStatus::EntriesDropped { .. } => {
+                if let Some(detail) = self.status.detail() {
+                    tracing::warn!("{source}: {detail}");
+                }
+            }
+            AliasConfigStatus::Unparseable { .. } => {
+                if let Some(detail) = self.status.detail() {
+                    tracing::error!("{source}: {detail}");
+                }
+            }
+        }
+    }
+}
+
+/// Process-wide record of how the live alias config parsed, so `/health` can
+/// surface a degraded aliasing state without threading a new field through
+/// `AppState` (and through its ~19 construction sites). Written once by
+/// [`Config::from_env`]; read by the health handler.
+static ALIAS_HEALTH: std::sync::RwLock<Option<(AliasConfigStatus, usize)>> =
+    std::sync::RwLock::new(None);
+
+/// Record the live alias-config outcome for `/health`. Last write wins (a
+/// poisoned lock is ignored rather than panicking a request path).
+pub fn record_alias_config_health(cfg: &AliasConfig) {
+    if let Ok(mut slot) = ALIAS_HEALTH.write() {
+        *slot = Some((cfg.status.clone(), cfg.aliases.len()));
+    }
+}
+
+/// The recorded alias-config outcome and loaded-alias count, or `None` when the
+/// process never parsed one (e.g. a test binary that never built a `Config`).
+pub fn alias_config_health() -> Option<(AliasConfigStatus, usize)> {
+    ALIAS_HEALTH.read().ok().and_then(|slot| slot.clone())
+}
+
+/// A JSON value's kind, for error messages (never the value itself).
+fn json_kind(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// Bound an operator-supplied name before putting it in a log/report line.
+fn truncate_for_report(s: &str) -> String {
+    const MAX: usize = 64;
+    if s.chars().count() <= MAX {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(MAX).collect::<String>())
+    }
+}
+
+/// Parse a raw `CHORD_MODEL_ALIASES` value (a JSON object of alias→model) into an
+/// [`AliasConfig`].
+///
+/// * Missing / empty / whitespace-only ⇒ empty map, [`AliasConfigStatus::Ok`]
+///   (a host with no aliases configured is a valid configuration).
+/// * Well-formed JSON object with some unusable entries ⇒ the usable entries are
+///   KEPT and the bad ones are dropped individually
+///   ([`AliasConfigStatus::EntriesDropped`]). Salvaging is deliberate here: the
+///   whole point of CHRD-82 is that one bad entry must not take down every other
+///   alias on the host. (Note this is stricter than terminus-rs's grant map, where
+///   a single malformed entry does fail the whole map — that policy is right for a
+///   security allowlist, where partial application would be a privilege question,
+///   and wrong here, where partial application is strictly less damage.)
+/// * Anything else — a syntax error, or valid JSON that is not an object ⇒ empty
+///   map, [`AliasConfigStatus::Unparseable`] carrying serde's line/column.
+///
+/// This function NEVER logs and NEVER panics; the caller decides how to shout.
+pub fn parse_model_aliases(raw: Option<String>) -> AliasConfig {
     let Some(text) = raw.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) else {
-        return HashMap::new();
+        return AliasConfig {
+            aliases: HashMap::new(),
+            status: AliasConfigStatus::Ok,
+        };
     };
-    serde_json::from_str::<HashMap<String, String>>(&text).unwrap_or_default()
+
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            return AliasConfig {
+                aliases: HashMap::new(),
+                status: AliasConfigStatus::Unparseable {
+                    error: e.to_string(),
+                },
+            }
+        }
+    };
+
+    let serde_json::Value::Object(obj) = value else {
+        return AliasConfig {
+            aliases: HashMap::new(),
+            status: AliasConfigStatus::Unparseable {
+                error: format!(
+                    "expected a JSON object mapping alias → model, found {}",
+                    json_kind(&value)
+                ),
+            },
+        };
+    };
+
+    let mut aliases = HashMap::new();
+    let mut dropped = Vec::new();
+    for (key, val) in obj {
+        let alias = key.trim();
+        if alias.is_empty() {
+            dropped.push("\"\": blank alias name".to_string());
+            continue;
+        }
+        match val {
+            serde_json::Value::String(target) if !target.trim().is_empty() => {
+                aliases.insert(alias.to_string(), target.trim().to_string());
+            }
+            serde_json::Value::String(_) => dropped.push(format!(
+                "\"{}\": empty target model",
+                truncate_for_report(alias)
+            )),
+            other => dropped.push(format!(
+                "\"{}\": target is not a JSON string (found {})",
+                truncate_for_report(alias),
+                json_kind(&other)
+            )),
+        }
+    }
+
+    let status = if dropped.is_empty() {
+        AliasConfigStatus::Ok
+    } else {
+        AliasConfigStatus::EntriesDropped { dropped }
+    };
+    AliasConfig { aliases, status }
+}
+
+/// The `--check-config` validation path: parse `raw` exactly as the service would
+/// and render an operator-facing report plus a process exit code (`0` clean,
+/// `1` degraded in any way). Pure, so the flag's behaviour is unit-testable.
+///
+/// Reports alias NAMES (which are not secrets) so an operator can confirm the entry
+/// they just hand-edited actually landed; never echoes the raw env value.
+pub fn check_config_report(raw: Option<String>) -> (String, i32) {
+    let cfg = parse_model_aliases(raw);
+    let mut names: Vec<&str> = cfg.aliases.keys().map(String::as_str).collect();
+    names.sort_unstable();
+
+    match &cfg.status {
+        AliasConfigStatus::Ok => (
+            format!(
+                "CHORD_MODEL_ALIASES: OK — {} alias(es) loaded: {}",
+                names.len(),
+                if names.is_empty() {
+                    "(none configured)".to_string()
+                } else {
+                    names.join(", ")
+                }
+            ),
+            0,
+        ),
+        AliasConfigStatus::EntriesDropped { dropped } => (
+            format!(
+                "CHORD_MODEL_ALIASES: DEGRADED — {} alias(es) would load: {}\n  \
+                 dropped {} malformed entr{}:\n{}\n  \
+                 Fix these before restarting; the listed aliases would NOT resolve.",
+                names.len(),
+                names.join(", "),
+                dropped.len(),
+                if dropped.len() == 1 { "y" } else { "ies" },
+                dropped
+                    .iter()
+                    .map(|d| format!("    - {d}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            1,
+        ),
+        AliasConfigStatus::Unparseable { error } => (
+            format!(
+                "CHORD_MODEL_ALIASES: INVALID — {error}\n  \
+                 0 aliases would load: EVERY alias on this host would MISS \
+                 (lumina-fast/lumina-deep/lumina-embed/coder-*/…) and every resident role \
+                 would report that its alias resolves to no target.\n  \
+                 DO NOT restart the service until this is fixed."
+            ),
+            1,
+        ),
+    }
 }
 
 /// Resolve a model name through an alias map. Returns the mapped backend model when
@@ -317,8 +598,15 @@ impl Config {
         // Treat an empty/blank CHORD_LLM_URL the same as unset → endpoint disabled (503).
         let llm_backend_url = normalize_llm_url(std::env::var("CHORD_LLM_URL").ok());
 
-        // Model alias map (CHORD_MODEL_ALIASES JSON). Bad/empty → no rewriting.
-        let model_aliases = parse_model_aliases(std::env::var("CHORD_MODEL_ALIASES").ok());
+        // Model alias map (CHORD_MODEL_ALIASES JSON). CHRD-82: a parse failure is
+        // LOUD (ERROR naming the var + parse position, WARN per dropped entry) and
+        // is recorded for `/health`, instead of silently yielding an empty map.
+        // Deliberately NOT a startup abort — see the CHRD-82 note above
+        // `parse_model_aliases`.
+        let alias_config = parse_model_aliases(std::env::var("CHORD_MODEL_ALIASES").ok());
+        alias_config.log_if_degraded("startup config");
+        record_alias_config_health(&alias_config);
+        let model_aliases = alias_config.aliases;
 
         let model_archive_path = std::env::var("MODEL_ARCHIVE_PATH")
             .unwrap_or_else(|_| "/var/lib/model-archive".into());
@@ -946,20 +1234,173 @@ mod tests {
 
     #[test]
     fn test_parse_model_aliases_valid_json() {
-        let m = parse_model_aliases(Some(
+        let cfg = parse_model_aliases(Some(
             r#"{"lumina-fast":"gpt-oss:20b","lumina-deep":"gpt-oss:120b"}"#.into(),
         ));
+        let m = &cfg.aliases;
         assert_eq!(m.get("lumina-fast").map(String::as_str), Some("gpt-oss:20b"));
         assert_eq!(m.get("lumina-deep").map(String::as_str), Some("gpt-oss:120b"));
+        assert_eq!(cfg.status, AliasConfigStatus::Ok);
     }
 
     #[test]
-    fn test_parse_model_aliases_missing_or_blank_or_bad_is_empty() {
-        assert!(parse_model_aliases(None).is_empty());
-        assert!(parse_model_aliases(Some(String::new())).is_empty());
-        assert!(parse_model_aliases(Some("   ".into())).is_empty());
-        // Malformed JSON must not panic — yields empty map (alias rewriting disabled).
-        assert!(parse_model_aliases(Some("{not json".into())).is_empty());
+    fn test_parse_model_aliases_missing_or_blank_is_empty_and_ok() {
+        // An unconfigured host is NOT a fault: empty map, clean status, no shouting.
+        for raw in [None, Some(String::new()), Some("   ".to_string())] {
+            let cfg = parse_model_aliases(raw);
+            assert!(cfg.aliases.is_empty());
+            assert_eq!(cfg.status, AliasConfigStatus::Ok);
+            assert!(!cfg.status.is_degraded());
+        }
+    }
+
+    // ── CHRD-82 ──────────────────────────────────────────────────────────────
+    // The guard: a malformed CHORD_MODEL_ALIASES must NEVER resolve to a silent
+    // empty map. Before CHRD-82 this exact input returned `HashMap::new()` with no
+    // signal at all, which disabled every alias on the host at once and made the
+    // failure look like a residency/model bug.
+
+    #[test]
+    fn test_wholly_unparseable_json_is_loud_never_a_silent_empty_map() {
+        let cfg = parse_model_aliases(Some(r#"{"lumina-fast":"gpt-oss:20b",}"#.into()));
+        // No aliases survive a broken map...
+        assert!(cfg.aliases.is_empty());
+        // ...but the failure is REPORTED, which is the whole point.
+        assert!(cfg.status.is_degraded(), "must not fail silently");
+        let AliasConfigStatus::Unparseable { ref error } = cfg.status else {
+            panic!("expected Unparseable, got {:?}", cfg.status);
+        };
+        // serde's message carries the parse position.
+        assert!(error.contains("line 1"), "no parse position in {error:?}");
+        let detail = cfg.status.detail().expect("degraded status must explain itself");
+        assert!(detail.contains("CHORD_MODEL_ALIASES"), "must name the env var");
+        assert!(
+            detail.contains("DISABLED"),
+            "must state the blast radius: {detail}"
+        );
+        // The misdirection killer: say out loud this is NOT a residency bug.
+        assert!(
+            detail.contains("NOT a residency"),
+            "must point away from resident_set: {detail}"
+        );
+    }
+
+    #[test]
+    fn test_valid_json_that_is_not_an_object_is_unparseable() {
+        for raw in [r#"["lumina-fast"]"#, r#""lumina-fast""#, "42", "null"] {
+            let cfg = parse_model_aliases(Some(raw.to_string()));
+            assert!(cfg.aliases.is_empty());
+            assert!(
+                matches!(cfg.status, AliasConfigStatus::Unparseable { .. }),
+                "{raw} should be Unparseable, got {:?}",
+                cfg.status
+            );
+        }
+    }
+
+    #[test]
+    fn test_single_malformed_entry_drops_only_that_entry() {
+        // Well-formed JSON object, one bad value: every OTHER alias must survive.
+        // This is the deliberate divergence from an all-or-nothing parse — one typo
+        // must not take the whole host's aliasing down.
+        let cfg = parse_model_aliases(Some(
+            r#"{"lumina-fast":"gpt-oss:20b","lumina-embed":123,"lumina-deep":"gpt-oss:120b","coder-fast":"","":"x"}"#
+                .into(),
+        ));
+        assert_eq!(
+            cfg.aliases.get("lumina-fast").map(String::as_str),
+            Some("gpt-oss:20b")
+        );
+        assert_eq!(
+            cfg.aliases.get("lumina-deep").map(String::as_str),
+            Some("gpt-oss:120b")
+        );
+        assert_eq!(cfg.aliases.len(), 2, "only the good entries survive");
+        assert!(!cfg.aliases.contains_key("lumina-embed"));
+        assert!(!cfg.aliases.contains_key("coder-fast"));
+
+        let AliasConfigStatus::EntriesDropped { ref dropped } = cfg.status else {
+            panic!("expected EntriesDropped, got {:?}", cfg.status);
+        };
+        assert_eq!(dropped.len(), 3, "dropped: {dropped:?}");
+        let joined = dropped.join(" | ");
+        // Each dropped entry is NAMED, so the operator knows which alias went dark.
+        assert!(joined.contains("lumina-embed"), "{joined}");
+        assert!(joined.contains("coder-fast"), "{joined}");
+        assert!(cfg.status.is_degraded());
+    }
+
+    #[test]
+    fn test_positive_control_realistic_map_parses_every_alias() {
+        // Proves the guard did not just start rejecting everything: the shape of a
+        // real host's CHORD_MODEL_ALIASES must still parse, all of it.
+        let cfg = parse_model_aliases(Some(
+            r#"{"lumina":"granite4.1","lumina-fast":"granite4.1","lumina-deep":"gpt-oss:120b",
+                "lumina-embed":"nomic-embed-text","lumina-search":"granite4.1",
+                "coder-fast":"qwen3-coder:30b","coder-deep":"qwen3-coder:30b",
+                "laguna":"granite4.1","122b":"gpt-oss:120b","llama":"llama3.1:8b"}"#
+                .into(),
+        ));
+        assert_eq!(cfg.status, AliasConfigStatus::Ok);
+        assert!(!cfg.status.is_degraded());
+        assert_eq!(cfg.aliases.len(), 10);
+        for (alias, target) in [
+            ("lumina", "granite4.1"),
+            ("lumina-fast", "granite4.1"),
+            ("lumina-deep", "gpt-oss:120b"),
+            ("lumina-embed", "nomic-embed-text"),
+            ("lumina-search", "granite4.1"),
+            ("coder-fast", "qwen3-coder:30b"),
+            ("coder-deep", "qwen3-coder:30b"),
+            ("laguna", "granite4.1"),
+            ("122b", "gpt-oss:120b"),
+            ("llama", "llama3.1:8b"),
+        ] {
+            assert_eq!(
+                resolve_model_alias(&cfg.aliases, alias),
+                target,
+                "alias {alias} must resolve"
+            );
+        }
+        // And an unknown model still passes through untouched.
+        assert_eq!(resolve_model_alias(&cfg.aliases, "granite4.1"), "granite4.1");
+    }
+
+    #[test]
+    fn test_check_config_rejects_a_bad_file_and_accepts_a_good_one() {
+        // The operator-facing validation path: non-zero exit on anything degraded,
+        // zero on a good config, BEFORE the service is restarted.
+        let (good, code) =
+            check_config_report(Some(r#"{"lumina-fast":"granite4.1","122b":"gpt-oss:120b"}"#.into()));
+        assert_eq!(code, 0, "good config must pass: {good}");
+        assert!(good.contains("OK"), "{good}");
+        assert!(good.contains("lumina-fast") && good.contains("122b"), "{good}");
+
+        let (bad, code) = check_config_report(Some(r#"{"lumina-fast":"granite4.1",}"#.into()));
+        assert_eq!(code, 1, "unparseable config must fail: {bad}");
+        assert!(bad.contains("INVALID"), "{bad}");
+        assert!(bad.contains("DO NOT restart"), "{bad}");
+
+        let (partial, code) =
+            check_config_report(Some(r#"{"lumina-fast":"granite4.1","lumina-embed":123}"#.into()));
+        assert_eq!(code, 1, "a dropped entry must also fail the check: {partial}");
+        assert!(partial.contains("DEGRADED"), "{partial}");
+        assert!(partial.contains("lumina-embed"), "{partial}");
+
+        // An unconfigured host is legitimately clean.
+        let (none, code) = check_config_report(None);
+        assert_eq!(code, 0, "{none}");
+        assert!(none.contains("none configured"), "{none}");
+    }
+
+    #[test]
+    fn test_alias_entries_are_trimmed() {
+        let cfg = parse_model_aliases(Some(r#"{" lumina-fast ":"  granite4.1 "}"#.into()));
+        assert_eq!(
+            cfg.aliases.get("lumina-fast").map(String::as_str),
+            Some("granite4.1")
+        );
+        assert_eq!(cfg.status, AliasConfigStatus::Ok);
     }
 
     #[test]

@@ -40,7 +40,7 @@ blocking startup. The keys that matter first:
 | `CHORD_CONTROL_PORT` | Control/operator listener (default 8090) |
 | `CHORD_JWT_SECRET` | Bearer-JWT auth for both listeners; empty disables auth (trusted single-tenant / tests only) |
 | `CHORD_LLM_URL` | Upstream LLM backend for `/v1/chat/completions` |
-| `CHORD_MODEL_ALIASES` | Alias → real model-name rewrites |
+| `CHORD_MODEL_ALIASES` | Alias → real model-name rewrites (JSON object). A malformed value fails LOUD — see `--check-config` below |
 | `MCP_BACKEND_URL`, `MCP_BACKEND_TOKEN` | MCP tool backend; without it, the in-process Rust fallback tools still serve |
 | `MODEL_LOCAL_PATH`, `MODEL_ARCHIVE_PATH`, `MODEL_REGISTRY_PATH` | Storage-tiering roots + the persistent registry JSON |
 | `MODEL_PROTECTED` | Models that must never be evicted to cold |
@@ -62,6 +62,21 @@ registry tier counts, the eviction sweep interval, the SNAP monitor, the
 sweep-status monitor, and both listener ports.
 
 `./target/release/chord-proxy --version` prints the version line and exits.
+
+`./target/release/chord-proxy --check-config` validates the alias configuration and
+exits — `0` when `CHORD_MODEL_ALIASES` parses cleanly, `1` when it is unparseable or
+when any individual entry had to be dropped. Run it with the service's environment
+sourced *before* restarting, since one env value backs every alias on the host:
+
+```sh
+set -a; . /path/to/the/chord/env/file; set +a
+./target/release/chord-proxy --check-config; echo "rc=$?"
+```
+
+Both flags are handled before logging, the secrets bootstrap, and any listener bind,
+so they are safe to run on a live host. If aliasing is already degraded on a running
+process, `GET /health` reports it under `model_aliases` and lists `model_aliases` in
+`degraded`.
 
 ## Verify
 
