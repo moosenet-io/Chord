@@ -133,15 +133,24 @@ pub struct LuminaAliasStore {
     inner: Arc<ArcSwap<HashMap<String, String>>>,
     /// CQH-01 (F1/F2): a shared serialization point between an alias PUBLICATION
     /// ([`set`](Self::set)) and a consumer that must read the current targets and
-    /// then commit an action atomically w.r.t. any repoint. The hot read path
-    /// ([`resolve`](Self::resolve)) stays lock-free (`ArcSwap::load`) — this lock
-    /// is taken ONLY on the rare write (`set`, a promotion event) and by a consumer
-    /// that explicitly brackets a read+commit with [`publish_guard`](Self::publish_guard).
-    /// Holding a plain registry mutex cannot order against a lock-free `ArcSwap`
-    /// publish, so the cold-quota pruner acquires THIS lock around its delete-time
-    /// keep-set re-check + record-drop; a repoint therefore cannot land between the
-    /// pruner's `current()` read and its `remove_record()`.
-    publish_lock: Arc<std::sync::Mutex<()>>,
+    /// then commit a MULTI-STEP, `await`-crossing action atomically w.r.t. any
+    /// repoint. The hot read path ([`resolve`](Self::resolve)) stays lock-free
+    /// (`ArcSwap::load`) — this lock is taken ONLY on the rare write (`set`, a
+    /// promotion event) and by a consumer that brackets its whole critical section
+    /// via [`publish_lock_arc`](Self::publish_lock_arc)`.lock_owned()`.
+    ///
+    /// It is a `tokio::sync::Mutex` (not `std`) SPECIFICALLY so the cold-quota
+    /// pruner can hold it ACROSS its async filesystem delete: the delete-time
+    /// keep/resident re-check → `remove_record` → `remover.remove().await` must ALL
+    /// be atomic w.r.t. a repoint, or an alias could repoint onto a candidate in
+    /// the record-drop→fs-delete window and the already-scheduled delete would wipe
+    /// a now-live target's archive. A plain registry mutex cannot order against a
+    /// lock-free `ArcSwap` publish, and a `std` mutex cannot be held across the
+    /// `.await`; this lock solves both. Lock order at the one site that takes both
+    /// this and the registry lock (the prune commit) is ALWAYS publish→registry;
+    /// nothing takes registry→publish (`set` and the registry methods each take
+    /// only their own lock), so there is no inversion.
+    publish_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl LuminaAliasStore {
@@ -157,7 +166,7 @@ impl LuminaAliasStore {
         }
         LuminaAliasStore {
             inner: Arc::new(ArcSwap::from_pointee(seed)),
-            publish_lock: Arc::new(std::sync::Mutex::new(())),
+            publish_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -166,7 +175,7 @@ impl LuminaAliasStore {
     pub fn empty() -> Self {
         LuminaAliasStore {
             inner: Arc::new(ArcSwap::from_pointee(HashMap::new())),
-            publish_lock: Arc::new(std::sync::Mutex::new(())),
+            publish_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -188,16 +197,14 @@ impl LuminaAliasStore {
     /// publish: [`ArcSwap::rcu`] clones the current map, updates the one key, and
     /// atomically swaps the new `Arc` in — concurrent readers see either the old
     /// or the new map, never a torn state.
-    pub fn set(&self, key: &str, target: String) {
-        // CQH-01 (F1/F2): serialize the publish against a consumer holding
-        // `publish_guard()` (the cold-quota prune commit), so a repoint cannot land
-        // between that consumer's `resolve`/`snapshot` read and its commit. Writes
-        // are rare (promotion events); readers stay lock-free (`resolve`). The guard
-        // scopes ONLY the `ArcSwap` publish — no `.await`, no other lock nested.
-        let _publish = self
-            .publish_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    pub async fn set(&self, key: &str, target: String) {
+        // CQH-01 (F1/F2): serialize the publish against a consumer holding the
+        // publish lock (the cold-quota prune commit), so a repoint cannot land
+        // anywhere inside that consumer's read → record-drop → fs-delete critical
+        // section. Writes are rare (promotion events); readers stay lock-free
+        // (`resolve`/`snapshot` never take this lock). The guard scopes ONLY the
+        // `ArcSwap` publish here — no other lock is nested under it in `set`.
+        let _publish = self.publish_lock.lock().await;
         self.inner.rcu(|current| {
             let mut next: HashMap<String, String> = (**current).clone();
             next.insert(key.to_string(), target.clone());
@@ -205,16 +212,16 @@ impl LuminaAliasStore {
         });
     }
 
-    /// CQH-01 (F1/F2): acquire the alias-publish-vs-consumer serialization lock.
-    /// A consumer (the cold-quota pruner) holds this guard across a
-    /// `snapshot`/`resolve` read AND the action it commits from that read, so the
-    /// read+commit are atomic w.r.t. any concurrent [`set`](Self::set). The guard
-    /// scopes a SHORT, await-free critical section only. Poison is recovered (the
-    /// lock guards no invariant beyond serialization).
-    pub fn publish_guard(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.publish_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// CQH-01 (F1/F2): the alias-publish serialization lock, as an `Arc` the caller
+    /// can `.lock_owned().await` to hold across a whole `await`-crossing critical
+    /// section. The cold-quota pruner holds it across its delete-time keep/resident
+    /// re-check → `remove_record` → `remover.remove().await`, so no repoint (also
+    /// taking this lock in [`set`](Self::set)) can interleave any part of that
+    /// section. Lock order where both this and the registry lock are held is
+    /// ALWAYS publish→registry (see the field docs); `resolve`/`snapshot` never take
+    /// it, so the hot path is unaffected.
+    pub fn publish_lock_arc(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.publish_lock.clone()
     }
 
     /// A snapshot of all current lumina targets (for tests / diagnostics).
@@ -1157,7 +1164,7 @@ pub async fn run_alias_refresh_tick(
                 new_score,
                 ..
             } => {
-                store.set(&key, to.clone());
+                store.set(&key, to.clone()).await;
                 // INFO rationale: the winning candidate's full breakdown so a live
                 // repoint is verifiable without DEBUG logging enabled.
                 let winner = ranked.iter().find(|s| s.model_id == to);
@@ -1240,14 +1247,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn store_set_repoints_one_key_only() {
+    #[tokio::test]
+    async fn store_set_repoints_one_key_only() {
         let mut statics = HashMap::new();
         statics.insert("lumina-fast".to_string(), "a:1b".to_string());
         statics.insert("lumina-deep".to_string(), "b:2b".to_string());
         let store = LuminaAliasStore::from_static(&statics);
 
-        store.set("lumina-fast", "c:3b".to_string());
+        store.set("lumina-fast", "c:3b".to_string()).await;
         assert_eq!(store.resolve("lumina-fast").as_deref(), Some("c:3b"));
         // lumina-deep untouched.
         assert_eq!(store.resolve("lumina-deep").as_deref(), Some("b:2b"));
