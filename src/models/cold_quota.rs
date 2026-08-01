@@ -29,11 +29,13 @@
 //! Each cold candidate is ranked by, in precedence order:
 //!   1. **PRIMARY — lowest measured `assistant_avg_value`** (from the
 //!      `model_dual_profile` view; a swept model's measured quality).
-//!   2. **FALLBACK — lowest `fit_score`** (from `model_discovery_candidate`; the
-//!      practical estimate) — used ONLY for un-swept models (no measured value)
-//!      that are past the grace window. Measured candidates are always pruned
-//!      before fallback ones (a measured-low model is a stronger evict signal than
-//!      an unmeasured one).
+//!   2. **FALLBACK — lowest `discovery_score`** (from `model_discovery_candidate`;
+//!      the stored practical estimate — CQH-01/F5: the persisted column is
+//!      `discovery_score`, NOT `fit_score`; `fit_score` is a derived blend that is
+//!      never stored) — used ONLY for un-swept models (no measured value) that are
+//!      past the grace window. Measured candidates are always pruned before
+//!      fallback ones (a measured-low model is a stronger evict signal than an
+//!      unmeasured one).
 //!   3. **tie-break — oldest `last_requested`** (LRU).
 //!   4. **final tie-break — largest `size_bytes`** (reclaim the most per delete).
 //! Only `tier == Cold` models are candidates.
@@ -46,8 +48,12 @@
 //! - **Protected / keep-set exclusion:** never prune [`ModelRegistry::is_protected`]
 //!   (granite4.1 / embedders / coder), never Warm/Hot (only Cold are candidates),
 //!   never the CURRENT dynamic lumina proxy target(s) (read from
-//!   [`crate::routing::lumina_alias::LuminaAliasStore`] and passed in as the
-//!   keep-set).
+//!   [`crate::routing::lumina_alias::LuminaAliasStore`]), and never a
+//!   VRAM-keep-resident model (CQH-01/F4: the resident-set pins, resolved via
+//!   [`crate::routing::resident_set::resident_exempt_models`] — the current
+//!   single-owner successor to the retired `MODEL_KEEP_RESIDENT` set). The keep
+//!   set is queried LIVE at delete time (CQH-01/F2), not from a stale snapshot, so
+//!   a mid-pass lumina-alias repoint protects the new target.
 //! - **Grace window** (`MODEL_ARCHIVE_QUOTA_GRACE_DAYS` default 14): a model whose
 //!   first-seen/ingest time is within the window is exempt (so the sweep can
 //!   MEASURE it before it is judged). The `fit_score` fallback ranking applies
@@ -85,6 +91,8 @@ use super::registry::{parse_manifest_blobs, ModelRegistry, StorageTier};
 use super::transfer::{
     blob_filename, find_manifest_leaf, nearest_existing_ancestor, DiskSpaceProbe,
 };
+use crate::routing::lumina_alias::LuminaAliasStore;
+use crate::routing::resident_set::{resident_exempt_models, ResidentSetConfig};
 
 /// 1 GiB in bytes (matches `eviction::BYTES_PER_GB`'s GiB convention).
 const GIB: u64 = 1_073_741_824;
@@ -122,8 +130,17 @@ const DEFAULT_MIN_SANE_GB: u64 = 10;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ColdQuotaConfig {
     /// `MODEL_ARCHIVE_QUOTA_GB` — ABSOLUTE quota in GiB. `Some(n)` (n>0) TAKES
-    /// PRECEDENCE over the percent quota. `None` (unset/0) ⇒ use the percent.
+    /// PRECEDENCE over the percent quota. `None` (unset) ⇒ use the percent. An
+    /// EXPLICIT `=0` does NOT land here as `None` — it is captured by
+    /// [`explicit_zero_quota`](Self::explicit_zero_quota) and aborts the pass.
     pub quota_gb: Option<u64>,
+    /// CQH-01 (F3): `MODEL_ARCHIVE_QUOTA_GB` was EXPLICITLY set to `0`. Previously
+    /// an explicit `=0` was filtered to `None` and silently collapsed to the 80%
+    /// percent default (a large quota) — the zero-quota abort never fired. A
+    /// deliberate `=0` is a misconfiguration (it would try to empty the archive to
+    /// the min-keep floor), so it ABORTS the whole pass (prune nothing). An
+    /// UNSET/absent var leaves this `false` and uses the percent default, unchanged.
+    pub explicit_zero_quota: bool,
     /// `MODEL_ARCHIVE_QUOTA_PERCENT` — quota as a percent OF THE ARCHIVE MOUNT's
     /// total capacity (default 80). Used only when `quota_gb` is unset.
     pub quota_percent: u8,
@@ -159,6 +176,7 @@ impl Default for ColdQuotaConfig {
     fn default() -> Self {
         ColdQuotaConfig {
             quota_gb: None,
+            explicit_zero_quota: false,
             quota_percent: DEFAULT_QUOTA_PERCENT,
             dry_run: true, // SAFE default: deploy inert until audited + armed.
             grace_days: DEFAULT_GRACE_DAYS,
@@ -181,6 +199,24 @@ fn dry_run_from_raw(raw: Option<String>) -> bool {
     match raw {
         Some(v) => v.trim() != "0",
         None => true,
+    }
+}
+
+/// CQH-01 (F3): classify a raw `MODEL_ARCHIVE_QUOTA_GB` value into
+/// `(quota_gb, explicit_zero)`. An EXPLICIT, well-formed `0` (any surrounding
+/// whitespace trimmed) is a misconfiguration signal — returned as
+/// `(None, true)` so the pass aborts rather than silently using the percent
+/// default. A positive integer ⇒ `(Some(n), false)`. Unset, or any
+/// non-integer/garbage value ⇒ `(None, false)` (fall through to the percent
+/// quota, unchanged). Pure/testable — the point-of-parse for the arm-path fix.
+fn parse_quota_gb_raw(raw: Option<&str>) -> (Option<u64>, bool) {
+    match raw.map(str::trim) {
+        Some(v) => match v.parse::<u64>() {
+            Ok(0) => (None, true),        // explicit zero → abort signal
+            Ok(n) => (Some(n), false),    // positive absolute quota
+            Err(_) => (None, false),      // garbage → percent path (unchanged)
+        },
+        None => (None, false), // unset → percent path (unchanged)
     }
 }
 
@@ -215,10 +251,8 @@ impl ColdQuotaConfig {
     /// unset/malformed var. The DRY-RUN default is ON — omitting the var leaves the
     /// tier inert (logs a would-prune plan, deletes nothing).
     pub fn from_env() -> Self {
-        let quota_gb = std::env::var("MODEL_ARCHIVE_QUOTA_GB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|g| *g > 0);
+        let (quota_gb, explicit_zero_quota) =
+            parse_quota_gb_raw(std::env::var("MODEL_ARCHIVE_QUOTA_GB").ok().as_deref());
         let quota_percent = std::env::var("MODEL_ARCHIVE_QUOTA_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u8>().ok())
@@ -231,6 +265,7 @@ impl ColdQuotaConfig {
             .unwrap_or(DEFAULT_MAX_PASS_FRACTION);
         ColdQuotaConfig {
             quota_gb,
+            explicit_zero_quota,
             quota_percent,
             dry_run: dry_run_from_raw(std::env::var("MODEL_ARCHIVE_QUOTA_DRY_RUN").ok()),
             grace_days: env_u64("MODEL_ARCHIVE_QUOTA_GRACE_DAYS", DEFAULT_GRACE_DAYS),
@@ -267,7 +302,10 @@ impl ColdQuotaConfig {
 pub struct QualificationScores {
     /// Measured quality: mean `assistant_avg_value` from `model_dual_profile`.
     pub assistant_avg_value: HashMap<String, f64>,
-    /// Practical estimate: `fit_score` from `model_discovery_candidate`.
+    /// Practical estimate: the stored `discovery_score` from
+    /// `model_discovery_candidate` (CQH-01/F5 — the persisted column; `fit_score`
+    /// is a derived blend that is never stored). The name is kept for continuity
+    /// with the "fallback / practical" ranking bucket.
     pub fit_score: HashMap<String, f64>,
 }
 
@@ -321,6 +359,15 @@ pub struct DbColdScoreSource {
     pool: sqlx::PgPool,
 }
 
+/// CQH-01 (F5): the fallback (practical) score query. The STORED column is
+/// `discovery_score` (Terminus `model_discovery_candidate`, DISC-01 DDL) — NOT
+/// `fit_score` (a derived blend that is never persisted, which is why the old
+/// query errored every pass). Named so a unit test pins the column without a live
+/// Postgres.
+pub(crate) const FALLBACK_SCORE_SQL: &str = "SELECT model_name, discovery_score::float8 AS f \
+     FROM model_discovery_candidate \
+     WHERE discovery_score IS NOT NULL";
+
 impl DbColdScoreSource {
     pub fn new(pool: sqlx::PgPool) -> Self {
         DbColdScoreSource { pool }
@@ -358,21 +405,24 @@ impl ColdScoreSource for DbColdScoreSource {
             }
         }
 
-        // (2) Practical estimate — `fit_score` from `model_discovery_candidate`,
-        // keyed by `model_name` (the byte-for-byte fleet identity, per the DISC-01
-        // schema). fit_score is the S127/Ask-4 practical selector value. This is
-        // BEST-EFFORT: if the column is absent on the live DB, the query errors,
-        // is logged, and the fallback simply doesn't fire (measured-only) — a safe
-        // degradation, never a hard failure. The whole source is fail-open at the
-        // call site regardless.
+        // (2) Practical estimate — `discovery_score` from
+        // `model_discovery_candidate`, keyed by `model_name` (the byte-for-byte
+        // fleet identity, per the DISC-01 schema). CQH-01 (F5): the STORED practical
+        // column is `discovery_score DOUBLE PRECISION` (verified against the
+        // canonical DDL, Terminus `migrations/S114-disc01-brochure.sql`, and the
+        // `DiscoveryCandidate` row struct). `fit_score` is a DERIVED blend computed
+        // at selection time and is NEVER persisted, so the old
+        // `SELECT ... fit_score` errored every pass ("column fit_score does not
+        // exist") and silently degraded the fallback bucket to empty (measured-only)
+        // WITHOUT any operator DDL being possible to fix it. Querying the column that
+        // actually exists makes the score-based fallback populate in the common case.
+        // Still BEST-EFFORT: a genuine query error (DB down / schema older than
+        // DISC-01) is logged and degrades to measured-only — never a hard failure;
+        // the whole source is fail-open at the call site regardless.
         let mut fit_score: HashMap<String, f64> = HashMap::new();
-        match sqlx::query(
-            "SELECT model_name, fit_score::float8 AS f \
-             FROM model_discovery_candidate \
-             WHERE fit_score IS NOT NULL",
-        )
-        .fetch_all(&self.pool)
-        .await
+        match sqlx::query(FALLBACK_SCORE_SQL)
+            .fetch_all(&self.pool)
+            .await
         {
             Ok(rows) => {
                 for r in rows {
@@ -385,11 +435,12 @@ impl ColdScoreSource for DbColdScoreSource {
                 }
             }
             Err(e) => {
-                // Non-fatal: the measured join already succeeded; fit_score is a
-                // fallback signal only. Log and continue with an empty fit map.
+                // Non-fatal: the measured join already succeeded; the practical
+                // score is a fallback signal only. Log and continue with an empty
+                // fallback map.
                 tracing::warn!(
                     error = %e,
-                    "[cold-quota] fit_score query failed (model_discovery_candidate.fit_score) — \
+                    "[cold-quota] discovery_score query failed (model_discovery_candidate.discovery_score) — \
                      fallback ranking disabled this pass (measured-only)"
                 );
             }
@@ -414,7 +465,8 @@ pub struct ColdCandidate {
     pub name: String,
     /// Measured `assistant_avg_value` (swept). `None` ⇒ un-swept.
     pub assistant_avg_value: Option<f64>,
-    /// Practical `fit_score` (fallback for un-swept-past-grace).
+    /// Practical stored `discovery_score` (fallback for un-swept-past-grace;
+    /// CQH-01/F5). Field name kept for the "fallback" ranking bucket.
     pub fit_score: Option<f64>,
     /// LRU tie-break signal (`None` = oldest).
     pub last_requested: Option<i64>,
@@ -502,6 +554,23 @@ pub fn plan_prune(
     used_bytes: u64,
     quota_bytes: u64,
 ) -> PrunePlan {
+    // CQH-01 (F3): an explicit MODEL_ARCHIVE_QUOTA_GB=0 aborts the whole plan
+    // (defense in depth — the orchestrator also short-circuits before probing).
+    if cfg.explicit_zero_quota {
+        return PrunePlan {
+            items: Vec::new(),
+            est_total_freed_bytes: 0,
+            aborted: Some(
+                "MODEL_ARCHIVE_QUOTA_GB explicitly set to 0 — refusing to prune (suspected \
+                 misconfiguration; unset to use the percent quota)"
+                    .to_string(),
+            ),
+            cold_total,
+            used_bytes,
+            quota_bytes,
+        };
+    }
+
     let grace_secs = (cfg.grace_days as i64).saturating_mul(SECS_PER_DAY);
 
     // ── Eligibility + rank key ──
@@ -566,7 +635,7 @@ pub fn plan_prune(
         freed = freed.saturating_add(c.est_freed_bytes);
         let reason = match key {
             RankKey::Measured(v) => format!("measured assistant_avg_value={v:.3}"),
-            RankKey::Fallback(f) => format!("fit_score={f:.3} (un-swept, past grace)"),
+            RankKey::Fallback(f) => format!("discovery_score={f:.3} (un-swept, past grace)"),
         };
         items.push(PrunePlanItem {
             name: c.name.clone(),
@@ -730,6 +799,97 @@ impl ColdArchiveRemover for FsColdArchiveRemover {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CQH-01 (F1/F2/F4): the LIVE keep/exempt set
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A source of the "never-prune" model names, queried LIVE (re-evaluated each
+/// time it is asked). CQH-01 (F2): the pass no longer takes a frozen `HashSet`
+/// snapshotted once at pass start — it takes this handle and RE-QUERIES it in the
+/// delete-time revalidation, so a lumina-alias repoint (or a resident-set change)
+/// that happens mid-pass protects the new target instead of the stale one.
+pub trait LiveKeepSet: Send + Sync {
+    /// The current set of model names that must never be pruned: the live dynamic
+    /// lumina proxy target(s) + the VRAM keep-resident pins. Cheap enough to call
+    /// once per candidate delete. Lock-free (an `ArcSwap` load); its consistency
+    /// w.r.t. a repoint comes from the caller holding [`publish_lock`](Self::publish_lock).
+    fn current(&self) -> HashSet<String>;
+
+    /// CQH-01 (F1/F2): the alias-publish serialization lock, if this keep-set has a
+    /// publisher that could race a delete. The cold-quota pruner `.lock_owned()`s it
+    /// and holds it across the WHOLE per-item critical section — the live keep/
+    /// resident re-read → `remove_record` → the async `remover.remove().await` — so
+    /// no repoint (which also takes this lock in [`LuminaAliasStore::set`]) can
+    /// interleave any part of check→record-drop→fs-delete. `None` ⇒ no publisher can
+    /// race (e.g. a frozen `HashSet`), so no serialization is needed. Lock order at
+    /// the prune commit (the one site holding both) is ALWAYS publish→registry.
+    fn publish_lock(&self) -> Option<Arc<Mutex<()>>> {
+        None
+    }
+}
+
+/// A frozen set is trivially a (constant) live set — lets existing callers/tests
+/// pass a plain `HashSet` and keeps the pure-planner fixtures unchanged. No
+/// publisher can race it, so `publish_lock` is `None` (default).
+impl LiveKeepSet for HashSet<String> {
+    fn current(&self) -> HashSet<String> {
+        self.clone()
+    }
+}
+
+/// Production keep-set: the current lumina alias targets (queried LIVE off the
+/// shared [`LuminaAliasStore`] — an `ArcSwap`, so a background repoint is visible
+/// immediately) UNIONED with the VRAM keep-resident pins (CQH-01/F4, resolved via
+/// [`resident_exempt_models`] against the SAME live dynamic store + the static
+/// aliases). Holding this handle and calling [`current`](Self::current) at delete
+/// time is what makes the arm-path re-check see LIVE keep data (F2) and never
+/// prune a keep-resident model (F4).
+pub struct LuminaResidentKeepSet {
+    dynamic: LuminaAliasStore,
+    statics: HashMap<String, String>,
+    resident_cfg: ResidentSetConfig,
+}
+
+impl LuminaResidentKeepSet {
+    pub fn new(
+        dynamic: LuminaAliasStore,
+        statics: HashMap<String, String>,
+        resident_cfg: ResidentSetConfig,
+    ) -> Self {
+        Self {
+            dynamic,
+            statics,
+            resident_cfg,
+        }
+    }
+}
+
+impl LiveKeepSet for LuminaResidentKeepSet {
+    fn current(&self) -> HashSet<String> {
+        // Live dynamic lumina targets (F2) …
+        let mut set: HashSet<String> = self.dynamic.snapshot().into_values().collect();
+        // … plus the VRAM keep-resident pins (F4). Both resolved against the SAME
+        // live dynamic store so a mid-pass repoint moves the protection with it.
+        set.extend(resident_exempt_models(
+            &self.resident_cfg,
+            &self.dynamic,
+            &self.statics,
+        ));
+        set
+    }
+
+    /// CQH-01 (F1/F2): expose the alias-publish lock so the pruner holds it across
+    /// its whole per-item critical section (re-read → record-drop → fs delete).
+    /// `LuminaAliasStore::set` takes the SAME lock, so a repoint — of a dynamic
+    /// lumina target OR a resident-role alias resolved from the dynamic store —
+    /// cannot interleave any part of that section. The registry lock (also held)
+    /// handles the protect-toggle path (`set_protected` takes the registry mutex);
+    /// this closes the alias/ArcSwap path the registry mutex cannot order against.
+    fn publish_lock(&self) -> Option<Arc<Mutex<()>>> {
+        Some(self.dynamic.publish_lock_arc())
+    }
+}
+
 /// Run one cold-quota pass with the real wall clock.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_cold_quota_pass(
@@ -737,7 +897,7 @@ pub async fn run_cold_quota_pass(
     archive_root: &Path,
     probe: &dyn DiskSpaceProbe,
     scores: &QualificationScores,
-    keep_set: &HashSet<String>,
+    keep: &dyn LiveKeepSet,
     remover: &dyn ColdArchiveRemover,
     cfg: &ColdQuotaConfig,
     disk_op_lock: &DiskOpLock,
@@ -747,7 +907,7 @@ pub async fn run_cold_quota_pass(
         archive_root,
         probe,
         scores,
-        keep_set,
+        keep,
         remover,
         cfg,
         disk_op_lock,
@@ -768,12 +928,23 @@ pub async fn run_cold_quota_pass_at(
     archive_root: &Path,
     probe: &dyn DiskSpaceProbe,
     scores: &QualificationScores,
-    keep_set: &HashSet<String>,
+    keep: &dyn LiveKeepSet,
     remover: &dyn ColdArchiveRemover,
     cfg: &ColdQuotaConfig,
     disk_op_lock: &DiskOpLock,
     now_secs: i64,
 ) {
+    // ── CQH-01 (F3): explicit MODEL_ARCHIVE_QUOTA_GB=0 is a misconfiguration ──
+    // A deliberate `=0` used to collapse to the 80% percent default; treat it as an
+    // abort (prune nothing) rather than silently resolving to a large quota.
+    if cfg.explicit_zero_quota {
+        warn!(
+            "[cold-quota] ABORT: MODEL_ARCHIVE_QUOTA_GB is explicitly set to 0 — refusing to prune \
+             (suspected misconfiguration; unset the var to use the percent quota)"
+        );
+        return;
+    }
+
     // ── Archive-reachability skip invariant (never prune with no archive mount) ──
     if !archive_root.exists() {
         warn!(
@@ -845,9 +1016,13 @@ pub async fn run_cold_quota_pass_at(
         .unwrap_or_default()
     };
 
+    // CQH-01 (F2): snapshot the LIVE keep set for PLANNING. The delete-time
+    // revalidation re-queries `keep.current()` again so a mid-pass repoint is
+    // still honored even though this snapshot is stale by then.
+    let keep_snapshot = keep.current();
     let plan = plan_prune(
         &candidates,
-        keep_set,
+        &keep_snapshot,
         cfg,
         now_secs,
         cold_total,
@@ -923,39 +1098,28 @@ pub async fn run_cold_quota_pass_at(
             }
         }
 
-        // TOCTOU guard: the plan was computed BEFORE we took the disk-op lock. A
-        // concurrent cold→warm pull, protect toggle, or lumina-alias repoint
-        // between plan and now could make this model no longer eligible. Holding
-        // disk_op_lock already blocks a concurrent pull's copy; re-validate the
-        // registry-only conditions (tier still Cold, not protected, not in the
-        // keep-set) and the LIVE min-keep floor under a brief registry lock right
-        // before deleting, and confirm the archive manifest still exists. Skip any
-        // item that no longer qualifies — never delete a now-Warm/protected/kept
-        // model's archive or drop its record.
-        {
-            let reg = registry.lock().await;
-            if reg.cold_count() <= cfg.min_keep {
-                drop(reg);
-                info!("[cold-quota] live cold count at min-keep floor mid-pass; stopping");
-                break;
-            }
-            let still_eligible = reg
-                .get(&item.name)
-                .map(|r| r.tier == StorageTier::Cold)
-                .unwrap_or(false)
-                && !reg.is_protected(&item.name)
-                && !keep_set.contains(&item.name);
-            drop(reg);
-            if !still_eligible {
-                warn!(
-                    model = %item.name,
-                    "[cold-quota] item no longer eligible at delete time (promoted/protected/kept) — skipping"
-                );
-                continue;
-            }
-        }
-        // A missing archive manifest at delete time ⇒ already gone, or the archive
-        // became unreadable/unmounted since planning → skip rather than error.
+        // CQH-01 (F1 + F2): ATOMIC revalidate + commit. The plan was computed
+        // BEFORE we took the disk-op lock. `disk_op_lock` blocks a concurrent
+        // cold→warm pull's copy, but the control-plane registry mutations (a
+        // protect toggle, a lumina-alias repoint) do NOT take it — so a model can
+        // become protected/kept in the gap between the plan and this delete. The
+        // OLD code re-checked eligibility under the registry lock, then DROPPED the
+        // lock before the async remove + a separate record-drop — leaving a window
+        // where a protect/repoint could still race the delete. Here the final
+        // re-check AND the registry-record removal happen under ONE registry lock
+        // hold, so the commit point (record removal) is atomic with the decision:
+        //   * a model that became protected / promoted to Warm / entered the LIVE
+        //     keep set (F2: `keep.current()` re-queried HERE, not the stale
+        //     snapshot) is skipped — its archive + record survive;
+        //   * once we commit (drop the record under the lock) no concurrent protect
+        //     can "save" it, and the fs delete follows.
+        // We cannot hold the registry lock across the async `remover.remove().await`
+        // (it is fs I/O and the remover may itself need the registry lock — see the
+        // TOCTOU test), so the record is committed-removed FIRST, then the fs delete
+        // runs. If the fs delete then fails, the archive files are left behind but
+        // untracked; the next reconcile re-tiers them as Cold (idempotent), so the
+        // pass never wedges. A missing manifest ⇒ already gone / archive
+        // unreachable → skip without touching the record.
         if find_manifest_leaf(archive_root, &item.name).is_none() {
             warn!(
                 model = %item.name,
@@ -964,19 +1128,75 @@ pub async fn run_cold_quota_pass_at(
             continue;
         }
 
+        // CQH-01 (F1/F2, review r3): hold the alias-publish lock across the ENTIRE
+        // per-item critical section — the live keep/resident re-read, the
+        // `remove_record`, AND the async `remover.remove().await` (the fs delete).
+        // `LuminaAliasStore::set` takes the SAME lock, so no repoint can interleave
+        // ANY part of check→record-drop→fs-delete; an alias can no longer point at a
+        // candidate in the record-drop→fs-delete window and have the scheduled
+        // delete wipe a now-live target. Acquired PER ITEM (released each iteration)
+        // so the alias updater is never blocked across the whole multi-delete pass,
+        // and a repoint BETWEEN items is honored by the next item's re-read.
+        //
+        // LOCK ORDER (the ONLY site holding both): publish → registry. `set` takes
+        // only publish; the registry methods take only registry; `resolve`/`snapshot`
+        // take neither. So there is no registry→publish path and no inversion. The
+        // registry lock is released BEFORE the fs delete (only publish spans it), so
+        // the slow NFS delete never blocks chat/`update_last_requested`.
+        let _publish = match keep.publish_lock() {
+            Some(m) => Some(m.lock_owned().await),
+            None => None,
+        };
+
+        // `committed` ⇒ the record was dropped (proceed to fs delete);
+        // `min_keep_stop` ⇒ the live floor was hit (stop the whole loop).
+        let mut committed = false;
+        let mut min_keep_stop = false;
+        {
+            let mut reg = registry.lock().await;
+            if reg.cold_count() <= cfg.min_keep {
+                min_keep_stop = true;
+            } else {
+                // The registry lock additionally serializes the protect-toggle path
+                // (`set_protected`). An item that became protected / promoted to Warm
+                // / a LIVE keep or resident target is skipped; otherwise drop the
+                // record (the Terminus discovery/catalog row is NEVER touched →
+                // re-pullable).
+                let live_keep = keep.current();
+                let still_eligible = reg
+                    .get(&item.name)
+                    .map(|r| r.tier == StorageTier::Cold)
+                    .unwrap_or(false)
+                    && !reg.is_protected(&item.name)
+                    && !live_keep.contains(&item.name);
+                if still_eligible {
+                    reg.remove_record(&item.name);
+                    if let Err(e) = reg.save() {
+                        warn!(
+                            "[cold-quota] failed to persist registry after pruning {}: {e}",
+                            item.name
+                        );
+                    }
+                    committed = true;
+                }
+            }
+            drop(reg); // release registry BEFORE the (slow, NFS) fs delete
+        }
+        if min_keep_stop {
+            info!("[cold-quota] live cold count at min-keep floor mid-pass; stopping");
+            break; // `_publish` drops here
+        }
+        if !committed {
+            warn!(
+                model = %item.name,
+                "[cold-quota] item no longer eligible at delete time (promoted/protected/kept) — skipping"
+            );
+            continue; // `_publish` drops here
+        }
+
+        // Still under `_publish`: the fs delete cannot race a repoint.
         match remover.remove(&item.name).await {
             Ok(()) => {
-                // Drop the Chord registry record (archive copy is gone). The
-                // Terminus discovery/catalog row is NEVER touched → re-pullable.
-                let mut reg = registry.lock().await;
-                reg.remove_record(&item.name);
-                if let Err(e) = reg.save() {
-                    warn!(
-                        "[cold-quota] failed to persist registry after pruning {}: {e}",
-                        item.name
-                    );
-                }
-                drop(reg);
                 pruned += 1;
                 freed_actual = freed_actual.saturating_add(item.est_freed_bytes);
                 info!(
@@ -987,9 +1207,16 @@ pub async fn run_cold_quota_pass_at(
                 );
             }
             Err(e) => {
-                warn!(model = %item.name, error = %e, "[cold-quota] prune failed; leaving model in archive");
+                // Record already committed-removed; files remain and will be
+                // re-tiered as Cold by the next reconcile (idempotent).
+                warn!(
+                    model = %item.name,
+                    error = %e,
+                    "[cold-quota] archive delete failed after record drop; files left for reconcile to re-track"
+                );
             }
         }
+        drop(_publish); // release the publish lock before the next item
     }
     info!(
         pruned,
@@ -1009,7 +1236,7 @@ pub async fn run_cold_quota_pass_with_source(
     archive_root: &Path,
     probe: &dyn DiskSpaceProbe,
     score_source: &SharedColdScoreSource,
-    keep_set: &HashSet<String>,
+    keep: &dyn LiveKeepSet,
     cfg: &ColdQuotaConfig,
     disk_op_lock: &DiskOpLock,
 ) {
@@ -1034,7 +1261,7 @@ pub async fn run_cold_quota_pass_with_source(
         archive_root,
         probe,
         &scores,
-        keep_set,
+        keep,
         &remover,
         cfg,
         disk_op_lock,
@@ -1160,7 +1387,7 @@ mod tests {
                 600,
             ),
         ];
-        let plan = plan_prune(&cands, &HashSet::new(), &rank_cfg(), NOW, 100, 1000, 500);
+        let plan = plan_prune(&cands, &HashSet::<String>::new(), &rank_cfg(), NOW, 100, 1000, 500);
         assert!(plan.aborted.is_none());
         assert_eq!(plan.items.len(), 1);
         assert_eq!(
@@ -1193,7 +1420,7 @@ mod tests {
                 400,
             ),
         ];
-        let plan = plan_prune(&cands, &HashSet::new(), &rank_cfg(), NOW, 100, 1000, 200);
+        let plan = plan_prune(&cands, &HashSet::<String>::new(), &rank_cfg(), NOW, 100, 1000, 200);
         assert!(plan.aborted.is_none());
         assert_eq!(plan.items[0].name, "measured");
         assert_eq!(plan.items[1].name, "unswept");
@@ -1222,7 +1449,7 @@ mod tests {
                 600,
             ),
         ];
-        let plan = plan_prune(&cands, &HashSet::new(), &rank_cfg(), NOW, 100, 1000, 500);
+        let plan = plan_prune(&cands, &HashSet::<String>::new(), &rank_cfg(), NOW, 100, 1000, 500);
         assert_eq!(plan.items.len(), 1);
         assert_eq!(plan.items[0].name, "lo_fit");
     }
@@ -1260,7 +1487,7 @@ mod tests {
                 100,
             ),
         ];
-        let plan = plan_prune(&cands, &HashSet::new(), &rank_cfg(), NOW, 100, 1000, 999);
+        let plan = plan_prune(&cands, &HashSet::<String>::new(), &rank_cfg(), NOW, 100, 1000, 999);
         // used 1000, quota 999, each frees 100 → one prune; oldest wins the LRU.
         assert_eq!(plan.items[0].name, "older");
     }
@@ -1311,7 +1538,7 @@ mod tests {
             Some(NOW - 3 * DAY),
             600,
         )];
-        let plan = plan_prune(&cands, &HashSet::new(), &rank_cfg(), NOW, 100, 1000, 100);
+        let plan = plan_prune(&cands, &HashSet::<String>::new(), &rank_cfg(), NOW, 100, 1000, 100);
         assert!(
             plan.items.is_empty(),
             "within-grace un-swept model is exempt"
@@ -1329,7 +1556,7 @@ mod tests {
             Some(NOW - 30 * DAY),
             600,
         )];
-        let plan = plan_prune(&cands, &HashSet::new(), &rank_cfg(), NOW, 100, 1000, 100);
+        let plan = plan_prune(&cands, &HashSet::<String>::new(), &rank_cfg(), NOW, 100, 1000, 100);
         assert_eq!(plan.items.len(), 1);
         assert_eq!(plan.items[0].name, "old_unswept");
     }
@@ -1349,7 +1576,7 @@ mod tests {
             Some(NOW - 30 * DAY),
             600,
         )];
-        let plan = plan_prune(&cands, &HashSet::new(), &cfg, NOW, 100, 1000, 100);
+        let plan = plan_prune(&cands, &HashSet::<String>::new(), &cfg, NOW, 100, 1000, 100);
         assert!(
             plan.items.is_empty(),
             "measured-only mode leaves un-swept models alone"
@@ -1393,7 +1620,7 @@ mod tests {
                 100,
             ),
         ];
-        let plan = plan_prune(&cands, &HashSet::new(), &cfg, NOW, 3, 1000, 1);
+        let plan = plan_prune(&cands, &HashSet::<String>::new(), &cfg, NOW, 3, 1000, 1);
         assert!(plan.aborted.is_none());
         assert_eq!(
             plan.items.len(),
@@ -1415,7 +1642,7 @@ mod tests {
         )];
         // used 400 <= quota 500 shouldn't even be called, but plan is safe: greedy
         // stops immediately.
-        let plan = plan_prune(&cands, &HashSet::new(), &rank_cfg(), NOW, 100, 400, 500);
+        let plan = plan_prune(&cands, &HashSet::<String>::new(), &rank_cfg(), NOW, 100, 400, 500);
         assert!(plan.items.is_empty());
     }
 
@@ -1439,7 +1666,7 @@ mod tests {
             100,
         )];
         let quota = resolve_quota_bytes(&cfg, 3000 * GIB);
-        let plan = plan_prune(&cands, &HashSet::new(), &cfg, NOW, 100, 3000 * GIB, quota);
+        let plan = plan_prune(&cands, &HashSet::<String>::new(), &cfg, NOW, 100, 3000 * GIB, quota);
         assert!(plan.aborted.is_some(), "absurd absolute quota must abort");
     }
 
@@ -1467,7 +1694,7 @@ mod tests {
             ));
         }
         // used 1000, quota 400, each frees 100 → wants 6 prunes → 6 > cap(2) → abort.
-        let plan = plan_prune(&cands, &HashSet::new(), &cfg, NOW, 10, 1000, 400);
+        let plan = plan_prune(&cands, &HashSet::<String>::new(), &cfg, NOW, 10, 1000, 400);
         assert!(plan.aborted.is_some(), ">25% single-pass prune must abort");
         assert!(plan.aborted.as_ref().unwrap().contains("single pass"));
     }
@@ -1606,7 +1833,7 @@ mod tests {
             &archive,
             &probe,
             &scores,
-            &HashSet::new(),
+            &HashSet::<String>::new(),
             &remover,
             &armed_cfg(),
             &lock,
@@ -1662,7 +1889,7 @@ mod tests {
             &archive,
             &probe,
             &scores,
-            &HashSet::new(),
+            &HashSet::<String>::new(),
             &spy,
             &cfg,
             &lock,
@@ -1706,7 +1933,7 @@ mod tests {
             &archive,
             &probe,
             &QualificationScores::default(),
-            &HashSet::new(),
+            &HashSet::<String>::new(),
             &spy,
             &armed_cfg(),
             &lock,
@@ -1738,7 +1965,7 @@ mod tests {
             &archive,
             &probe,
             &QualificationScores::default(),
-            &HashSet::new(),
+            &HashSet::<String>::new(),
             &spy,
             &armed_cfg(),
             &lock,
@@ -1801,7 +2028,7 @@ mod tests {
             &archive,
             &probe,
             &scores,
-            &HashSet::new(),
+            &HashSet::<String>::new(),
             &remover,
             &cfg,
             &lock,
@@ -1843,7 +2070,7 @@ mod tests {
             &archive,
             &probe,
             &scores,
-            &HashSet::new(),
+            &HashSet::<String>::new(),
             &remover,
             &armed_cfg(),
             &lock,
@@ -1912,7 +2139,7 @@ mod tests {
             &archive,
             &probe,
             &scores,
-            &HashSet::new(),
+            &HashSet::<String>::new(),
             &remover,
             &armed_cfg(),
             &lock,
@@ -1981,7 +2208,7 @@ mod tests {
             &archive,
             &probe,
             &scores,
-            &HashSet::new(),
+            &HashSet::<String>::new(),
             &remover,
             &armed_cfg(),
             &lock,
@@ -1998,5 +2225,491 @@ mod tests {
             remaining, 2,
             "probe failure mid-pass must stop after exactly one prune (fail-safe)"
         );
+    }
+
+    // ── CQH-01 (F3): explicit MODEL_ARCHIVE_QUOTA_GB=0 aborts ──────────────────
+
+    #[test]
+    fn parse_quota_gb_classifies_explicit_zero_vs_unset() {
+        // Unset ⇒ (None, false) — use the percent quota, unchanged.
+        assert_eq!(parse_quota_gb_raw(None), (None, false));
+        // Explicit, well-formed 0 (any whitespace) ⇒ abort signal (None, true).
+        assert_eq!(parse_quota_gb_raw(Some("0")), (None, true));
+        assert_eq!(parse_quota_gb_raw(Some("  0 ")), (None, true));
+        // Positive ⇒ absolute quota.
+        assert_eq!(parse_quota_gb_raw(Some("100")), (Some(100), false));
+        // Garbage ⇒ percent path (unchanged), never the abort signal.
+        assert_eq!(parse_quota_gb_raw(Some("abc")), (None, false));
+        assert_eq!(parse_quota_gb_raw(Some("")), (None, false));
+    }
+
+    #[test]
+    fn plan_prune_aborts_on_explicit_zero_quota() {
+        let cfg = ColdQuotaConfig {
+            explicit_zero_quota: true,
+            min_sane_gb: 0,
+            ..ColdQuotaConfig::default()
+        };
+        let cands = vec![cand(
+            "a",
+            Some(1.0),
+            None,
+            Some(1),
+            10,
+            Some(NOW - 100 * DAY),
+            100,
+        )];
+        // Even maximally over quota, an explicit =0 aborts (prune nothing).
+        let plan = plan_prune(&cands, &HashSet::<String>::new(), &cfg, NOW, 100, 1000, 1);
+        assert!(plan.aborted.is_some(), "explicit QUOTA_GB=0 must abort");
+        assert!(plan.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn orchestrator_aborts_on_explicit_zero_quota() {
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        let archive = base.join("archive");
+        make_archive_model(&archive, "lowq", "1", &[100]);
+        let mut reg = reg_with(base, vec![]);
+        reg.reconcile();
+        reg.set_last_requested_for_test("lowq:1", 1000);
+        let registry = Arc::new(Mutex::new(reg));
+        let mut scores = QualificationScores::default();
+        scores.assistant_avg_value.insert("lowq:1".into(), 5.0);
+
+        let free = Arc::new(std::sync::atomic::AtomicU64::new(0)); // 100% used
+        let probe = FixedProbe { total: 1000, free };
+        let spy = SpyRemover(Arc::new(AtomicUsize::new(0)));
+        let calls = match &spy {
+            SpyRemover(c) => c.clone(),
+        };
+        // ARMED, but explicit zero quota → must prune nothing.
+        let cfg = ColdQuotaConfig {
+            explicit_zero_quota: true,
+            ..armed_cfg()
+        };
+        let lock = new_disk_op_lock();
+
+        run_cold_quota_pass_at(
+            &registry,
+            &archive,
+            &probe,
+            &scores,
+            &HashSet::<String>::new(),
+            &spy,
+            &cfg,
+            &lock,
+            NOW,
+        )
+        .await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "explicit QUOTA_GB=0 must abort the pass before any delete"
+        );
+        assert!(registry.lock().await.get("lowq:1").is_some());
+    }
+
+    // ── CQH-01 (F5): fallback query uses the column that actually exists ────────
+
+    #[test]
+    fn fallback_query_targets_discovery_score_not_fit_score() {
+        // The live intake DB stores `discovery_score` (DISC-01 DDL); `fit_score` is
+        // a derived blend that is never persisted. The query must reference the
+        // real column so the fallback bucket populates without operator DDL.
+        assert!(
+            FALLBACK_SCORE_SQL.contains("discovery_score"),
+            "fallback query must select the stored discovery_score column"
+        );
+        assert!(
+            !FALLBACK_SCORE_SQL.contains("fit_score"),
+            "fallback query must NOT reference the non-existent fit_score column"
+        );
+        assert!(FALLBACK_SCORE_SQL.contains("model_discovery_candidate"));
+        assert!(FALLBACK_SCORE_SQL.contains("model_name"));
+    }
+
+    #[test]
+    fn fallback_bucket_populates_and_ranks_from_practical_score() {
+        // With the fallback score present (as the discovery_score-sourced map would
+        // provide), an un-swept-past-grace model becomes prunable and ranks by that
+        // score — proving the fallback bucket is functional (F5's end state).
+        let mut scores = QualificationScores::default();
+        scores.fit_score.insert("lo".into(), 0.1);
+        scores.fit_score.insert("hi".into(), 0.9);
+        let cands = vec![
+            cand(
+                "hi",
+                None,
+                scores.fit_score.get("hi").copied(),
+                Some(1),
+                10,
+                Some(NOW - 100 * DAY),
+                600,
+            ),
+            cand(
+                "lo",
+                None,
+                scores.fit_score.get("lo").copied(),
+                Some(1),
+                10,
+                Some(NOW - 100 * DAY),
+                600,
+            ),
+        ];
+        let plan = plan_prune(&cands, &HashSet::<String>::new(), &rank_cfg(), NOW, 100, 1000, 500);
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(
+            plan.items[0].name, "lo",
+            "lowest practical (discovery_score-sourced) fallback pruned first"
+        );
+        assert!(
+            plan.items[0].reason.contains("discovery_score"),
+            "reason names the practical column"
+        );
+    }
+
+    // ── CQH-01 (F2): a LIVE keep repoint mid-pass protects the new target ───────
+
+    /// A keep set backed by a shared, MUTABLE cell — models can enter it mid-pass.
+    struct MutableKeepSet(Arc<std::sync::Mutex<HashSet<String>>>);
+    impl LiveKeepSet for MutableKeepSet {
+        fn current(&self) -> HashSet<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn live_keep_repoint_mid_pass_protects_new_target() {
+        // F1+F2: a model that ENTERS the live keep set between plan and its delete
+        // (e.g. the lumina alias updater repoints lumina onto it) must be skipped by
+        // the delete-time re-query — its archive + record survive.
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        let archive = base.join("archive");
+        make_archive_model(&archive, "lowq", "1", &[100]);
+        make_archive_model(&archive, "midq", "1", &[100]);
+        make_archive_model(&archive, "hiq", "1", &[100]);
+        let mut reg = reg_with(base, vec![]);
+        reg.reconcile();
+        reg.set_last_requested_for_test("lowq:1", 1000);
+        reg.set_last_requested_for_test("midq:1", 1000);
+        reg.set_last_requested_for_test("hiq:1", 1000);
+        let registry = Arc::new(Mutex::new(reg));
+        let mut scores = QualificationScores::default();
+        scores.assistant_avg_value.insert("lowq:1".into(), 1.0);
+        scores.assistant_avg_value.insert("midq:1".into(), 2.0);
+        scores.assistant_avg_value.insert("hiq:1".into(), 500.0);
+
+        let keep_cell = Arc::new(std::sync::Mutex::new(HashSet::<String>::new()));
+        let keep = MutableKeepSet(keep_cell.clone());
+
+        // Remover that, on deleting lowq (first), repoints the live keep set onto
+        // midq — exactly the mid-pass alias repoint F2 must honor at delete time.
+        struct RepointRemover {
+            archive_root: PathBuf,
+            keep_cell: Arc<std::sync::Mutex<HashSet<String>>>,
+        }
+        #[async_trait]
+        impl ColdArchiveRemover for RepointRemover {
+            async fn remove(&self, model: &str) -> Result<(), String> {
+                if model == "lowq:1" {
+                    self.keep_cell.lock().unwrap().insert("midq:1".to_string());
+                }
+                fs_remove_model(&self.archive_root, model)
+            }
+        }
+        let remover = RepointRemover {
+            archive_root: archive.clone(),
+            keep_cell: keep_cell.clone(),
+        };
+        let free = Arc::new(std::sync::atomic::AtomicU64::new(0)); // maximally over
+        let probe = FixedProbe { total: 1000, free };
+        let lock = new_disk_op_lock();
+
+        run_cold_quota_pass_at(
+            &registry,
+            &archive,
+            &probe,
+            &scores,
+            &keep,
+            &remover,
+            &armed_cfg(),
+            &lock,
+            NOW,
+        )
+        .await;
+
+        let reg = registry.lock().await;
+        assert!(reg.get("lowq:1").is_none(), "lowq pruned");
+        assert!(
+            reg.get("midq:1").is_some(),
+            "midq entered the LIVE keep set mid-pass and must be skipped"
+        );
+        assert!(archive
+            .join("manifests/registry.ollama.ai/library/midq/1")
+            .is_file());
+    }
+
+    // ── CQH-01 (F4): a VRAM keep-resident model in Cold is exempt ──────────────
+
+    #[tokio::test]
+    async fn keep_resident_model_in_cold_is_exempt() {
+        use crate::routing::resident_set::{ResidentSetConfig, Role};
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        let archive = base.join("archive");
+        make_archive_model(&archive, "residentmodel", "1", &[100]);
+        make_archive_model(&archive, "prunable", "1", &[100]);
+        let mut reg = reg_with(base, vec![]);
+        reg.reconcile();
+        reg.set_last_requested_for_test("residentmodel:1", 1000);
+        reg.set_last_requested_for_test("prunable:1", 1000);
+        let registry = Arc::new(Mutex::new(reg));
+        let mut scores = QualificationScores::default();
+        // Resident model has the WORST score — only its keep-resident status saves it.
+        scores.assistant_avg_value.insert("residentmodel:1".into(), 0.0);
+        scores.assistant_avg_value.insert("prunable:1".into(), 500.0);
+
+        // Static alias "lumina-embed" → residentmodel:1; the resident Embedding role
+        // resolves through it, so resident_exempt_models yields {residentmodel:1}.
+        let mut statics = HashMap::new();
+        statics.insert("lumina-embed".to_string(), "residentmodel:1".to_string());
+        let dynamic = LuminaAliasStore::empty();
+        let resident_cfg = ResidentSetConfig {
+            enabled: true,
+            aliases: vec![(Role::Embedding, "lumina-embed".to_string())],
+            ..ResidentSetConfig::default()
+        };
+        let keep = LuminaResidentKeepSet::new(dynamic, statics, resident_cfg);
+
+        // Confirm the keep set actually contains the resident model.
+        assert!(keep.current().contains("residentmodel:1"));
+
+        let free = Arc::new(std::sync::atomic::AtomicU64::new(150)); // over by a little
+        let probe = FixedProbe { total: 1000, free };
+        let remover = FsColdArchiveRemover::new(archive.clone());
+        let cfg = ColdQuotaConfig {
+            dry_run: false,
+            grace_days: 0,
+            min_keep: 1,
+            min_sane_gb: 0,
+            ..ColdQuotaConfig::default()
+        };
+        let lock = new_disk_op_lock();
+
+        run_cold_quota_pass_at(
+            &registry,
+            &archive,
+            &probe,
+            &scores,
+            &keep,
+            &remover,
+            &cfg,
+            &lock,
+            NOW,
+        )
+        .await;
+
+        let reg = registry.lock().await;
+        assert!(
+            reg.get("residentmodel:1").is_some(),
+            "keep-resident model must never be pruned, even at the worst score"
+        );
+        assert!(
+            reg.get("prunable:1").is_none(),
+            "the non-resident candidate is the one pruned"
+        );
+    }
+
+    // ── CQH-01 (F1/F2 review round 3): publish lock spans the fs delete ─────────
+
+    #[tokio::test]
+    async fn publish_lock_serializes_set_against_owned_prune_guard() {
+        // The core of the fix: `LuminaAliasStore::set` and the pruner's owned
+        // publish guard are MUTUALLY EXCLUSIVE. While the pruner holds the owned
+        // guard (across its read → record-drop → fs delete), a repoint cannot
+        // publish; it applies only once the guard is released.
+        use std::sync::atomic::AtomicBool;
+        let store = LuminaAliasStore::from_static(&{
+            let mut m = HashMap::new();
+            m.insert("lumina-fast".to_string(), "old:1".to_string());
+            m
+        });
+        let lockarc = store.publish_lock_arc();
+        let guard = lockarc.clone().lock_owned().await; // pruner "in the section"
+
+        // A concurrent repoint cannot even acquire the lock while the guard is held.
+        assert!(
+            lockarc.try_lock().is_err(),
+            "set()/repoint must not acquire the publish lock while the prune guard is held"
+        );
+
+        let done = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let store = store.clone();
+            let done = done.clone();
+            tokio::spawn(async move {
+                store.set("lumina-fast", "new:1".to_string()).await; // blocks on the guard
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "set() must block while the owned prune guard is held"
+        );
+        assert_eq!(
+            store.resolve("lumina-fast").as_deref(),
+            Some("old:1"),
+            "no repoint may be observed while the guard is held"
+        );
+
+        drop(guard); // pruner releases → repoint may now publish
+        handle.await.unwrap();
+        assert!(done.load(Ordering::SeqCst));
+        assert_eq!(
+            store.resolve("lumina-fast").as_deref(),
+            Some("new:1"),
+            "repoint applies once the guard is released"
+        );
+    }
+
+    /// A remover that, while deleting `victim`, fires a concurrent repoint of
+    /// `repoint_key` → `victim` on the SAME store. The orchestrator holds the
+    /// publish guard across this whole `remove().await`, so the repoint MUST block
+    /// until the delete completes + the guard drops — proving the record-drop→
+    /// fs-delete window is guarded (the review-round-3 gap).
+    struct RepointDuringDeleteRemover {
+        archive_root: PathBuf,
+        store: LuminaAliasStore,
+        repoint_key: String,
+        victim: String,
+        observed_blocked_during_delete: Arc<std::sync::atomic::AtomicBool>,
+        repoint_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    }
+    #[async_trait]
+    impl ColdArchiveRemover for RepointDuringDeleteRemover {
+        async fn remove(&self, model: &str) -> Result<(), String> {
+            if model == self.victim {
+                let store = self.store.clone();
+                let key = self.repoint_key.clone();
+                let victim = self.victim.clone();
+                // Fire the repoint concurrently with the fs delete. It shares the
+                // publish lock the orchestrator holds → it must block here.
+                let h = tokio::spawn(async move { store.set(&key, victim).await });
+                *self.repoint_handle.lock().unwrap() = Some(h);
+                // Give it a chance to (try to) publish; it must still be blocked, so
+                // the repoint must NOT yet be observable (lock-free `resolve`).
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let still_blocked =
+                    self.store.resolve(&self.repoint_key).as_deref() != Some(self.victim.as_str());
+                self.observed_blocked_during_delete
+                    .store(still_blocked, Ordering::SeqCst);
+            }
+            fs_remove_model(&self.archive_root, model)
+        }
+    }
+
+    async fn run_fs_delete_window_case(resident: bool, repoint_key: &str) {
+        use crate::routing::resident_set::Role;
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        let archive = base.join("archive");
+        make_archive_model(&archive, "victim", "1", &[100]);
+        make_archive_model(&archive, "other", "1", &[100]);
+        let mut reg = reg_with(base, vec![]);
+        reg.reconcile();
+        reg.set_last_requested_for_test("victim:1", 1000);
+        reg.set_last_requested_for_test("other:1", 1000);
+        let registry = Arc::new(Mutex::new(reg));
+        let mut scores = QualificationScores::default();
+        scores.assistant_avg_value.insert("victim:1".into(), 1.0); // ranked first
+        scores.assistant_avg_value.insert("other:1".into(), 500.0);
+
+        // Real store, empty at PLAN time (so victim is planned/evictable at commit).
+        let store = LuminaAliasStore::empty();
+        let resident_cfg = if resident {
+            ResidentSetConfig {
+                enabled: true,
+                aliases: vec![(Role::Embedding, repoint_key.to_string())],
+                ..ResidentSetConfig::default()
+            }
+        } else {
+            ResidentSetConfig {
+                enabled: false,
+                ..ResidentSetConfig::default()
+            }
+        };
+        let keep = LuminaResidentKeepSet::new(store.clone(), HashMap::new(), resident_cfg);
+
+        let observed_blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let repoint_handle = Arc::new(std::sync::Mutex::new(None));
+        let remover = RepointDuringDeleteRemover {
+            archive_root: archive.clone(),
+            store: store.clone(),
+            repoint_key: repoint_key.to_string(),
+            victim: "victim:1".to_string(),
+            observed_blocked_during_delete: observed_blocked.clone(),
+            repoint_handle: repoint_handle.clone(),
+        };
+
+        let free = Arc::new(std::sync::atomic::AtomicU64::new(0)); // maximally over
+        let probe = FixedProbe { total: 1000, free };
+        let lock = new_disk_op_lock();
+
+        run_cold_quota_pass_at(
+            &registry,
+            &archive,
+            &probe,
+            &scores,
+            &keep,
+            &remover,
+            &armed_cfg(),
+            &lock,
+            NOW,
+        )
+        .await;
+
+        // The repoint (blocked during the delete) completes after the guard drops.
+        if let Some(h) = repoint_handle.lock().unwrap().take() {
+            h.await.unwrap();
+        }
+
+        assert!(
+            observed_blocked.load(Ordering::SeqCst),
+            "repoint MUST be blocked while the fs delete runs under the publish guard \
+             (record-drop→fs-delete window is guarded)"
+        );
+        let reg = registry.lock().await;
+        // victim was legitimately evictable at commit time (not a target then), so
+        // it IS deleted — but the repoint could NOT tear that, and only lands after.
+        assert!(reg.get("victim:1").is_none(), "victim evicted (was not a target at commit)");
+        assert!(
+            !archive
+                .join("manifests/registry.ollama.ai/library/victim/1")
+                .is_file(),
+            "victim archive deleted under the guard"
+        );
+        assert_eq!(
+            store.resolve(repoint_key).as_deref(),
+            Some("victim:1"),
+            "the repoint applied only AFTER the delete completed (serialized by the guard)"
+        );
+    }
+
+    #[tokio::test]
+    async fn repoint_during_fs_delete_is_blocked_alias_path() {
+        // F1/F2 r3: an alias repoint during the record-drop→fs-delete window is held
+        // off by the publish guard until the delete finishes.
+        run_fs_delete_window_case(false, "lumina-fast").await;
+    }
+
+    #[tokio::test]
+    async fn repoint_during_fs_delete_is_blocked_resident_path() {
+        // Same guarantee for a resident-role alias (resolved through the dynamic
+        // store) — it shares the identical publish lock.
+        run_fs_delete_window_case(true, "lumina-embed").await;
     }
 }

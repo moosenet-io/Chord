@@ -1033,14 +1033,19 @@ pub async fn ingest_model(
             reg.archive_path().to_path_buf()
         };
         let cold_cfg = crate::models::cold_quota::ColdQuotaConfig::from_env();
-        let keep_set: std::collections::HashSet<String> =
-            state.lumina_aliases.snapshot().into_values().collect();
+        // CQH-01 (F2/F4): LIVE keep set — dynamic lumina targets re-queried at
+        // delete time, unioned with the VRAM keep-resident pins.
+        let keep = crate::models::cold_quota::LuminaResidentKeepSet::new(
+            state.lumina_aliases.clone(),
+            state.model_aliases.clone(),
+            crate::routing::resident_set::ResidentSetConfig::from_env(),
+        );
         crate::models::cold_quota::run_cold_quota_pass_with_source(
             &state.model_registry,
             &archive_root,
             state.disk_probe.as_ref(),
             &state.cold_score_source,
-            &keep_set,
+            &keep,
             &cold_cfg,
             &state.disk_op_lock,
         )

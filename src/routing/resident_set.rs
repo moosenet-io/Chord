@@ -498,6 +498,30 @@ pub fn resolve_alias(
         .filter(|s| !s.is_empty())
 }
 
+/// CQH-01 (F4): the set of MODEL NAMES the resident set currently pins in VRAM —
+/// each role's configured alias key resolved through the live dynamic store then
+/// the static aliases (exactly the resolution the warm planner uses). This is the
+/// current, single-owner successor to the retired `MODEL_KEEP_RESIDENT` env set
+/// (CHRD-PIN-01 removed that config; VRAM residency is owned solely by this
+/// module). The cold-quota tier folds these into its keep/exempt set so a
+/// keep-resident model can never be pruned from the archive even if it somehow
+/// lands in Cold. Returns an empty set when the resident set is disabled (nothing
+/// is pinned) — never a code-level fallback model name. Pure (no I/O); safe to
+/// call every pass.
+pub fn resident_exempt_models(
+    cfg: &ResidentSetConfig,
+    dynamic: &LuminaAliasStore,
+    statics: &HashMap<String, String>,
+) -> HashSet<String> {
+    if !cfg.enabled {
+        return HashSet::new();
+    }
+    cfg.aliases
+        .iter()
+        .filter_map(|(_, alias)| resolve_alias(alias, dynamic, statics))
+        .collect()
+}
+
 /// The ACTIONABLE half of the unresolved-alias warning: what the operator should
 /// actually do, named concretely for THIS role and THIS alias key.
 ///
@@ -2932,13 +2956,13 @@ mod tests {
 
     // ── Role resolution goes through aliases, never a hard-wired name ────────
 
-    #[test]
-    fn alias_resolves_dynamic_first_then_static() {
+    #[tokio::test]
+    async fn alias_resolves_dynamic_first_then_static() {
         let mut statics = HashMap::new();
         statics.insert("lumina-fast".to_string(), "static-model".to_string());
         statics.insert("lumina-embed".to_string(), "embed-model".to_string());
         let dynamic = LuminaAliasStore::from_static(&statics);
-        dynamic.set("lumina-fast", "dynamic-model".to_string());
+        dynamic.set("lumina-fast", "dynamic-model".to_string()).await;
 
         assert_eq!(
             resolve_alias("lumina-fast", &dynamic, &statics).as_deref(),
@@ -3037,8 +3061,8 @@ mod tests {
 
     /// Positive control for the removal: a RESOLVED alias still resolves normally,
     /// dynamic-store-first, for every role.
-    #[test]
-    fn a_resolved_alias_still_resolves_for_every_role() {
+    #[tokio::test]
+    async fn a_resolved_alias_still_resolves_for_every_role() {
         let mut statics = HashMap::new();
         // Keyed by ALIAS, not by role — personality and router deliberately share
         // `lumina-fast`, and a shared alias must resolve identically for both.
@@ -3057,7 +3081,7 @@ mod tests {
             );
         }
         // …and a runtime repoint still wins over the static map.
-        dynamic.set("lumina-embed", "dynamic-embed:1b".to_string());
+        dynamic.set("lumina-embed", "dynamic-embed:1b".to_string()).await;
         assert_eq!(
             resolve_alias("lumina-embed", &dynamic, &statics).as_deref(),
             Some("dynamic-embed:1b"),
@@ -5883,13 +5907,16 @@ mod tests {
         let state = crate::routes::tests::test_state("http://mcp.invalid:3200".to_string());
         state
             .lumina_aliases
-            .set("lumina-deep", SEAM_PERSONALITY_MODEL.to_string());
+            .set("lumina-deep", SEAM_PERSONALITY_MODEL.to_string())
+            .await;
         state
             .lumina_aliases
-            .set("lumina-fast", SEAM_ROUTER_MODEL.to_string());
+            .set("lumina-fast", SEAM_ROUTER_MODEL.to_string())
+            .await;
         state
             .lumina_aliases
-            .set("lumina-embed", SEAM_EMBED_MODEL.to_string());
+            .set("lumina-embed", SEAM_EMBED_MODEL.to_string())
+            .await;
         {
             let mut reg = state.model_registry.lock().await;
             for m in [

@@ -1318,8 +1318,8 @@ mod tests {
 
     // ── CHRD-91390429: agentic path resolves via the SAME dynamic store ─────────
 
-    #[test]
-    fn agentic_alias_resolution_prefers_dynamic_store() {
+    #[tokio::test]
+    async fn agentic_alias_resolution_prefers_dynamic_store() {
         use crate::routing::lumina_alias::LuminaAliasStore;
 
         // Static CHORD_MODEL_ALIASES says lumina-fast → static-model.
@@ -1329,7 +1329,7 @@ mod tests {
 
         // The runtime store has been repointed to dynamic-model.
         let store = LuminaAliasStore::from_static(&statics);
-        store.set("lumina-fast", "dynamic-model".to_string());
+        store.set("lumina-fast", "dynamic-model".to_string()).await;
 
         // With the store, the agentic path resolves the DYNAMIC target — exactly
         // like the chat hot path — not the stale static one.
