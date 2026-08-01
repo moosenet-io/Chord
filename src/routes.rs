@@ -774,6 +774,24 @@ fn is_unforwardable_request_header(name: &HeaderName) -> bool {
             | "upgrade"
             // Auth header is the proxy's own JWT, never forwarded to the LLM backend.
             | "authorization"
+            // CHRD-90: Terminus's identity headers (TERM #595). These are the one
+            // class of header where blind forwarding is actively harmful rather
+            // than merely untidy.
+            //
+            // `x-terminus-person-assertion` is a SIGNED, short-lived HS256 bearer
+            // token naming which household member a turn is for. The LLM backend
+            // may be a third party (see the CHORD_LLM_URL note below), and a
+            // bearer token handed to a third party is a bearer token they can
+            // replay: principal binding stops replay under a DIFFERENT principal,
+            // but not under the same one, so expiry bounds the window without
+            // closing it. `x-terminus-on-behalf-of` is worse in a quieter way —
+            // it is a person's name in cleartext, egressed to a vendor who has no
+            // business knowing which family member is talking.
+            //
+            // Neither is an input the inference backend has any use for, so there
+            // is no cost to dropping them and no case for an opt-out.
+            | "x-terminus-person-assertion"
+            | "x-terminus-on-behalf-of"
     )
 }
 
@@ -2378,6 +2396,61 @@ pub(crate) mod tests {
     use axum::http::{Method, Request};
     use serial_test::serial;
     use tower::ServiceExt;
+
+    // ---- CHRD-90: Terminus identity headers must never reach the LLM backend ----
+
+    /// The LLM backend can be a THIRD PARTY (OpenRouter). Terminus's signed
+    /// person assertion is a short-lived bearer token, and a bearer token handed
+    /// to a third party is one they can replay — principal binding stops replay
+    /// under a different principal, not under the same one, so expiry bounds the
+    /// window rather than closing it. The plaintext on-behalf-of header is a
+    /// household member's NAME, which a vendor has no business receiving.
+    ///
+    /// Neither is an input the inference backend can use, so dropping them costs
+    /// nothing.
+    #[test]
+    fn terminus_identity_headers_are_never_forwarded_upstream() {
+        for h in ["x-terminus-person-assertion", "x-terminus-on-behalf-of"] {
+            let name = axum::http::HeaderName::from_static(h);
+            assert!(
+                is_unforwardable_request_header(&name),
+                "{h} would be egressed to the LLM backend"
+            );
+        }
+    }
+
+    /// Header names are matched case-insensitively by `HeaderName`, so a caller
+    /// cannot slip one past the denylist by changing its casing.
+    #[test]
+    fn identity_header_matching_is_not_case_sensitive() {
+        let name = axum::http::HeaderName::from_bytes(b"X-Terminus-Person-Assertion").unwrap();
+        assert!(is_unforwardable_request_header(&name));
+    }
+
+    /// POSITIVE CONTROL. The denylist must still be a denylist, not a blanket
+    /// refusal — an ordinary header keeps flowing. Without this, a build that
+    /// dropped EVERY header would pass the assertions above while breaking the
+    /// proxy entirely.
+    #[test]
+    fn ordinary_headers_are_still_forwarded() {
+        for h in ["content-type", "accept", "user-agent"] {
+            let name = axum::http::HeaderName::from_static(h);
+            assert!(
+                !is_unforwardable_request_header(&name),
+                "{h} is a normal header and must still reach the backend"
+            );
+        }
+    }
+
+    /// The pre-existing entries are still covered — this change adds to the
+    /// denylist and must not have replaced any of it.
+    #[test]
+    fn the_existing_denylist_entries_survive() {
+        for h in ["authorization", "host", "content-length", "transfer-encoding"] {
+            let name = axum::http::HeaderName::from_static(h);
+            assert!(is_unforwardable_request_header(&name), "{h} regressed");
+        }
+    }
 
     use crate::agentic::AgenticExecutor;
     use crate::audit::AuditLogger;
