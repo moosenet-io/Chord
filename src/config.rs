@@ -291,6 +291,19 @@ pub fn parse_protected_models(raw: &str) -> Vec<String> {
 // pre-checkable degradation keeps inference serving while making the fault
 // impossible to misattribute.
 
+/// The invocation an operator should actually type to validate the config.
+///
+/// Deliberately the ABSOLUTE DEPLOYED PATH, not a bare binary name. The cargo bin
+/// target is `chord-proxy`, but the OCI updater installs it as
+/// `OCI_INSTALL=( "chord-proxy:<path>/harmony-chord:chord.service" )` — so on
+/// every host that runs the service the on-disk binary is `harmony-chord`, and
+/// neither bare name is on `PATH`. A bare name in a log line resolves differently
+/// depending on where the reader is standing; this message is read by an operator
+/// on the deployed host, mid-incident, with every alias dark, so it names the one
+/// thing they can paste. Developers running from a build tree use
+/// `./target/release/chord-proxy --check-config` (documented in the README).
+pub const CHECK_CONFIG_INVOCATION: &str = "<path>/harmony-chord --check-config";
+
 /// What happened while parsing `CHORD_MODEL_ALIASES`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AliasConfigStatus {
@@ -331,7 +344,7 @@ impl AliasConfigStatus {
                  role will report that its alias resolves to no target. This is a CONFIG PARSE \
                  failure, NOT a residency/model/backend bug — fix the JSON in the service's \
                  environment file and restart. Validate it BEFORE restarting with: \
-                 `harmony-chord --check-config`"
+                 `{CHECK_CONFIG_INVOCATION}`"
             )),
         }
     }
@@ -429,6 +442,36 @@ fn truncate_for_report(s: &str) -> String {
 /// * Anything else — a syntax error, or valid JSON that is not an object ⇒ empty
 ///   map, [`AliasConfigStatus::Unparseable`] carrying serde's line/column.
 ///
+/// ## Whitespace policy: keys are REJECTED, values are TRIMMED
+///
+/// A whitespace-padded KEY (`{" lumina-fast ": "granite4.1"}`) is dropped as a
+/// malformed entry, NAMED, and never silently normalized. An earlier revision
+/// trimmed keys, which introduced a silent collision: `{"foo":"a", " foo ":"b"}`
+/// is legal JSON, reported a clean `Ok`, and left exactly ONE `foo` in the map —
+/// which one depending on the object's iteration order. That is the same
+/// defect class CHRD-82 exists to remove (a config that quietly means something
+/// other than what it says), and it is the same conclusion terminus-rs reached
+/// for its grant map's `validate_identity_key` after a config carrying both
+/// `" lumina"` and `"lumina"` resolved differently across runs.
+///
+/// Rejecting costs nothing that was ever reachable: lookups (`resolve_model_alias`)
+/// match the requested model name LITERALLY, so a padded key could never have been
+/// hit by any caller. Trimming, by contrast, SYNTHESISES a mapping the operator did
+/// not literally write — and, once two keys normalize to the same name, it has to
+/// pick one. The rejection is order-independent by construction: the padded entry
+/// never enters the map, so the literal `foo` always wins no matter which is seen
+/// first.
+///
+/// VALUES are still trimmed (`{"lumina-fast": " granite4.1 "}` ⇒ `granite4.1`).
+/// The asymmetry is deliberate and rests on the two properties that made key
+/// trimming unsafe, neither of which holds for a value: (1) values are not a
+/// lookup domain — they are emitted to the backend, so two entries can never
+/// collide into one and there is nothing for iteration order to decide; and
+/// (2) a padded target has exactly one sensible reading, whereas dropping the
+/// entry would take a working alias dark for a cosmetic defect, which is strictly
+/// more blast radius for zero added safety. Trimming a value is normalization;
+/// trimming a key was disambiguation.
+///
 /// This function NEVER logs and NEVER panics; the caller decides how to shout.
 pub fn parse_model_aliases(raw: Option<String>) -> AliasConfig {
     let Some(text) = raw.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) else {
@@ -465,11 +508,22 @@ pub fn parse_model_aliases(raw: Option<String>) -> AliasConfig {
     let mut aliases = HashMap::new();
     let mut dropped = Vec::new();
     for (key, val) in obj {
-        let alias = key.trim();
-        if alias.is_empty() {
+        if key.trim().is_empty() {
             dropped.push("\"\": blank alias name".to_string());
             continue;
         }
+        // KEYS ARE NOT TRIMMED — a whitespace-padded key is REJECTED. See the
+        // `Whitespace policy` note above `parse_model_aliases`.
+        if key.trim() != key {
+            dropped.push(format!(
+                "\"{}\": alias name has leading/trailing whitespace (keys are matched \
+                 literally and are never trimmed, so this entry could never be hit); \
+                 remove the padding",
+                truncate_for_report(&key)
+            ));
+            continue;
+        }
+        let alias = key.as_str();
         match val {
             serde_json::Value::String(target) if !target.trim().is_empty() => {
                 aliases.insert(alias.to_string(), target.trim().to_string());
@@ -1394,13 +1448,95 @@ mod tests {
     }
 
     #[test]
-    fn test_alias_entries_are_trimmed() {
-        let cfg = parse_model_aliases(Some(r#"{" lumina-fast ":"  granite4.1 "}"#.into()));
+    fn test_alias_values_are_trimmed_but_padded_keys_are_rejected() {
+        // VALUES: trimmed. A padded target has one reading and no collision domain.
+        let cfg = parse_model_aliases(Some(r#"{"lumina-fast":"  granite4.1 "}"#.into()));
         assert_eq!(
             cfg.aliases.get("lumina-fast").map(String::as_str),
             Some("granite4.1")
         );
         assert_eq!(cfg.status, AliasConfigStatus::Ok);
+
+        // KEYS: rejected, never trimmed. Neither spelling ends up in the map, and
+        // the operator is told which entry went nowhere.
+        let cfg = parse_model_aliases(Some(r#"{" lumina-fast ":"granite4.1"}"#.into()));
+        assert!(
+            !cfg.aliases.contains_key("lumina-fast"),
+            "a padded key must NOT be normalized into a live alias: {:?}",
+            cfg.aliases
+        );
+        assert!(!cfg.aliases.contains_key(" lumina-fast "));
+        assert!(cfg.aliases.is_empty(), "{:?}", cfg.aliases);
+        let AliasConfigStatus::EntriesDropped { ref dropped } = cfg.status else {
+            panic!("a padded key must be an explicit dropped entry, got {:?}", cfg.status);
+        };
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+        assert!(dropped[0].contains("lumina-fast"), "must name it: {dropped:?}");
+        assert!(
+            dropped[0].contains("whitespace"),
+            "must say why: {dropped:?}"
+        );
+    }
+
+    #[test]
+    fn test_padded_key_collision_is_deterministic_and_explicit() {
+        // The silent-collision case that key-trimming introduced:
+        // `{"foo":"model-a", " foo ":"model-b"}` is valid JSON and, with trimming,
+        // produced a clean `Ok` with exactly ONE surviving `foo` — whichever the
+        // object's iteration order happened to visit last. Now the literal key
+        // ALWAYS wins and the padded one is ALWAYS reported, in both textual
+        // orders, on every run.
+        for raw in [
+            r#"{"foo":"model-a"," foo ":"model-b"}"#,
+            r#"{" foo ":"model-b","foo":"model-a"}"#,
+        ] {
+            for i in 0..64 {
+                let cfg = parse_model_aliases(Some(raw.to_string()));
+                assert_eq!(
+                    cfg.aliases.get("foo").map(String::as_str),
+                    Some("model-a"),
+                    "iteration {i} of {raw}: the literally-written key must win every time"
+                );
+                assert_eq!(cfg.aliases.len(), 1, "iteration {i}: {:?}", cfg.aliases);
+                // Never a clean bill of health for a collision.
+                assert!(
+                    cfg.status.is_degraded(),
+                    "iteration {i}: a colliding padded key must not report Ok"
+                );
+                let AliasConfigStatus::EntriesDropped { ref dropped } = cfg.status else {
+                    panic!("iteration {i}: expected EntriesDropped, got {:?}", cfg.status);
+                };
+                assert_eq!(dropped.len(), 1, "iteration {i}: {dropped:?}");
+                assert!(dropped[0].contains("foo"), "iteration {i}: {dropped:?}");
+                assert!(
+                    dropped[0].contains("whitespace"),
+                    "iteration {i}: {dropped:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_degraded_detail_names_an_invocation_that_works_on_a_deployed_host() {
+        // The bare binary name `harmony-chord` is not on PATH anywhere, and the
+        // cargo bin is `chord-proxy` — two different names depending on where the
+        // reader stands. The message an operator reads mid-incident must name the
+        // ABSOLUTE deployed path, which is fixed by the module's
+        // OCI_INSTALL=( "chord-proxy:<path>/harmony-chord:chord.service" ).
+        assert_eq!(CHECK_CONFIG_INVOCATION, "<path>/harmony-chord --check-config");
+
+        let cfg = parse_model_aliases(Some(r#"{"lumina-fast":"granite4.1",}"#.into()));
+        let detail = cfg.status.detail().expect("unparseable must explain itself");
+        let idx = detail
+            .find("--check-config")
+            .expect("the fix-it message must name --check-config");
+        let before = detail[..idx].trim_end();
+        assert!(
+            before.ends_with("<path>/harmony-chord"),
+            "--check-config must be invoked via its absolute deployed path, \
+             not a bare binary name; got: ...{}",
+            &detail[idx.saturating_sub(40)..]
+        );
     }
 
     #[test]

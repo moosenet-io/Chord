@@ -63,15 +63,33 @@ sweep-status monitor, and both listener ports.
 
 `./target/release/chord-proxy --version` prints the version line and exits.
 
-`./target/release/chord-proxy --check-config` validates the alias configuration and
-exits — `0` when `CHORD_MODEL_ALIASES` parses cleanly, `1` when it is unparseable or
-when any individual entry had to be dropped. Run it with the service's environment
-sourced *before* restarting, since one env value backs every alias on the host:
+`--check-config` validates the alias configuration and exits — `0` when
+`CHORD_MODEL_ALIASES` parses cleanly, `1` when it is unparseable or when any
+individual entry had to be dropped. Run it with the service's environment sourced
+*before* restarting, since one env value backs every alias on the host.
+
+**On a deployed host, the binary is `<path>/harmony-chord`, not `chord-proxy`.**
+The cargo bin target is `chord-proxy`, but the module ships via
+`OCI_INSTALL=( "chord-proxy:<path>/harmony-chord:chord.service" )`, so that is
+the path the installed service actually runs — and it is the path the runtime error
+message tells the operator to use:
 
 ```sh
+# On the deployed host (what an operator wants, mid-incident):
 set -a; . /path/to/the/chord/env/file; set +a
+<path>/harmony-chord --check-config; echo "rc=$?"
+
+# From a build tree:
 ./target/release/chord-proxy --check-config; echo "rc=$?"
 ```
+
+Whitespace in the JSON object is handled asymmetrically, on purpose: a
+whitespace-padded *value* is trimmed, but a whitespace-padded *key*
+(`{" lumina-fast ": "…"}`) is **rejected** and reported as a dropped entry rather
+than silently trimmed. Alias lookups match the requested model name literally, so a
+padded key could never have resolved anyway; trimming it would invent a mapping that
+was not written, and would let `{"foo":"a", " foo ":"b"}` collapse to one
+iteration-order-dependent `foo` while still reporting a clean parse.
 
 Both flags are handled before logging, the secrets bootstrap, and any listener bind,
 so they are safe to run on a live host. If aliasing is already degraded on a running
