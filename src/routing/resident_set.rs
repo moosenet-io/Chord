@@ -1035,6 +1035,11 @@ enum Admission {
 pub struct ResidentSet {
     cfg: ResidentSetConfig,
     inner: Mutex<Inner>,
+    /// CHRD-95: the Terminus-visible residency snapshot. The resident set is the
+    /// single owner of VRAM residency (CHRD-PIN-01), so it is also the only thing
+    /// that can honestly say what is resident. Purely observational — see
+    /// [`ResidentSet::publish_snapshot`].
+    snapshot: crate::routing::residency_snapshot::SnapshotWriter,
 }
 
 /// The process-global resident set.
@@ -1078,7 +1083,52 @@ impl ResidentSet {
                 cancel: CancelToken::new(),
                 pending: Vec::new(),
             }),
+            snapshot: crate::routing::residency_snapshot::SnapshotWriter::new(),
         }
+    }
+
+    /// CHRD-95: publish the Terminus-visible residency snapshot.
+    ///
+    /// **This is observability and it must never be able to break serving.** A
+    /// failed write (unwritable path, full disk, read-only mount) is logged and
+    /// swallowed inside [`residency_snapshot::SnapshotWriter::publish`], which
+    /// returns `()` for exactly that reason — there is no error to propagate, by
+    /// construction. Callers are the two STATE-CHANGE points (the end of a warm
+    /// pass, and a release), never the reconcile tick: the writer additionally
+    /// skips an unchanged body, so a re-assert that changes nothing writes
+    /// nothing.
+    ///
+    /// Takes the residents as an ARGUMENT rather than re-reading them through
+    /// [`Self::status`], deliberately: both call sites are inside the commit that
+    /// produced them and one of them still holds `inner`, so a self-read here
+    /// would be a lock re-entry — i.e. the observability path could DEADLOCK the
+    /// serving path, the very thing this must not be able to do. Synchronous and
+    /// awaitless for the same reason: it cannot yield, block, or park a warm.
+    ///
+    /// The four fields of the old SRV-13 shape that have no live source are
+    /// emitted as `null` and cannot be supplied here (see
+    /// `residency_snapshot::Unsourced`).
+    fn publish_snapshot(
+        &self,
+        env: &dyn ResidentEnv,
+        residents: Vec<crate::routing::residency_snapshot::ResidentEntry>,
+        reason: &str,
+    ) {
+        use crate::routing::residency_snapshot::ResidencySnapshot;
+
+        // Post-CHRD-PIN-01 the personality role IS the pinned chat model. Only
+        // reported while the role is actually held — a slot that is not held pins
+        // nothing, whatever its alias resolves to (a non-held role never appears
+        // in `residents`).
+        let pinned_chat_model = residents
+            .iter()
+            .find(|r| r.role == Role::Personality.id())
+            .map(|r| r.model_id.clone());
+
+        self.snapshot.publish(
+            &ResidencySnapshot::new(residents, env.free_vram_gb(), pinned_chat_model),
+            reason,
+        );
     }
 
     pub fn config(&self) -> &ResidentSetConfig {
@@ -1659,6 +1709,24 @@ impl ResidentSet {
                 .collect()
         };
 
+        // CHRD-95: the snapshot's view of this commit, taken from the very slots
+        // being installed — no second read, no second source of truth.
+        let snapshot_residents: Vec<crate::routing::residency_snapshot::ResidentEntry> = new_slots
+            .iter()
+            .filter(|(_, s)| s.state.is_held())
+            .filter_map(|(role, s)| {
+                s.model
+                    .clone()
+                    .map(|model_id| crate::routing::residency_snapshot::ResidentEntry {
+                        role: role.id(),
+                        model_id,
+                        // Registry ON-DISK size, not measured VRAM — documented as
+                        // an estimate on the field and in `vram_gb_source`.
+                        vram_gb: s.size_gb,
+                    })
+            })
+            .collect();
+
         inner.slots = new_slots;
         inner.active = true;
         inner.last_warm = Some(Instant::now());
@@ -1767,6 +1835,10 @@ impl ResidentSet {
             held = held.len(),
             "resident-set: warm pass complete"
         );
+        // CHRD-95: a STATE CHANGE — the pass committed a new held set. Cannot
+        // fail the pass: `publish_snapshot` swallows every IO error, and `report`
+        // is already final at this point either way.
+        self.publish_snapshot(env, snapshot_residents, trigger);
         report
     }
 
@@ -2053,6 +2125,11 @@ impl ResidentSet {
             compensated = report.compensated,
             "resident-set: RELEASED for a mode swap — models are immediately reclaimable"
         );
+        // CHRD-95: a STATE CHANGE — nothing is held any more, and that is exactly
+        // the state the snapshot used to LIE about (an absent file read as an idle
+        // GPU). A release holds nothing, so the resident list is empty BY
+        // CONSTRUCTION, not by a re-read. Cannot fail the release.
+        self.publish_snapshot(env, Vec::new(), reason);
         report
     }
 
@@ -6876,5 +6953,202 @@ mod tests {
         exempt.sort();
         assert_eq!(exempt, expected, "the registry exemption must be installed");
         assert!(set.status().await.active);
+    }
+
+    // ── CHRD-95: the Terminus-visible residency snapshot ────────────────────
+    //
+    // The tool that reads this file used to report "IDLE, nothing resident" on a
+    // box actively serving models, because nothing ever wrote it. These tests
+    // exist to keep that from silently coming back: the FIRST one is the positive
+    // control — a build that never writes the file at all cannot pass it — and the
+    // LAST one is the load-bearing safety property, that a write failure must not
+    // be able to break a warm or a release.
+
+    /// Sets `CHORD_RESIDENCY_STATE_PATH` for the duration of one (serialized) test
+    /// and restores the environment afterwards, panic or not.
+    struct SnapshotPathGuard;
+    impl SnapshotPathGuard {
+        fn set(path: &str) -> Self {
+            std::env::set_var("CHORD_RESIDENCY_STATE_PATH", path);
+            Self
+        }
+    }
+    impl Drop for SnapshotPathGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("CHORD_RESIDENCY_STATE_PATH");
+        }
+    }
+
+    fn read_snapshot(path: &std::path::Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).expect("snapshot file")).unwrap()
+    }
+
+    /// POSITIVE CONTROL. A committed warm pass writes the snapshot, and the
+    /// contents describe what the set actually holds.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_warm_pass_writes_the_residency_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("residency.json");
+        let _guard = SnapshotPathGuard::set(path.to_str().unwrap());
+
+        let set = ResidentSet::new(live_cfg());
+        let (env, _entered) = FakeEnv::new(three_roles(), Some(96.0));
+        let report = set.warm_with(env.as_ref(), "startup", true, None).await;
+        assert_eq!(report.warmed, 3);
+
+        let v = read_snapshot(&path);
+        let mut got: Vec<(String, String)> = v["residents"]
+            .as_array()
+            .expect("residents")
+            .iter()
+            .map(|r| {
+                (
+                    r["role"].as_str().unwrap().to_string(),
+                    r["model_id"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("embedding".to_string(), "embed:1".to_string()),
+                ("personality".to_string(), "voice:1".to_string()),
+                ("router".to_string(), "router:1".to_string()),
+            ],
+            "residents are the HELD role slots, keyed by role id: {v}"
+        );
+        assert_eq!(v["free_vram_gb"], 96.0, "free VRAM comes from the env read");
+        assert_eq!(
+            v["pinned_chat_model"], "voice:1",
+            "the personality slot IS the pinned chat model post-CHRD-PIN-01"
+        );
+        assert!(
+            v["written_at"].is_string(),
+            "a snapshot with no timestamp reads as live even when Chord is dead"
+        );
+        // The per-resident size is the registry's on-disk figure, and the file
+        // says so where a reader will see it.
+        assert_eq!(v["residents"][0]["vram_gb"], 8.0);
+        assert!(v["vram_gb_source"].as_str().unwrap().contains("on-disk"));
+
+        // The four fields with no live source are NULL — never zeroed, never a
+        // defaulted mode. This is the highest-risk item in CHRD-95.
+        for f in [
+            "mode",
+            "assumed_memory_model",
+            "gpu_ceiling_gb",
+            "cpu_ceiling_gb",
+        ] {
+            assert!(
+                v.get(f).is_some_and(|x| x.is_null()),
+                "{f} has no live source and must be null, not fabricated: {v}"
+            );
+        }
+    }
+
+    /// A release is a state change too — and it is precisely the state the old
+    /// missing-file behaviour used to claim was always true.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_release_writes_an_empty_residency_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("residency.json");
+        let _guard = SnapshotPathGuard::set(path.to_str().unwrap());
+
+        let set = ResidentSet::new(live_cfg());
+        let (env, _entered) = FakeEnv::new(three_roles(), Some(96.0));
+        set.warm_with(env.as_ref(), "startup", true, None).await;
+        assert_eq!(read_snapshot(&path)["residents"].as_array().unwrap().len(), 3);
+
+        let rel = set.release_with(env.as_ref(), "mode-swap").await;
+        assert_eq!(rel.released, 3);
+
+        let v = read_snapshot(&path);
+        assert!(
+            v["residents"].as_array().unwrap().is_empty(),
+            "a release holds nothing: {v}"
+        );
+        assert!(v["pinned_chat_model"].is_null(), "and pins no chat model: {v}");
+    }
+
+    /// The set re-asserts on a background loop; an unchanged pass must not churn
+    /// the disk. Deleting the file and re-running an identical pass proves the
+    /// skip is real (a rewrite would recreate it).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_unchanged_pass_does_not_rewrite_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("residency.json");
+        let _guard = SnapshotPathGuard::set(path.to_str().unwrap());
+
+        let set = ResidentSet::new(live_cfg());
+        let (env, _entered) = FakeEnv::new(three_roles(), Some(96.0));
+        set.warm_with(env.as_ref(), "startup", true, None).await;
+        assert!(path.exists());
+        std::fs::remove_file(&path).unwrap();
+
+        // Same state, forced past the debounce so the pass genuinely re-runs.
+        set.warm_with(env.as_ref(), "reconcile", true, None).await;
+        assert!(
+            !path.exists(),
+            "an identical state must not rewrite the snapshot every tick"
+        );
+
+        // A REAL change publishes again.
+        env.resolved.lock().unwrap()[0].model = Some("voice:2".to_string());
+        set.warm_with(env.as_ref(), "reconcile", true, None).await;
+        assert_eq!(
+            read_snapshot(&path)["pinned_chat_model"], "voice:2",
+            "a genuine state change must still be published"
+        );
+    }
+
+    /// **THE LOAD-BEARING SAFETY PROPERTY.** The snapshot is observability, and
+    /// observability that can take down the thing it observes is worse than none.
+    /// With an unwritable path (a directory that does not exist — the shape of a
+    /// bad mount or a bad config), the warm and the release must both complete
+    /// exactly as they would with no snapshot configured at all: same report, same
+    /// exemptions, same role states.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_snapshot_write_failure_never_breaks_a_warm_or_a_release() {
+        // Baseline: what the same operations do with snapshotting switched off.
+        let (baseline_warm, baseline_release, baseline_exempt) = {
+            std::env::remove_var("CHORD_RESIDENCY_STATE_PATH");
+            let set = ResidentSet::new(live_cfg());
+            let (env, _entered) = FakeEnv::new(three_roles(), Some(96.0));
+            let w = set.warm_with(env.as_ref(), "startup", true, None).await;
+            let exempt = env.exempt();
+            let r = set.release_with(env.as_ref(), "mode-swap").await;
+            (w, r, exempt)
+        };
+
+        let _guard = SnapshotPathGuard::set("/nonexistent-dir-chrd95/nope/residency.json");
+        let set = ResidentSet::new(live_cfg());
+        let (env, _entered) = FakeEnv::new(three_roles(), Some(96.0));
+
+        let warm = set.warm_with(env.as_ref(), "startup", true, None).await;
+        assert_eq!(
+            warm, baseline_warm,
+            "an unwritable snapshot path must not change the warm's outcome"
+        );
+        assert_eq!(
+            env.exempt(),
+            baseline_exempt,
+            "…nor what is actually held on the GPU"
+        );
+        assert!(
+            set.status().await.roles.iter().all(|r| r.state.is_held()),
+            "…nor the role states"
+        );
+
+        let release = set.release_with(env.as_ref(), "mode-swap").await;
+        assert_eq!(
+            release, baseline_release,
+            "an unwritable snapshot path must not change the release's outcome"
+        );
+        assert!(!set.status().await.active, "…and the set is still released");
     }
 }
