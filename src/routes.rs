@@ -172,6 +172,10 @@ fn proxy_error_response(err: ProxyError) -> Response {
     let status = match &err {
         ProxyError::ToolNotFound(_) => StatusCode::NOT_FOUND,
         ProxyError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
+        // 400, not 502: a malformed person assertion is a defect in the request
+        // this proxy was handed, not a failure of anything upstream. The error
+        // body is the variant's fixed Display text and never the value itself.
+        ProxyError::InvalidPersonAssertion => StatusCode::BAD_REQUEST,
         _ => StatusCode::BAD_GATEWAY,
     };
     let body = serde_json::json!({"error": err.to_string()});
@@ -195,6 +199,7 @@ fn proxy_error_kind(err: &ProxyError) -> &'static str {
         ProxyError::Http(_) => "http_error",
         ProxyError::Json(_) => "json_error",
         ProxyError::Config(_) => "config_error",
+        ProxyError::InvalidPersonAssertion => "invalid_person_assertion",
     }
 }
 
@@ -377,9 +382,13 @@ pub async fn tools_call(
     // substitute from `claims.sub` (that would manufacture an identity claim
     // Chord is not entitled to make). A non-ASCII/garbage value is dropped at
     // the session layer rather than failing the call.
+    // Raw BYTES, not `to_str()`: `HeaderValue::to_str` fails on any value that
+    // is legal at the HTTP transport level but not UTF-8, and swallowing that
+    // here would silently narrow an opaque relay to "whatever Chord could
+    // decode". Chord must pass on what it received.
     let person_assertion = headers
         .get(crate::session::PERSON_ASSERTION_HEADER)
-        .and_then(|v| v.to_str().ok());
+        .map(|v| v.as_bytes());
     match state
         .proxy
         .tool_call(&req.name, req.arguments, person_assertion)

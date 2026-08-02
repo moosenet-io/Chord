@@ -25,6 +25,14 @@ pub enum ProxyError {
 
     #[error("Configuration error: {0}")]
     Config(String),
+
+    /// The inbound `x-terminus-person-assertion` could not be relayed verbatim.
+    ///
+    /// Deliberately carries NO payload: the offending value is a bearer token
+    /// and must never reach an error string, a log line, or an HTTP response.
+    /// The variant itself is the whole diagnostic.
+    #[error("Malformed person assertion")]
+    InvalidPersonAssertion,
 }
 
 #[derive(Debug, Error)]

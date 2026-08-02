@@ -129,30 +129,46 @@ impl McpSession {
     /// inbound request. Like `authorize`, this never logs or formats the value:
     /// it is a bearer token.
     ///
-    /// A value that is not a legal HTTP header value is DROPPED (not sent, not
-    /// fatal). Terminus mints these as a signed compact token, so a value that
-    /// cannot even be encoded as a header was never minted upstream — it is
-    /// client-forged junk. Dropping it fails safe: the backend simply sees a
-    /// call with no assertion and applies its no-identity policy, which is what
-    /// it would do for a forgery anyway. Failing the whole tool call instead
-    /// would let any client with a malformed header deny service.
+    /// Takes raw BYTES, not a `&str`, and re-encodes with
+    /// `HeaderValue::from_bytes`. Relaying `HeaderValue::to_str()` output would
+    /// silently discard any value containing bytes that are perfectly legal at
+    /// the HTTP transport level but not UTF-8 — which would make Chord pass on
+    /// what it could *decode* rather than what it *received*. A relay that must
+    /// not interpret the token must not narrow it either.
+    ///
+    /// A value that cannot be encoded as a header value is REFUSED: the call
+    /// fails with [`ProxyError::InvalidPersonAssertion`]. It is deliberately not
+    /// dropped, because **an attempted identity that cannot be honoured must
+    /// never be indistinguishable from no identity at all**. Dropping it would
+    /// make "assertion present but malformed" arrive at the backend looking
+    /// exactly like "no assertion supplied", and the call would then proceed
+    /// bearer-authenticated with no identity — a silent downgrade, regardless of
+    /// what the backend's no-identity policy happens to be, because Chord has
+    /// destroyed the signal the backend would have judged. This is the same
+    /// invariant enforced at Terminus's ingress (TERM #595), TERM-599 dispatch,
+    /// the caller key, and the router's tool cache; do not re-litigate it here.
+    ///
+    /// Refusing is not a denial-of-service lever: it harms only the client that
+    /// sent the bad header, with no amplification and no cost to anyone else.
+    /// And Terminus's ingress already refuses claims it cannot honour, so in a
+    /// well-formed system this branch is unreachable.
     fn with_person_assertion(
         &self,
         builder: reqwest::RequestBuilder,
-        person_assertion: Option<&str>,
-    ) -> reqwest::RequestBuilder {
+        person_assertion: Option<&[u8]>,
+    ) -> Result<reqwest::RequestBuilder, ProxyError> {
         match person_assertion {
-            Some(a) => match reqwest::header::HeaderValue::from_str(a) {
-                Ok(v) => builder.header(PERSON_ASSERTION_HEADER, v),
+            Some(a) => match reqwest::header::HeaderValue::from_bytes(a) {
+                Ok(v) => Ok(builder.header(PERSON_ASSERTION_HEADER, v)),
                 Err(_) => {
                     warn!(
-                        "Dropping malformed {PERSON_ASSERTION_HEADER} on outbound MCP call \
-                         (not a valid header value; value deliberately not logged)"
+                        "Refusing outbound MCP call: malformed {PERSON_ASSERTION_HEADER} \
+                         (not encodable as a header value; value deliberately not logged)"
                     );
-                    builder
+                    Err(ProxyError::InvalidPersonAssertion)
                 }
             },
-            None => builder,
+            None => Ok(builder),
         }
     }
 
@@ -248,15 +264,17 @@ impl McpSession {
     /// Send a JSON-RPC request to the MCP backend and return the result.
     ///
     /// `person_assertion` is the opaque, Terminus-minted assertion that arrived
-    /// on the inbound request, if any (see [`PERSON_ASSERTION_HEADER`]). It is
-    /// relayed verbatim as a per-call header alongside the process-lifetime
-    /// bearer, giving the backend per-request identity that the shared session
-    /// cannot carry. `None` reproduces the previous behaviour exactly.
+    /// on the inbound request, if any (see [`PERSON_ASSERTION_HEADER`]) — raw
+    /// header BYTES, so the relay stays byte-exact. It is relayed verbatim as a
+    /// per-call header alongside the process-lifetime bearer, giving the backend
+    /// per-request identity that the shared session cannot carry. `None`
+    /// reproduces the previous behaviour exactly; a value that cannot be encoded
+    /// as a header is refused, not dropped (see `with_person_assertion`).
     pub async fn send_request(
         &self,
         method: &str,
         params: Option<Value>,
-        person_assertion: Option<&str>,
+        person_assertion: Option<&[u8]>,
     ) -> Result<Value, ProxyError> {
         let session_id = self.ensure_session().await?;
 
@@ -273,7 +291,7 @@ impl McpSession {
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
             .header("Mcp-Session-Id", &session_id);
-        let request_builder = self.with_person_assertion(request_builder, person_assertion);
+        let request_builder = self.with_person_assertion(request_builder, person_assertion)?;
         let response = self
             .authorize(request_builder)
             .json(&request)
@@ -800,7 +818,7 @@ mod tests {
             .send_request(
                 "tools/call",
                 Some(serde_json::json!({"name": "t", "arguments": {}})),
-                Some("<REDACTED-SECRET>"),
+                Some(b"<REDACTED-SECRET>".as_slice()),
             )
             .await
             .unwrap();
@@ -842,20 +860,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_malformed_person_assertion_is_dropped_not_fatal() {
-        // A header value with a control character cannot be a Terminus-minted
-        // token, so it is dropped rather than failing the call — a client-forged
-        // junk value must not be a denial-of-service lever. The bearer still
-        // rides (positive control), so the call degrades to "no identity", which
-        // is the same posture the backend applies to any unattested request.
+    async fn test_malformed_person_assertion_is_refused_not_silently_dropped() {
+        // A header value with a control character cannot be encoded as a header
+        // value, so the call is REFUSED rather than sent without the assertion.
+        //
+        // Dropping it would make "assertion present but malformed" arrive at the
+        // backend byte-for-byte identical to "no assertion supplied": the call
+        // would proceed bearer-authenticated with no identity, and the backend
+        // would apply its no-identity policy to a request that was in fact an
+        // attempted identity claim. That is a silent downgrade — Chord would
+        // have destroyed the very signal the backend needed to judge. The
+        // invariant, enforced identically at Terminus's ingress (TERM #595),
+        // TERM-599 dispatch, the caller key, and the router's tool cache, is
+        // that an attempted identity which cannot be honoured must NEVER be
+        // indistinguishable from no identity.
+        //
+        // This is not a DoS lever: refusing harms only the client that sent the
+        // bad header — no amplification, no cost to any other caller.
         let mock_server = httpmock::MockServer::start_async().await;
         mock_handshake(&mock_server, "assert-bad");
 
+        // Registered but expected to receive NOTHING. The assertion that this
+        // mock was never hit is the real content of the test: it proves the
+        // request was not merely stripped of the header and sent anyway.
         let call_mock = mock_server.mock(|when, then| {
             when.method(httpmock::Method::POST)
                 .path("/mcp")
-                .header("Authorization", "Bearer mcp-token-3")
-                .matches(lacks_header!("x-terminus-person-assertion"))
                 .body_contains("tools/call");
             then.status(200)
                 .json_body(serde_json::json!({"jsonrpc":"2.0","id":2,"result":{"ok":true}}));
@@ -863,16 +893,88 @@ mod tests {
 
         let session =
             McpSession::with_token(mock_server.base_url(), 10, Some("mcp-token-3".to_string()));
-        let result = session
+        let err = session
             .send_request(
                 "tools/call",
                 Some(serde_json::json!({"name": "t", "arguments": {}})),
-                Some("bad\nvalue"),
+                Some(b"bad\nvalue".as_slice()),
             )
             .await
+            .unwrap_err();
+        assert!(matches!(err, ProxyError::InvalidPersonAssertion));
+        // The offending value must never reach the error text.
+        assert!(!err.to_string().contains("bad"));
+        call_mock.assert_hits(0);
+    }
+
+    #[test]
+    fn test_person_assertion_relays_non_utf8_bytes_verbatim() {
+        // Chord is an opaque relay: it must forward exactly the bytes it
+        // received. `HeaderValue::to_str()` rejects any value that is legal at
+        // the HTTP transport level but not UTF-8, so a `to_str()`-based relay
+        // would either lose or mangle such a value — Chord would be passing on
+        // what it could DECODE rather than what it RECEIVED.
+        //
+        // Asserted against the built `reqwest::Request` rather than a mock
+        // server on purpose: `httpmock` records request headers as `String`, so
+        // it physically cannot observe a non-UTF-8 header value (it 500s on
+        // one). The built request is the actual wire representation and is the
+        // stricter check.
+        //
+        // 0xE9 is a valid header-value byte (obs-text, RFC 7230 §3.2.6) but is
+        // not valid UTF-8 on its own.
+        let raw: &[u8] = b"assert-\xe9-tail";
+
+        let session = McpSession::with_token(
+            "http://backend.invalid".to_string(),
+            10,
+            Some("mcp-token-5".to_string()),
+        );
+        let builder = session.client.post("http://backend.invalid/mcp");
+        let builder = session
+            .with_person_assertion(builder, Some(raw))
+            .expect("a transport-legal byte string must be relayable");
+        let req = builder.build().unwrap();
+
+        let sent = req
+            .headers()
+            .get(PERSON_ASSERTION_HEADER)
+            .expect("assertion header must be present");
+        assert_eq!(sent.as_bytes(), raw, "bytes must be relayed verbatim");
+        // Pins WHY this test exists: this exact value is one a `to_str()`-based
+        // relay would have failed to carry.
+        assert!(
+            sent.to_str().is_err(),
+            "test value must be one that to_str() cannot represent, or it proves nothing"
+        );
+    }
+
+    #[test]
+    fn test_with_person_assertion_refuses_untransportable_bytes() {
+        // The builder-level counterpart to the refusal test above: a value that
+        // is not encodable as a header value yields an error, never a builder
+        // that quietly lost the header.
+        let session = McpSession::with_token(
+            "http://backend.invalid".to_string(),
+            10,
+            Some("mcp-token-6".to_string()),
+        );
+        let builder = session.client.post("http://backend.invalid/mcp");
+        let err = session
+            .with_person_assertion(builder, Some(b"bad\nvalue".as_slice()))
+            .err()
+            .expect("a malformed assertion must be refused, not dropped");
+        assert!(matches!(err, ProxyError::InvalidPersonAssertion));
+        assert!(!err.to_string().contains("bad"));
+
+        // And `None` still passes the builder through untouched.
+        let builder = session.client.post("http://backend.invalid/mcp");
+        let req = session
+            .with_person_assertion(builder, None)
+            .unwrap()
+            .build()
             .unwrap();
-        assert_eq!(result["ok"], true);
-        call_mock.assert_hits(1);
+        assert!(req.headers().get(PERSON_ASSERTION_HEADER).is_none());
     }
 
     #[tokio::test]
@@ -909,7 +1011,7 @@ mod tests {
             .send_request(
                 "tools/call",
                 Some(serde_json::json!({"name": "t", "arguments": {}})),
-                Some("person-assertion-token"),
+                Some(b"person-assertion-token".as_slice()),
             )
             .await
             .unwrap();
