@@ -630,9 +630,20 @@ impl ModelRegistry {
                 return self.arch_safe_fallback(arch);
             }
         }
-        // Not excluded (or unprofiled / unmapped tag / unknown arch) → unchanged
-        // behavior. An unknown arch never hard-fails a model here.
-        self.backend_for(model)
+        // Not tag-excluded (usable tag, or untagged, or an unresolved/unknown
+        // tag). Select as usual — but the arch invariant must hold on EVERY
+        // path, not just the reject path: `backend_for` can still return an
+        // arch-INCOMPATIBLE default (e.g. an untagged, or unresolved-tag, KNOWN
+        // gptoss model falling through to a llama-server default). Validate the
+        // FINAL selected backend against the model's known arch and, if it
+        // can't serve it, steer to an arch-verified backend (else None →
+        // caller degrades to CHORD_LLM_URL). An unknown arch never hard-fails.
+        let selected = self.backend_for(model)?;
+        if backends::kind_can_serve_arch(selected.kind, arch) {
+            Some(selected)
+        } else {
+            self.arch_safe_fallback(arch)
+        }
     }
 
     /// CHRD phase3: whether a defined backend NAME can serve architecture
@@ -683,21 +694,28 @@ impl ModelRegistry {
 
     /// CHRD phase3 (profiler / task-26): record the ARCHITECTURE a MINT sweep
     /// observed a model actually served under, so arch-aware routing becomes
-    /// DATA-DRIVEN rather than guessed. Additive and non-blocking: a blank arch
-    /// or an unknown model is a no-op (returns `false`) — a profiler failure
-    /// never breaks a sweep or a route. Persisting is the caller's job
-    /// (`save()`), matching the mutate-then-save pattern.
+    /// DATA-DRIVEN rather than guessed.
+    ///
+    /// SET-IF-ABSENT (non-clobbering), matching `apply_reconcile`'s contract:
+    /// arch is written ONLY when the record currently has none (`None`/empty).
+    /// A record whose arch is already populated — by reconcile, or by an earlier
+    /// profiler task — is left untouched (returns `false`). This is what makes a
+    /// DELAYED, detached serve-time profiler task safe: it can never overwrite a
+    /// value reconcile (or another task) already established. A blank arch or an
+    /// unknown model is also a no-op (`false`). Persisting is the caller's job
+    /// (`save()`).
     pub fn record_served_arch(&mut self, model: &str, arch: &str) -> bool {
         let arch = arch.trim();
         if arch.is_empty() {
             return false;
         }
         match self.records.get_mut(model) {
-            Some(rec) => {
+            Some(rec) if rec.arch.as_deref().map(str::is_empty).unwrap_or(true) => {
                 rec.arch = Some(arch.to_string());
                 true
             }
-            None => false,
+            // Already populated (or unknown model) → non-clobbering no-op.
+            _ => false,
         }
     }
 
@@ -3187,6 +3205,125 @@ mod tests {
             reg2.backend_for_arch_aware("gpt-oss:20b", &[], None).is_none(),
             "no arch-capable backend → explicit selection failure, not an incompatible default"
         );
+    }
+
+    #[test]
+    fn untagged_or_unresolved_tag_gptoss_never_gets_a_llama_server_default() {
+        // gpt56 r2 fix 1: the arch invariant must hold on the UNTAGGED and
+        // UNRESOLVED-TAG selection paths too, not only the reject path.
+        use crate::models::backends::{Backend, BackendKind, Hardware};
+        let mk = |name: &str, kind: BackendKind, always_on: bool| Backend {
+            name: name.into(),
+            url: format!("http://127.0.0.1:0/{name}"),
+            hardware: Hardware::Gpu,
+            kind,
+            unit: None,
+            always_on,
+            idle_stop_secs: 0,
+            launch: None,
+            api_key_env: None,
+        };
+        let mk_rec = |name: &str, tag: Option<&str>, arch: &str| ModelRecord {
+            name: name.into(),
+            tier: StorageTier::Warm,
+            local_path: None,
+            archive_path: None,
+            size_bytes: 0,
+            last_loaded: None,
+            last_requested: None,
+            protected: false,
+            managed_by: MANAGED_BY_OLLAMA.to_string(),
+            backend: tag.map(str::to_string),
+            gguf_path: None,
+            rope_scaling: None,
+            rope_scaling_note: None,
+            arch: Some(arch.into()),
+        };
+
+        // Default is a llama-server backend; an arch-capable Ollama backend also
+        // exists. A KNOWN gptoss model selected via backend_for (untagged, or a
+        // tag that names no known backend) must NOT land on the llama-server
+        // default — it must be steered to the arch-capable backend.
+        let tmp = tempdir().unwrap();
+        let mut reg = reg_at(tmp.path(), vec![]);
+        reg.upsert_backend(mk("zdefault", BackendKind::LlamaServer, true));
+        reg.upsert_backend(mk("myollama", BackendKind::Ollama, false));
+        assert_eq!(reg.default_backend().unwrap().name, "zdefault");
+
+        // (a) Untagged (backend == None) → backend_for would return the default.
+        reg.records.insert("gpt-oss:untagged".into(), mk_rec("gpt-oss:untagged", None, "gpt-oss"));
+        assert_eq!(
+            reg.backend_for_arch_aware("gpt-oss:untagged", &[], None).unwrap().name,
+            "myollama",
+            "untagged known-gptoss must not get the llama-server default"
+        );
+        // (b) Tag names a backend that isn't in the catalogue → backend_for
+        //     also falls through to the default.
+        reg.records.insert("gpt-oss:staletag".into(), mk_rec("gpt-oss:staletag", Some("gone"), "gpt-oss"));
+        assert_eq!(
+            reg.backend_for_arch_aware("gpt-oss:staletag", &[], None).unwrap().name,
+            "myollama",
+            "unresolved-tag known-gptoss must not get the llama-server default"
+        );
+        // (c) No regression: an untagged model whose arch IS llama-loadable
+        //     keeps the (llama-server) default unchanged.
+        reg.records.insert("qwen3:untagged".into(), mk_rec("qwen3:untagged", None, "qwen3"));
+        assert_eq!(
+            reg.backend_for_arch_aware("qwen3:untagged", &[], None).unwrap().name,
+            "zdefault",
+            "a llama-loadable untagged model keeps the default (no regression)"
+        );
+
+        // (d) Untagged gptoss with NO arch-capable backend at all → None.
+        let tmp2 = tempdir().unwrap();
+        let mut reg2 = reg_at(tmp2.path(), vec![]);
+        reg2.upsert_backend(mk("zdefault", BackendKind::LlamaServer, true));
+        reg2.records.insert("gpt-oss:untagged".into(), mk_rec("gpt-oss:untagged", None, "gpt-oss"));
+        assert!(
+            reg2.backend_for_arch_aware("gpt-oss:untagged", &[], None).is_none(),
+            "untagged gptoss with nothing arch-capable → explicit None"
+        );
+    }
+
+    #[test]
+    fn record_served_arch_is_set_if_absent_and_never_clobbers() {
+        // gpt56 r2 fix 2: a delayed detached profiler task must NOT overwrite an
+        // arch already established by reconcile (or an earlier task).
+        let tmp = tempdir().unwrap();
+        let mut reg = reg_at(tmp.path(), vec![]);
+        reg.records.insert(
+            "m:1b".into(),
+            ModelRecord {
+                name: "m:1b".into(),
+                tier: StorageTier::Warm,
+                local_path: None,
+                archive_path: None,
+                size_bytes: 0,
+                last_loaded: None,
+                last_requested: None,
+                protected: false,
+                managed_by: MANAGED_BY_OLLAMA.to_string(),
+                backend: None,
+                gguf_path: None,
+                rope_scaling: None,
+                rope_scaling_note: None,
+                arch: Some("qwen3".into()), // already populated (e.g. by reconcile)
+            },
+        );
+        // A late serve-time profiler task tries to write a different arch → refused.
+        assert!(
+            !reg.record_served_arch("m:1b", "gpt-oss"),
+            "must not overwrite an arch already set"
+        );
+        assert_eq!(
+            reg.get("m:1b").unwrap().arch.as_deref(),
+            Some("qwen3"),
+            "existing arch is preserved (non-clobbering)"
+        );
+        // Set-if-absent: a record with an EMPTY arch is treated as absent.
+        reg.records.get_mut("m:1b").unwrap().arch = Some(String::new());
+        assert!(reg.record_served_arch("m:1b", "gpt-oss"));
+        assert_eq!(reg.get("m:1b").unwrap().arch.as_deref(), Some("gpt-oss"));
     }
 
     #[test]
