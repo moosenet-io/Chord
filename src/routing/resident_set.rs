@@ -7199,6 +7199,13 @@ mod tests {
     /// takes two seconds per write, a warm plus a release must still complete in
     /// milliseconds, because the write happens on the writer thread and never
     /// inside the resident-set critical section.
+    ///
+    /// **The two numbers are SUPPOSED to disagree — that is the whole test.** The
+    /// 2s sleep is the INSTRUMENT, not the expectation: if the write were on the
+    /// serving path, warm+release could not possibly finish in under 500ms, so the
+    /// assertion failing is exactly how a regression announces itself. Making the
+    /// bound accommodate the sleep would delete the measurement and leave a test
+    /// that passes whether or not the property holds. Do not "reconcile" them.
     #[tokio::test]
     #[serial_test::serial]
     async fn a_blocking_snapshot_write_never_slows_a_warm_or_a_release() {

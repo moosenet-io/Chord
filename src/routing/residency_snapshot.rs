@@ -287,8 +287,18 @@ impl SnapshotWriter {
             }
         });
 
-        // Depth-one, drop-oldest. Superseding an unwritten snapshot is CORRECT:
-        // it no longer describes the current state.
+        // Depth-one, drop-oldest. Superseding an unwritten snapshot is CORRECT
+        // rather than merely acceptable: the dropped one is BY DEFINITION
+        // superseded by a newer one that does get written, and newer is more true.
+        // There is no ordering in which dropping the older loses information the
+        // reader wanted.
+        //
+        // The one residual case, recorded here so it is not rediscovered: a
+        // snapshot dropped while the writer is in its failure BACKOFF leaves the
+        // on-disk file slightly stale. That is exactly what `written_at` is for —
+        // the reader can see how old the state is and age it out — and it is
+        // strictly better than the pre-CHRD-95 behaviour, where there was no file
+        // and the tool asserted "IDLE".
         let mut q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
         q.queued += 1;
         if q.next.is_some() {
@@ -339,9 +349,14 @@ impl Drop for SnapshotWriter {
         if let Ok(mut q) = self.shared.queue.lock() {
             q.shutdown = true;
         }
-        // Signal and go. Deliberately NOT joined: a join would block the dropping
-        // thread for however long an in-flight write takes, which is the exact
-        // coupling this module exists to prevent.
+        // Signal and go. **Deliberately NOT joined, and this must stay that way.**
+        // A join would block the dropping thread for however long an in-flight
+        // write takes — i.e. it would reintroduce, at shutdown, the exact coupling
+        // to a hung disk that the whole module is structured to avoid, turning a
+        // stalled NFS mount into a process that will not exit. The cost of not
+        // joining is that a snapshot in flight at shutdown may not land, which is
+        // the correct trade: it describes a process that is going away, and the
+        // next Chord to start republishes on its first warm.
         self.shared.cv.notify_all();
     }
 }
@@ -350,6 +365,12 @@ impl Drop for SnapshotWriter {
 struct Worker {
     shared: Arc<Shared>,
     /// Last key CONFIRMED on disk. An identical payload is skipped.
+    ///
+    /// ASSUMPTION: the key is the BODY only, not the destination path. That is
+    /// safe exactly as long as the path is fixed for the process lifetime — it
+    /// comes from `CHORD_RESIDENCY_STATE_PATH`, read per publish but never
+    /// changed at runtime. If the path ever becomes dynamic, this key must
+    /// include it, or an unchanged body would skip the first write to a NEW file.
     last_written: Option<serde_json::Value>,
     /// Last key that FAILED, and when. Kept separate from `last_written` so a
     /// repeated identical payload does not re-attempt doomed IO on every state
@@ -409,7 +430,38 @@ impl Worker {
             }
         }
 
-        match (self.shared.sink)(&job.path, &job.body) {
+        // PANIC ISOLATION. The writer thread is spawned exactly once (`Once`), so
+        // a panic escaping the sink would unwind it and detach the whole mechanism
+        // permanently — and the only symptom would be that snapshots quietly stop
+        // appearing. That is precisely the failure class CHRD-95 exists to remove:
+        // a component that has stopped working while looking fine. (Terminus would
+        // at least say `state=UNKNOWN` rather than lie, but the cause would be
+        // invisible.) So a panicking sink is caught, logged loudly ONCE, and the
+        // thread carries on serving subsequent publishes.
+        //
+        // `AssertUnwindSafe` is sound here: the closure owns `job` outright, the
+        // sink is `Fn` (no interior state we mutate across the boundary), and the
+        // only state that survives a panic is `last_written`/`last_failed` below —
+        // which are updated AFTER the boundary, from the result, never during it.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (self.shared.sink)(&job.path, &job.body)
+        }));
+        let result = match outcome {
+            Ok(r) => r,
+            Err(_) => {
+                // Treated as a failed write: it takes the same backoff, so a sink
+                // that panics deterministically on one payload does not spin.
+                self.last_failed = Some((job.key, Instant::now()));
+                tracing::error!(
+                    reason = %job.reason,
+                    "residency snapshot: the writer PANICKED — snapshot skipped, writer kept alive. \
+                     Residency itself is unaffected; this is a bug in the snapshot path, not the serving path"
+                );
+                return;
+            }
+        };
+
+        match result {
             Ok(()) => {
                 self.last_written = Some(job.key);
                 self.last_failed = None;
@@ -678,6 +730,47 @@ mod tests {
             writes.load(Ordering::SeqCst),
             1,
             "only the first of three identical snapshots should reach the disk"
+        );
+    }
+
+    /// A PANICKING sink must not latch the writer dead. The thread is spawned
+    /// once, so an escaping panic would detach the mechanism permanently and the
+    /// only symptom would be snapshots quietly ceasing — the same "stopped working
+    /// while looking fine" failure this whole change exists to remove.
+    #[test]
+    #[serial_test::serial]
+    fn a_panicking_sink_does_not_kill_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let _g = PathGuard::set(dir.path().join("residency.json").to_str().unwrap());
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let landed = Arc::new(AtomicUsize::new(0));
+        let l = landed.clone();
+        let writer = SnapshotWriter::with_sink(Box::new(move |_, _| {
+            if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("sink panicked on its first call");
+            }
+            l.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+
+        writer.publish(&snap(), "first");
+        assert!(writer.flush(Duration::from_secs(5)), "a panic must not wedge the queue");
+
+        // A DIFFERENT payload, so the failure backoff does not apply.
+        writer.publish(&ResidencySnapshot::new(Vec::new(), None, None), "second");
+        assert!(writer.flush(Duration::from_secs(5)));
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the writer thread must survive the panic and take the next job"
+        );
+        assert_eq!(
+            landed.load(Ordering::SeqCst),
+            1,
+            "and the subsequent write must actually land"
         );
     }
 
