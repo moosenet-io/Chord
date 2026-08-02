@@ -95,12 +95,74 @@ pub struct ModelRecord {
     /// context") or has not run yet.
     #[serde(default)]
     pub rope_scaling_note: Option<String>,
+    /// CHRD phase3: the model's ARCHITECTURE family (e.g. `"gptoss"`, `"qwen3"`,
+    /// `"llama"`), as reported by the model's own GGUF `general.architecture` kv
+    /// ([`ingest_arch`](ModelRegistry::ingest_arch)) or recorded by the MINT
+    /// sweep profiler from the backend that actually served it
+    /// ([`record_served_arch`](ModelRegistry::record_served_arch)).
+    ///
+    /// Drives arch-aware backend selection
+    /// ([`backend_for_arch_aware`](ModelRegistry::backend_for_arch_aware))
+    /// INDEPENDENTLY of the serving-profile DB, so a known-incompatible pairing
+    /// (a gptoss model tagged to a llama-server backend) is rejected even when
+    /// the RoutingMap is empty (DB unreachable). `None` ⇒ arch not yet known —
+    /// the arch guard is inert (unchanged routing), so registries written before
+    /// this field existed deserialize and route exactly as before.
+    #[serde(default)]
+    pub arch: Option<String>,
 }
 
 /// Default for `ModelRecord::managed_by` so registries written before this field existed still
 /// deserialize (every legacy record is an Ollama-managed model).
 fn default_managed_by() -> String {
     "ollama".to_string()
+}
+
+/// CHRD phase3 — the single "is this arch KNOWN?" predicate.
+///
+/// An architecture is KNOWN only when it is present AND nonblank; `None`,
+/// `Some("")`, and whitespace-only all count as UNKNOWN. This matches
+/// [`ModelRecord::set_arch_if_absent`] and the routing arch guard
+/// ([`backends::kind_can_serve_arch`] treats an empty/normalized-away arch as
+/// "no constraint"), so every "is arch known" decision — including the
+/// serve-time profiler's re-derive gate — is consistent: a `Some("")` record is
+/// treated as unresolved and will be (re-)derived, never permanently skipped.
+pub fn arch_is_known(arch: Option<&str>) -> bool {
+    arch.map(str::trim).filter(|s| !s.is_empty()).is_some()
+}
+
+impl ModelRecord {
+    /// CHRD phase3 — the SINGLE arch-write policy: **SET-IF-ABSENT**.
+    ///
+    /// Writes (trimmed) `arch` onto this record ONLY when it currently has none
+    /// (`None` or empty), and returns whether it wrote. A blank input is a
+    /// no-op. EVERY path that populates [`ModelRecord::arch`] — reconcile's
+    /// stamp ([`ModelRegistry::apply_reconcile`]), [`ModelRegistry::ingest_arch`],
+    /// and the serve-time profiler ([`ModelRegistry::record_served_arch`]) —
+    /// routes through here, so no writer can ever clobber an architecture an
+    /// earlier writer already established.
+    ///
+    /// This "first write wins" rule loses no information: every writer derives
+    /// arch from the SAME authoritative source — the model's own GGUF
+    /// `general.architecture` kv — for an IMMUTABLE `name:tag` (a tag maps to
+    /// fixed weights), so a second write would only ever re-assert the same
+    /// value. Collapsing that to a no-op keeps the profiler/reconcile contract
+    /// consistent and avoids racy rewrites. There is deliberately NO
+    /// force/overwrite variant: a genuine re-derive (a model removed and
+    /// re-pulled) is handled by the record being RECREATED fresh on reconcile
+    /// (arch re-derived on insert), never by clobbering in place.
+    pub fn set_arch_if_absent(&mut self, arch: &str) -> bool {
+        let arch = arch.trim();
+        if arch.is_empty() {
+            return false;
+        }
+        if self.arch.as_deref().map(str::is_empty).unwrap_or(true) {
+            self.arch = Some(arch.to_string());
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// `managed_by` value for an Ollama-managed model (the reconcile default).
@@ -289,6 +351,58 @@ struct DiscoveredModel {
     size_bytes: u64,
     /// Epoch seconds of the manifest file's mtime.
     mtime: i64,
+    /// CHRD phase3: the model's architecture (`general.architecture`), derived
+    /// off-lock from its largest LOCAL blob during the slow scan. `None` for
+    /// archive-only scans (no local blob to read) or when the GGUF declares
+    /// none — populated into [`ModelRecord::arch`] by `apply_reconcile`.
+    arch: Option<String>,
+}
+
+/// CHRD phase3: read `general.architecture` from a GGUF blob file, best-effort.
+/// `None` on any error / no-arch / empty. Does file I/O — an OFF-LOCK helper;
+/// never call it while holding the registry `Mutex`.
+fn read_arch_from_gguf(path: &Path) -> Option<String> {
+    let arch = rope_ingest::read_gguf_rope_kv(path)?.architecture?;
+    let arch = arch.trim().to_string();
+    if arch.is_empty() {
+        None
+    } else {
+        Some(arch)
+    }
+}
+
+/// CHRD phase3: given an Ollama manifest LEAF path and the ollama `blobs/` root,
+/// resolve the model's largest layer blob (the GGUF weights) and read its
+/// `general.architecture`. Best-effort / OFF-LOCK. `None` if the manifest is
+/// unreadable, references no blob layers, or the blob has no architecture kv.
+fn derive_arch_from_manifest(leaf: &Path, blobs_root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(leaf).ok()?;
+    let manifest: OllamaManifest = serde_json::from_str(&text).ok()?;
+    // The largest layer by size is the model weights (GGUF); config + projector
+    // layers are far smaller. Skip layers with no digest.
+    let digest = manifest
+        .layers
+        .into_iter()
+        .filter(|l| !l.digest.is_empty())
+        .max_by_key(|l| l.size)?
+        .digest;
+    // Ollama stores content-addressed blobs as `sha256-<hex>` (the manifest
+    // writes the digest as `sha256:<hex>`).
+    let blob = blobs_root.join(digest.replacen(':', "-", 1));
+    read_arch_from_gguf(&blob)
+}
+
+/// CHRD phase3: derive a LOCAL Ollama model's architecture from disk by
+/// reconstructing its manifest leaf under `<local_root>/manifests/…` and reading
+/// its largest blob's `general.architecture`. Best-effort / OFF-LOCK — used by
+/// the serve-time profiler hook ([`crate::models::routing::resolve_and_ensure`])
+/// to backfill arch the first time a model actually serves, when reconcile has
+/// not yet populated it. `None` when the name has no tag, the manifest is not
+/// found at the canonical path, or no architecture is declared.
+pub fn derive_arch_for_local_model(local_root: &Path, model: &str) -> Option<String> {
+    let rel = manifest_rel_path(model)?;
+    let leaf = local_root.join("manifests").join(rel);
+    derive_arch_from_manifest(&leaf, &local_root.join("blobs"))
 }
 
 /// Owned snapshot of the SLOW manifest-tree filesystem scan produced by
@@ -526,25 +640,149 @@ impl ModelRegistry {
         excluded_tiers: &[ServingBackend],
         chosen_tier: Option<ServingBackend>,
     ) -> Option<&Backend> {
-        let tag = self.records.get(model).and_then(|r| r.backend.as_deref());
+        let rec = self.records.get(model);
+        let tag = rec.and_then(|r| r.backend.as_deref());
+        let arch = rec.and_then(|r| r.arch.as_deref());
         if let Some(name) = tag {
-            if let Some(tier) = Self::serving_tier_of_backend(name) {
-                if excluded_tiers.contains(&tier) {
-                    // Stale/bad tag → steer to the chosen usable route, then
-                    // fall back to the default backend if that tier maps to no
-                    // known chord backend.
-                    if let Some(chosen) = chosen_tier {
-                        let chosen_name = Self::backend_name_for_tier(chosen);
+            // A tag is arch-EXCLUDED for this model when EITHER:
+            //  (a) the serving-profile RoutingMap marked its tier excluded
+            //      (DB-driven — needs a live serving profile), OR
+            //  (b) the model's KNOWN architecture cannot be served by this
+            //      backend's runtime (data-driven, DB-INDEPENDENT: fires even
+            //      when the RoutingMap is empty, which closes the gptoss→
+            //      llama-server hang gap the profile-only guard left open when
+            //      the intake DB is unreachable).
+            let tier_excluded = Self::serving_tier_of_backend(name)
+                .map(|tier| excluded_tiers.contains(&tier))
+                .unwrap_or(false);
+            let arch_excluded = !self.backend_name_can_serve_arch(name, arch);
+            if tier_excluded || arch_excluded {
+                // Steer to the chosen usable route — but only if IT too can
+                // serve this model's arch — then fall back to an ARCH-VERIFIED
+                // backend. NEVER blindly return the default: if the configured
+                // default is itself arch-incompatible (e.g. a deployment whose
+                // default is a llama-server backend), routing a gptoss model to
+                // it would re-introduce the exact hang. `arch_safe_fallback`
+                // returns the default only when it can serve the arch, else any
+                // arch-capable backend, else `None` (explicit selection failure
+                // → caller degrades to CHORD_LLM_URL rather than hanging).
+                if let Some(chosen) = chosen_tier {
+                    let chosen_name = Self::backend_name_for_tier(chosen);
+                    if self.backend_name_can_serve_arch(chosen_name, arch) {
                         if let Some(b) = self.backends.get(chosen_name) {
                             return Some(b);
                         }
                     }
-                    return self.default_backend();
                 }
+                return self.arch_safe_fallback(arch);
             }
         }
-        // Not excluded (or unprofiled / unmapped tag) → unchanged behavior.
-        self.backend_for(model)
+        // Not tag-excluded (usable tag, or untagged, or an unresolved/unknown
+        // tag). Select as usual — but the arch invariant must hold on EVERY
+        // path, not just the reject path: `backend_for` can still return an
+        // arch-INCOMPATIBLE default (e.g. an untagged, or unresolved-tag, KNOWN
+        // gptoss model falling through to a llama-server default). Validate the
+        // FINAL selected backend against the model's known arch and, if it
+        // can't serve it, steer to an arch-verified backend (else None →
+        // caller degrades to CHORD_LLM_URL). An unknown arch never hard-fails.
+        let selected = self.backend_for(model)?;
+        if backends::kind_can_serve_arch(selected.kind, arch) {
+            Some(selected)
+        } else {
+            self.arch_safe_fallback(arch)
+        }
+    }
+
+    /// CHRD phase3: whether a defined backend NAME can serve architecture
+    /// `arch`, resolved by its [`BackendKind`]. An unknown backend name or an
+    /// unknown arch (`None`) ⇒ `true` (never hard-fail on missing data). Thin
+    /// wrapper over [`backends::kind_can_serve_arch`].
+    fn backend_name_can_serve_arch(&self, name: &str, arch: Option<&str>) -> bool {
+        match self.backends.get(name) {
+            Some(b) => backends::kind_can_serve_arch(b.kind, arch),
+            None => true,
+        }
+    }
+
+    /// CHRD phase3: an ARCH-VERIFIED fallback backend for the arch-reject path.
+    ///
+    /// Returns the [`default_backend`](Self::default_backend) when it can serve
+    /// `arch`; otherwise the primary `ollama` (if arch-capable), otherwise any
+    /// defined LOCAL (non-`OpenRouter`) backend that can serve `arch`, picked
+    /// deterministically by name. Returns `None` when NOTHING defined can serve
+    /// the arch — the caller then fails the selection explicitly (degrading to
+    /// `CHORD_LLM_URL`) rather than dispatching to an incompatible backend. A
+    /// remote (`OpenRouter`) backend is never chosen as an IMPLICIT fallback —
+    /// same rule as [`default_backend`](Self::default_backend): it is only ever
+    /// reached by an explicit per-model tag.
+    fn arch_safe_fallback(&self, arch: Option<&str>) -> Option<&Backend> {
+        if let Some(b) = self.default_backend() {
+            if backends::kind_can_serve_arch(b.kind, arch) {
+                return Some(b);
+            }
+        }
+        if let Some(b) = self.backends.get("ollama") {
+            if backends::kind_can_serve_arch(b.kind, arch) {
+                return Some(b);
+            }
+        }
+        let mut names: Vec<&String> = self
+            .backends
+            .iter()
+            .filter(|(_, b)| {
+                b.kind != backends::BackendKind::OpenRouter
+                    && backends::kind_can_serve_arch(b.kind, arch)
+            })
+            .map(|(n, _)| n)
+            .collect();
+        names.sort();
+        names.first().and_then(|n| self.backends.get(*n))
+    }
+
+    /// CHRD phase3 (profiler / task-26): record the ARCHITECTURE a MINT sweep
+    /// observed a model actually served under, so arch-aware routing becomes
+    /// DATA-DRIVEN rather than guessed.
+    ///
+    /// SET-IF-ABSENT (non-clobbering), matching `apply_reconcile`'s contract:
+    /// arch is written ONLY when the record currently has none (`None`/empty).
+    /// A record whose arch is already populated — by reconcile, or by an earlier
+    /// profiler task — is left untouched (returns `false`). This is what makes a
+    /// DELAYED, detached serve-time profiler task safe: it can never overwrite a
+    /// value reconcile (or another task) already established. A blank arch or an
+    /// unknown model is also a no-op (`false`). Persisting is the caller's job
+    /// (`save()`).
+    pub fn record_served_arch(&mut self, model: &str, arch: &str) -> bool {
+        // Routes through the single SET-IF-ABSENT policy helper (see
+        // `ModelRecord::set_arch_if_absent`) — never clobbers, so a delayed
+        // detached profiler task can't overwrite reconcile's value.
+        match self.records.get_mut(model) {
+            Some(rec) => rec.set_arch_if_absent(arch),
+            None => false,
+        }
+    }
+
+    /// CHRD phase3: best-effort derive a model's architecture and stamp it onto
+    /// `rec.arch`, returning the derived arch. Reads the model's OWN GGUF
+    /// `general.architecture` kv — from an explicit `gguf_path` if set, else by
+    /// resolving the largest LOCAL Ollama blob (so it also works for the
+    /// Ollama-managed models reconcile discovers, which carry no `gguf_path`).
+    /// No-op (`None`) when the model is unknown, no GGUF is resolvable, or the
+    /// GGUF is unreadable / declares no architecture — it never fabricates one
+    /// and never fails. NOTE: does file I/O; call OFF the request hot path.
+    /// Persisting is the caller's job (`save()`).
+    pub fn ingest_arch(&mut self, name: &str) -> Option<String> {
+        let rec = self.records.get(name)?;
+        let arch = match rec.gguf_path.clone() {
+            Some(path) => read_arch_from_gguf(Path::new(&path))?,
+            None => derive_arch_for_local_model(&self.local_path, name)?,
+        };
+        // SET-IF-ABSENT via the single policy helper — an already-populated arch
+        // is preserved (this derives the SAME value from the GGUF anyway). The
+        // derived value is still returned so callers see what the GGUF declared.
+        if let Some(rec) = self.records.get_mut(name) {
+            rec.set_arch_if_absent(&arch);
+        }
+        Some(arch)
     }
 
     /// Set (or clear) a model's backend tag. Returns false if the model is
@@ -610,12 +848,16 @@ impl ModelRegistry {
     /// control API. The lock must NEVER be held across FS/NFS I/O; only across
     /// the fast in-memory apply.
     pub fn scan_disk(local_path: PathBuf, archive_path: PathBuf) -> ReconcileScan {
-        let local = scan_manifest_tree(&local_path.join("manifests"));
+        // Local scan derives arch off-lock from each model's largest local blob
+        // (CHRD phase3); the archive scan passes no blobs root — cold models are
+        // never read over NFS just to derive arch (they get it once local).
+        let local_blobs = local_path.join("blobs");
+        let local = scan_manifest_tree(&local_path.join("manifests"), Some(&local_blobs));
         // `exists()` on an NFS mount is itself a (cheap) stat; do it here, off
         // the lock, so `apply_reconcile` never touches the filesystem.
         let archive_present = archive_path.exists();
         let archive = if archive_present {
-            scan_manifest_tree(&archive_path.join("manifests"))
+            scan_manifest_tree(&archive_path.join("manifests"), None)
         } else {
             Vec::new()
         };
@@ -660,28 +902,45 @@ impl ModelRegistry {
                     rec.local_path = Some(local_root);
                     rec.size_bytes = m.size_bytes;
                     rec.protected = rec.protected || protected;
+                    // CHRD phase3: backfill arch derived off-lock by the scan,
+                    // via the single SET-IF-ABSENT policy helper — never clobbers
+                    // an arch a profiler/serve-hook (or an earlier reconcile)
+                    // already recorded. This is what populates `arch` for every
+                    // local model through the normal reconcile flow (startup +
+                    // every eviction-sweep tick + the control reconcile endpoint).
+                    if let Some(arch) = &m.arch {
+                        rec.set_arch_if_absent(arch);
+                    }
                 }
                 None => {
-                    self.records.insert(
-                        m.name.clone(),
-                        ModelRecord {
-                            name: m.name.clone(),
-                            tier: StorageTier::Warm,
-                            local_path: Some(local_root),
-                            archive_path: None,
-                            size_bytes: m.size_bytes,
-                            last_loaded: None,
-                            // A newly-discovered local model has just been warmed
-                            // (pulled) into the local tier — treat discovery as the
-                            // last-access time so it reads ~0h idle, never the
-                            // possibly-ancient manifest mtime (CHRD-75).
-                            last_requested: Some(now_epoch_secs()),
-                            protected,
-                            managed_by: MANAGED_BY_OLLAMA.to_string(),
-                            backend: None, gguf_path: None,
-                        rope_scaling: None, rope_scaling_note: None,
-                        },
-                    );
+                    // Fresh record: build with no arch, then stamp via the same
+                    // set-if-absent helper so EVERY arch-write path is uniform
+                    // (a brand-new record is trivially "absent", so this always
+                    // takes the scan's derived value when present).
+                    let mut new_rec = ModelRecord {
+                        name: m.name.clone(),
+                        tier: StorageTier::Warm,
+                        local_path: Some(local_root),
+                        archive_path: None,
+                        size_bytes: m.size_bytes,
+                        last_loaded: None,
+                        // A newly-discovered local model has just been warmed
+                        // (pulled) into the local tier — treat discovery as the
+                        // last-access time so it reads ~0h idle, never the
+                        // possibly-ancient manifest mtime (CHRD-75).
+                        last_requested: Some(now_epoch_secs()),
+                        protected,
+                        managed_by: MANAGED_BY_OLLAMA.to_string(),
+                        backend: None,
+                        gguf_path: None,
+                        rope_scaling: None,
+                        rope_scaling_note: None,
+                        arch: None,
+                    };
+                    if let Some(arch) = &m.arch {
+                        new_rec.set_arch_if_absent(arch);
+                    }
+                    self.records.insert(m.name.clone(), new_rec);
                 }
             }
         }
@@ -735,7 +994,7 @@ impl ModelRegistry {
                                 protected,
                                 managed_by: MANAGED_BY_OLLAMA.to_string(),
                                 backend: None, gguf_path: None,
-                        rope_scaling: None, rope_scaling_note: None,
+                        rope_scaling: None, rope_scaling_note: None, arch: None,
                             },
                         );
                     }
@@ -826,7 +1085,7 @@ impl ModelRegistry {
                         protected: false,
                         managed_by: managed_by.to_string(),
                         backend: None, gguf_path: None,
-                        rope_scaling: None, rope_scaling_note: None,
+                        rope_scaling: None, rope_scaling_note: None, arch: None,
                     },
                 );
             }
@@ -913,6 +1172,7 @@ impl ModelRegistry {
                         gguf_path: None,
                         rope_scaling: None,
                         rope_scaling_note: None,
+                        arch: None,
                     },
                 );
             }
@@ -1301,7 +1561,7 @@ impl ModelRegistry {
 /// otherwise `<namespace>/<model>:<tag>`. The registry/host component
 /// (`registry.ollama.ai`, `hf.co`, …) is not part of the name. Returns an empty
 /// vec if the root does not exist.
-fn scan_manifest_tree(root: &Path) -> Vec<DiscoveredModel> {
+fn scan_manifest_tree(root: &Path, blobs_root: Option<&Path>) -> Vec<DiscoveredModel> {
     let mut out = Vec::new();
     if !root.exists() {
         return out;
@@ -1336,10 +1596,14 @@ fn scan_manifest_tree(root: &Path) -> Vec<DiscoveredModel> {
         };
 
         let size_bytes = parse_manifest_size(&leaf);
+        // CHRD phase3: derive arch off-lock from the largest local blob, only
+        // for a LOCAL scan (blobs present). Best-effort — never fails the scan.
+        let arch = blobs_root.and_then(|b| derive_arch_from_manifest(&leaf, b));
         out.push(DiscoveredModel {
             name,
             size_bytes,
             mtime: mtime_epoch_secs(&leaf),
+            arch,
         });
     }
     out
@@ -1680,7 +1944,7 @@ mod tests {
                 protected: false,
                 managed_by: MANAGED_BY_OLLAMA.to_string(),
                 backend: None, gguf_path: None,
-                        rope_scaling: None, rope_scaling_note: None,
+                        rope_scaling: None, rope_scaling_note: None, arch: None,
             },
         );
         reg.reconcile();
@@ -2449,6 +2713,7 @@ mod tests {
                 gguf_path: None,
                 rope_scaling: None,
                 rope_scaling_note: None,
+                arch: None,
             }
         }
 
@@ -2529,5 +2794,699 @@ mod tests {
             "llama-gpu",
             "unprofiled model keeps its tag (unchanged backend_for behavior)"
         );
+    }
+
+    // ── CHRD phase3: back-compat deserialization of pre-phase3 registries ─────
+
+    #[test]
+    fn legacy_registry_json_deserializes_with_defaulted_new_fields() {
+        // A pre-managed_by / pre-arch bare-map registry (the OLDEST on-disk
+        // format): only the always-present fields, tagged to the retired
+        // `ollama-cpu` backend. It MUST still parse — every field added since
+        // (managed_by, backend, gguf_path, rope_scaling*, arch) is
+        // `#[serde(default)]`, so an old registry loads without a hard error.
+        let legacy = r#"{
+            "legacy-model:1b": {
+                "name": "legacy-model:1b",
+                "tier": "warm",
+                "local_path": null,
+                "archive_path": null,
+                "size_bytes": 123,
+                "last_loaded": null,
+                "last_requested": null,
+                "protected": false,
+                "backend": "ollama-cpu"
+            }
+        }"#;
+        let (records, backends) = parse_registry_file(legacy).expect("legacy json parses");
+        assert!(backends.is_empty(), "bare-map legacy file has no backends section");
+        let rec = records.get("legacy-model:1b").expect("legacy record loaded");
+        assert_eq!(rec.arch, None, "arch defaults to None on an old registry");
+        assert_eq!(rec.managed_by, MANAGED_BY_OLLAMA, "managed_by defaults to ollama");
+        assert_eq!(rec.backend.as_deref(), Some("ollama-cpu"), "old ollama-cpu tag preserved verbatim");
+        assert_eq!(rec.rope_scaling, None);
+    }
+
+    #[test]
+    fn retired_ollama_cpu_tag_resolves_to_default_backend_not_error() {
+        use crate::models::backends::{Backend, BackendKind, Hardware};
+        // The unified-GTT cleanup removed the `ollama-cpu` backend from the
+        // seeded catalogue, but a model may still carry the retired tag on disk.
+        // It must map to the unified representation — resolve to the default
+        // (ollama) backend — NEVER hard-fail (None) or panic.
+        let tmp = tempdir().unwrap();
+        let mut reg = reg_at(tmp.path(), vec![]);
+        reg.upsert_backend(Backend {
+            name: "ollama".into(),
+            url: "http://127.0.0.1:11434".into(),
+            hardware: Hardware::Gpu,
+            kind: BackendKind::Ollama,
+            unit: Some("ollama.service".into()),
+            always_on: true,
+            idle_stop_secs: 0,
+            launch: None,
+            api_key_env: None,
+        });
+        let rec = ModelRecord {
+            name: "legacy-model:1b".into(),
+            tier: StorageTier::Warm,
+            local_path: None,
+            archive_path: None,
+            size_bytes: 0,
+            last_loaded: None,
+            last_requested: None,
+            protected: false,
+            managed_by: MANAGED_BY_OLLAMA.to_string(),
+            backend: Some("ollama-cpu".into()), // retired tag, not in catalogue
+            gguf_path: None,
+            rope_scaling: None,
+            rope_scaling_note: None,
+            arch: None,
+        };
+        reg.records.insert("legacy-model:1b".into(), rec);
+
+        // Plain backend_for falls back to the default (ollama) — the retired tag
+        // names no known backend.
+        assert_eq!(reg.backend_for("legacy-model:1b").unwrap().name, "ollama");
+        // The arch-aware resolver (empty RoutingMap, no arch) is identical.
+        assert_eq!(
+            reg.backend_for_arch_aware("legacy-model:1b", &[], None)
+                .unwrap()
+                .name,
+            "ollama"
+        );
+    }
+
+    // ── CHRD phase3: DB-INDEPENDENT arch guard (empty RoutingMap) ─────────────
+
+    #[test]
+    fn arch_guard_rejects_gptoss_on_llama_gpu_without_any_routing_map() {
+        use crate::models::backends::{Backend, BackendKind, Hardware};
+        let tmp = tempdir().unwrap();
+        let mut reg = reg_at(tmp.path(), vec![]);
+        let mk = |name: &str, kind: BackendKind| Backend {
+            name: name.into(),
+            url: format!("http://127.0.0.1:0/{name}"),
+            hardware: Hardware::Gpu,
+            kind,
+            unit: None,
+            always_on: name == "ollama",
+            idle_stop_secs: 0,
+            launch: None,
+            api_key_env: None,
+        };
+        reg.upsert_backend(mk("llama-gpu", BackendKind::LlamaServer));
+        reg.upsert_backend(mk("ollama", BackendKind::Ollama));
+
+        let mk_rec = |name: &str, tag: &str, arch: Option<&str>| ModelRecord {
+            name: name.into(),
+            tier: StorageTier::Warm,
+            local_path: None,
+            archive_path: None,
+            size_bytes: 0,
+            last_loaded: None,
+            last_requested: None,
+            protected: false,
+            managed_by: MANAGED_BY_OLLAMA.to_string(),
+            backend: Some(tag.into()),
+            gguf_path: None,
+            rope_scaling: None,
+            rope_scaling_note: None,
+            arch: arch.map(str::to_string),
+        };
+        // gptoss tagged llama-gpu, arch KNOWN — but NO RoutingMap rows at all
+        // (empty excluded/None chosen: the DB-unreachable case). The arch guard
+        // must still steer it off the arch-incompatible llama-gpu backend.
+        reg.records.insert(
+            "gpt-oss:20b".into(),
+            mk_rec("gpt-oss:20b", "llama-gpu", Some("gpt-oss")),
+        );
+        // A llama-loadable arch on llama-gpu is preserved (no regression).
+        reg.records.insert(
+            "qwen3:8b".into(),
+            mk_rec("qwen3:8b", "llama-gpu", Some("qwen3")),
+        );
+        // Unknown arch (None) is never hard-failed — keeps its tag.
+        reg.records.insert(
+            "mystery:1b".into(),
+            mk_rec("mystery:1b", "llama-gpu", None),
+        );
+
+        assert_eq!(
+            reg.backend_for_arch_aware("gpt-oss:20b", &[], None).unwrap().name,
+            "ollama",
+            "gptoss must NOT dispatch to llama-gpu even with an empty RoutingMap"
+        );
+        assert_eq!(
+            reg.backend_for_arch_aware("qwen3:8b", &[], None).unwrap().name,
+            "llama-gpu",
+            "a llama-loadable arch keeps its llama-gpu tag (no regression)"
+        );
+        assert_eq!(
+            reg.backend_for_arch_aware("mystery:1b", &[], None).unwrap().name,
+            "llama-gpu",
+            "unknown arch never hard-fails — unchanged behavior"
+        );
+    }
+
+    #[test]
+    fn every_real_backend_shape_still_resolves_when_tagged() {
+        // Deliverable gate: every currently-configured real backend still
+        // resolves for a model explicitly tagged to it. Uses the exact backend
+        // shapes seed_from_env produces (kinds/always_on), built deterministically
+        // to avoid cross-test env races.
+        use crate::models::backends::{Backend, BackendKind, Hardware, LaunchSpec};
+        let tmp = tempdir().unwrap();
+        let mut reg = reg_at(tmp.path(), vec![]);
+        let base = |name: &str, kind: BackendKind, hw: Hardware, always_on: bool| Backend {
+            name: name.into(),
+            url: format!("http://127.0.0.1:0/{name}"),
+            hardware: hw,
+            kind,
+            unit: None,
+            always_on,
+            idle_stop_secs: 0,
+            launch: None,
+            api_key_env: None,
+        };
+        reg.upsert_backend(base("ollama", BackendKind::Ollama, Hardware::Gpu, true));
+        reg.upsert_backend(base("lemonade-coder", BackendKind::LlamaServer, Hardware::Gpu, false));
+        let mut lg = base("llama-gpu", BackendKind::LlamaServer, Hardware::Gpu, false);
+        lg.launch = Some(LaunchSpec {
+            bin: "/x/llama-server".into(),
+            args: vec![],
+            model_arg: "-m".into(),
+            model_from: "ollama-blob".into(),
+        });
+        reg.upsert_backend(lg);
+        reg.upsert_backend(base("vulkan", BackendKind::LlamaServer, Hardware::Gpu, false));
+        let mut or = base("openrouter", BackendKind::OpenRouter, Hardware::Cpu, true);
+        or.api_key_env = Some("OPENROUTER_API_KEY_CHORDHARMONY".into());
+        reg.upsert_backend(or);
+
+        // A model tagged to each backend resolves to THAT backend. For llama-server
+        // backends use a llama-loadable arch so the phase3 arch guard is a no-op.
+        for name in ["ollama", "lemonade-coder", "llama-gpu", "vulkan", "openrouter"] {
+            let model = format!("m-{name}:1b");
+            reg.records.insert(
+                model.clone(),
+                ModelRecord {
+                    name: model.clone(),
+                    tier: StorageTier::Warm,
+                    local_path: None,
+                    archive_path: None,
+                    size_bytes: 0,
+                    last_loaded: None,
+                    last_requested: None,
+                    protected: false,
+                    managed_by: MANAGED_BY_OLLAMA.to_string(),
+                    backend: Some(name.to_string()),
+                    gguf_path: None,
+                    rope_scaling: None,
+                    rope_scaling_note: None,
+                    arch: Some("qwen3".to_string()),
+                },
+            );
+            assert_eq!(
+                reg.backend_for(&model).unwrap().name,
+                name,
+                "explicit tag resolves to its backend: {name}"
+            );
+            assert_eq!(
+                reg.backend_for_arch_aware(&model, &[], None).unwrap().name,
+                name,
+                "arch-aware resolve preserves a valid backend tag: {name}"
+            );
+        }
+    }
+
+    // ── CHRD phase3: profiler recording ──────────────────────────────────────
+
+    #[test]
+    fn record_served_arch_is_additive_and_non_blocking() {
+        let tmp = tempdir().unwrap();
+        let mut reg = reg_at(tmp.path(), vec![]);
+        reg.records.insert(
+            "m:1b".into(),
+            ModelRecord {
+                name: "m:1b".into(),
+                tier: StorageTier::Warm,
+                local_path: None,
+                archive_path: None,
+                size_bytes: 0,
+                last_loaded: None,
+                last_requested: None,
+                protected: false,
+                managed_by: MANAGED_BY_OLLAMA.to_string(),
+                backend: None,
+                gguf_path: None,
+                rope_scaling: None,
+                rope_scaling_note: None,
+                arch: None,
+            },
+        );
+        // Known model, real arch → recorded.
+        assert!(reg.record_served_arch("m:1b", " gptoss "));
+        assert_eq!(reg.get("m:1b").unwrap().arch.as_deref(), Some("gptoss"));
+        // Blank arch → no-op (never clobbers with garbage).
+        assert!(!reg.record_served_arch("m:1b", "   "));
+        assert_eq!(reg.get("m:1b").unwrap().arch.as_deref(), Some("gptoss"));
+        // Unknown model → no-op, no panic.
+        assert!(!reg.record_served_arch("nope:1b", "llama"));
+    }
+
+    /// Write a minimal valid GGUF file carrying a single
+    /// `general.architecture` string kv (enough for the phase3 arch reader).
+    fn write_gguf_with_arch(path: &Path, arch: &str) {
+        const GGUF_TYPE_STRING: u32 = 8;
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes()); // version
+        buf.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        buf.extend_from_slice(&1u64.to_le_bytes()); // kv_count
+        let key = "general.architecture";
+        buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        buf.extend_from_slice(key.as_bytes());
+        buf.extend_from_slice(&GGUF_TYPE_STRING.to_le_bytes());
+        buf.extend_from_slice(&(arch.len() as u64).to_le_bytes());
+        buf.extend_from_slice(arch.as_bytes());
+        fs::write(path, &buf).unwrap();
+    }
+
+    /// Lay down a LOCAL Ollama model: the GGUF blob (as the largest layer) plus
+    /// a manifest leaf pointing at it, under `<local_root>/{blobs,manifests}`.
+    /// Uses a distinct hex digest per model so blobs don't collide.
+    fn write_local_ollama_model_with_arch(local_root: &Path, model: &str, tag: &str, arch: &str) {
+        let blobs = local_root.join("blobs");
+        fs::create_dir_all(&blobs).unwrap();
+        // Deterministic 64-hex digest derived from the model name.
+        let hex: String = model
+            .bytes()
+            .flat_map(|b| format!("{:02x}", b).into_bytes())
+            .map(|c| c as char)
+            .chain(std::iter::repeat('0'))
+            .take(64)
+            .collect();
+        let gguf = blobs.join(format!("sha256-{hex}"));
+        write_gguf_with_arch(&gguf, arch);
+        let gguf_size = fs::metadata(&gguf).unwrap().len();
+        // Manifest leaf with a small config layer + the (largest) GGUF layer.
+        let dir = local_root
+            .join("manifests")
+            .join("registry.ollama.ai")
+            .join("library")
+            .join(model);
+        fs::create_dir_all(&dir).unwrap();
+        let body = serde_json::json!({
+            "config": { "size": 4u64, "digest": "sha256:cccc" },
+            "layers": [
+                { "size": 2u64, "digest": "sha256:small" },
+                { "size": gguf_size, "digest": format!("sha256:{hex}") },
+            ],
+        });
+        fs::write(dir.join(tag), serde_json::to_string(&body).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn derive_arch_for_local_model_reads_largest_blob() {
+        let tmp = tempdir().unwrap();
+        let local = tmp.path().join("local");
+        write_local_ollama_model_with_arch(&local, "qwen3", "8b", "qwen3");
+        assert_eq!(
+            derive_arch_for_local_model(&local, "qwen3:8b").as_deref(),
+            Some("qwen3")
+        );
+        // Unknown model / no manifest → None (best-effort, never panics).
+        assert_eq!(derive_arch_for_local_model(&local, "nope:1b"), None);
+    }
+
+    #[test]
+    fn reconcile_populates_arch_from_gguf_through_normal_flow() {
+        // The PRIMARY profiler wiring: a plain reconcile() (scan_disk →
+        // apply_reconcile, the same path startup + every eviction-sweep tick +
+        // the control reconcile endpoint run) must populate `arch` from each
+        // local model's own GGUF — proving arch does NOT stay None forever.
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        write_local_ollama_model_with_arch(&base.join("local"), "gpt-oss", "20b", "gpt-oss");
+        write_local_ollama_model_with_arch(&base.join("local"), "qwen3", "8b", "qwen3");
+
+        let mut reg = reg_at(base, vec![]);
+        reg.reconcile();
+
+        assert_eq!(reg.get("gpt-oss:20b").unwrap().arch.as_deref(), Some("gpt-oss"));
+        assert_eq!(reg.get("qwen3:8b").unwrap().arch.as_deref(), Some("qwen3"));
+
+        // And the populated arch actually ACTIVATES the DB-independent guard:
+        // tag the gptoss model to llama-gpu and confirm it is steered off it.
+        use crate::models::backends::{Backend, BackendKind, Hardware};
+        let mk = |name: &str, kind: BackendKind, always_on: bool| Backend {
+            name: name.into(),
+            url: format!("http://127.0.0.1:0/{name}"),
+            hardware: Hardware::Gpu,
+            kind,
+            unit: None,
+            always_on,
+            idle_stop_secs: 0,
+            launch: None,
+            api_key_env: None,
+        };
+        reg.upsert_backend(mk("llama-gpu", BackendKind::LlamaServer, false));
+        reg.upsert_backend(mk("ollama", BackendKind::Ollama, true));
+        assert!(reg.set_model_backend("gpt-oss:20b", Some("llama-gpu".into())));
+        assert_eq!(
+            reg.backend_for_arch_aware("gpt-oss:20b", &[], None).unwrap().name,
+            "ollama",
+            "reconcile-populated arch must steer gptoss off llama-gpu"
+        );
+    }
+
+    #[test]
+    fn ingest_arch_resolves_local_blob_when_no_gguf_path() {
+        // ingest_arch must work for an Ollama-managed record that carries NO
+        // gguf_path, by resolving the largest local blob (the reconcile-discovered
+        // shape). local_root here is the registry's own local_path (reg_at uses
+        // <dir>/local), which ingest_arch consults.
+        let tmp = tempdir().unwrap();
+        write_local_ollama_model_with_arch(&tmp.path().join("local"), "llama3", "8b", "llama");
+        let mut reg = reg_at(tmp.path(), vec![]);
+        reg.records.insert(
+            "llama3:8b".into(),
+            ModelRecord {
+                name: "llama3:8b".into(),
+                tier: StorageTier::Warm,
+                local_path: Some(tmp.path().join("local").to_string_lossy().to_string()),
+                archive_path: None,
+                size_bytes: 0,
+                last_loaded: None,
+                last_requested: None,
+                protected: false,
+                managed_by: MANAGED_BY_OLLAMA.to_string(),
+                backend: None,
+                gguf_path: None, // no explicit path → must resolve from blob
+                rope_scaling: None,
+                rope_scaling_note: None,
+                arch: None,
+            },
+        );
+        assert_eq!(reg.ingest_arch("llama3:8b").as_deref(), Some("llama"));
+        assert_eq!(reg.get("llama3:8b").unwrap().arch.as_deref(), Some("llama"));
+    }
+
+    // ── CHRD phase3: arch-VERIFIED reject fallback (gpt56 fix 2) ──────────────
+
+    #[test]
+    fn reject_fallback_never_returns_an_arch_incompatible_default() {
+        use crate::models::backends::{Backend, BackendKind, Hardware};
+        let mk = |name: &str, kind: BackendKind, always_on: bool| Backend {
+            name: name.into(),
+            url: format!("http://127.0.0.1:0/{name}"),
+            hardware: Hardware::Gpu,
+            kind,
+            unit: None,
+            always_on,
+            idle_stop_secs: 0,
+            launch: None,
+            api_key_env: None,
+        };
+        let mk_rec = |name: &str, tag: &str, arch: &str| ModelRecord {
+            name: name.into(),
+            tier: StorageTier::Warm,
+            local_path: None,
+            archive_path: None,
+            size_bytes: 0,
+            last_loaded: None,
+            last_requested: None,
+            protected: false,
+            managed_by: MANAGED_BY_OLLAMA.to_string(),
+            backend: Some(tag.into()),
+            gguf_path: None,
+            rope_scaling: None,
+            rope_scaling_note: None,
+            arch: Some(arch.into()),
+        };
+
+        // Case A: the configured DEFAULT is itself a llama-server backend (no
+        // `ollama`-named backend; the always_on one is llama-server), but an
+        // arch-capable Ollama-kind backend also exists. A gptoss model tagged to
+        // the llama-server default must be steered to the arch-capable backend,
+        // NOT blindly returned to the incompatible default.
+        let tmp = tempdir().unwrap();
+        let mut reg = reg_at(tmp.path(), vec![]);
+        reg.upsert_backend(mk("zdefault", BackendKind::LlamaServer, true));
+        reg.upsert_backend(mk("myollama", BackendKind::Ollama, false));
+        // Sanity: default_backend() would be the llama-server one here.
+        assert_eq!(reg.default_backend().unwrap().name, "zdefault");
+        reg.records.insert("gpt-oss:20b".into(), mk_rec("gpt-oss:20b", "zdefault", "gpt-oss"));
+        assert_eq!(
+            reg.backend_for_arch_aware("gpt-oss:20b", &[], None).unwrap().name,
+            "myollama",
+            "must pick an arch-capable backend, never the incompatible default"
+        );
+
+        // Case B: the ONLY backend is llama-server (nothing can serve gptoss).
+        // Selection must FAIL explicitly (None) rather than return the
+        // incompatible backend (caller then degrades to CHORD_LLM_URL).
+        let tmp2 = tempdir().unwrap();
+        let mut reg2 = reg_at(tmp2.path(), vec![]);
+        reg2.upsert_backend(mk("zdefault", BackendKind::LlamaServer, true));
+        reg2.records.insert("gpt-oss:20b".into(), mk_rec("gpt-oss:20b", "zdefault", "gpt-oss"));
+        assert!(
+            reg2.backend_for_arch_aware("gpt-oss:20b", &[], None).is_none(),
+            "no arch-capable backend → explicit selection failure, not an incompatible default"
+        );
+    }
+
+    #[test]
+    fn untagged_or_unresolved_tag_gptoss_never_gets_a_llama_server_default() {
+        // gpt56 r2 fix 1: the arch invariant must hold on the UNTAGGED and
+        // UNRESOLVED-TAG selection paths too, not only the reject path.
+        use crate::models::backends::{Backend, BackendKind, Hardware};
+        let mk = |name: &str, kind: BackendKind, always_on: bool| Backend {
+            name: name.into(),
+            url: format!("http://127.0.0.1:0/{name}"),
+            hardware: Hardware::Gpu,
+            kind,
+            unit: None,
+            always_on,
+            idle_stop_secs: 0,
+            launch: None,
+            api_key_env: None,
+        };
+        let mk_rec = |name: &str, tag: Option<&str>, arch: &str| ModelRecord {
+            name: name.into(),
+            tier: StorageTier::Warm,
+            local_path: None,
+            archive_path: None,
+            size_bytes: 0,
+            last_loaded: None,
+            last_requested: None,
+            protected: false,
+            managed_by: MANAGED_BY_OLLAMA.to_string(),
+            backend: tag.map(str::to_string),
+            gguf_path: None,
+            rope_scaling: None,
+            rope_scaling_note: None,
+            arch: Some(arch.into()),
+        };
+
+        // Default is a llama-server backend; an arch-capable Ollama backend also
+        // exists. A KNOWN gptoss model selected via backend_for (untagged, or a
+        // tag that names no known backend) must NOT land on the llama-server
+        // default — it must be steered to the arch-capable backend.
+        let tmp = tempdir().unwrap();
+        let mut reg = reg_at(tmp.path(), vec![]);
+        reg.upsert_backend(mk("zdefault", BackendKind::LlamaServer, true));
+        reg.upsert_backend(mk("myollama", BackendKind::Ollama, false));
+        assert_eq!(reg.default_backend().unwrap().name, "zdefault");
+
+        // (a) Untagged (backend == None) → backend_for would return the default.
+        reg.records.insert("gpt-oss:untagged".into(), mk_rec("gpt-oss:untagged", None, "gpt-oss"));
+        assert_eq!(
+            reg.backend_for_arch_aware("gpt-oss:untagged", &[], None).unwrap().name,
+            "myollama",
+            "untagged known-gptoss must not get the llama-server default"
+        );
+        // (b) Tag names a backend that isn't in the catalogue → backend_for
+        //     also falls through to the default.
+        reg.records.insert("gpt-oss:staletag".into(), mk_rec("gpt-oss:staletag", Some("gone"), "gpt-oss"));
+        assert_eq!(
+            reg.backend_for_arch_aware("gpt-oss:staletag", &[], None).unwrap().name,
+            "myollama",
+            "unresolved-tag known-gptoss must not get the llama-server default"
+        );
+        // (c) No regression: an untagged model whose arch IS llama-loadable
+        //     keeps the (llama-server) default unchanged.
+        reg.records.insert("qwen3:untagged".into(), mk_rec("qwen3:untagged", None, "qwen3"));
+        assert_eq!(
+            reg.backend_for_arch_aware("qwen3:untagged", &[], None).unwrap().name,
+            "zdefault",
+            "a llama-loadable untagged model keeps the default (no regression)"
+        );
+
+        // (d) Untagged gptoss with NO arch-capable backend at all → None.
+        let tmp2 = tempdir().unwrap();
+        let mut reg2 = reg_at(tmp2.path(), vec![]);
+        reg2.upsert_backend(mk("zdefault", BackendKind::LlamaServer, true));
+        reg2.records.insert("gpt-oss:untagged".into(), mk_rec("gpt-oss:untagged", None, "gpt-oss"));
+        assert!(
+            reg2.backend_for_arch_aware("gpt-oss:untagged", &[], None).is_none(),
+            "untagged gptoss with nothing arch-capable → explicit None"
+        );
+    }
+
+    #[test]
+    fn record_served_arch_is_set_if_absent_and_never_clobbers() {
+        // gpt56 r2 fix 2: a delayed detached profiler task must NOT overwrite an
+        // arch already established by reconcile (or an earlier task).
+        let tmp = tempdir().unwrap();
+        let mut reg = reg_at(tmp.path(), vec![]);
+        reg.records.insert(
+            "m:1b".into(),
+            ModelRecord {
+                name: "m:1b".into(),
+                tier: StorageTier::Warm,
+                local_path: None,
+                archive_path: None,
+                size_bytes: 0,
+                last_loaded: None,
+                last_requested: None,
+                protected: false,
+                managed_by: MANAGED_BY_OLLAMA.to_string(),
+                backend: None,
+                gguf_path: None,
+                rope_scaling: None,
+                rope_scaling_note: None,
+                arch: Some("qwen3".into()), // already populated (e.g. by reconcile)
+            },
+        );
+        // A late serve-time profiler task tries to write a different arch → refused.
+        assert!(
+            !reg.record_served_arch("m:1b", "gpt-oss"),
+            "must not overwrite an arch already set"
+        );
+        assert_eq!(
+            reg.get("m:1b").unwrap().arch.as_deref(),
+            Some("qwen3"),
+            "existing arch is preserved (non-clobbering)"
+        );
+        // Set-if-absent: a record with an EMPTY arch is treated as absent.
+        reg.records.get_mut("m:1b").unwrap().arch = Some(String::new());
+        assert!(reg.record_served_arch("m:1b", "gpt-oss"));
+        assert_eq!(reg.get("m:1b").unwrap().arch.as_deref(), Some("gpt-oss"));
+    }
+
+    #[test]
+    fn arch_is_known_treats_blank_or_empty_as_unresolved() {
+        // gpt56 r4: the serve-time derive gate keys off `arch_is_known`. An
+        // empty/whitespace arch must be treated as UNKNOWN (→ re-derive), the
+        // same contract as set_arch_if_absent — never permanently skipped.
+        assert!(arch_is_known(Some("gpt-oss")));
+        assert!(arch_is_known(Some("  qwen3  "))); // nonblank after trim
+        assert!(!arch_is_known(None));
+        assert!(!arch_is_known(Some("")), "empty-string arch is unresolved");
+        assert!(!arch_is_known(Some("   ")), "whitespace-only arch is unresolved");
+
+        // And the record-level gate the serve-time profiler uses (Some("") must
+        // gate the SAME as None → the derive path will run).
+        let tmp = tempdir().unwrap();
+        let mut reg = reg_at(tmp.path(), vec![]);
+        let mk = |name: &str, arch: Option<&str>| ModelRecord {
+            name: name.into(),
+            tier: StorageTier::Warm,
+            local_path: None,
+            archive_path: None,
+            size_bytes: 0,
+            last_loaded: None,
+            last_requested: None,
+            protected: false,
+            managed_by: MANAGED_BY_OLLAMA.to_string(),
+            backend: None,
+            gguf_path: None,
+            rope_scaling: None,
+            rope_scaling_note: None,
+            arch: arch.map(str::to_string),
+        };
+        reg.records.insert("empty:1b".into(), mk("empty:1b", Some("")));
+        reg.records.insert("none:1b".into(), mk("none:1b", None));
+        reg.records.insert("set:1b".into(), mk("set:1b", Some("qwen3")));
+        let known = |r: &str| arch_is_known(reg.get(r).and_then(|x| x.arch.as_deref()));
+        assert!(!known("empty:1b"), "Some(\"\") gates as unresolved, like None");
+        assert!(!known("none:1b"));
+        assert!(known("set:1b"));
+    }
+
+    #[test]
+    fn no_arch_writer_clobbers_an_established_arch() {
+        // gpt56 r3: enforce the whole-class contract — NO arch-write path
+        // (reconcile stamp, record_served_arch, ingest_arch) overwrites an
+        // architecture already established. All route through
+        // `ModelRecord::set_arch_if_absent`.
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        write_local_ollama_model_with_arch(&base.join("local"), "qwen3", "8b", "qwen3");
+        let mut reg = reg_at(base, vec![]);
+
+        // First reconcile establishes arch from the GGUF.
+        reg.reconcile();
+        assert_eq!(reg.get("qwen3:8b").unwrap().arch.as_deref(), Some("qwen3"));
+
+        // Force a DISTINCT established value so a clobber would be observable
+        // (every real writer derives "qwen3" from the same GGUF, so only a
+        // sentinel can prove first-write-wins actually holds).
+        reg.records.get_mut("qwen3:8b").unwrap().arch = Some("established-sentinel".into());
+
+        // (a) reconcile-then-reconcile keeps the first (established) value.
+        reg.reconcile();
+        assert_eq!(
+            reg.get("qwen3:8b").unwrap().arch.as_deref(),
+            Some("established-sentinel"),
+            "reconcile stamp must not clobber an established arch"
+        );
+
+        // (b) record_served_arch is a no-op on an established arch.
+        assert!(!reg.record_served_arch("qwen3:8b", "gpt-oss"));
+        assert_eq!(
+            reg.get("qwen3:8b").unwrap().arch.as_deref(),
+            Some("established-sentinel")
+        );
+
+        // (c) ingest_arch returns the GGUF-derived value but does NOT clobber.
+        assert_eq!(reg.ingest_arch("qwen3:8b").as_deref(), Some("qwen3"));
+        assert_eq!(
+            reg.get("qwen3:8b").unwrap().arch.as_deref(),
+            Some("established-sentinel"),
+            "ingest_arch must not clobber an established arch"
+        );
+    }
+
+    #[test]
+    fn ingest_arch_no_ops_without_gguf_path_or_model() {
+        let tmp = tempdir().unwrap();
+        let mut reg = reg_at(tmp.path(), vec![]);
+        // Unknown model → None.
+        assert_eq!(reg.ingest_arch("nope:1b"), None);
+        // Known model with no gguf_path → None (nothing to read), arch untouched.
+        reg.records.insert(
+            "m:1b".into(),
+            ModelRecord {
+                name: "m:1b".into(),
+                tier: StorageTier::Warm,
+                local_path: None,
+                archive_path: None,
+                size_bytes: 0,
+                last_loaded: None,
+                last_requested: None,
+                protected: false,
+                managed_by: MANAGED_BY_OLLAMA.to_string(),
+                backend: None,
+                gguf_path: None,
+                rope_scaling: None,
+                rope_scaling_note: None,
+                arch: None,
+            },
+        );
+        assert_eq!(reg.ingest_arch("m:1b"), None);
+        assert_eq!(reg.get("m:1b").unwrap().arch, None);
     }
 }
