@@ -118,6 +118,40 @@ fn default_managed_by() -> String {
     "ollama".to_string()
 }
 
+impl ModelRecord {
+    /// CHRD phase3 — the SINGLE arch-write policy: **SET-IF-ABSENT**.
+    ///
+    /// Writes (trimmed) `arch` onto this record ONLY when it currently has none
+    /// (`None` or empty), and returns whether it wrote. A blank input is a
+    /// no-op. EVERY path that populates [`ModelRecord::arch`] — reconcile's
+    /// stamp ([`ModelRegistry::apply_reconcile`]), [`ModelRegistry::ingest_arch`],
+    /// and the serve-time profiler ([`ModelRegistry::record_served_arch`]) —
+    /// routes through here, so no writer can ever clobber an architecture an
+    /// earlier writer already established.
+    ///
+    /// This "first write wins" rule loses no information: every writer derives
+    /// arch from the SAME authoritative source — the model's own GGUF
+    /// `general.architecture` kv — for an IMMUTABLE `name:tag` (a tag maps to
+    /// fixed weights), so a second write would only ever re-assert the same
+    /// value. Collapsing that to a no-op keeps the profiler/reconcile contract
+    /// consistent and avoids racy rewrites. There is deliberately NO
+    /// force/overwrite variant: a genuine re-derive (a model removed and
+    /// re-pulled) is handled by the record being RECREATED fresh on reconcile
+    /// (arch re-derived on insert), never by clobbering in place.
+    pub fn set_arch_if_absent(&mut self, arch: &str) -> bool {
+        let arch = arch.trim();
+        if arch.is_empty() {
+            return false;
+        }
+        if self.arch.as_deref().map(str::is_empty).unwrap_or(true) {
+            self.arch = Some(arch.to_string());
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// `managed_by` value for an Ollama-managed model (the reconcile default).
 pub const MANAGED_BY_OLLAMA: &str = "ollama";
 
@@ -705,17 +739,12 @@ impl ModelRegistry {
     /// unknown model is also a no-op (`false`). Persisting is the caller's job
     /// (`save()`).
     pub fn record_served_arch(&mut self, model: &str, arch: &str) -> bool {
-        let arch = arch.trim();
-        if arch.is_empty() {
-            return false;
-        }
+        // Routes through the single SET-IF-ABSENT policy helper (see
+        // `ModelRecord::set_arch_if_absent`) — never clobbers, so a delayed
+        // detached profiler task can't overwrite reconcile's value.
         match self.records.get_mut(model) {
-            Some(rec) if rec.arch.as_deref().map(str::is_empty).unwrap_or(true) => {
-                rec.arch = Some(arch.to_string());
-                true
-            }
-            // Already populated (or unknown model) → non-clobbering no-op.
-            _ => false,
+            Some(rec) => rec.set_arch_if_absent(arch),
+            None => false,
         }
     }
 
@@ -734,8 +763,11 @@ impl ModelRegistry {
             Some(path) => read_arch_from_gguf(Path::new(&path))?,
             None => derive_arch_for_local_model(&self.local_path, name)?,
         };
+        // SET-IF-ABSENT via the single policy helper — an already-populated arch
+        // is preserved (this derives the SAME value from the GGUF anyway). The
+        // derived value is still returned so callers see what the GGUF declared.
         if let Some(rec) = self.records.get_mut(name) {
-            rec.arch = Some(arch.clone());
+            rec.set_arch_if_absent(&arch);
         }
         Some(arch)
     }
@@ -858,39 +890,44 @@ impl ModelRegistry {
                     rec.size_bytes = m.size_bytes;
                     rec.protected = rec.protected || protected;
                     // CHRD phase3: backfill arch derived off-lock by the scan,
-                    // WITHOUT clobbering an arch a profiler/serve-hook already
-                    // recorded. This is what actually populates `arch` for every
+                    // via the single SET-IF-ABSENT policy helper — never clobbers
+                    // an arch a profiler/serve-hook (or an earlier reconcile)
+                    // already recorded. This is what populates `arch` for every
                     // local model through the normal reconcile flow (startup +
                     // every eviction-sweep tick + the control reconcile endpoint).
-                    if rec.arch.is_none() {
-                        if let Some(arch) = m.arch.clone() {
-                            rec.arch = Some(arch);
-                        }
+                    if let Some(arch) = &m.arch {
+                        rec.set_arch_if_absent(arch);
                     }
                 }
                 None => {
-                    self.records.insert(
-                        m.name.clone(),
-                        ModelRecord {
-                            name: m.name.clone(),
-                            tier: StorageTier::Warm,
-                            local_path: Some(local_root),
-                            archive_path: None,
-                            size_bytes: m.size_bytes,
-                            last_loaded: None,
-                            // A newly-discovered local model has just been warmed
-                            // (pulled) into the local tier — treat discovery as the
-                            // last-access time so it reads ~0h idle, never the
-                            // possibly-ancient manifest mtime (CHRD-75).
-                            last_requested: Some(now_epoch_secs()),
-                            protected,
-                            managed_by: MANAGED_BY_OLLAMA.to_string(),
-                            backend: None, gguf_path: None,
-                        rope_scaling: None, rope_scaling_note: None,
-                        // CHRD phase3: arch derived off-lock by the scan.
-                        arch: m.arch.clone(),
-                        },
-                    );
+                    // Fresh record: build with no arch, then stamp via the same
+                    // set-if-absent helper so EVERY arch-write path is uniform
+                    // (a brand-new record is trivially "absent", so this always
+                    // takes the scan's derived value when present).
+                    let mut new_rec = ModelRecord {
+                        name: m.name.clone(),
+                        tier: StorageTier::Warm,
+                        local_path: Some(local_root),
+                        archive_path: None,
+                        size_bytes: m.size_bytes,
+                        last_loaded: None,
+                        // A newly-discovered local model has just been warmed
+                        // (pulled) into the local tier — treat discovery as the
+                        // last-access time so it reads ~0h idle, never the
+                        // possibly-ancient manifest mtime (CHRD-75).
+                        last_requested: Some(now_epoch_secs()),
+                        protected,
+                        managed_by: MANAGED_BY_OLLAMA.to_string(),
+                        backend: None,
+                        gguf_path: None,
+                        rope_scaling: None,
+                        rope_scaling_note: None,
+                        arch: None,
+                    };
+                    if let Some(arch) = &m.arch {
+                        new_rec.set_arch_if_absent(arch);
+                    }
+                    self.records.insert(m.name.clone(), new_rec);
                 }
             }
         }
@@ -3324,6 +3361,50 @@ mod tests {
         reg.records.get_mut("m:1b").unwrap().arch = Some(String::new());
         assert!(reg.record_served_arch("m:1b", "gpt-oss"));
         assert_eq!(reg.get("m:1b").unwrap().arch.as_deref(), Some("gpt-oss"));
+    }
+
+    #[test]
+    fn no_arch_writer_clobbers_an_established_arch() {
+        // gpt56 r3: enforce the whole-class contract — NO arch-write path
+        // (reconcile stamp, record_served_arch, ingest_arch) overwrites an
+        // architecture already established. All route through
+        // `ModelRecord::set_arch_if_absent`.
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        write_local_ollama_model_with_arch(&base.join("local"), "qwen3", "8b", "qwen3");
+        let mut reg = reg_at(base, vec![]);
+
+        // First reconcile establishes arch from the GGUF.
+        reg.reconcile();
+        assert_eq!(reg.get("qwen3:8b").unwrap().arch.as_deref(), Some("qwen3"));
+
+        // Force a DISTINCT established value so a clobber would be observable
+        // (every real writer derives "qwen3" from the same GGUF, so only a
+        // sentinel can prove first-write-wins actually holds).
+        reg.records.get_mut("qwen3:8b").unwrap().arch = Some("established-sentinel".into());
+
+        // (a) reconcile-then-reconcile keeps the first (established) value.
+        reg.reconcile();
+        assert_eq!(
+            reg.get("qwen3:8b").unwrap().arch.as_deref(),
+            Some("established-sentinel"),
+            "reconcile stamp must not clobber an established arch"
+        );
+
+        // (b) record_served_arch is a no-op on an established arch.
+        assert!(!reg.record_served_arch("qwen3:8b", "gpt-oss"));
+        assert_eq!(
+            reg.get("qwen3:8b").unwrap().arch.as_deref(),
+            Some("established-sentinel")
+        );
+
+        // (c) ingest_arch returns the GGUF-derived value but does NOT clobber.
+        assert_eq!(reg.ingest_arch("qwen3:8b").as_deref(), Some("qwen3"));
+        assert_eq!(
+            reg.get("qwen3:8b").unwrap().arch.as_deref(),
+            Some("established-sentinel"),
+            "ingest_arch must not clobber an established arch"
+        );
     }
 
     #[test]
