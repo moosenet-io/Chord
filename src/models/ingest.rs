@@ -73,8 +73,9 @@
 //!   authenticated-pull support, this is the one place to relax the refusal —
 //!   verify against the deployed daemon first.)
 //! - **Bounded:** an oversize repo is refused ([`IngestStatus::TooLarge`])
-//!   before any byte is copied, protecting the shared disk (<host> disk-pressure
-//!   discipline), and the pull/copy steps are wrapped in timeouts.
+//!   before any byte is copied, protecting the shared build host's disk
+//!   (disk-pressure discipline), and the pull/copy steps are wrapped in
+//!   timeouts.
 
 use std::time::Duration;
 
