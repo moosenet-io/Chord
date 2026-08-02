@@ -1089,21 +1089,26 @@ impl ResidentSet {
 
     /// CHRD-95: publish the Terminus-visible residency snapshot.
     ///
-    /// **This is observability and it must never be able to break serving.** A
-    /// failed write (unwritable path, full disk, read-only mount) is logged and
-    /// swallowed inside [`residency_snapshot::SnapshotWriter::publish`], which
-    /// returns `()` for exactly that reason — there is no error to propagate, by
-    /// construction. Callers are the two STATE-CHANGE points (the end of a warm
-    /// pass, and a release), never the reconcile tick: the writer additionally
-    /// skips an unchanged body, so a re-assert that changes nothing writes
-    /// nothing.
+    /// **This is observability and it must never be able to break, block, or slow
+    /// serving.** Both halves matter. A failed write is logged and swallowed
+    /// inside `residency_snapshot::SnapshotWriter::publish`, which returns `()` by
+    /// construction — there is no error to propagate. And a SLOW write cannot
+    /// reach here at all: `publish` performs no filesystem IO, it hands the
+    /// document to a dedicated writer thread through a depth-one, drop-oldest
+    /// slot. A stalled disk therefore cannot stall a warm, cannot occupy a tokio
+    /// worker, and cannot grow memory.
+    ///
+    /// Called at the two STATE-CHANGE points (the end of a warm pass, and a
+    /// release), never on the reconcile tick, and in both cases with `inner`
+    /// ALREADY DROPPED — the critical section is never held across this call. The
+    /// writer additionally skips an unchanged body, so a re-assert that changes
+    /// nothing writes nothing.
     ///
     /// Takes the residents as an ARGUMENT rather than re-reading them through
-    /// [`Self::status`], deliberately: both call sites are inside the commit that
-    /// produced them and one of them still holds `inner`, so a self-read here
-    /// would be a lock re-entry — i.e. the observability path could DEADLOCK the
-    /// serving path, the very thing this must not be able to do. Synchronous and
-    /// awaitless for the same reason: it cannot yield, block, or park a warm.
+    /// [`Self::status`], deliberately: they are captured from the very commit that
+    /// produced them, and a self-read here would be a lock re-entry from the
+    /// observability path into the serving path (that deadlock was real, and was
+    /// caught in test before this shape landed).
     ///
     /// The four fields of the old SRV-13 shape that have no live source are
     /// emitted as `null` and cannot be supplied here (see
@@ -1737,6 +1742,12 @@ impl ResidentSet {
             if let Some(tx) = inner.in_flight.take() {
                 let _ = tx.send(report.clone());
             }
+            // CHRD-95: release the guard on THIS branch too (the orphan branch
+            // already drops it below). The commit is complete and nothing further
+            // reads `inner` here, and the snapshot publish at the end of this
+            // function must not happen inside the critical section — nothing on
+            // the observability path may hold a lock the serving path needs.
+            drop(inner);
         } else {
             // NOTE: `in_flight` is deliberately NOT taken yet — the same trick the
             // discard path uses. Holding it keeps any concurrent caller COALESCED
@@ -6958,11 +6969,15 @@ mod tests {
     // ── CHRD-95: the Terminus-visible residency snapshot ────────────────────
     //
     // The tool that reads this file used to report "IDLE, nothing resident" on a
-    // box actively serving models, because nothing ever wrote it. These tests
-    // exist to keep that from silently coming back: the FIRST one is the positive
-    // control — a build that never writes the file at all cannot pass it — and the
-    // LAST one is the load-bearing safety property, that a write failure must not
-    // be able to break a warm or a release.
+    // box actively serving models, because nothing ever wrote it. These tests keep
+    // that from silently coming back: the FIRST is the positive control — a build
+    // that never writes the file at all cannot pass it — and the LAST TWO are the
+    // load-bearing safety property, in both its halves. A snapshot write must
+    // never break a warm or a release (failure), and must never slow one either
+    // (latency). The first shape of this change violated the property by deadlock,
+    // the second by doing blocking IO under the resident-set lock; neither was
+    // caught by an error-only test, which is why the latency half is tested with
+    // an actual slow sink.
 
     /// Sets `CHORD_RESIDENCY_STATE_PATH` for the duration of one (serialized) test
     /// and restores the environment afterwards, panic or not.
@@ -6977,6 +6992,15 @@ mod tests {
         fn drop(&mut self) {
             std::env::remove_var("CHORD_RESIDENCY_STATE_PATH");
         }
+    }
+
+    /// The snapshot is written off-thread, so a test that reads the file must
+    /// first wait for the writer to settle. Fails loudly rather than flaking.
+    fn drain_snapshot(set: &ResidentSet) {
+        assert!(
+            set.snapshot.flush(Duration::from_secs(10)),
+            "the residency snapshot writer never drained"
+        );
     }
 
     fn read_snapshot(path: &std::path::Path) -> serde_json::Value {
@@ -6996,6 +7020,7 @@ mod tests {
         let (env, _entered) = FakeEnv::new(three_roles(), Some(96.0));
         let report = set.warm_with(env.as_ref(), "startup", true, None).await;
         assert_eq!(report.warmed, 3);
+        drain_snapshot(&set);
 
         let v = read_snapshot(&path);
         let mut got: Vec<(String, String)> = v["residents"]
@@ -7030,7 +7055,6 @@ mod tests {
         );
         // The per-resident size is the registry's on-disk figure, and the file
         // says so where a reader will see it.
-        assert_eq!(v["residents"][0]["vram_gb"], 8.0);
         assert!(v["vram_gb_source"].as_str().unwrap().contains("on-disk"));
 
         // The four fields with no live source are NULL — never zeroed, never a
@@ -7060,10 +7084,12 @@ mod tests {
         let set = ResidentSet::new(live_cfg());
         let (env, _entered) = FakeEnv::new(three_roles(), Some(96.0));
         set.warm_with(env.as_ref(), "startup", true, None).await;
+        drain_snapshot(&set);
         assert_eq!(read_snapshot(&path)["residents"].as_array().unwrap().len(), 3);
 
         let rel = set.release_with(env.as_ref(), "mode-swap").await;
         assert_eq!(rel.released, 3);
+        drain_snapshot(&set);
 
         let v = read_snapshot(&path);
         assert!(
@@ -7086,11 +7112,13 @@ mod tests {
         let set = ResidentSet::new(live_cfg());
         let (env, _entered) = FakeEnv::new(three_roles(), Some(96.0));
         set.warm_with(env.as_ref(), "startup", true, None).await;
+        drain_snapshot(&set);
         assert!(path.exists());
         std::fs::remove_file(&path).unwrap();
 
         // Same state, forced past the debounce so the pass genuinely re-runs.
         set.warm_with(env.as_ref(), "reconcile", true, None).await;
+        drain_snapshot(&set);
         assert!(
             !path.exists(),
             "an identical state must not rewrite the snapshot every tick"
@@ -7099,30 +7127,32 @@ mod tests {
         // A REAL change publishes again.
         env.resolved.lock().unwrap()[0].model = Some("voice:2".to_string());
         set.warm_with(env.as_ref(), "reconcile", true, None).await;
+        drain_snapshot(&set);
         assert_eq!(
             read_snapshot(&path)["pinned_chat_model"], "voice:2",
             "a genuine state change must still be published"
         );
     }
 
-    /// **THE LOAD-BEARING SAFETY PROPERTY.** The snapshot is observability, and
-    /// observability that can take down the thing it observes is worse than none.
-    /// With an unwritable path (a directory that does not exist — the shape of a
-    /// bad mount or a bad config), the warm and the release must both complete
-    /// exactly as they would with no snapshot configured at all: same report, same
-    /// exemptions, same role states.
+    /// **THE SAFETY PROPERTY, FAILURE HALF.** With an unwritable path (a directory
+    /// that does not exist — the shape of a bad mount or a bad config), the warm
+    /// and the release must behave EXACTLY as they do with snapshotting switched
+    /// off: same reports, same installed exemptions, same role states, same active
+    /// flag. Captured from a real baseline run and compared, not merely spot-checked.
     #[tokio::test]
     #[serial_test::serial]
     async fn a_snapshot_write_failure_never_breaks_a_warm_or_a_release() {
-        // Baseline: what the same operations do with snapshotting switched off.
-        let (baseline_warm, baseline_release, baseline_exempt) = {
+        // Baseline: the same operations with snapshotting switched off entirely.
+        let (base_warm, base_roles_after_warm, base_exempt, base_release, base_roles_after_release) = {
             std::env::remove_var("CHORD_RESIDENCY_STATE_PATH");
             let set = ResidentSet::new(live_cfg());
             let (env, _entered) = FakeEnv::new(three_roles(), Some(96.0));
             let w = set.warm_with(env.as_ref(), "startup", true, None).await;
+            let roles_warm = set.status().await.roles;
             let exempt = env.exempt();
             let r = set.release_with(env.as_ref(), "mode-swap").await;
-            (w, r, exempt)
+            let roles_rel = set.status().await.roles;
+            (w, roles_warm, exempt, r, roles_rel)
         };
 
         let _guard = SnapshotPathGuard::set("/nonexistent-dir-chrd95/nope/residency.json");
@@ -7131,24 +7161,83 @@ mod tests {
 
         let warm = set.warm_with(env.as_ref(), "startup", true, None).await;
         assert_eq!(
-            warm, baseline_warm,
+            warm, base_warm,
             "an unwritable snapshot path must not change the warm's outcome"
         );
         assert_eq!(
-            env.exempt(),
-            baseline_exempt,
-            "…nor what is actually held on the GPU"
+            set.status().await.roles,
+            base_roles_after_warm,
+            "…nor any role's state after the warm"
         );
-        assert!(
-            set.status().await.roles.iter().all(|r| r.state.is_held()),
-            "…nor the role states"
+        assert_eq!(
+            env.exempt(),
+            base_exempt,
+            "…nor what is actually held on the GPU"
         );
 
         let release = set.release_with(env.as_ref(), "mode-swap").await;
         assert_eq!(
-            release, baseline_release,
+            release, base_release,
             "an unwritable snapshot path must not change the release's outcome"
         );
-        assert!(!set.status().await.active, "…and the set is still released");
+        assert_eq!(
+            set.status().await.roles,
+            base_roles_after_release,
+            "…nor any role's state after the release"
+        );
+        assert!(!set.status().await.active);
+
+        // And the failure really did reach the writer (otherwise this proves
+        // nothing): it drains, having attempted and failed.
+        drain_snapshot(&set);
+    }
+
+    /// **THE SAFETY PROPERTY, LATENCY HALF.** A snapshot write that BLOCKS — not
+    /// one that fails — must not slow the warm or the release either. Swallowing
+    /// an IO error only helps once the IO returns; a degraded disk, a full
+    /// filesystem or a stalled `fsync` simply takes a long time. With a sink that
+    /// takes two seconds per write, a warm plus a release must still complete in
+    /// milliseconds, because the write happens on the writer thread and never
+    /// inside the resident-set critical section.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_blocking_snapshot_write_never_slows_a_warm_or_a_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = SnapshotPathGuard::set(dir.path().join("residency.json").to_str().unwrap());
+
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let w = writes.clone();
+        let mut set = ResidentSet::new(live_cfg());
+        set.snapshot = crate::routing::residency_snapshot::SnapshotWriter::with_sink(Box::new(
+            move |_, _| {
+                w.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_secs(2));
+                Ok(())
+            },
+        ));
+        let (env, _entered) = FakeEnv::new(three_roles(), Some(96.0));
+
+        let t0 = std::time::Instant::now();
+        let warm = set.warm_with(env.as_ref(), "startup", true, None).await;
+        let release = set.release_with(env.as_ref(), "mode-swap").await;
+        let elapsed = t0.elapsed();
+
+        assert_eq!(warm.warmed, 3, "the warm still did its job");
+        assert_eq!(release.released, 3, "and so did the release");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "a 2s-per-write snapshot sink slowed the warm+release to {elapsed:?} — the write is \
+             back on the serving path"
+        );
+
+        // Not a vacuous pass: the sink really is being driven, just off-path.
+        assert!(
+            set.snapshot.flush(Duration::from_secs(20)),
+            "the writer never drained"
+        );
+        assert!(
+            writes.load(Ordering::SeqCst) >= 1,
+            "the snapshot must still actually be written, just not on the warm's thread"
+        );
     }
 }

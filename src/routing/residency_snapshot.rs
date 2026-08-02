@@ -19,14 +19,38 @@
 //! by the live owner instead.
 //!
 //! ## THE LOAD-BEARING SAFETY PROPERTY
-//! **A failed snapshot write MUST NEVER break a warm or a release.** This file is
-//! observability, and observability that can take down the thing it observes is
-//! strictly worse than no observability: an unwritable path, a full disk, or a
-//! read-only mount would turn a diagnostic nicety into a GPU-residency outage.
-//! Every entry point here is therefore infallible to the caller — errors are
-//! logged and swallowed, and no IO error can propagate into the serving path.
-//! [`SnapshotWriter::publish`] returns `()` for that reason; it is not an
-//! oversight and must not "helpfully" be given a `Result`.
+//! **A failed OR SLOW snapshot write must never break, block, or slow a warm or a
+//! release.** This file is observability, and observability that can take down —
+//! or merely stall — the thing it observes is strictly worse than no
+//! observability.
+//!
+//! Note the "or slow". Swallowing an IO error only helps once the IO *returns*; a
+//! degraded disk, a full filesystem, an NFS stall, or an `fsync` queued behind
+//! other writers does not return an error, it just takes a long time. Doing that
+//! work on the caller's thread — even synchronously, even with every error
+//! swallowed — would stall the warm and, while the resident-set mutex is held,
+//! every other residency operation queued behind it. That is why this is not a
+//! function call that happens to be careful; it is a **structural** separation:
+//!
+//! 1. [`SnapshotWriter::publish`] does NO filesystem IO. It serializes a small
+//!    document and hands it to a dedicated OS thread. It cannot block on a disk.
+//! 2. The handoff is a **single slot** — a bounded queue of depth one. A snapshot
+//!    is a point-in-time diagnostic, so when a newer one arrives while the writer
+//!    is still busy, the older one is DROPPED. That is the correct semantic (the
+//!    superseded state is no longer true) and it means a stalled writer cannot
+//!    grow memory either.
+//! 3. The writer thread is an OS thread, not a tokio task, so its blocking IO
+//!    cannot occupy a runtime worker.
+//! 4. Both call sites additionally publish with the resident-set lock ALREADY
+//!    DROPPED, so even the (tiny, IO-free) publish call is outside the critical
+//!    section.
+//!
+//! An earlier revision of this change read the residents back through
+//! `ResidentSet::status()` inside the commit and deadlocked the warm path on lock
+//! re-entry; the revision after that did the IO synchronously under the lock. Both
+//! were the same mistake — letting the observability path take the serving path's
+//! resources, once its mutex and once its thread — and both are why the separation
+//! above is structural rather than a comment asking future callers to be careful.
 //!
 //! ## What is NOT in the file
 //! Four fields of the old SRV-13 shape — `mode`, `assumed_memory_model`,
@@ -39,7 +63,8 @@
 //! [`Unsourced`] is a type with no constructor arguments, so there is nothing to
 //! fabricate them WITH.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex, Once};
+use std::time::{Duration, Instant};
 
 use serde::{Serialize, Serializer};
 use tracing::{debug, warn};
@@ -74,10 +99,9 @@ pub struct ResidentEntry {
     /// lock. Real resident VRAM is larger (KV cache, context, runtime overhead),
     /// so this figure reads LOW against `nvidia-smi` / Ollama's `size_vram`.
     /// Deliberately not sourced from Ollama `/api/ps` here: that would mean an
-    /// extra network round trip inside the warm path for a diagnostic field, and
-    /// the safety property above says this file must never be able to slow or
-    /// break a warm. The top-level `vram_gb_source` marker says the same thing in
-    /// the file itself, where a reader will actually see it.
+    /// extra network round trip to build a diagnostic field. The top-level
+    /// `vram_gb_source` marker says the same thing in the file itself, where a
+    /// reader will actually see it.
     ///
     /// Omitted entirely when the registry has no size (never emitted as `0.0` —
     /// the reader defaults absent numerics to zero, but a zero we WROTE would be
@@ -116,6 +140,12 @@ pub struct ResidencySnapshot {
 /// What [`ResidentEntry::vram_gb`] is, stated in the file.
 const VRAM_GB_SOURCE: &str = "registry-on-disk-model-size (estimate; reads LOW vs resident VRAM)";
 
+/// How long an identical payload that FAILED to write is left alone before it is
+/// attempted again. See [`Worker::handle`] — without this, a persistently
+/// unwritable path turns every state change into another doomed write attempt and
+/// another warn line, forever.
+const RETRY_BACKOFF: Duration = Duration::from_secs(60);
+
 impl ResidencySnapshot {
     /// Build a snapshot from the live owner's state. The four unsourced fields
     /// are not parameters — there is deliberately no way to supply them.
@@ -138,35 +168,90 @@ impl ResidencySnapshot {
     }
 }
 
-/// Publishes the snapshot on a STATE CHANGE, never on every reconcile tick.
+/// Where a snapshot actually goes. Injectable so tests can substitute a SLOW sink
+/// and prove the warm path does not wait on it — the property is about latency as
+/// well as failure, so it has to be testable with latency, not merely with errors.
+type Sink = Box<dyn Fn(&str, &serde_json::Value) -> std::io::Result<()> + Send + Sync>;
+
+/// One queued snapshot.
+struct Job {
+    path: String,
+    body: serde_json::Value,
+    /// `body` minus `written_at` — the change key. `written_at` moves on every
+    /// call by construction and would defeat change detection on its own.
+    key: serde_json::Value,
+    reason: String,
+}
+
+/// The single-slot handoff. Depth ONE, drop-oldest: see the module docs.
+#[derive(Default)]
+struct Queue {
+    next: Option<Job>,
+    /// Monotonic count of publishes accepted. With `done`, lets a test wait for
+    /// quiescence without sleeping.
+    queued: u64,
+    done: u64,
+    shutdown: bool,
+}
+
+struct Shared {
+    queue: Mutex<Queue>,
+    cv: Condvar,
+    sink: Sink,
+}
+
+/// Publishes the snapshot on a STATE CHANGE, never on every reconcile tick, and
+/// never on the caller's thread.
 ///
 /// The resident set re-asserts on a background loop; writing the same bytes every
-/// tick is pointless disk churn on a shared host. So the writer remembers the
-/// last body it successfully wrote (everything except `written_at`, which changes
-/// every call by construction) and skips an identical one. A failed write is NOT
-/// remembered, so the next state change retries rather than latching a stale file
-/// as current.
-#[derive(Debug, Default)]
+/// tick is pointless disk churn on a shared host. Change detection lives in the
+/// writer thread (so even the comparison is off the serving path): it remembers
+/// the last body it successfully wrote and skips an identical one.
 pub struct SnapshotWriter {
-    /// Last body successfully written, `written_at` excluded.
-    last: Mutex<Option<serde_json::Value>>,
+    shared: Arc<Shared>,
+    /// The writer thread is spawned on FIRST publish, not at construction: the
+    /// resident set is built in a great many tests that never configure a
+    /// snapshot path, and none of them should get a thread.
+    spawn: Once,
+}
+
+impl Default for SnapshotWriter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SnapshotWriter {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_sink(Box::new(write_state_file))
     }
 
-    /// Write the snapshot if the state actually changed.
+    /// A writer with a substituted sink. Test seam — see [`Sink`].
+    pub fn with_sink(sink: Sink) -> Self {
+        Self {
+            shared: Arc::new(Shared {
+                queue: Mutex::new(Queue::default()),
+                cv: Condvar::new(),
+                sink,
+            }),
+            spawn: Once::new(),
+        }
+    }
+
+    /// Hand the snapshot to the writer thread if the state actually changed.
     ///
-    /// **Infallible by contract** — see the module docs. Every failure mode
-    /// (no path configured, serialization, IO) logs and returns. Nothing here can
-    /// propagate into a warm or a release.
+    /// **Infallible AND non-blocking by contract** — see the module docs. It
+    /// performs no filesystem IO whatsoever: the only lock it takes is the
+    /// handoff's own, held for the duration of an `Option` replace. Every failure
+    /// mode (no path configured, serialization, IO) is logged and swallowed, here
+    /// or on the writer thread. Nothing in this call can propagate into, or wait
+    /// on behalf of, a warm or a release.
     ///
     /// `reason` is only for the log line.
     pub fn publish(&self, snapshot: &ResidencySnapshot, reason: &str) {
         // No path configured ⇒ snapshot persistence is off. Not an error: the
-        // path is never guessed (pii_gate).
+        // path is never guessed (pii_gate). Checked BEFORE the thread is spawned,
+        // so a set with no snapshot path never starts one.
         let Some(path) = crate::config::residency_state_path() else {
             return;
         };
@@ -182,44 +267,165 @@ impl SnapshotWriter {
                 return;
             }
         };
-        // The change key: identical state must not rewrite, and `written_at`
-        // would defeat that on its own.
         let mut key = body.clone();
         if let Some(obj) = key.as_object_mut() {
             obj.remove("written_at");
         }
 
-        // Held across the write: it is a short synchronous fs op with no await
-        // inside, and holding it makes "compare, write, remember" atomic against
-        // a concurrent publisher. Poison is irrelevant here (there is no
-        // invariant to corrupt), so it is recovered rather than propagated —
-        // a panic here would violate the safety property.
-        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
-        if last.as_ref() == Some(&key) {
+        let shared = self.shared.clone();
+        self.spawn.call_once(move || {
+            if let Err(e) = std::thread::Builder::new()
+                .name("residency-snapshot".into())
+                .spawn(move || Worker::new(shared).run())
+            {
+                // Even this is soft: no writer thread means no snapshot, which is
+                // exactly where we were before CHRD-95 — never a failed warm.
+                warn!(
+                    error = %e,
+                    "residency snapshot: writer thread could not be started — snapshots are off for this process"
+                );
+            }
+        });
+
+        // Depth-one, drop-oldest. Superseding an unwritten snapshot is CORRECT:
+        // it no longer describes the current state.
+        let mut q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+        q.queued += 1;
+        if q.next.is_some() {
             debug!(
                 reason,
+                "residency snapshot: superseded an unwritten snapshot — only the newest state is published"
+            );
+        }
+        q.next = Some(Job {
+            path,
+            body,
+            key,
+            reason: reason.to_string(),
+        });
+        drop(q);
+        self.shared.cv.notify_one();
+    }
+
+    /// Wait until everything published so far has been processed (written,
+    /// skipped, or failed). Returns `false` on timeout.
+    ///
+    /// Test support, and deliberately not called from any serving path — the whole
+    /// point of this module is that nothing on that path ever waits for the disk.
+    pub fn flush(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let target = q.queued;
+        while q.done < target {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            let (guard, res) = self
+                .shared
+                .cv
+                .wait_timeout(q, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            q = guard;
+            if res.timed_out() && q.done < target {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl Drop for SnapshotWriter {
+    fn drop(&mut self) {
+        if let Ok(mut q) = self.shared.queue.lock() {
+            q.shutdown = true;
+        }
+        // Signal and go. Deliberately NOT joined: a join would block the dropping
+        // thread for however long an in-flight write takes, which is the exact
+        // coupling this module exists to prevent.
+        self.shared.cv.notify_all();
+    }
+}
+
+/// The writer thread. Owns change detection and every filesystem call.
+struct Worker {
+    shared: Arc<Shared>,
+    /// Last key CONFIRMED on disk. An identical payload is skipped.
+    last_written: Option<serde_json::Value>,
+    /// Last key that FAILED, and when. Kept separate from `last_written` so a
+    /// repeated identical payload does not re-attempt doomed IO on every state
+    /// change, while a retry still happens once [`RETRY_BACKOFF`] has elapsed —
+    /// a transient failure (a full disk that is later cleared) still heals.
+    last_failed: Option<(serde_json::Value, Instant)>,
+}
+
+impl Worker {
+    fn new(shared: Arc<Shared>) -> Self {
+        Self {
+            shared,
+            last_written: None,
+            last_failed: None,
+        }
+    }
+
+    fn run(mut self) {
+        loop {
+            let (job, seq) = 'wait: loop {
+                let mut q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if let Some(job) = q.next.take() {
+                        break 'wait (job, q.queued);
+                    }
+                    if q.shutdown {
+                        return;
+                    }
+                    q = self.shared.cv.wait(q).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+
+            self.handle(job);
+
+            let mut q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+            q.done = seq;
+            drop(q);
+            self.shared.cv.notify_all();
+        }
+    }
+
+    fn handle(&mut self, job: Job) {
+        if self.last_written.as_ref() == Some(&job.key) {
+            debug!(
+                reason = %job.reason,
                 "residency snapshot: unchanged since the last write — not rewriting"
             );
             return;
         }
-
-        match write_state_file(&path, &body) {
-            Ok(()) => {
-                *last = Some(key);
+        if let Some((failed_key, at)) = &self.last_failed {
+            if failed_key == &job.key && at.elapsed() < RETRY_BACKOFF {
                 debug!(
-                    reason,
-                    residents = snapshot.residents.len(),
-                    "residency snapshot: written"
+                    reason = %job.reason,
+                    "residency snapshot: identical payload already failed recently — backing off rather than retrying"
+                );
+                return;
+            }
+        }
+
+        match (self.shared.sink)(&job.path, &job.body) {
+            Ok(()) => {
+                self.last_written = Some(job.key);
+                self.last_failed = None;
+                debug!(reason = %job.reason, "residency snapshot: written");
+            }
+            // Log, remember the failure for the backoff, carry on. Nobody is
+            // waiting on this.
+            Err(e) => {
+                self.last_failed = Some((job.key, Instant::now()));
+                warn!(
+                    reason = %job.reason,
+                    error = %e,
+                    "residency snapshot: could not be written — residency itself is unaffected, only the \
+                     Terminus-visible snapshot is stale (it carries `written_at` so a reader can tell)"
                 );
             }
-            // THE SAFETY PROPERTY, at its one enforcement point: log, do not
-            // remember, RETURN. The warm/release that called us carries on.
-            Err(e) => warn!(
-                reason,
-                error = %e,
-                "residency snapshot: could not be written — residency itself is unaffected, only the \
-                 Terminus-visible snapshot is stale (it carries `written_at` so a reader can tell)"
-            ),
         }
     }
 }
@@ -234,9 +440,8 @@ static STATE_WRITE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// error the temp file is removed so no junk accumulates.
 ///
 /// SALVAGED verbatim in behaviour from `serving::residency::write_state_file`,
-/// which was already correct; only the payload type changed. Errors are returned
-/// here and swallowed by the single caller — keeping the IO fallible at this level
-/// is what lets the caller's log line say something useful.
+/// which was already correct; only the payload type changed. This is the only
+/// blocking code in the module and it runs exclusively on the writer thread.
 fn write_state_file(path: &str, body: &serde_json::Value) -> std::io::Result<()> {
     use std::io::Write;
     use std::sync::atomic::Ordering;
@@ -275,6 +480,7 @@ fn write_state_file(path: &str, body: &serde_json::Value) -> std::io::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn snap() -> ResidencySnapshot {
         ResidencySnapshot::new(
@@ -286,6 +492,21 @@ mod tests {
             Some(42.0),
             Some("voice:1".into()),
         )
+    }
+
+    /// Sets `CHORD_RESIDENCY_STATE_PATH` for one (serialized) test and restores
+    /// the environment afterwards, panic or not.
+    struct PathGuard;
+    impl PathGuard {
+        fn set(path: &str) -> Self {
+            std::env::set_var("CHORD_RESIDENCY_STATE_PATH", path);
+            Self
+        }
+    }
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("CHORD_RESIDENCY_STATE_PATH");
+        }
     }
 
     /// The four fields with no live source are `null` — never `0.0`, never a
@@ -363,7 +584,7 @@ mod tests {
     }
 
     /// A write to an unwritable path returns an error rather than panicking —
-    /// the caller's swallow only works if the failure is a value.
+    /// the swallow only works if the failure is a value.
     #[test]
     fn write_state_file_errors_on_an_unwritable_path() {
         let err = write_state_file(
@@ -371,5 +592,127 @@ mod tests {
             &serde_json::to_value(snap()).unwrap(),
         );
         assert!(err.is_err());
+    }
+
+    /// `publish` performs no filesystem IO on the calling thread: with a sink that
+    /// takes seconds, publishing still returns immediately. This is the latency
+    /// half of the safety property — a slow disk must not be able to slow a warm.
+    #[test]
+    #[serial_test::serial]
+    fn publish_does_not_wait_for_the_sink() {
+        let dir = tempfile::tempdir().unwrap();
+        let _g = PathGuard::set(dir.path().join("residency.json").to_str().unwrap());
+
+        let writer = SnapshotWriter::with_sink(Box::new(|_, _| {
+            std::thread::sleep(Duration::from_secs(2));
+            Ok(())
+        }));
+
+        let t0 = Instant::now();
+        writer.publish(&snap(), "test");
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "publish waited on the sink ({elapsed:?}) — the write is back on the caller's thread"
+        );
+    }
+
+    /// The handoff is depth-one and drop-oldest, so a stalled writer cannot grow
+    /// memory: 200 publishes behind a slow sink reach the disk a handful of times,
+    /// not 200.
+    #[test]
+    #[serial_test::serial]
+    fn a_stalled_writer_drops_superseded_snapshots_instead_of_queueing_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let _g = PathGuard::set(dir.path().join("residency.json").to_str().unwrap());
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let s = seen.clone();
+        let writer = SnapshotWriter::with_sink(Box::new(move |_, _| {
+            s.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(200));
+            Ok(())
+        }));
+
+        for i in 0..200 {
+            writer.publish(
+                &ResidencySnapshot::new(
+                    vec![ResidentEntry {
+                        role: "router",
+                        model_id: format!("m:{i}"),
+                        vram_gb: None,
+                    }],
+                    None,
+                    None,
+                ),
+                "test",
+            );
+        }
+        assert!(writer.flush(Duration::from_secs(20)), "writer never drained");
+        assert!(
+            seen.load(Ordering::SeqCst) <= 5,
+            "superseded snapshots must be dropped, not queued: {} writes for 200 publishes",
+            seen.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Change detection: an identical payload is not rewritten.
+    #[test]
+    #[serial_test::serial]
+    fn an_identical_payload_is_not_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let _g = PathGuard::set(dir.path().join("residency.json").to_str().unwrap());
+
+        let writes = Arc::new(AtomicUsize::new(0));
+        let w = writes.clone();
+        let writer = SnapshotWriter::with_sink(Box::new(move |_, _| {
+            w.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+
+        for _ in 0..3 {
+            writer.publish(&snap(), "test");
+            assert!(writer.flush(Duration::from_secs(5)));
+        }
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            1,
+            "only the first of three identical snapshots should reach the disk"
+        );
+    }
+
+    /// A FAILED write must not turn every subsequent state change into another
+    /// doomed attempt: an identical payload backs off, while a genuinely new one
+    /// is still attempted (so a cleared disk heals on the next real change).
+    #[test]
+    #[serial_test::serial]
+    fn a_failed_identical_payload_backs_off_but_a_new_one_is_still_attempted() {
+        let dir = tempfile::tempdir().unwrap();
+        let _g = PathGuard::set(dir.path().join("residency.json").to_str().unwrap());
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let a = attempts.clone();
+        let writer = SnapshotWriter::with_sink(Box::new(move |_, _| {
+            a.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("disk full"))
+        }));
+
+        for _ in 0..5 {
+            writer.publish(&snap(), "test");
+            assert!(writer.flush(Duration::from_secs(5)));
+        }
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "an identical payload that just failed must back off, not retry on every state change"
+        );
+
+        writer.publish(&ResidencySnapshot::new(Vec::new(), None, None), "mode-swap");
+        assert!(writer.flush(Duration::from_secs(5)));
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "a genuinely different payload must still be attempted after a failure"
+        );
     }
 }
