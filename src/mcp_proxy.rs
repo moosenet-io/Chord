@@ -180,7 +180,19 @@ impl McpProxy {
     ///   2. Otherwise try MCP first; if MCP fails or returns an error, try Rust.
     ///
     /// Returns `(result_text, source)` where source is "mcp" or "chord" (Rust fallback).
-    pub async fn tool_call(&self, name: &str, args: Value) -> Result<(String, &'static str), ProxyError> {
+    ///
+    /// `person_assertion` is the opaque Terminus person assertion from the
+    /// inbound request (see `session::PERSON_ASSERTION_HEADER`), relayed to the
+    /// MCP backend on this call only. It is NOT passed to the Rust fallback
+    /// registry: those tools execute in-process here, so there is no hop to
+    /// carry an identity across. `None` means "no identity available", which is
+    /// the pre-existing behaviour.
+    pub async fn tool_call(
+        &self,
+        name: &str,
+        args: Value,
+        person_assertion: Option<&str>,
+    ) -> Result<(String, &'static str), ProxyError> {
         // Hard gate: only tools on Chord's core allowlist are servable, even if
         // registered in the MCP backend or Rust fallback — this must be checked
         // here (not just filtered out of the catalog), since a caller who
@@ -210,7 +222,7 @@ impl McpProxy {
         }
 
         // Try MCP backend
-        match self.call_mcp(name, args.clone()).await {
+        match self.call_mcp(name, args.clone(), person_assertion).await {
             Ok(result) => return Ok((result, "mcp")),
             Err(e) => {
                 debug!("MCP call failed for {name}: {e}. Trying Rust fallback.");
@@ -237,7 +249,9 @@ impl McpProxy {
     async fn fetch_mcp_tools(&self) -> Result<Vec<ToolEntry>, ProxyError> {
         let result = tokio::time::timeout(
             self.timeout,
-            self.session.send_request("tools/list", None),
+            // Catalog listing is shared and cached across all users, so it is
+            // never person-scoped — see `session::ensure_session`.
+            self.session.send_request("tools/list", None, None),
         )
         .await
         .map_err(|_| ProxyError::Timeout("tools/list".into()))??;
@@ -246,7 +260,12 @@ impl McpProxy {
         Ok(parse_mcp_tools(&result))
     }
 
-    async fn call_mcp(&self, name: &str, args: Value) -> Result<String, ProxyError> {
+    async fn call_mcp(
+        &self,
+        name: &str,
+        args: Value,
+        person_assertion: Option<&str>,
+    ) -> Result<String, ProxyError> {
         let params = serde_json::json!({
             "name": name,
             "arguments": args
@@ -254,7 +273,8 @@ impl McpProxy {
 
         let result = tokio::time::timeout(
             self.timeout,
-            self.session.send_request("tools/call", Some(params)),
+            self.session
+                .send_request("tools/call", Some(params), person_assertion),
         )
         .await
         .map_err(|_| ProxyError::Timeout(name.into()))??;
@@ -376,7 +396,7 @@ mod tests {
 
         let proxy = McpProxy::new(&config, make_registry_with_echo());
         let (result, source) = proxy
-            .tool_call("gitea_echo_test", serde_json::json!({"text": "fallback works"}))
+            .tool_call("gitea_echo_test", serde_json::json!({"text": "fallback works"}), None)
             .await
             .unwrap();
         assert_eq!(result, "fallback works");
@@ -459,7 +479,7 @@ mod tests {
         }
 
         let (result, source) = proxy
-            .tool_call("gitea_echo_test", serde_json::json!({"text": "fallback on 401"}))
+            .tool_call("gitea_echo_test", serde_json::json!({"text": "fallback on 401"}), None)
             .await
             .unwrap();
         assert_eq!(result, "fallback on 401");
@@ -516,7 +536,7 @@ mod tests {
 
         let reg = Arc::new(FallbackRegistry::new()); // no tools registered
         let proxy = McpProxy::new(&config, reg);
-        let err = proxy.tool_call("nonexistent_tool", serde_json::json!({})).await.unwrap_err();
+        let err = proxy.tool_call("nonexistent_tool", serde_json::json!({}), None).await.unwrap_err();
         assert!(matches!(err, ProxyError::ToolNotFound(_)));
     }
 

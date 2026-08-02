@@ -370,7 +370,21 @@ pub async fn tools_call(
     }
 
     let rl_headers = rate_limit_headers(&rl_result);
-    match state.proxy.tool_call(&req.name, req.arguments).await {
+    // Relay the Terminus person assertion (TERM #595) onward to the MCP backend
+    // for THIS call only. Chord neither verifies nor mints it — see
+    // `session::PERSON_ASSERTION_HEADER`. Read straight off the inbound headers:
+    // if Terminus did not send one, we send none, and we never synthesize a
+    // substitute from `claims.sub` (that would manufacture an identity claim
+    // Chord is not entitled to make). A non-ASCII/garbage value is dropped at
+    // the session layer rather than failing the call.
+    let person_assertion = headers
+        .get(crate::session::PERSON_ASSERTION_HEADER)
+        .and_then(|v| v.to_str().ok());
+    match state
+        .proxy
+        .tool_call(&req.name, req.arguments, person_assertion)
+        .await
+    {
         Ok((result, source)) => {
             state.audit_logger.log_tool_call(
                 &claims.sub,
@@ -535,7 +549,9 @@ pub async fn personal_tools_call(
     }
 
     let rl_headers = rate_limit_headers(&rl_result);
-    match proxy.tool_call(&req.name, req.arguments).await {
+    // Out of scope for CHRD-91 (relay is being landed on the default
+    // `/v1/tools/call` path first); `None` preserves existing behaviour here.
+    match proxy.tool_call(&req.name, req.arguments, None).await {
         Ok((result, source)) => {
             state.audit_logger.log_tool_call(
                 &claims.sub,
