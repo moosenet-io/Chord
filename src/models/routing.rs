@@ -112,7 +112,12 @@ pub async fn resolve_and_ensure(
         let gguf = reg.get(registry_key).and_then(|r| r.gguf_path.clone());
         // CHRD phase3: is this model's arch already recorded? (Drives the
         // serve-time profiler backfill below.)
-        let arch_known = reg.get(registry_key).map(|r| r.arch.is_some()).unwrap_or(false);
+        // "Known" means NONBLANK — an empty-string arch (`Some("")`) is treated
+        // as unresolved (re-derive), consistent with `set_arch_if_absent` and the
+        // routing guard, which both treat blank/empty arch as absent/unknown.
+        let arch_known = crate::models::registry::arch_is_known(
+            reg.get(registry_key).and_then(|r| r.arch.as_deref()),
+        );
         let bearer_key = b
             .api_key_env
             .as_ref()

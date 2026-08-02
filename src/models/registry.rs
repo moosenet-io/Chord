@@ -118,6 +118,19 @@ fn default_managed_by() -> String {
     "ollama".to_string()
 }
 
+/// CHRD phase3 — the single "is this arch KNOWN?" predicate.
+///
+/// An architecture is KNOWN only when it is present AND nonblank; `None`,
+/// `Some("")`, and whitespace-only all count as UNKNOWN. This matches
+/// [`ModelRecord::set_arch_if_absent`] and the routing arch guard
+/// ([`backends::kind_can_serve_arch`] treats an empty/normalized-away arch as
+/// "no constraint"), so every "is arch known" decision — including the
+/// serve-time profiler's re-derive gate — is consistent: a `Some("")` record is
+/// treated as unresolved and will be (re-)derived, never permanently skipped.
+pub fn arch_is_known(arch: Option<&str>) -> bool {
+    arch.map(str::trim).filter(|s| !s.is_empty()).is_some()
+}
+
 impl ModelRecord {
     /// CHRD phase3 — the SINGLE arch-write policy: **SET-IF-ABSENT**.
     ///
@@ -3361,6 +3374,46 @@ mod tests {
         reg.records.get_mut("m:1b").unwrap().arch = Some(String::new());
         assert!(reg.record_served_arch("m:1b", "gpt-oss"));
         assert_eq!(reg.get("m:1b").unwrap().arch.as_deref(), Some("gpt-oss"));
+    }
+
+    #[test]
+    fn arch_is_known_treats_blank_or_empty_as_unresolved() {
+        // gpt56 r4: the serve-time derive gate keys off `arch_is_known`. An
+        // empty/whitespace arch must be treated as UNKNOWN (→ re-derive), the
+        // same contract as set_arch_if_absent — never permanently skipped.
+        assert!(arch_is_known(Some("gpt-oss")));
+        assert!(arch_is_known(Some("  qwen3  "))); // nonblank after trim
+        assert!(!arch_is_known(None));
+        assert!(!arch_is_known(Some("")), "empty-string arch is unresolved");
+        assert!(!arch_is_known(Some("   ")), "whitespace-only arch is unresolved");
+
+        // And the record-level gate the serve-time profiler uses (Some("") must
+        // gate the SAME as None → the derive path will run).
+        let tmp = tempdir().unwrap();
+        let mut reg = reg_at(tmp.path(), vec![]);
+        let mk = |name: &str, arch: Option<&str>| ModelRecord {
+            name: name.into(),
+            tier: StorageTier::Warm,
+            local_path: None,
+            archive_path: None,
+            size_bytes: 0,
+            last_loaded: None,
+            last_requested: None,
+            protected: false,
+            managed_by: MANAGED_BY_OLLAMA.to_string(),
+            backend: None,
+            gguf_path: None,
+            rope_scaling: None,
+            rope_scaling_note: None,
+            arch: arch.map(str::to_string),
+        };
+        reg.records.insert("empty:1b".into(), mk("empty:1b", Some("")));
+        reg.records.insert("none:1b".into(), mk("none:1b", None));
+        reg.records.insert("set:1b".into(), mk("set:1b", Some("qwen3")));
+        let known = |r: &str| arch_is_known(reg.get(r).and_then(|x| x.arch.as_deref()));
+        assert!(!known("empty:1b"), "Some(\"\") gates as unresolved, like None");
+        assert!(!known("none:1b"));
+        assert!(known("set:1b"));
     }
 
     #[test]
