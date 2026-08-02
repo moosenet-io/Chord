@@ -172,6 +172,10 @@ fn proxy_error_response(err: ProxyError) -> Response {
     let status = match &err {
         ProxyError::ToolNotFound(_) => StatusCode::NOT_FOUND,
         ProxyError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
+        // 400, not 502: a malformed person assertion is a defect in the request
+        // this proxy was handed, not a failure of anything upstream. The error
+        // body is the variant's fixed Display text and never the value itself.
+        ProxyError::InvalidPersonAssertion => StatusCode::BAD_REQUEST,
         _ => StatusCode::BAD_GATEWAY,
     };
     let body = serde_json::json!({"error": err.to_string()});
@@ -195,6 +199,7 @@ fn proxy_error_kind(err: &ProxyError) -> &'static str {
         ProxyError::Http(_) => "http_error",
         ProxyError::Json(_) => "json_error",
         ProxyError::Config(_) => "config_error",
+        ProxyError::InvalidPersonAssertion => "invalid_person_assertion",
     }
 }
 
@@ -370,7 +375,30 @@ pub async fn tools_call(
     }
 
     let rl_headers = rate_limit_headers(&rl_result);
-    match state.proxy.tool_call(&req.name, req.arguments).await {
+    // Relay the Terminus person assertion (TERM #595) onward to the MCP backend
+    // for THIS call only. Chord neither verifies nor mints it — see
+    // `session::PERSON_ASSERTION_HEADER`. Read straight off the inbound headers:
+    // if Terminus did not send one, we send none, and we never synthesize a
+    // substitute from `claims.sub` (that would manufacture an identity claim
+    // Chord is not entitled to make). A value that cannot be encoded as an HTTP
+    // header at all is REFUSED (400), never dropped: dropping would make "an
+    // assertion was supplied but could not be relayed" indistinguishable from
+    // "none was supplied", and the call would then run bearer-authenticated with
+    // no identity — the fail-open this whole item exists to close. Note the check
+    // is ALSO duplicated at the top of `McpProxy::tool_call`, because an error
+    // raised only in the session layer is swallowed by the Rust fallback.
+    // Raw BYTES, not `to_str()`: `HeaderValue::to_str` fails on any value that
+    // is legal at the HTTP transport level but not UTF-8, and swallowing that
+    // here would silently narrow an opaque relay to "whatever Chord could
+    // decode". Chord must pass on what it received.
+    let person_assertion = headers
+        .get(crate::session::PERSON_ASSERTION_HEADER)
+        .map(|v| v.as_bytes());
+    match state
+        .proxy
+        .tool_call(&req.name, req.arguments, person_assertion)
+        .await
+    {
         Ok((result, source)) => {
             state.audit_logger.log_tool_call(
                 &claims.sub,
@@ -535,7 +563,9 @@ pub async fn personal_tools_call(
     }
 
     let rl_headers = rate_limit_headers(&rl_result);
-    match proxy.tool_call(&req.name, req.arguments).await {
+    // Out of scope for CHRD-91 (relay is being landed on the default
+    // `/v1/tools/call` path first); `None` preserves existing behaviour here.
+    match proxy.tool_call(&req.name, req.arguments, None).await {
         Ok((result, source)) => {
             state.audit_logger.log_tool_call(
                 &claims.sub,

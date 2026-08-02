@@ -1155,7 +1155,7 @@ impl AgenticExecutor {
                         // ── Execute via MCP proxy ─────────────────────────────
                         new_execution_this_iter = true;
                         let exec_start = Instant::now();
-                        let exec_result = self.proxy.tool_call(tc_name, sanitized_args).await;
+                        let exec_result = self.proxy.tool_call(tc_name, sanitized_args, None).await;
                         let exec_ms = exec_start.elapsed().as_millis() as u64;
 
                         let raw_result = match exec_result {

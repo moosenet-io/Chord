@@ -180,7 +180,42 @@ impl McpProxy {
     ///   2. Otherwise try MCP first; if MCP fails or returns an error, try Rust.
     ///
     /// Returns `(result_text, source)` where source is "mcp" or "chord" (Rust fallback).
-    pub async fn tool_call(&self, name: &str, args: Value) -> Result<(String, &'static str), ProxyError> {
+    ///
+    /// `person_assertion` is the opaque Terminus person assertion from the
+    /// inbound request (see `session::PERSON_ASSERTION_HEADER`), as raw header
+    /// bytes, relayed to the MCP backend on this call only. It is NOT passed to
+    /// the Rust fallback registry: those tools execute in-process here, so there
+    /// is no hop to carry an identity across. `None` means "no identity
+    /// available", which is the pre-existing behaviour.
+    pub async fn tool_call(
+        &self,
+        name: &str,
+        args: Value,
+        person_assertion: Option<&[u8]>,
+    ) -> Result<(String, &'static str), ProxyError> {
+        // Refuse a malformed assertion BEFORE any routing decision — before the
+        // allowlist gate, before the Rust-fallback shortcut, before MCP is even
+        // tried.
+        //
+        // This is not redundant with the identical check in
+        // `McpSession::with_person_assertion`, and moving it there alone would
+        // reintroduce the exact fail-open this guards against: every MCP error
+        // below falls through to `self.fallback.call(...)`, so a refusal raised
+        // down in the session layer would be swallowed by that fallback and the
+        // tool would execute anyway — with no identity, and with the caller none
+        // the wiser. An attempted identity that cannot be honoured must never be
+        // indistinguishable from no identity, and "the call quietly succeeded
+        // via a different route" is the worst version of that.
+        if let Some(a) = person_assertion {
+            if reqwest::header::HeaderValue::from_bytes(a).is_err() {
+                warn!(
+                    "Refusing tool_call for {name}: malformed person assertion \
+                     (value deliberately not logged)"
+                );
+                return Err(ProxyError::InvalidPersonAssertion);
+            }
+        }
+
         // Hard gate: only tools on Chord's core allowlist are servable, even if
         // registered in the MCP backend or Rust fallback — this must be checked
         // here (not just filtered out of the catalog), since a caller who
@@ -210,7 +245,7 @@ impl McpProxy {
         }
 
         // Try MCP backend
-        match self.call_mcp(name, args.clone()).await {
+        match self.call_mcp(name, args.clone(), person_assertion).await {
             Ok(result) => return Ok((result, "mcp")),
             Err(e) => {
                 debug!("MCP call failed for {name}: {e}. Trying Rust fallback.");
@@ -237,7 +272,9 @@ impl McpProxy {
     async fn fetch_mcp_tools(&self) -> Result<Vec<ToolEntry>, ProxyError> {
         let result = tokio::time::timeout(
             self.timeout,
-            self.session.send_request("tools/list", None),
+            // Catalog listing is shared and cached across all users, so it is
+            // never person-scoped — see `session::ensure_session`.
+            self.session.send_request("tools/list", None, None),
         )
         .await
         .map_err(|_| ProxyError::Timeout("tools/list".into()))??;
@@ -246,7 +283,12 @@ impl McpProxy {
         Ok(parse_mcp_tools(&result))
     }
 
-    async fn call_mcp(&self, name: &str, args: Value) -> Result<String, ProxyError> {
+    async fn call_mcp(
+        &self,
+        name: &str,
+        args: Value,
+        person_assertion: Option<&[u8]>,
+    ) -> Result<String, ProxyError> {
         let params = serde_json::json!({
             "name": name,
             "arguments": args
@@ -254,7 +296,8 @@ impl McpProxy {
 
         let result = tokio::time::timeout(
             self.timeout,
-            self.session.send_request("tools/call", Some(params)),
+            self.session
+                .send_request("tools/call", Some(params), person_assertion),
         )
         .await
         .map_err(|_| ProxyError::Timeout(name.into()))??;
@@ -326,6 +369,93 @@ mod tests {
         assert!(result.is_none());
     }
 
+    /// CHRD-91: a malformed person assertion must not be laundered by the Rust
+    /// fallback.
+    ///
+    /// `gitea_echo_test` is in the fallback registry and the MCP backend here
+    /// 500s on every `tools/call` — i.e. this is exactly the configuration in
+    /// which `test_tool_call_uses_rust_fallback_when_mcp_fails` succeeds via the
+    /// fallback. If the refusal lived only in the session layer, that fallback
+    /// would swallow it and the tool would run anyway with no identity and a
+    /// success returned to the caller. Refusing up front in `tool_call` is what
+    /// makes the failure reach the caller.
+    #[tokio::test]
+    async fn test_malformed_person_assertion_is_not_laundered_by_rust_fallback() {
+        let mock_server = httpmock::MockServer::start_async().await;
+
+        mock_server.mock(|when, then| {
+            when.body_contains(r#""method":"initialize""#);
+            then.status(200)
+                .header("Mcp-Session-Id", "assert-fallback")
+                .json_body(serde_json::json!({"jsonrpc":"2.0","id":1,"result":{}}));
+        });
+        mock_server.mock(|when, then| {
+            when.body_contains("notifications/initialized");
+            then.status(200).body("");
+        });
+        mock_server.mock(|when, then| {
+            when.body_contains("tools/call");
+            then.status(500).body("internal error");
+        });
+
+        let config = Config {
+            mcp_backend_url: mock_server.base_url(),
+            jwt_secret: String::new(),
+            tool_timeout_secs: 5,
+            catalog_cache_secs: 300,
+            listen_port: 9099,
+            control_port: 8090,
+            rate_limits: RateLimitConfig::default(),
+            llm_backend_url: None,
+            model_aliases: std::collections::HashMap::new(),
+            model_archive_path: "/var/lib/model-archive".into(),
+            model_local_path: "/opt/ollama-models".into(),
+            model_protected: vec![],
+            model_pull_timeout_secs: 600,
+            model_registry_path: "<path>/model-registry.json".into(),
+            model_disk_pressure_percent: 80,
+            model_sweep_interval_secs: 1800,
+            model_warm_cooldown_hours: 168,
+            model_archive_copy_timeout_secs: 1800,
+            model_gc_min_age_secs: 300,
+            model_source_allowlist: Vec::new(),
+            outbound_proxy: None,
+            runtime_telemetry_off: true,
+            mcp_backend_token: None,
+            personal_backend_url: None,
+            personal_backend_token: None,
+        };
+
+        let proxy = McpProxy::new(&config, make_registry_with_echo());
+
+        // Control: the same call with no assertion DOES get served by the
+        // fallback — so the failure below is caused by the assertion, not by
+        // the tool being unavailable.
+        let (result, source) = proxy
+            .tool_call(
+                "gitea_echo_test",
+                serde_json::json!({"text": "served"}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, "served");
+        assert_eq!(source, "chord");
+
+        // With a malformed assertion the identical call must FAIL, not quietly
+        // succeed via the fallback with no identity attached.
+        let err = proxy
+            .tool_call(
+                "gitea_echo_test",
+                serde_json::json!({"text": "must not run"}),
+                Some(b"bad\nassertion".as_slice()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProxyError::InvalidPersonAssertion));
+        assert!(!err.to_string().contains("assertion\n"));
+    }
+
     #[tokio::test]
     async fn test_tool_call_uses_rust_fallback_when_mcp_fails() {
         let mock_server = httpmock::MockServer::start_async().await;
@@ -376,7 +506,7 @@ mod tests {
 
         let proxy = McpProxy::new(&config, make_registry_with_echo());
         let (result, source) = proxy
-            .tool_call("gitea_echo_test", serde_json::json!({"text": "fallback works"}))
+            .tool_call("gitea_echo_test", serde_json::json!({"text": "fallback works"}), None)
             .await
             .unwrap();
         assert_eq!(result, "fallback works");
@@ -459,7 +589,7 @@ mod tests {
         }
 
         let (result, source) = proxy
-            .tool_call("gitea_echo_test", serde_json::json!({"text": "fallback on 401"}))
+            .tool_call("gitea_echo_test", serde_json::json!({"text": "fallback on 401"}), None)
             .await
             .unwrap();
         assert_eq!(result, "fallback on 401");
@@ -516,7 +646,7 @@ mod tests {
 
         let reg = Arc::new(FallbackRegistry::new()); // no tools registered
         let proxy = McpProxy::new(&config, reg);
-        let err = proxy.tool_call("nonexistent_tool", serde_json::json!({})).await.unwrap_err();
+        let err = proxy.tool_call("nonexistent_tool", serde_json::json!({}), None).await.unwrap_err();
         assert!(matches!(err, ProxyError::ToolNotFound(_)));
     }
 

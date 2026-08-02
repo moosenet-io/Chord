@@ -12,6 +12,26 @@ use tracing::{debug, warn};
 
 use crate::error::ProxyError;
 
+/// Header carrying the Terminus-minted person assertion (TERM #595): a signed,
+/// short-lived HS256 token naming which household member the current turn is
+/// for.
+///
+/// Chord's role here is OPAQUE RELAY, deliberately: it does not parse, verify,
+/// or mint this value. Only a gateway that has actually authenticated a
+/// principal may mint one, and Chord holds no signing key — so verifying here
+/// would be security theatre, and minting here would be forgery. An inbound
+/// assertion is trustworthy only in the sense that it arrived from Terminus
+/// over the trusted hop; Terminus itself re-verifies on the way back in, which
+/// is where the real check lives.
+///
+/// Note the asymmetry with the LLM path: this header is relayed BACK to
+/// Terminus (the party that minted it and can verify it), and is never
+/// forwarded onward to the inference backend — `is_unforwardable_request_header`
+/// in `routes.rs` denies the whole `x-terminus-*` prefix for that direction
+/// (CHRD-90). Handing a bearer token to a third-party model vendor is exactly
+/// what that guard exists to prevent; do not weaken it to "reuse" this relay.
+pub const PERSON_ASSERTION_HEADER: &str = "x-terminus-person-assertion";
+
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 fn next_id() -> u64 {
@@ -105,7 +125,63 @@ impl McpSession {
         }
     }
 
+    /// Attach the per-call Terminus person assertion when one rode in on the
+    /// inbound request. Like `authorize`, this never logs or formats the value:
+    /// it is a bearer token.
+    ///
+    /// Takes raw BYTES, not a `&str`, and re-encodes with
+    /// `HeaderValue::from_bytes`. Relaying `HeaderValue::to_str()` output would
+    /// silently discard any value containing bytes that are perfectly legal at
+    /// the HTTP transport level but not UTF-8 — which would make Chord pass on
+    /// what it could *decode* rather than what it *received*. A relay that must
+    /// not interpret the token must not narrow it either.
+    ///
+    /// A value that cannot be encoded as a header value is REFUSED: the call
+    /// fails with [`ProxyError::InvalidPersonAssertion`]. It is deliberately not
+    /// dropped, because **an attempted identity that cannot be honoured must
+    /// never be indistinguishable from no identity at all**. Dropping it would
+    /// make "assertion present but malformed" arrive at the backend looking
+    /// exactly like "no assertion supplied", and the call would then proceed
+    /// bearer-authenticated with no identity — a silent downgrade, regardless of
+    /// what the backend's no-identity policy happens to be, because Chord has
+    /// destroyed the signal the backend would have judged. This is the same
+    /// invariant enforced at Terminus's ingress (TERM #595), TERM-599 dispatch,
+    /// the caller key, and the router's tool cache; do not re-litigate it here.
+    ///
+    /// Refusing is not a denial-of-service lever: it harms only the client that
+    /// sent the bad header, with no amplification and no cost to anyone else.
+    /// And Terminus's ingress already refuses claims it cannot honour, so in a
+    /// well-formed system this branch is unreachable.
+    fn with_person_assertion(
+        &self,
+        builder: reqwest::RequestBuilder,
+        person_assertion: Option<&[u8]>,
+    ) -> Result<reqwest::RequestBuilder, ProxyError> {
+        match person_assertion {
+            Some(a) => match reqwest::header::HeaderValue::from_bytes(a) {
+                Ok(v) => Ok(builder.header(PERSON_ASSERTION_HEADER, v)),
+                Err(_) => {
+                    warn!(
+                        "Refusing outbound MCP call: malformed {PERSON_ASSERTION_HEADER} \
+                         (not encodable as a header value; value deliberately not logged)"
+                    );
+                    Err(ProxyError::InvalidPersonAssertion)
+                }
+            },
+            None => Ok(builder),
+        }
+    }
+
     /// Get or initialize a session ID. Reconnects if the session was lost.
+    ///
+    /// NOTE — no person assertion is ever attached here, by design. The MCP
+    /// session is SHARED and long-lived: it is established once and then reused
+    /// across every user and every turn for the lifetime of the process. Binding
+    /// an identity to `initialize` / `notifications/initialized` would therefore
+    /// stamp whichever household member happened to trigger the first (or a
+    /// reconnecting) call onto every subsequent call from everyone else. A
+    /// per-turn identity can only ever ride a per-CALL header — see
+    /// `send_request` — never session establishment.
     pub async fn ensure_session(&self) -> Result<String, ProxyError> {
         let mut state = self.state.lock().await;
 
@@ -186,10 +262,19 @@ impl McpSession {
     }
 
     /// Send a JSON-RPC request to the MCP backend and return the result.
+    ///
+    /// `person_assertion` is the opaque, Terminus-minted assertion that arrived
+    /// on the inbound request, if any (see [`PERSON_ASSERTION_HEADER`]) — raw
+    /// header BYTES, so the relay stays byte-exact. It is relayed verbatim as a
+    /// per-call header alongside the process-lifetime bearer, giving the backend
+    /// per-request identity that the shared session cannot carry. `None`
+    /// reproduces the previous behaviour exactly; a value that cannot be encoded
+    /// as a header is refused, not dropped (see `with_person_assertion`).
     pub async fn send_request(
         &self,
         method: &str,
         params: Option<Value>,
+        person_assertion: Option<&[u8]>,
     ) -> Result<Value, ProxyError> {
         let session_id = self.ensure_session().await?;
 
@@ -206,6 +291,7 @@ impl McpSession {
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
             .header("Mcp-Session-Id", &session_id);
+        let request_builder = self.with_person_assertion(request_builder, person_assertion)?;
         let response = self
             .authorize(request_builder)
             .json(&request)
@@ -413,7 +499,7 @@ mod tests {
         });
 
         let session = McpSession::new(mock_server.base_url(), 10);
-        let result = session.send_request("tools/list", None).await.unwrap();
+        let result = session.send_request("tools/list", None, None).await.unwrap();
         assert!(result["tools"].is_array());
         tools_mock.assert();
     }
@@ -445,6 +531,7 @@ mod tests {
             .send_request(
                 "tools/call",
                 Some(serde_json::json!({"name": "test_tool", "arguments": {}})),
+                None,
             )
             .await
             .unwrap();
@@ -477,7 +564,7 @@ mod tests {
 
         let session = McpSession::new(mock_server.base_url(), 10);
         let err = session
-            .send_request("tools/call", Some(serde_json::json!({})))
+            .send_request("tools/call", Some(serde_json::json!({})), None)
             .await
             .unwrap_err();
         assert!(matches!(err, ProxyError::McpBackend(_)));
@@ -521,7 +608,7 @@ mod tests {
         let session =
             McpSession::with_token(mock_server.base_url(), 10, Some("super-secret-token-xyz".to_string()));
         let err = session
-            .send_request("tools/call", Some(serde_json::json!({})))
+            .send_request("tools/call", Some(serde_json::json!({})), None)
             .await
             .unwrap_err();
         assert!(matches!(err, ProxyError::McpBackend(_)));
@@ -603,7 +690,7 @@ mod tests {
 
         let session =
             McpSession::with_token(mock_server.base_url(), 10, Some("secret-xyz".to_string()));
-        let result = session.send_request("tools/list", None).await.unwrap();
+        let result = session.send_request("tools/list", None, None).await.unwrap();
         assert!(result["tools"].is_array());
         tools_mock.assert();
     }
@@ -666,10 +753,270 @@ mod tests {
         // Deliberately configured with the WRONG/no token so the mock 401s.
         let session = McpSession::new(mock_server.base_url(), 10);
         let err = session
-            .send_request("tools/call", Some(serde_json::json!({})))
+            .send_request("tools/call", Some(serde_json::json!({})), None)
             .await
             .unwrap_err();
         assert!(matches!(err, ProxyError::McpBackend(_)));
         assert!(err.to_string().contains("401"));
+    }
+
+    // ── CHRD-91: per-call Terminus person-assertion relay ─────────────────
+    //
+    // Shared scaffolding: every test below mocks initialize + the initialized
+    // notification identically and only differs in what it asserts about the
+    // `tools/call` request.
+    fn mock_handshake(mock_server: &httpmock::MockServer, session_id: &'static str) {
+        mock_server.mock(|when, then| {
+            when.body_contains(r#""method":"initialize""#);
+            then.status(200)
+                .header("Mcp-Session-Id", session_id)
+                .json_body(serde_json::json!({"jsonrpc":"2.0","id":1,"result":{}}));
+        });
+        mock_server.mock(|when, then| {
+            when.body_contains("notifications/initialized");
+            then.status(200).body("");
+        });
+    }
+
+    /// Expands to a `matches` predicate asserting the named header is ABSENT.
+    /// A macro rather than a fn so the closure's `httpmock` request type stays
+    /// inferred (it is a private-ish path that has moved between 0.7 patches).
+    macro_rules! lacks_header {
+        ($name:expr) => {
+            |req| {
+                !req.headers
+                    .as_ref()
+                    .map(|hs| hs.iter().any(|(k, _)| k.eq_ignore_ascii_case($name)))
+                    .unwrap_or(false)
+            }
+        };
+    }
+
+    #[tokio::test]
+    async fn test_send_request_relays_person_assertion_header_when_present() {
+        let mock_server = httpmock::MockServer::start_async().await;
+        mock_handshake(&mock_server, "assert-present");
+
+        // Both headers are required on the SAME request. Matching the bearer
+        // here is a deliberate positive control: an implementation that relayed
+        // the assertion but dropped `authorize()` would otherwise pass this
+        // test while silently unauthenticating every outbound MCP call.
+        let call_mock = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/mcp")
+                .header("Authorization", "Bearer mcp-token-1")
+                .header("x-terminus-person-assertion", "<REDACTED-SECRET>")
+                .header("Mcp-Session-Id", "assert-present")
+                .body_contains("tools/call");
+            then.status(200)
+                .json_body(serde_json::json!({"jsonrpc":"2.0","id":2,"result":{"ok":true}}));
+        });
+
+        let session =
+            McpSession::with_token(mock_server.base_url(), 10, Some("mcp-token-1".to_string()));
+        let result = session
+            .send_request(
+                "tools/call",
+                Some(serde_json::json!({"name": "t", "arguments": {}})),
+                Some(b"<REDACTED-SECRET>".as_slice()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["ok"], true);
+        call_mock.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn test_send_request_omits_person_assertion_header_when_none() {
+        let mock_server = httpmock::MockServer::start_async().await;
+        mock_handshake(&mock_server, "assert-absent");
+
+        // Requires the ABSENCE of the assertion header *and* the PRESENCE of the
+        // bearer — again the positive control: "no assertion" must mean exactly
+        // the pre-CHRD-91 request, not a request that lost its auth too. Chord
+        // must never synthesize an assertion it was not given.
+        let call_mock = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/mcp")
+                .header("Authorization", "Bearer mcp-token-2")
+                .matches(lacks_header!("x-terminus-person-assertion"))
+                .body_contains("tools/call");
+            then.status(200)
+                .json_body(serde_json::json!({"jsonrpc":"2.0","id":2,"result":{"ok":true}}));
+        });
+
+        let session =
+            McpSession::with_token(mock_server.base_url(), 10, Some("mcp-token-2".to_string()));
+        let result = session
+            .send_request(
+                "tools/call",
+                Some(serde_json::json!({"name": "t", "arguments": {}})),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["ok"], true);
+        call_mock.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn test_malformed_person_assertion_is_refused_not_silently_dropped() {
+        // A header value with a control character cannot be encoded as a header
+        // value, so the call is REFUSED rather than sent without the assertion.
+        //
+        // Dropping it would make "assertion present but malformed" arrive at the
+        // backend byte-for-byte identical to "no assertion supplied": the call
+        // would proceed bearer-authenticated with no identity, and the backend
+        // would apply its no-identity policy to a request that was in fact an
+        // attempted identity claim. That is a silent downgrade — Chord would
+        // have destroyed the very signal the backend needed to judge. The
+        // invariant, enforced identically at Terminus's ingress (TERM #595),
+        // TERM-599 dispatch, the caller key, and the router's tool cache, is
+        // that an attempted identity which cannot be honoured must NEVER be
+        // indistinguishable from no identity.
+        //
+        // This is not a DoS lever: refusing harms only the client that sent the
+        // bad header — no amplification, no cost to any other caller.
+        let mock_server = httpmock::MockServer::start_async().await;
+        mock_handshake(&mock_server, "assert-bad");
+
+        // Registered but expected to receive NOTHING. The assertion that this
+        // mock was never hit is the real content of the test: it proves the
+        // request was not merely stripped of the header and sent anyway.
+        let call_mock = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/mcp")
+                .body_contains("tools/call");
+            then.status(200)
+                .json_body(serde_json::json!({"jsonrpc":"2.0","id":2,"result":{"ok":true}}));
+        });
+
+        let session =
+            McpSession::with_token(mock_server.base_url(), 10, Some("mcp-token-3".to_string()));
+        let err = session
+            .send_request(
+                "tools/call",
+                Some(serde_json::json!({"name": "t", "arguments": {}})),
+                Some(b"bad\nvalue".as_slice()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProxyError::InvalidPersonAssertion));
+        // The offending value must never reach the error text.
+        assert!(!err.to_string().contains("bad"));
+        call_mock.assert_hits(0);
+    }
+
+    #[test]
+    fn test_person_assertion_relays_non_utf8_bytes_verbatim() {
+        // Chord is an opaque relay: it must forward exactly the bytes it
+        // received. `HeaderValue::to_str()` rejects any value that is legal at
+        // the HTTP transport level but not UTF-8, so a `to_str()`-based relay
+        // would either lose or mangle such a value — Chord would be passing on
+        // what it could DECODE rather than what it RECEIVED.
+        //
+        // Asserted against the built `reqwest::Request` rather than a mock
+        // server on purpose: `httpmock` records request headers as `String`, so
+        // it physically cannot observe a non-UTF-8 header value (it 500s on
+        // one). The built request is the actual wire representation and is the
+        // stricter check.
+        //
+        // 0xE9 is a valid header-value byte (obs-text, RFC 7230 §3.2.6) but is
+        // not valid UTF-8 on its own.
+        let raw: &[u8] = b"assert-\xe9-tail";
+
+        let session = McpSession::with_token(
+            "http://backend.invalid".to_string(),
+            10,
+            Some("mcp-token-5".to_string()),
+        );
+        let builder = session.client.post("http://backend.invalid/mcp");
+        let builder = session
+            .with_person_assertion(builder, Some(raw))
+            .expect("a transport-legal byte string must be relayable");
+        let req = builder.build().unwrap();
+
+        let sent = req
+            .headers()
+            .get(PERSON_ASSERTION_HEADER)
+            .expect("assertion header must be present");
+        assert_eq!(sent.as_bytes(), raw, "bytes must be relayed verbatim");
+        // Pins WHY this test exists: this exact value is one a `to_str()`-based
+        // relay would have failed to carry.
+        assert!(
+            sent.to_str().is_err(),
+            "test value must be one that to_str() cannot represent, or it proves nothing"
+        );
+    }
+
+    #[test]
+    fn test_with_person_assertion_refuses_untransportable_bytes() {
+        // The builder-level counterpart to the refusal test above: a value that
+        // is not encodable as a header value yields an error, never a builder
+        // that quietly lost the header.
+        let session = McpSession::with_token(
+            "http://backend.invalid".to_string(),
+            10,
+            Some("mcp-token-6".to_string()),
+        );
+        let builder = session.client.post("http://backend.invalid/mcp");
+        let err = session
+            .with_person_assertion(builder, Some(b"bad\nvalue".as_slice()))
+            .err()
+            .expect("a malformed assertion must be refused, not dropped");
+        assert!(matches!(err, ProxyError::InvalidPersonAssertion));
+        assert!(!err.to_string().contains("bad"));
+
+        // And `None` still passes the builder through untouched.
+        let builder = session.client.post("http://backend.invalid/mcp");
+        let req = session
+            .with_person_assertion(builder, None)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(req.headers().get(PERSON_ASSERTION_HEADER).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_session_handshake_never_carries_a_person_assertion() {
+        // The MCP session is SHARED and long-lived across every household
+        // member, so identity can only ever ride a per-CALL header. Neither
+        // `initialize` nor `notifications/initialized` has any parameter through
+        // which an assertion could be attached — this test pins that by
+        // requiring the header's absence on both handshake requests even while
+        // a tool call on the same session carries one.
+        let mock_server = httpmock::MockServer::start_async().await;
+
+        let init_mock = mock_server.mock(|when, then| {
+            when.matches(lacks_header!("x-terminus-person-assertion"))
+                .body_contains(r#""method":"initialize""#);
+            then.status(200)
+                .header("Mcp-Session-Id", "handshake-clean")
+                .json_body(serde_json::json!({"jsonrpc":"2.0","id":1,"result":{}}));
+        });
+        let notif_mock = mock_server.mock(|when, then| {
+            when.matches(lacks_header!("x-terminus-person-assertion"))
+                .body_contains("notifications/initialized");
+            then.status(200).body("");
+        });
+        mock_server.mock(|when, then| {
+            when.body_contains("tools/call");
+            then.status(200)
+                .json_body(serde_json::json!({"jsonrpc":"2.0","id":2,"result":{"ok":true}}));
+        });
+
+        let session =
+            McpSession::with_token(mock_server.base_url(), 10, Some("mcp-token-4".to_string()));
+        session
+            .send_request(
+                "tools/call",
+                Some(serde_json::json!({"name": "t", "arguments": {}})),
+                Some(b"person-assertion-token".as_slice()),
+            )
+            .await
+            .unwrap();
+
+        init_mock.assert_hits(1);
+        notif_mock.assert_hits(1);
     }
 }
