@@ -402,6 +402,7 @@ pub fn is_vulkan_candidate(model: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn on_demand_flag() {
@@ -432,6 +433,7 @@ mod tests {
     }
 
     #[test]
+    #[serial] // CHRD-94: mutates PROCESS-GLOBAL env; must not overlap another test that reads it
     fn seed_from_env_includes_generic_gpu() {
         // llama-gpu is always offered regardless of env.
         std::env::remove_var("OLLAMA_URL");
@@ -447,6 +449,7 @@ mod tests {
     }
 
     #[test]
+    #[serial] // CHRD-94: mutates PROCESS-GLOBAL env; must not overlap another test that reads it
     fn seed_from_env_never_seeds_dead_ollama_cpu() {
         // Unified-GTT cleanup (Phase 2): the retired `ollama-cpu` serve (:11435)
         // must NEVER be seeded, even when a stale `OLLAMA_CPU_URL` is still set
@@ -463,6 +466,7 @@ mod tests {
     }
 
     #[test]
+    #[serial] // CHRD-94: mutates PROCESS-GLOBAL env; must not overlap another test that reads it
     fn seed_from_env_primary_ollama_is_not_cpu_labeled() {
         // The primary Ollama serve runs on unified GTT with ROCm engaged — it is
         // NOT a CPU-tier backend. It must be seeded and labeled `Gpu`.
@@ -482,6 +486,7 @@ mod tests {
     }
 
     #[test]
+    #[serial] // CHRD-94: mutates PROCESS-GLOBAL env; must not overlap another test that reads it
     fn seed_from_env_includes_vulkan() {
         // vulkan is always offered regardless of env (like llama-gpu).
         std::env::remove_var("VULKAN_LLAMA_BIN");
@@ -501,6 +506,7 @@ mod tests {
     }
 
     #[test]
+    #[serial] // CHRD-94: mutates PROCESS-GLOBAL env; must not overlap another test that reads it
     fn seed_from_env_includes_openrouter() {
         // openrouter is always offered regardless of env (like llama-gpu/vulkan).
         std::env::remove_var("OPENROUTER_URL");
@@ -523,6 +529,7 @@ mod tests {
     }
 
     #[test]
+    #[serial] // CHRD-94: mutates PROCESS-GLOBAL env; must not overlap another test that reads it
     fn seed_from_env_openrouter_respects_env_overrides() {
         std::env::set_var("OPENROUTER_URL", "https://openrouter.example/api");
         std::env::set_var("OPENROUTER_API_KEY_ENV_NAME", "MY_CUSTOM_KEY_VAR");

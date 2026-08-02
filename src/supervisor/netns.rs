@@ -444,6 +444,7 @@ pub(crate) fn run_priv(bin: &str, args: &[&str]) -> Result<(), NetnsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     // ── posture → config mapping (the pure, always-runnable core) ──────────────
 
@@ -671,7 +672,19 @@ mod tests {
 
     // ── override / enable flags (off-by-default loudness) ──────────────────────
 
+    // CHRD-94: `#[serial]` is required, not decorative. `unisolated_override()`
+    // and `isolation_enabled()` read `CHORD_ALLOW_UNISOLATED` /
+    // `CHORD_NETNS_ISOLATION` straight out of the PROCESS environment — there is
+    // no injectable seam — so these two tests must mutate process-global state to
+    // exercise them at all. `supervisor::launch_isolation::tests` and
+    // `serving::launcher::tests` drive `decide_isolation` through the same two
+    // variables and are already `#[serial]`; without this attribute these tests
+    // sit outside that group and their `remove_var` at the end of the body can
+    // land between another test's `set_var` and its `decide_isolation()` call,
+    // flipping that test's outcome. Keep the group UNNAMED so it is the same lock
+    // those tests use.
     #[test]
+    #[serial]
     #[cfg_attr(miri, ignore)]
     fn unisolated_override_is_off_unless_exactly_1() {
         // Default off.
@@ -685,7 +698,10 @@ mod tests {
         std::env::remove_var("CHORD_ALLOW_UNISOLATED");
     }
 
+    // CHRD-94: `#[serial]` for the same reason as the test above — process-global
+    // `CHORD_NETNS_ISOLATION`, shared with the `#[serial]` isolation-decision tests.
     #[test]
+    #[serial]
     #[cfg_attr(miri, ignore)]
     fn isolation_is_default_on_disabled_only_by_explicit_0() {
         std::env::remove_var("CHORD_NETNS_ISOLATION");

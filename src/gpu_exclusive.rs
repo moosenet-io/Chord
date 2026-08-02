@@ -518,6 +518,7 @@ pub fn is_generate_unsupported_rejection(body: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn rec(holder: &str, acquired_at: u64, last_heartbeat: u64) -> LockRecord {
         LockRecord {
@@ -698,6 +699,7 @@ mod tests {
     }
 
     #[test]
+    #[serial] // CHRD-94: mutates PROCESS-GLOBAL env; must not overlap another test that reads it
     fn ttl_env_parsing_falls_back_on_junk() {
         // (Env is process-global; set+remove within this one test only.)
         std::env::set_var("CHORD_GPU_EXCLUSIVE_TTL_SECS", "not-a-number");

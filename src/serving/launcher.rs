@@ -1001,18 +1001,41 @@ mod tests {
         })
     }
 
-    /// Set the three runtime endpoint env vars so config helpers resolve. Returns
-    /// nothing — caller uses `#[serial]` to avoid env races.
-    fn set_runtime_endpoints() {
+    /// Removes the runtime endpoint env vars when it goes out of scope.
+    ///
+    /// CHRD-94: these are PROCESS-GLOBAL. The previous version of
+    /// `set_runtime_endpoints` set them and never unset them, so the very first
+    /// launcher test to run left `OLLAMA_URL=http://ollama.invalid/health` in
+    /// the environment for the remainder of the test binary. Anything that reads
+    /// the environment later in the run — notably
+    /// `models::backends::seed_from_env`, which every `ModelRegistry::new` calls
+    /// — then inherited a backend nobody asked for. `#[serial]` bounds the
+    /// concurrent overlap while the test runs; only unsetting bounds the damage
+    /// after it finishes.
+    struct RuntimeEndpointsGuard;
+    impl Drop for RuntimeEndpointsGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("LLAMA_SERVER_URL");
+            std::env::remove_var("OLLAMA_URL");
+            std::env::remove_var("OLLAMA_CPU_URL");
+        }
+    }
+
+    /// Set the three runtime endpoint env vars so config helpers resolve. Caller
+    /// uses `#[serial]` to avoid env races and binds the returned guard so the
+    /// vars are removed again when the test ends.
+    #[must_use]
+    fn set_runtime_endpoints() -> RuntimeEndpointsGuard {
         std::env::set_var("LLAMA_SERVER_URL", "http://llama.invalid/health");
         std::env::set_var("OLLAMA_URL", "http://ollama.invalid/health");
         std::env::set_var("OLLAMA_CPU_URL", "http://ollama-cpu.invalid/health");
+        RuntimeEndpointsGuard
     }
 
     #[test]
     #[serial]
     fn llama_command_has_no_mmap_and_flash_when_set() {
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         let e = entry(
             "big:70b",
             ServingBackend::LlamaGpu,
@@ -1034,7 +1057,7 @@ mod tests {
     #[test]
     #[serial]
     fn llama_command_emits_explicit_ctx_flag() {
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         let e = entry(
             "qwen3-coder:30b",
             ServingBackend::LlamaGpu,
@@ -1054,7 +1077,7 @@ mod tests {
     #[test]
     #[serial]
     fn llama_command_emits_yarn_flags_when_validated() {
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         let e = entry(
             "big:coder",
             ServingBackend::LlamaGpu,
@@ -1089,7 +1112,7 @@ mod tests {
     fn llama_command_unvalidated_yarn_emits_no_flags_native_context() {
         // NEGATIVE TEST: method=yarn but validated=false → no yarn/ctx-size flags,
         // native context (the "configured but not validated" path).
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         let e = entry(
             "big:coder",
             ServingBackend::LlamaGpu,
@@ -1112,7 +1135,7 @@ mod tests {
         // NEGATIVE TEST: validated=true does NOT license emitting garbage numbers
         // verbatim to llama-server. A nonsensical rope_scale (<=0) must refuse to
         // emit, same as the unvalidated path (native context, no flags).
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         let e = entry(
             "big:coder",
             ServingBackend::LlamaGpu,
@@ -1147,7 +1170,7 @@ mod tests {
     #[serial]
     fn llama_command_method_none_emits_no_scaling_flags() {
         // method=none (or the block absent entirely) → unchanged behavior.
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         let e = entry(
             "m",
             ServingBackend::LlamaGpu,
@@ -1168,7 +1191,7 @@ mod tests {
     #[test]
     #[serial]
     fn llama_command_emits_linear_flags_without_yarn_finetune() {
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         let e = entry(
             "m",
             ServingBackend::LlamaGpu,
@@ -1196,7 +1219,7 @@ mod tests {
     #[serial]
     fn llama_command_no_op_when_target_ctx_not_greater_than_orig() {
         // target_ctx <= yarn_orig_ctx → no extension needed, no-op even validated.
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         let e = entry(
             "m",
             ServingBackend::LlamaGpu,
@@ -1216,7 +1239,7 @@ mod tests {
     fn ollama_command_ignores_yarn_rope_scaling_never_crashes() {
         // NEGATIVE TEST: ollama tier cannot apply rope scaling — ignored, logged,
         // and the command builds successfully (no panic, no flags).
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         let e = entry(
             "gemma4:9b",
             ServingBackend::OllamaGpu,
@@ -1234,7 +1257,7 @@ mod tests {
     #[test]
     #[serial]
     fn cpu_command_ignores_yarn_rope_scaling_never_crashes() {
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         let e = entry(
             "small:3b",
             ServingBackend::Cpu,
@@ -1254,7 +1277,7 @@ mod tests {
     #[test]
     #[serial]
     fn llama_command_emits_thinking_flags_when_validated() {
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         let e = entry(
             "reasoner:30b",
             ServingBackend::LlamaGpu,
@@ -1272,7 +1295,7 @@ mod tests {
     #[test]
     #[serial]
     fn llama_command_emits_thinking_flag_without_cache_flag_when_not_required() {
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         let e = entry(
             "reasoner:30b",
             ServingBackend::LlamaGpu,
@@ -1290,7 +1313,7 @@ mod tests {
     #[test]
     #[serial]
     fn llama_command_unvalidated_thinking_emits_no_flags() {
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         let e = entry(
             "reasoner:30b",
             ServingBackend::LlamaGpu,
@@ -1309,7 +1332,7 @@ mod tests {
     #[test]
     #[serial]
     fn llama_command_no_supports_thinking_emits_no_flags_unchanged_baseline() {
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         // No `thinking` block at all — the unchanged, no-op baseline.
         let e = entry("plain:7b", ServingBackend::LlamaGpu, Runtime::LlamaCpp, "{}", false, None);
         let cmd = build_launch_command(&e, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
@@ -1320,7 +1343,7 @@ mod tests {
     #[test]
     #[serial]
     fn llama_command_preserve_requested_on_non_supporting_model_refuses() {
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         // preserve_thinking=true but supports_thinking=false ⇒ refuse, no flags,
         // never emit a meaningless preservation flag.
         let e = entry(
@@ -1340,7 +1363,7 @@ mod tests {
     #[test]
     #[serial]
     fn ollama_command_ignores_thinking_never_crashes() {
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         let e = entry(
             "reasoner:30b",
             ServingBackend::OllamaGpu,
@@ -1358,7 +1381,7 @@ mod tests {
     #[test]
     #[serial]
     fn cpu_command_ignores_thinking_never_crashes() {
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         let e = entry(
             "small:3b",
             ServingBackend::Cpu,
@@ -1378,7 +1401,7 @@ mod tests {
         // The SRV-02/seed shape: gfx_override bool + mmap_flag int. Previously this
         // dropped --no-mmap silently (the bug this fix closes). With the host gfx
         // override configured, `gfx_override: true` applies it.
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         std::env::set_var("CHORD_GFX_OVERRIDE_VERSION", "11.5.1");
         let e = entry(
             "minimax-m2.7",
@@ -1404,7 +1427,7 @@ mod tests {
     #[serial]
     fn llama_gfx_apply_default_omitted_when_host_unset() {
         // gfx_override:true but no host value configured ⇒ omit (never guess).
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         std::env::remove_var("CHORD_GFX_OVERRIDE_VERSION");
         let e = entry(
             "m",
@@ -1421,7 +1444,7 @@ mod tests {
     #[test]
     #[serial]
     fn llama_command_omits_mmap_flag_when_mmap_true_or_absent() {
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         // mmap absent → no flag.
         let e = entry("m", ServingBackend::LlamaGpu, Runtime::LlamaCpp, "{}", false, None);
         let cmd = build_launch_command(&e, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
@@ -1443,7 +1466,7 @@ mod tests {
     #[test]
     #[serial]
     fn ollama_command_is_serve_with_gfx() {
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         let e = entry(
             "gemma4:9b",
             ServingBackend::OllamaGpu,
@@ -1460,7 +1483,7 @@ mod tests {
     #[test]
     #[serial]
     fn cpu_command_sets_empty_gfx_and_cpu_lib() {
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         let e = entry(
             "small:3b",
             ServingBackend::Cpu,
@@ -1485,7 +1508,7 @@ mod tests {
         // The error string carries no infra.
         let s = err.to_string();
         assert!(!s.contains("://") && !s.contains("invalid"));
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
     }
 
     #[test]
@@ -1591,7 +1614,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn request_launches_best_runtime_and_health_checks() {
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         let spawner = ScriptedSpawner {
             fail_runtimes: vec![],
             calls: Mutex::new(vec![]),
@@ -1623,7 +1646,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn best_fails_then_fallback_succeeds() {
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         let spawner = ScriptedSpawner {
             fail_runtimes: vec![Runtime::LlamaCpp],
             calls: Mutex::new(vec![]),
@@ -1661,7 +1684,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn both_fail_gives_genericized_error_and_records() {
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         let spawner = ScriptedSpawner {
             fail_runtimes: vec![Runtime::LlamaCpp, Runtime::Ollama],
             calls: Mutex::new(vec![]),
@@ -1695,7 +1718,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn health_fail_on_best_triggers_fallback() {
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         // spawn succeeds for both, but health fails → both treated as failed.
         let spawner = ScriptedSpawner {
             fail_runtimes: vec![],
@@ -1736,7 +1759,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn keep_warm_delegates_to_residency_not_cold_launch() {
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         // The spawner would PANIC-equivalent: if it is ever called for this
         // keep_warm model the test fails because we assert zero spawn calls AND
         // the residency manager (not the spawner) produced the endpoint.
@@ -1780,7 +1803,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn try_runtime_refuses_keep_warm_defense_in_depth() {
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         let spawner = ScriptedSpawner {
             fail_runtimes: vec![],
             calls: Mutex::new(vec![]),
@@ -1807,7 +1830,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn cpu_only_model_exceeding_host_ram_is_refused() {
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         std::env::set_var("HOST_RAM_BUDGET_GB", "31");
         let spawner = ScriptedSpawner {
             fail_runtimes: vec![],
@@ -1837,7 +1860,7 @@ mod tests {
     fn scrub_layers_telemetry_off_under_runtime_env() {
         // The gfx override (a runtime-specific env pair) must SURVIVE the scrub and
         // sit ON TOP of the telemetry-off base.
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         let e = entry(
             "g",
             ServingBackend::OllamaGpu,
@@ -1870,7 +1893,7 @@ mod tests {
     async fn launcher_with_scrub_spawns_scrubbed_env() {
         // End-to-end through the launcher: the spawned command carries the ISO-01
         // telemetry-off vars when the launcher is built `with_scrub`.
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         struct CapturingSpawner {
             env: Mutex<Vec<(String, String)>>,
         }
@@ -1908,7 +1931,7 @@ mod tests {
         // WITHOUT CAP_NET_ADMIN and with isolation ON and NO override must REFUSE to
         // launch (IsolationRefused) — it must NEVER spawn the runtime with full host
         // egress. We assert the spawner was never called.
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         std::env::remove_var("CHORD_NETNS_ISOLATION"); // default ON
         std::env::remove_var("CHORD_ALLOW_UNISOLATED"); // no override
         let spawner = ScriptedSpawner { fail_runtimes: vec![], calls: Mutex::new(vec![]) };
@@ -1941,7 +1964,7 @@ mod tests {
         // With the explicit operator override, the same unprivileged host DOES
         // spawn (unisolated) — the sanctioned bypass. The serve handle carries no
         // namespace (none was created).
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         std::env::remove_var("CHORD_NETNS_ISOLATION");
         std::env::set_var("CHORD_ALLOW_UNISOLATED", "1");
         let spawner = ScriptedSpawner { fail_runtimes: vec![], calls: Mutex::new(vec![]) };
@@ -1961,7 +1984,7 @@ mod tests {
     #[serial]
     async fn with_scrub_disabled_by_config_spawns_unisolated_legacy_path() {
         // CHORD_NETNS_ISOLATION=0 is the dev/CI opt-out: spawn, no namespace.
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         std::env::set_var("CHORD_NETNS_ISOLATION", "0");
         let spawner = ScriptedSpawner { fail_runtimes: vec![], calls: Mutex::new(vec![]) };
         let health = ScriptedHealth { healthy: true };
@@ -1979,7 +2002,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn passthrough_residency_stub_launches_and_healthchecks() {
-        set_runtime_endpoints();
+        let _endpoints = set_runtime_endpoints();
         let spawner = ScriptedSpawner {
             fail_runtimes: vec![],
             calls: Mutex::new(vec![]),

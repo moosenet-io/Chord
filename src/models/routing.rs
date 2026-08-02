@@ -200,6 +200,7 @@ pub async fn stop_all_on_demand_backends(registry: &Arc<Mutex<ModelRegistry>>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use crate::models::backends::LaunchSpec;
 
     #[test]
@@ -254,6 +255,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial] // CHRD-94: mutates PROCESS-GLOBAL env; must not overlap another test that reads it
     async fn resolve_and_ensure_returns_bearer_key_for_openrouter_backend() {
         // Env var is read fresh inside resolve_and_ensure, keyed off the
         // backend's api_key_env — never stored in the Backend/ModelRecord.

@@ -1599,6 +1599,7 @@ pub async fn watchdog_loop(state: Arc<crate::routes::AppState>, interval: Durati
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn manifest(reason: &str, entered_at: u64, deadline: u64) -> ResumeManifest {
         ResumeManifest {
@@ -2117,6 +2118,7 @@ mod tests {
     // ── env parsing ──────────────────────────────────────────────────────────
 
     #[test]
+    #[serial] // CHRD-94: mutates PROCESS-GLOBAL env; must not overlap another test that reads it
     fn positive_env_falls_back_on_junk() {
         std::env::set_var("CHORD_IDLE_TEST_KEY", "not-a-number");
         assert_eq!(parse_positive_env("CHORD_IDLE_TEST_KEY", 42), 42);
@@ -2128,6 +2130,7 @@ mod tests {
     }
 
     #[test]
+    #[serial] // CHRD-94: mutates PROCESS-GLOBAL env; must not overlap another test that reads it
     fn compiler_lease_holders_default_when_unset() {
         std::env::remove_var("CHORD_IDLE_COMPILER_LEASE_HOLDERS");
         let p = compiler_lease_holders_from_env();
@@ -2136,6 +2139,7 @@ mod tests {
     }
 
     #[test]
+    #[serial] // CHRD-94: mutates PROCESS-GLOBAL env; must not overlap another test that reads it
     fn stale_threshold_always_exceeds_release_budget() {
         // finding #1 invariant: the watchdog stale bound must be strictly greater than
         // the release budget, so stale-recovery can never fire during live release.
