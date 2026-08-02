@@ -103,19 +103,22 @@ pub async fn resolve_and_ensure(
 
     // Brief lock: snapshot the backend + the model's local path, then release so
     // a (possibly long) on-demand start does not block other requests.
-    let (resolved, bearer_key) = {
+    let (resolved, bearer_key, arch_known) = {
         let reg = registry.lock().await;
         let b = reg
             .backend_for_arch_aware(registry_key, &excluded_tiers, chosen_tier)?
             .clone();
         let local = reg.get(registry_key).and_then(|r| r.local_path.clone());
         let gguf = reg.get(registry_key).and_then(|r| r.gguf_path.clone());
+        // CHRD phase3: is this model's arch already recorded? (Drives the
+        // serve-time profiler backfill below.)
+        let arch_known = reg.get(registry_key).map(|r| r.arch.is_some()).unwrap_or(false);
         let bearer_key = b
             .api_key_env
             .as_ref()
             .and_then(|env_name| std::env::var(env_name).ok())
             .filter(|v| !v.trim().is_empty());
-        (to_resolved(&b, local, gguf), bearer_key)
+        (to_resolved(&b, local, gguf), bearer_key, arch_known)
     };
 
     if let Err(e) = lifecycle::ensure_up(&resolved, model).await {
@@ -125,6 +128,45 @@ pub async fn resolve_and_ensure(
         );
         return None;
     }
+
+    // CHRD phase3 (profiler / task-26): the MINT sweep drives REAL serves through
+    // this path. The first time a model actually serves and its architecture is
+    // not yet known, derive it off-lock from disk and record it — so arch-aware
+    // routing becomes data-driven through the normal serve/sweep flow, not only
+    // via reconcile. Fully additive and non-blocking: it runs in a detached task
+    // (never delays this response), reads the GGUF on a blocking thread (never on
+    // the async runtime), and any failure simply leaves arch unset for now
+    // (reconcile still populates it). Only fires for LOCAL models (a resolvable
+    // local root) and only until arch is known — not a per-request cost.
+    if !arch_known {
+        if let Some(local_root) = resolved.model_local_path.clone() {
+            let registry = registry.clone();
+            let key = registry_key.to_string();
+            tokio::spawn(async move {
+                let key_for_read = key.clone();
+                let derived = tokio::task::spawn_blocking(move || {
+                    crate::models::registry::derive_arch_for_local_model(
+                        std::path::Path::new(&local_root),
+                        &key_for_read,
+                    )
+                })
+                .await
+                .ok()
+                .flatten();
+                if let Some(arch) = derived {
+                    let mut reg = registry.lock().await;
+                    if reg.record_served_arch(&key, &arch) {
+                        tracing::debug!(
+                            model = %key,
+                            arch = %arch,
+                            "CHRD phase3: recorded served arch (profiler backfill)"
+                        );
+                    }
+                }
+            });
+        }
+    }
+
     // ensure_up already touched the shared last-used file (read by the sweep).
     Some((format!("{}/v1/chat/completions", resolved.url), bearer_key))
 }

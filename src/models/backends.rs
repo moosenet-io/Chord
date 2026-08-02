@@ -433,16 +433,29 @@ fn normalize_arch(s: &str) -> String {
 /// [`llama_server_arch_denylist`] so tests exercise it WITHOUT mutating the
 /// shared process env (which races other parallel tests).
 fn parse_arch_denylist(raw: Option<&str>) -> Vec<String> {
-    match raw {
-        Some(v) if !v.trim().is_empty() => v
-            .split(',')
-            .map(normalize_arch)
-            .filter(|s| !s.is_empty())
-            .collect(),
-        _ => DEFAULT_LLAMA_SERVER_ARCH_DENYLIST
+    let default = || -> Vec<String> {
+        DEFAULT_LLAMA_SERVER_ARCH_DENYLIST
             .iter()
             .map(|s| normalize_arch(s))
-            .collect(),
+            .collect()
+    };
+    match raw {
+        Some(v) if !v.trim().is_empty() => {
+            let parsed: Vec<String> = v
+                .split(',')
+                .map(normalize_arch)
+                .filter(|s| !s.is_empty())
+                .collect();
+            // Fail-CLOSED: a nonblank value that normalizes to ZERO entries
+            // (e.g. `",,,"` / punctuation-only) must NOT disable the built-in
+            // protection — fall back to the default rather than "deny nothing".
+            if parsed.is_empty() {
+                default()
+            } else {
+                parsed
+            }
+        }
+        _ => default(),
     }
 }
 
@@ -675,10 +688,13 @@ mod tests {
         assert!(!dl.contains(&"gptoss".to_string()));
         assert!(!kind_can_serve_arch_with(&dl, BackendKind::LlamaServer, Some("mamba")));
         assert!(kind_can_serve_arch_with(&dl, BackendKind::LlamaServer, Some("gptoss")));
-        // None and a set-but-blank value both fall back to the default
-        // (never an empty, guard-disabling denylist).
+        // None, a set-but-blank value, AND a nonblank punctuation-only value
+        // that normalizes to zero entries all fall back to the default (never
+        // an empty, guard-disabling denylist — fail-closed).
         assert!(parse_arch_denylist(None).contains(&"gptoss".to_string()));
         assert!(parse_arch_denylist(Some("   ")).contains(&"gptoss".to_string()));
+        assert!(parse_arch_denylist(Some(",,,")).contains(&"gptoss".to_string()));
+        assert!(parse_arch_denylist(Some(" , - , _ ")).contains(&"gptoss".to_string()));
     }
 
     #[test]
