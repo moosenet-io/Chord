@@ -399,6 +399,89 @@ pub fn is_vulkan_candidate(model: &str) -> bool {
     )
 }
 
+/// CHRD phase3 — env var naming the architectures a llama.cpp (`llama-server`)
+/// backend CANNOT load, so a model of that architecture is never routed to a
+/// [`BackendKind::LlamaServer`] backend (`llama-gpu` / `lemonade-coder` /
+/// `vulkan`). Comma-separated architecture identifiers (as reported by GGUF
+/// `general.architecture` or a serving profile), matched case- and
+/// punctuation-insensitively. When set (non-blank) it REPLACES — never appends
+/// to — the built-in default.
+pub const LLAMA_SERVER_ARCH_DENYLIST_ENV: &str = "CHORD_LLAMASERVER_ARCH_DENYLIST";
+
+/// Built-in default llama-server architecture denylist: `gpt-oss` (`gptoss`).
+///
+/// llama.cpp cannot load the gptoss architecture — a `gpt-oss` model dispatched
+/// to a llama-server backend produces a ~120s egress HANG instead of a clean
+/// error (the exact mis-route this Phase-3 arch guard prevents). This is a fleet
+/// FACT about an architecture FAMILY (not a model name, so it does not violate
+/// the "no hardcoded model names" rule) and is therefore safe to ship as the
+/// default; override the whole set via [`LLAMA_SERVER_ARCH_DENYLIST_ENV`].
+const DEFAULT_LLAMA_SERVER_ARCH_DENYLIST: &[&str] = &["gptoss"];
+
+/// Normalize an architecture identifier for comparison: keep ASCII alphanumerics
+/// only, lowercased — so `gpt-oss`, `GPT_OSS`, and `gptoss` all compare equal.
+fn normalize_arch(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Pure parser: the normalized llama-server arch denylist for a raw env value.
+/// `None`/blank falls back to the built-in default (never an empty,
+/// guard-disabling denylist by accident). Factored out from
+/// [`llama_server_arch_denylist`] so tests exercise it WITHOUT mutating the
+/// shared process env (which races other parallel tests).
+fn parse_arch_denylist(raw: Option<&str>) -> Vec<String> {
+    match raw {
+        Some(v) if !v.trim().is_empty() => v
+            .split(',')
+            .map(normalize_arch)
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => DEFAULT_LLAMA_SERVER_ARCH_DENYLIST
+            .iter()
+            .map(|s| normalize_arch(s))
+            .collect(),
+    }
+}
+
+/// The normalized set of architectures a `llama-server` backend cannot serve,
+/// from [`LLAMA_SERVER_ARCH_DENYLIST_ENV`] or the built-in default.
+pub fn llama_server_arch_denylist() -> Vec<String> {
+    parse_arch_denylist(std::env::var(LLAMA_SERVER_ARCH_DENYLIST_ENV).ok().as_deref())
+}
+
+/// Pure core of [`kind_can_serve_arch`]: takes the (already-normalized) denylist
+/// explicitly so it is testable with no global env dependency.
+fn kind_can_serve_arch_with(denylist: &[String], kind: BackendKind, arch: Option<&str>) -> bool {
+    let Some(arch) = arch else {
+        return true;
+    };
+    if kind != BackendKind::LlamaServer {
+        return true;
+    }
+    let norm = normalize_arch(arch);
+    if norm.is_empty() {
+        return true;
+    }
+    !denylist.iter().any(|d| d == &norm)
+}
+
+/// CHRD phase3 — whether a backend of `kind` can serve a model of architecture
+/// `arch`.
+///
+/// Conservative / fail-CLOSED only on a KNOWN-incompatible pairing: a
+/// [`BackendKind::LlamaServer`] backend cannot serve an architecture in
+/// [`llama_server_arch_denylist`]. Every other pairing is allowed — an unknown
+/// arch (`None`/blank), any arch NOT on the denylist, or any non-`LlamaServer`
+/// kind (Ollama serves every local arch on this fleet; `Daemon`/`OpenRouter`
+/// are opaque remote/externally-managed serves). This only ever REJECTS a
+/// mis-route that would hang; it never re-routes a working pairing.
+pub fn kind_can_serve_arch(kind: BackendKind, arch: Option<&str>) -> bool {
+    kind_can_serve_arch_with(&llama_server_arch_denylist(), kind, arch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,8 +645,55 @@ mod tests {
     }
 
     #[test]
+    fn kind_can_serve_arch_rejects_only_known_incompatible_llamaserver_pairing() {
+        // Default denylist (no env), tested via the pure core so this never
+        // races a parallel test mutating the shared process env.
+        let dl = parse_arch_denylist(None);
+        let can = |k, a| kind_can_serve_arch_with(&dl, k, a);
+        // gptoss on a llama-server backend is the KNOWN mis-route → rejected.
+        assert!(!can(BackendKind::LlamaServer, Some("gptoss")));
+        // Punctuation/case variants of the same architecture are also rejected.
+        assert!(!can(BackendKind::LlamaServer, Some("gpt-oss")));
+        assert!(!can(BackendKind::LlamaServer, Some("GPT_OSS")));
+        // A llama-loadable arch on llama-server is fine (no regression).
+        assert!(can(BackendKind::LlamaServer, Some("qwen3")));
+        assert!(can(BackendKind::LlamaServer, Some("llama")));
+        // Ollama serves every local arch on this fleet — never guarded.
+        assert!(can(BackendKind::Ollama, Some("gptoss")));
+        // Unknown / blank arch is never hard-failed (data-driven, not guessed).
+        assert!(can(BackendKind::LlamaServer, None));
+        assert!(can(BackendKind::LlamaServer, Some("   ")));
+    }
+
+    #[test]
+    fn arch_denylist_env_override_replaces_default() {
+        // Pure parser — no global env mutation, so no cross-test race.
+        let dl = parse_arch_denylist(Some("mamba, some-new-arch"));
+        assert!(dl.contains(&"mamba".to_string()));
+        assert!(dl.contains(&"somenewarch".to_string()));
+        // Override REPLACES the default — gptoss is no longer denied under it.
+        assert!(!dl.contains(&"gptoss".to_string()));
+        assert!(!kind_can_serve_arch_with(&dl, BackendKind::LlamaServer, Some("mamba")));
+        assert!(kind_can_serve_arch_with(&dl, BackendKind::LlamaServer, Some("gptoss")));
+        // None and a set-but-blank value both fall back to the default
+        // (never an empty, guard-disabling denylist).
+        assert!(parse_arch_denylist(None).contains(&"gptoss".to_string()));
+        assert!(parse_arch_denylist(Some("   ")).contains(&"gptoss".to_string()));
+    }
+
+    #[test]
     fn hardware_and_kind_serde_lowercase_kebab() {
         assert_eq!(serde_json::to_string(&Hardware::Gpu).unwrap(), "\"gpu\"");
+        // Back-compat: the DEPRECATED `cpu` hardware tag from pre-unified-GTT
+        // registries / wire payloads must still deserialize (never hard-error).
+        assert_eq!(
+            serde_json::from_str::<Hardware>("\"cpu\"").unwrap(),
+            Hardware::Cpu
+        );
+        assert_eq!(
+            serde_json::from_str::<Hardware>("\"gpu\"").unwrap(),
+            Hardware::Gpu
+        );
         assert_eq!(
             serde_json::to_string(&BackendKind::LlamaServer).unwrap(),
             "\"llama-server\""
