@@ -380,8 +380,13 @@ pub async fn tools_call(
     // `session::PERSON_ASSERTION_HEADER`. Read straight off the inbound headers:
     // if Terminus did not send one, we send none, and we never synthesize a
     // substitute from `claims.sub` (that would manufacture an identity claim
-    // Chord is not entitled to make). A non-ASCII/garbage value is dropped at
-    // the session layer rather than failing the call.
+    // Chord is not entitled to make). A value that cannot be encoded as an HTTP
+    // header at all is REFUSED (400), never dropped: dropping would make "an
+    // assertion was supplied but could not be relayed" indistinguishable from
+    // "none was supplied", and the call would then run bearer-authenticated with
+    // no identity — the fail-open this whole item exists to close. Note the check
+    // is ALSO duplicated at the top of `McpProxy::tool_call`, because an error
+    // raised only in the session layer is swallowed by the Rust fallback.
     // Raw BYTES, not `to_str()`: `HeaderValue::to_str` fails on any value that
     // is legal at the HTTP transport level but not UTF-8, and swallowing that
     // here would silently narrow an opaque relay to "whatever Chord could
