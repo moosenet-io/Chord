@@ -2065,6 +2065,7 @@ mod tests {
     /// floor set (per-tier vars unset), every tier applies that global floor —
     /// preserving the prior global-only behavior.
     #[test]
+    #[serial_test::serial] // CHRD-94: mutates PROCESS-GLOBAL env; must not overlap another test that reads it
     fn unset_per_tier_floor_falls_back_to_global() {
         // from_env with only the global var set → both per-tier floors equal it.
         let keys = [
@@ -2088,6 +2089,7 @@ mod tests {
 
     /// A set per-tier var OVERRIDES the global for its tier only (from_env path).
     #[test]
+    #[serial_test::serial] // CHRD-94: mutates PROCESS-GLOBAL env; must not overlap another test that reads it
     fn set_per_tier_floor_overrides_global_from_env() {
         let keys = [
             "CHORD_ALIAS_MIN_QUALITY",

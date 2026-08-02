@@ -326,6 +326,7 @@ impl SlmRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use crate::models::backends::{BackendKind, Hardware};
 
     fn policy() -> RoutingPolicy {
@@ -595,6 +596,7 @@ mod tests {
     // ── HttpExecutor: bearer resolution via api_key_env indirection ────────
 
     #[tokio::test]
+    #[serial] // CHRD-94: mutates PROCESS-GLOBAL env; must not overlap another test that reads it
     async fn http_executor_uses_api_key_env_indirection_not_a_literal() {
         // Mirrors resolve_and_ensure_returns_bearer_key_for_openrouter_backend
         // in models/routing.rs: the env var NAME is config; the value is read

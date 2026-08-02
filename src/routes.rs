@@ -2588,6 +2588,38 @@ pub(crate) mod tests {
         }
     }
 
+    /// CHRD-94: build a [`ModelRegistry`] with an EXPLICITLY EMPTY backend
+    /// catalogue.
+    ///
+    /// `ModelRegistry::new` seeds its backends from the process environment
+    /// (`OLLAMA_URL`, `LLAMA_SERVER_URL`, `OPENROUTER_URL`, …). Inside a test
+    /// binary that environment is shared, mutable, process-global state that
+    /// *other* tests write to — e.g. `serving::launcher`'s test helper
+    /// `set_runtime_endpoints()` sets `OLLAMA_URL=http://ollama.invalid/health`.
+    /// A registry seeded from that env has a default backend, so
+    /// `chat_completions`' `resolve_and_ensure` resolves to it and forwards
+    /// there INSTEAD of the `llm_backend_url` the test pointed at its own
+    /// `MockServer` — the request never reaches the mock and the assertion sees
+    /// whatever that host replies (a 404, in the case that motivated this).
+    ///
+    /// The chat/completions tests all mean "registry knows no backend, so
+    /// routing falls back to the configured LLM URL". Stating that explicitly
+    /// makes it true regardless of what any other test — or the developer's own
+    /// shell — has in the environment.
+    fn isolated_registry(
+        path: std::path::PathBuf,
+        local_path: std::path::PathBuf,
+        archive_path: std::path::PathBuf,
+    ) -> crate::models::registry::ModelRegistry {
+        crate::models::registry::ModelRegistry::new_with_backends(
+            path,
+            local_path,
+            archive_path,
+            vec![],
+            std::collections::HashMap::new(),
+        )
+    }
+
     /// Build an empty model registry (pointing at throwaway paths) and a pull
     /// coordinator over it, for AppState test constructors that don't care about
     /// the pull-on-miss path. Returns `(registry, coordinator)` sharing the same
@@ -2598,13 +2630,11 @@ pub(crate) mod tests {
         Arc<Mutex<crate::models::registry::ModelRegistry>>,
         Arc<crate::models::transfer::PullCoordinator>,
     ) {
-        use crate::models::registry::ModelRegistry;
         use crate::models::transfer::PullCoordinator;
-        let reg = ModelRegistry::new(
+        let reg = isolated_registry(
             std::path::PathBuf::from("/nonexistent/chord-test-registry.json"),
             std::path::PathBuf::from("/nonexistent/local"),
             std::path::PathBuf::from("/nonexistent/archive"),
-            vec![],
         );
         let registry = Arc::new(Mutex::new(reg));
         let coordinator = Arc::new(PullCoordinator::new(
@@ -4824,18 +4854,20 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial(gpu_gate)]
     async fn test_chat_completions_pulls_cold_model_before_forwarding() {
-        use crate::models::registry::{ModelRegistry, StorageTier};
+        use crate::models::registry::StorageTier;
         use crate::models::transfer::PullCoordinator;
 
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path();
         let model = write_archive_model(&base.join("archive"), "coldmodel", "1", &[64, 64]);
 
-        let mut reg = ModelRegistry::new(
+        // CHRD-94: explicitly no backends — see `isolated_registry`. Otherwise a
+        // process-global `OLLAMA_URL` set by an unrelated concurrent test seeds a
+        // default backend and the forward goes there instead of `server`.
+        let mut reg = isolated_registry(
             base.join("registry.json"),
             base.join("local"),
             base.join("archive"),
-            vec![],
         );
         reg.reconcile();
         assert_eq!(reg.get(&model).unwrap().tier, StorageTier::Cold);
@@ -4883,7 +4915,7 @@ pub(crate) mod tests {
         // ("coldmodel:latest"), but clients often request the untagged name
         // ("coldmodel"). The pull-on-miss hook must normalize to ":latest" so the
         // cold model is still found and pulled.
-        use crate::models::registry::{ModelRegistry, StorageTier};
+        use crate::models::registry::StorageTier;
         use crate::models::transfer::PullCoordinator;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -4891,11 +4923,13 @@ pub(crate) mod tests {
         let model = write_archive_model(&base.join("archive"), "coldmodel", "latest", &[64, 64]);
         assert_eq!(model, "coldmodel:latest");
 
-        let mut reg = ModelRegistry::new(
+        // CHRD-94: explicitly no backends — see `isolated_registry`. Otherwise a
+        // process-global `OLLAMA_URL` set by an unrelated concurrent test seeds a
+        // default backend and the forward goes there instead of `server`.
+        let mut reg = isolated_registry(
             base.join("registry.json"),
             base.join("local"),
             base.join("archive"),
-            vec![],
         );
         reg.reconcile();
         assert_eq!(reg.get("coldmodel:latest").unwrap().tier, StorageTier::Cold);

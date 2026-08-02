@@ -446,16 +446,46 @@ fn parse_registry_file(
 }
 
 impl ModelRegistry {
-    /// Create an empty registry bound to the given paths.
+    /// Create an empty registry bound to the given paths, with its backend
+    /// catalogue seeded from the process environment
+    /// ([`backends::seed_from_env`]).
     pub fn new(
         path: PathBuf,
         local_path: PathBuf,
         archive_path: PathBuf,
         protected: Vec<String>,
     ) -> Self {
+        Self::new_with_backends(
+            path,
+            local_path,
+            archive_path,
+            protected,
+            backends::seed_from_env(),
+        )
+    }
+
+    /// Create an empty registry with an EXPLICIT backend catalogue, reading
+    /// nothing from the process environment.
+    ///
+    /// [`ModelRegistry::new`] seeds `backends` from `OLLAMA_URL` /
+    /// `LLAMA_SERVER_URL` / `OPENROUTER_URL` / … , which makes every registry it
+    /// builds a function of process-global state. That is correct in production
+    /// (there is exactly one process and one environment) but it makes any
+    /// registry built inside a test suite depend on whatever *other* concurrently
+    /// running tests have put in the environment — see CHRD-94. Callers that need
+    /// a registry whose backend routing is fully determined by the call site pass
+    /// their catalogue here (commonly `HashMap::new()`, i.e. "no backends, so
+    /// routing always falls back to the caller's configured LLM URL").
+    pub fn new_with_backends(
+        path: PathBuf,
+        local_path: PathBuf,
+        archive_path: PathBuf,
+        protected: Vec<String>,
+        backends: HashMap<String, Backend>,
+    ) -> Self {
         ModelRegistry {
             records: HashMap::new(),
-            backends: backends::seed_from_env(),
+            backends,
             path,
             protected,
             local_path,
@@ -1654,6 +1684,7 @@ fn parse_manifest_size(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::fs;
     use tempfile::tempdir;
 
@@ -1801,6 +1832,7 @@ mod tests {
     }
 
     #[test]
+    #[serial] // CHRD-94: mutates PROCESS-GLOBAL env; must not overlap another test that reads it
     fn loads_legacy_flat_registry_and_seeds_backends() {
         // P5: a pre-P5 registry is a bare {name: record} map with no `backend`
         // field and no `backends` section. It must still load, default each
@@ -1847,6 +1879,7 @@ mod tests {
     }
 
     #[test]
+    #[serial] // CHRD-94: mutates PROCESS-GLOBAL env; must not overlap another test that reads it
     fn default_backend_never_implicitly_picks_openrouter() {
         // Regression test for a real bug caught by the test suite while wiring
         // up OpenRouter: `openrouter` is `always_on: true` (no process
@@ -2263,6 +2296,7 @@ mod tests {
     }
 
     #[test]
+    #[serial] // CHRD-94: mutates PROCESS-GLOBAL env; must not overlap another test that reads it
     fn register_diffusiongemma_from_env_noop_without_paths() {
         let tmp = tempdir().unwrap();
         let mut reg = reg_at(tmp.path(), vec![]);
@@ -2274,6 +2308,7 @@ mod tests {
     }
 
     #[test]
+    #[serial] // CHRD-94: mutates PROCESS-GLOBAL env; must not overlap another test that reads it
     fn register_openrouter_owl_alpha_from_env_noop_when_disabled() {
         let tmp = tempdir().unwrap();
         let mut reg = reg_at(tmp.path(), vec![]);
@@ -2286,6 +2321,7 @@ mod tests {
     }
 
     #[test]
+    #[serial] // CHRD-94: mutates PROCESS-GLOBAL env; must not overlap another test that reads it
     fn register_openrouter_owl_alpha_from_env_uses_the_default_model_verbatim() {
         // OWL_ALPHA_MODEL_ID (currently the Nemotron substitute) already
         // contains ':' (its own "-free" tag), so the untagged->":latest"
@@ -2317,6 +2353,7 @@ mod tests {
     }
 
     #[test]
+    #[serial] // CHRD-94: mutates PROCESS-GLOBAL env; must not overlap another test that reads it
     fn register_openrouter_owl_alpha_from_env_normalizes_an_untagged_override_to_match_routes_rs() {
         // Regression test for a real bug caught via a live request through a
         // running chord-proxy: `routes.rs::chat_completions` normalizes an
