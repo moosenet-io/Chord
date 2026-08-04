@@ -38,18 +38,12 @@ use super::registry::{
     collect_manifest_leaves, parse_manifest_blobs, ManifestBlobs, ModelRegistry, StorageTier,
 };
 use super::transfer::{
-    blob_filename, cleanup_partial, copy_file_cancellable, find_manifest_leaf, CopyCancel,
-    DiskSpaceProbe, COPY_TEMP_INFIX,
+    blob_filename, cleanup_attempt, copy_file_cancellable, find_manifest_leaf, CopyCancel,
+    DiskSpaceProbe, CANCELLED, COPY_CANCEL_GRACE, COPY_TEMP_INFIX,
 };
 
-/// How long a timed-out eviction waits for its cancelled copy to actually stop
-/// before giving up on cleaning up inline.
-///
-/// Cancellation is checked between 4 MiB chunks, so this is only ever reached
-/// when the filesystem itself is wedged (a stalled NFS write inside a single
-/// chunk). In that case cleanup is handed to a detached task that runs once the
-/// copy really stops — the sweep is never blocked on a wedged mount.
-const COPY_CANCEL_GRACE: Duration = Duration::from_secs(30);
+/// Label used in `cleanup_attempt` logs for the warm→cold direction.
+const EVICT_OP: &str = "archive eviction (warm→cold)";
 
 const BYTES_PER_GB: f64 = 1_073_741_824.0; // 1 GiB
 const SECS_PER_HOUR: i64 = 3_600;
@@ -379,11 +373,15 @@ pub async fn evict_to_archive(
             match tokio::time::timeout(COPY_CANCEL_GRACE, &mut copy_task).await {
                 // Stopped early: we have the precise list of what it published.
                 // Still inside the caller's DiskOpLock, so the snapshot holds.
-                Ok(Ok(Err((_, published)))) => cleanup_attempt(model, &published, &pre_existing),
+                Ok(Ok(Err((_, published)))) => {
+                    cleanup_attempt(EVICT_OP, model, &published, &pre_existing)
+                }
                 // Finished (or panicked) before it saw the cancel: we don't have
                 // an exact list, so fall back to every planned archive path that
                 // did not exist before this attempt started.
-                Ok(Ok(Ok(()))) | Ok(Err(_)) => cleanup_attempt(model, &planned, &pre_existing),
+                Ok(Ok(Ok(()))) | Ok(Err(_)) => {
+                    cleanup_attempt(EVICT_OP, model, &planned, &pre_existing)
+                }
                 Err(_) => {
                     // The copy is wedged inside a single chunk write (only
                     // reachable on a stalled mount). We must not block the sweep
@@ -435,7 +433,7 @@ pub async fn evict_to_archive(
             // destroy data this attempt did not create, so `cleanup_attempt`
             // filters it out. Two cleanup routes with different safety rules is
             // how one of them ends up wrong — there is exactly one route.
-            cleanup_attempt(model, &published, &pre_existing);
+            cleanup_attempt(EVICT_OP, model, &published, &pre_existing);
             return Err(EvictError::ArchiveCopy(model.to_string(), e));
         }
         Err(join_err) => {
@@ -446,7 +444,7 @@ pub async fn evict_to_archive(
             // publish one complete, correct blob — never a partial or corrupt one
             // — because it writes solely into its own temp path.
             cancel.store(true, Ordering::Relaxed);
-            cleanup_attempt(model, &planned, &pre_existing);
+            cleanup_attempt(EVICT_OP, model, &planned, &pre_existing);
             return Err(EvictError::ArchiveCopy(
                 model.to_string(),
                 format!("archive copy task failed to join: {join_err}"),
@@ -563,56 +561,13 @@ async fn copy_model_to_archive(
     Ok(())
 }
 
-/// Error message a copy returns when it stopped because its [`CopyCancel`] flag
-/// was set. Only [`evict_to_archive`]'s timeout path sets that flag, so this
-/// never surfaces as a user-visible `ArchiveCopy` error.
-const CANCELLED: &str = "archive copy cancelled by timeout";
-
-/// The **one** route by which a failed eviction attempt removes archive files.
-///
-/// Every path handed here is a *complete* file — `copy_file_cancellable` stages
-/// into a temp file and publishes with `rename`, so a partial or corrupt archive
-/// file cannot exist. This is therefore purely about reclaiming disk from blobs
-/// an abandoned eviction published, never about scrubbing damage.
-///
-/// Removes every candidate that did **not** exist in `pre_existing` — the
-/// snapshot taken, under the caller's `DiskOpLock`, before this attempt published
-/// anything. A path that was already there is data this attempt did not create (a
-/// blob shared with another archived model, possibly its only copy) and is never
-/// removed, even though this attempt may have atomically replaced it with a
-/// correct copy of the same digest.
-///
-/// Two preconditions, both required for the snapshot to be accurate:
-/// 1. the copy has genuinely stopped (cancelled and awaited, or finished), and
-/// 2. the caller still holds `DiskOpLock`, so nothing else can have created an
-///    archive file since the snapshot.
-///
-/// Every failure path — mid-copy I/O error, timeout, copy-task panic — goes
-/// through here. The one path that cannot satisfy precondition 2 (the
-/// cancellation-grace expiry, which returns while the copy is still alive)
-/// deletes nothing at all and logs instead.
-fn cleanup_attempt(model: &str, candidates: &[PathBuf], pre_existing: &HashSet<PathBuf>) {
-    let (to_clean, kept): (Vec<PathBuf>, Vec<PathBuf>) = candidates
-        .iter()
-        .cloned()
-        .partition(|p| !pre_existing.contains(p));
-    if !kept.is_empty() {
-        info!(
-            model = %model,
-            kept = ?kept.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-            "leaving pre-existing archive files in place during cleanup of a failed eviction"
-        );
-    }
-    cleanup_partial(&to_clean);
-}
-
 /// Every archive path a warm→cold copy of `local_manifest`'s model *would*
 /// create (every referenced blob + the manifest), used for best-effort cleanup
 /// when the precise `published` list is unavailable (the copy task finished or
-/// panicked rather than reporting back). Only paths that exist are ever removed
-/// by [`cleanup_partial`], and [`cleanup_attempt`] additionally drops any path
-/// that already existed before this attempt started, so a pre-existing/shared
-/// archive blob is never removed via this list.
+/// panicked rather than reporting back). It is only ever consumed by
+/// [`cleanup_attempt`], which drops any path that already existed before this
+/// attempt started, so a pre-existing/shared archive blob is never removed via
+/// this list.
 ///
 /// Note this is a *superset* fallback, not evidence of what was written. Because
 /// every copy is published atomically, none of these paths can be half-written;

@@ -16,11 +16,16 @@
 //! - **Concurrent-pull dedup:** a [`PullCoordinator`] holds a per-model async
 //!   lock so two requests for the same cold model never double-copy — the second
 //!   awaits the first, then sees the model already warm and returns early.
-//! - **Timeout:** the copy is wrapped in `tokio::time::timeout`; on expiry every
-//!   file written by *this* pull is removed so no partial/corrupt local state is
-//!   left behind.
-//! - **Mid-copy failure cleanup:** any error partway through copying triggers the
-//!   same cleanup of this pull's partial files.
+//! - **Timeout:** the copy runs as an owned, cancellable task. On expiry it is
+//!   *cancelled and awaited* before anything is removed, so cleanup is ordered
+//!   strictly after the copy's last write rather than merely after the timer
+//!   fired. Only files this pull published — never a blob that was already there
+//!   — are removed.
+//! - **Mid-copy failure cleanup:** any error partway through copying goes through
+//!   that same single cleanup route, with the same pre-existing filter.
+//! - **No in-place writes:** every file is staged in a temp file in the
+//!   destination's own directory and published with `rename`, so a local blob
+//!   Ollama may have loaded is never truncated or partially overwritten.
 //! - **Progress events:** an optional [`PullEvent`] channel surfaces
 //!   "retrieving from archive" / "loading into VRAM" so a long NFS copy doesn't
 //!   look stuck. Tests pass `None`.
@@ -28,8 +33,9 @@
 //! Nothing here hardcodes infrastructure — all paths come from the registry /
 //! config, model names from the request.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -282,6 +288,9 @@ pub(crate) fn blob_filename(digest: &str) -> String {
 // ── Core pull ──────────────────────────────────────────────────────────────────
 
 /// Inputs describing one model's archive location, resolved from the registry.
+/// `Clone` so the copy can be handed to an owned `tokio::spawn`ed task while the
+/// caller keeps its own copy for cleanup.
+#[derive(Clone)]
 struct PullPlan {
     name: String,
     archive_root: PathBuf,
@@ -345,50 +354,150 @@ pub async fn archive_pull(
         });
     }
 
-    // ── Timeout-wrapped copy with partial-file tracking for cleanup ──
-    let copy_fut = copy_model_files(&plan);
-    match tokio::time::timeout(timeout, copy_fut).await {
+    // Snapshot which of the planned LOCAL paths already exist before this pull
+    // writes anything. This is the pull side's answer to the same question the
+    // eviction side asks: a path that was already here is not ours to delete. A
+    // local blob is content-addressed and freely shared between local manifests,
+    // so `blobs/sha256-<d>` may be the only copy of a blob a *different* warm
+    // model depends on — and Ollama may have it open right now. See
+    // [`cleanup_attempt`] for the two preconditions this snapshot needs.
+    let planned = planned_local_paths(&plan);
+    let pre_existing: HashSet<PathBuf> = planned.iter().filter(|p| p.exists()).cloned().collect();
+
+    // ── Copy archive → local as an owned, cancellable task ──
+    //
+    // Not `timeout(copy_future)`: timing out on a future only *drops* it, and a
+    // dropped `tokio::fs::copy` keeps running on the blocking pool. The old shape
+    // therefore ran its cleanup while the copy was still live and still able to
+    // create the very file being cleaned up — into the local Ollama root, which
+    // Ollama itself watches. See [`CopyCancel`].
+    let cancel: CopyCancel = Arc::new(AtomicBool::new(false));
+    let mut copy_task = tokio::spawn(copy_model_files(plan.clone(), cancel.clone()));
+
+    let copy_res = match tokio::time::timeout(timeout, &mut copy_task).await {
+        Ok(joined) => joined,
+        Err(_elapsed) => {
+            // Ask the copy to stop, then WAIT until it genuinely has before
+            // touching the local tree.
+            cancel.store(true, Ordering::Relaxed);
+            match tokio::time::timeout(COPY_CANCEL_GRACE, &mut copy_task).await {
+                // Stopped early: we have the exact list of what it published.
+                Ok(Ok(Err((_, published)))) => {
+                    cleanup_attempt(PULL_OP, &plan.name, &published, &pre_existing)
+                }
+                // Finished (or panicked) before it saw the cancel: no exact list,
+                // so fall back to every planned local path — minus the ones that
+                // were already there.
+                Ok(Ok(Ok(()))) | Ok(Err(_)) => {
+                    cleanup_attempt(PULL_OP, &plan.name, &planned, &pre_existing)
+                }
+                Err(_) => {
+                    // The copy is wedged inside a single chunk (only reachable on
+                    // a stalled mount). We must not block the caller on it, so we
+                    // return while it is still alive — and therefore **delete
+                    // nothing, now or later**. Once we return, the disk-op lock
+                    // `ensure_local` holds is released and another pull, an
+                    // eviction, or the orphan GC may legitimately create or come to
+                    // depend on any of these paths; a deferred cleanup carrying
+                    // this attempt's stale snapshot would delete a file that is by
+                    // then someone else's. An orphan blob costs disk and is
+                    // reconciled by the next pull of this model under the lock; a
+                    // wrongly deleted local blob can break a model that is loading.
+                    //
+                    // Temp-file staging makes the abandoned writer nearly free: it
+                    // is confined to its own scratch path, cannot mutate any local
+                    // blob, and will not publish once it observes the cancel flag.
+                    tracing::warn!(
+                        model = %plan.name,
+                        grace_secs = COPY_CANCEL_GRACE.as_secs(),
+                        temp_infix = COPY_TEMP_INFIX,
+                        "archive pull copy did not stop within the cancellation grace period; \
+                         NOT cleaning up — ownership of these local paths can no longer be \
+                         proven once the disk-op lock is released. The abandoned copy cannot \
+                         corrupt or publish anything; it may leave one scratch file behind."
+                    );
+                }
+            }
+            return Err(PullError::Timeout(timeout));
+        }
+    };
+
+    match copy_res {
         Ok(Ok(())) => Ok(()),
-        Ok(Err((e, written))) => {
-            cleanup_partial(&written);
+        Ok(Err((e, published))) => {
+            // Mid-copy failure: reclaim what this attempt published, through the
+            // SAME route (and the same pre-existing filter) as the timeout path.
+            // Two cleanup routes with different safety rules is how one of them
+            // ends up wrong — there is exactly one route.
+            cleanup_attempt(PULL_OP, &plan.name, &published, &pre_existing);
             Err(e)
         }
-        Err(_elapsed) => {
-            // Timed out: we don't have the in-flight written list here, so remove
-            // every file this pull *would* have created that now exists locally.
-            cleanup_partial(&planned_local_paths(&plan));
-            Err(PullError::Timeout(timeout))
+        Err(join_err) => {
+            // The copy task panicked. Its inner `spawn_blocking` closure is NOT
+            // stopped by that panic and may still be running, so set the cancel
+            // flag before cleaning up: it will then abandon its temp file rather
+            // than publish after cleanup has run.
+            cancel.store(true, Ordering::Relaxed);
+            cleanup_attempt(PULL_OP, &plan.name, &planned, &pre_existing);
+            Err(PullError::Io(format!(
+                "archive pull copy task failed to join: {join_err}"
+            )))
         }
     }
 }
 
-/// Copy the manifest + every referenced blob. On error returns the error plus
-/// the list of files this pull created so far (for cleanup). Blobs are copied
-/// first, manifest last, so Ollama never sees a manifest whose blobs are missing.
-async fn copy_model_files(plan: &PullPlan) -> Result<(), (PullError, Vec<PathBuf>)> {
-    let mut written: Vec<PathBuf> = Vec::new();
+/// Label used in [`cleanup_attempt`] logs for the cold→warm direction.
+const PULL_OP: &str = "archive pull (cold→warm)";
+
+/// Copy the manifest + every referenced blob into the local root.
+///
+/// On error returns the error plus every local path this call successfully
+/// **published** — an exact list, not a guess: each file is staged in a temp file
+/// and `rename`d into place, so a path absent from this list was not modified at
+/// all and no partial file exists anywhere. Blobs are copied first and the
+/// manifest last, so Ollama never sees a manifest whose blobs are missing.
+///
+/// `cancel` makes the copy stoppable: it is checked between blobs, between 4 MiB
+/// chunks within a blob, and once more immediately before publishing — so a
+/// cancelled pull never surfaces a blob into the root Ollama watches. Observing
+/// cancellation is reported as an error carrying the `published` list, like any
+/// other failure.
+///
+/// Takes an owned [`PullPlan`] so it can be driven as a `tokio::spawn`ed task the
+/// caller can await after cancelling.
+async fn copy_model_files(
+    plan: PullPlan,
+    cancel: CopyCancel,
+) -> Result<(), (PullError, Vec<PathBuf>)> {
+    let mut published: Vec<PathBuf> = Vec::new();
 
     // Blobs.
     let archive_blobs = plan.archive_root.join("blobs");
     let local_blobs = plan.local_root.join("blobs");
     if let Err(e) = tokio::fs::create_dir_all(&local_blobs).await {
-        return Err((PullError::Io(e.to_string()), written));
+        return Err((PullError::Io(e.to_string()), published));
     }
     for digest in &plan.blobs.digests {
         let fname = blob_filename(digest);
         let src = archive_blobs.join(&fname);
         let dst = local_blobs.join(&fname);
-        // Skip blobs already present locally (content-addressed → identical),
-        // but don't add them to `written` so cleanup never deletes pre-existing
-        // shared blobs.
+        // Skip blobs already present locally (content-addressed → identical).
+        // NOT added to `published`: a pre-existing local blob may be shared with
+        // another local manifest and must never be removed by this pull's
+        // cleanup. (`cleanup_attempt` enforces that independently; this skip
+        // additionally means we never even open it.)
         if dst.exists() {
             continue;
         }
-        if let Err(e) = tokio::fs::copy(&src, &dst).await {
-            written.push(dst);
-            return Err((PullError::Io(format!("copy blob {fname}: {e}")), written));
+        match copy_file_cancellable(&src, &dst, &cancel).await {
+            Ok(true) => published.push(dst),
+            // Cancelled → `dst` was never touched (the copy only ever wrote its
+            // own temp file, which it has already removed).
+            Ok(false) => return Err((PullError::Io(CANCELLED.to_string()), published)),
+            Err(e) => {
+                return Err((PullError::Io(format!("copy blob {fname}: {e}")), published));
+            }
         }
-        written.push(dst);
     }
 
     // Manifest leaf — mirror its path relative to the archive manifests root.
@@ -398,31 +507,37 @@ async fn copy_model_files(plan: &PullPlan) -> Result<(), (PullError, Vec<PathBuf
         Err(_) => {
             return Err((
                 PullError::Io("archive manifest path outside manifests root".into()),
-                written,
+                published,
             ))
         }
     };
     let dst_manifest = plan.local_root.join("manifests").join(&rel);
     if let Some(parent) = dst_manifest.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return Err((PullError::Io(e.to_string()), written));
+            return Err((PullError::Io(e.to_string()), published));
         }
     }
-    if let Err(e) = tokio::fs::copy(&plan.archive_manifest, &dst_manifest).await {
-        written.push(dst_manifest);
-        return Err((PullError::Io(format!("copy manifest: {e}")), written));
+    match copy_file_cancellable(&plan.archive_manifest, &dst_manifest, &cancel).await {
+        Ok(true) => published.push(dst_manifest),
+        Ok(false) => return Err((PullError::Io(CANCELLED.to_string()), published)),
+        Err(e) => return Err((PullError::Io(format!("copy manifest: {e}")), published)),
     }
-    written.push(dst_manifest);
 
     Ok(())
 }
 
-/// Every local path this pull would create (manifest + blobs). Used for cleanup
-/// after a timeout, where we lack the precise in-flight written list. Only paths
-/// that exist are removed, and pre-existing shared blobs are conservatively left
-/// in place is NOT possible here — so we only remove blobs whose copy this pull
-/// could plausibly own. To stay safe we limit timeout cleanup to the manifest +
-/// blobs, which is acceptable: a half-copied blob is corrupt and must go.
+/// Every local path this pull *would* create (every referenced blob + the
+/// manifest). Used as the cleanup candidate list when the precise `published`
+/// list is unavailable (the copy task finished or panicked rather than reporting
+/// back).
+///
+/// This is a *superset* fallback, not evidence of what was written — which is
+/// exactly why it must never be handed to [`cleanup_partial`] directly. It
+/// contains blobs that were already on disk before this pull started and are
+/// shared with other local manifests; [`cleanup_attempt`] is the only sanctioned
+/// consumer, and it drops those. Because every copy is published atomically, none
+/// of these paths can be half-written; the only question cleanup answers is which
+/// complete blobs to reclaim.
 fn planned_local_paths(plan: &PullPlan) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let local_blobs = plan.local_root.join("blobs");
@@ -436,10 +551,71 @@ fn planned_local_paths(plan: &PullPlan) -> Vec<PathBuf> {
     paths
 }
 
-/// Remove partial files left by a failed/timed-out pull (best-effort). Shared
-/// (via `pub(crate)`) with MSM-02's eviction copy (`models::eviction`), which
-/// reuses this exact cleanup for the opposite (warm→cold) direction so both
-/// copy paths get identical crash-safety behaviour.
+/// How long a timed-out transfer waits for its cancelled copy to actually stop
+/// before giving up on cleaning up inline.
+///
+/// Cancellation is checked between 4 MiB chunks, so this is only ever reached
+/// when the filesystem itself is wedged (a stalled NFS read/write inside a single
+/// chunk). Shared by both directions — it is a property of the cancellation
+/// protocol, not of either transfer.
+pub(crate) const COPY_CANCEL_GRACE: Duration = Duration::from_secs(30);
+
+/// Error message a copy returns when it stopped because its [`CopyCancel`] flag
+/// was set. Only a timeout path sets that flag, and both timeout paths return
+/// their own typed `Timeout` error, so this never surfaces to a caller.
+pub(crate) const CANCELLED: &str = "archive copy cancelled by timeout";
+
+/// The **one** route by which a failed transfer attempt removes files it may
+/// have published — in either direction (`op` names it, for logs only).
+///
+/// Every path handed here is a *complete* file: [`copy_file_cancellable`] stages
+/// into a temp file and publishes with `rename`, so a partial or corrupt file
+/// cannot exist. This is therefore purely about reclaiming disk from blobs an
+/// abandoned transfer published, never about scrubbing damage.
+///
+/// Removes every candidate that did **not** exist in `pre_existing` — the
+/// snapshot taken, under the caller's `DiskOpLock`, before this attempt published
+/// anything. A path that was already there is data this attempt did not create.
+/// On the archive side that is a blob shared with another archived model; on the
+/// local side it is a blob shared with another *warm* model, which Ollama may
+/// have loaded or may load next. Either way it is never removed.
+///
+/// Two preconditions, both required for the snapshot to be accurate:
+/// 1. the copy has genuinely stopped (cancelled and awaited, or finished), and
+/// 2. the caller still holds `DiskOpLock`, so nothing else can have created a
+///    file since the snapshot.
+///
+/// Every failure path — mid-copy I/O error, timeout, copy-task panic — goes
+/// through here. The one path that cannot satisfy precondition 2 (the
+/// cancellation-grace expiry, which returns while the copy is still alive)
+/// deletes nothing at all and logs instead.
+pub(crate) fn cleanup_attempt(
+    op: &str,
+    model: &str,
+    candidates: &[PathBuf],
+    pre_existing: &HashSet<PathBuf>,
+) {
+    let (to_clean, kept): (Vec<PathBuf>, Vec<PathBuf>) = candidates
+        .iter()
+        .cloned()
+        .partition(|p| !pre_existing.contains(p));
+    if !kept.is_empty() {
+        tracing::info!(
+            op = %op,
+            model = %model,
+            kept = ?kept.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            "leaving pre-existing files in place during cleanup of a failed transfer"
+        );
+    }
+    cleanup_partial(&to_clean);
+}
+
+/// Remove files left by a failed/timed-out transfer (best-effort).
+///
+/// **Not a public cleanup entry point**: it applies no ownership filter, so
+/// handing it a planned-path list would delete files this transfer never created.
+/// Call [`cleanup_attempt`] instead — it is the single filtered route both
+/// directions use.
 pub(crate) fn cleanup_partial(paths: &[PathBuf]) {
     for p in paths {
         if p.exists() {
@@ -1173,6 +1349,304 @@ mod tests {
         let manifest = local.join("manifests/registry.ollama.ai/library/slow/1");
         assert!(!blob.exists(), "partial blob must be cleaned up");
         assert!(!manifest.exists(), "manifest must not exist after timeout");
+    }
+
+    /// Replace `path` with a FIFO of the same name, so a copy reading it advances
+    /// exactly as far as the test feeds it. Returns false when `mkfifo` isn't
+    /// available (the caller then skips).
+    fn fifoize(path: &Path) -> bool {
+        let _ = fs::remove_file(path);
+        matches!(
+            std::process::Command::new("mkfifo").arg(path).status(),
+            Ok(s) if s.success()
+        )
+    }
+
+    #[test]
+    fn cleanup_attempt_never_removes_a_preexisting_local_blob() {
+        // The defect this whole change exists to close on the pull side: the old
+        // timeout path handed `planned_local_paths` straight to `cleanup_partial`
+        // with NO ownership filter, so a timed-out pull could delete a local blob
+        // that was already on disk and is shared with another local manifest —
+        // one Ollama may have loaded, or may load next.
+        //
+        // The filter is unit-tested here rather than end-to-end on purpose: the
+        // branch that consumes the planned-path *superset* is only reachable when
+        // the copy task happens to finish between the timer firing and the cancel
+        // store. That window is not deterministically constructible, and building
+        // a test that tries to hit it by timing would reintroduce exactly the kind
+        // of wall-clock race this change removes.
+        let tmp = tempdir().unwrap();
+        let shared = tmp.path().join("sha256-shared");
+        let mine = tmp.path().join("sha256-mine");
+        let never_written = tmp.path().join("sha256-absent");
+        fs::write(&shared, b"another manifest depends on this").unwrap();
+        fs::write(&mine, b"published by this attempt").unwrap();
+
+        let planned = vec![shared.clone(), mine.clone(), never_written.clone()];
+        // Snapshot as `archive_pull` does: taken before this attempt writes.
+        let pre_existing: HashSet<PathBuf> = vec![shared.clone()].into_iter().collect();
+        cleanup_attempt(PULL_OP, "m:1", &planned, &pre_existing);
+
+        assert!(
+            shared.is_file(),
+            "a blob that already existed before the pull started is shared data this \
+             pull did not create — cleanup must never remove it"
+        );
+        assert_eq!(
+            fs::read(&shared).unwrap(),
+            b"another manifest depends on this",
+            "a kept blob must also be byte-identical"
+        );
+        assert!(!mine.exists(), "a blob this attempt published must be reclaimed");
+        assert!(!never_written.exists());
+    }
+
+    #[tokio::test]
+    async fn timeout_leaves_a_preexisting_local_blob_intact() {
+        // End-to-end companion to the unit test above, against the *old* shape:
+        // `cleanup_partial(&planned_local_paths(&plan))` deleted every planned
+        // path that existed — including the pre-seeded shared blob below.
+        //
+        // Honest note on why it passes now: at a 1 ns timeout the copy is
+        // cancelled before it opens anything, so cleanup runs over an EMPTY
+        // published list and the pre-existing filter is not what saves the blob.
+        // It is still a real regression guard (it fails against the old code),
+        // but the filter itself is covered by
+        // `cleanup_attempt_never_removes_a_preexisting_local_blob`.
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        make_model(&base.join("archive"), "shared", "1", &[8 * 1024 * 1024]);
+
+        // A local blob with the same digest already on disk, referenced by some
+        // other warm model, with content we can prove was not touched.
+        let local_blobs = base.join("local").join("blobs");
+        fs::create_dir_all(&local_blobs).unwrap();
+        let victim = local_blobs.join("sha256-sharedcfg");
+        fs::write(&victim, b"belongs to another local manifest").unwrap();
+
+        let err = archive_pull(
+            "shared:1",
+            &base.join("archive"),
+            &base.join("local"),
+            Duration::from_nanos(1),
+            &FixedProbe(u64::MAX),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PullError::Timeout(_)), "got {err:?}");
+
+        assert!(
+            victim.is_file(),
+            "a timed-out pull must not delete a local blob it did not create"
+        );
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"belongs to another local manifest",
+            "and must not have mutated it either"
+        );
+        assert!(
+            leftover_temps(&local_blobs).is_empty(),
+            "no scratch file may be left in the local blobs dir"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pull_copy_cancelled_midflight_publishes_nothing() {
+        // "Mid-flight" is established STRUCTURALLY by a FIFO source: the copy can
+        // only advance as far as the test feeds it, so there is no observer
+        // thread, no scratch-file polling, and nothing for CPU load to starve.
+        use std::io::Write as _;
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        let (archive, local) = (base.join("archive"), base.join("local"));
+        make_model(&archive, "fif", "1", &[64]);
+        let fifo = archive.join("blobs/sha256-fif0");
+        if !fifoize(&fifo) {
+            return; // no mkfifo on this platform — nothing to assert
+        }
+
+        let plan = plan_pull("fif:1", &archive, &local).unwrap();
+        let cancel: CopyCancel = Arc::new(AtomicBool::new(false));
+        let copy = tokio::spawn(copy_model_files(plan, cancel.clone()));
+
+        // Opening the write end releases the copy's blocking `File::open`. The
+        // pipe buffer is far smaller than a chunk, so `write_all` cannot return
+        // until the copy has consumed most of it — it has provably created its
+        // scratch file and written into it. That is the mid-flight moment.
+        let mut w = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+        w.write_all(&vec![3u8; COPY_CHUNK_BYTES]).unwrap();
+        w.flush().unwrap();
+        cancel.store(true, Ordering::Relaxed);
+        let _ = w.write_all(&[3u8]);
+        drop(w); // EOF, so a reader parked in `read` is released either way
+
+        let (err, published) = copy.await.unwrap().unwrap_err();
+        assert!(
+            matches!(&err, PullError::Io(m) if m == CANCELLED),
+            "got {err:?}"
+        );
+        let blob_dst = local.join("blobs/sha256-fif0");
+        assert!(
+            !blob_dst.exists(),
+            "a cancelled pull must not publish a blob into the root Ollama watches"
+        );
+        assert!(
+            !published.contains(&blob_dst),
+            "the published list must be exact — it must not claim a blob that was never renamed into place"
+        );
+        assert!(
+            !local.join("manifests/registry.ollama.ai/library/fif/1").exists(),
+            "a cancelled pull must never publish the manifest"
+        );
+        assert!(
+            leftover_temps(&local.join("blobs")).is_empty(),
+            "a cancelled copy must remove its own scratch file"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pull_never_truncates_an_existing_local_manifest() {
+        // The pull side's truncation victim is the MANIFEST, not a blob: blobs
+        // that already exist locally are skipped outright (content-addressed), so
+        // they are never opened for writing — but the manifest is copied
+        // unconditionally, over whatever is already at that path. Writing it in
+        // place with a truncating `File::create` would destroy a manifest Ollama
+        // may be reading, and no deletion filter can see that: the damage is a
+        // mutation, not a deletion.
+        //
+        // The archive manifest is swapped for a FIFO *after* planning (planning is
+        // what reads it), so the copy parks inside the manifest write and the test
+        // — not the clock — decides when it is mid-flight.
+        use std::io::Write as _;
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        let (archive, local) = (base.join("archive"), base.join("local"));
+        make_model(&archive, "mani", "1", &[64]);
+        let plan = plan_pull("mani:1", &archive, &local).unwrap();
+
+        // Every blob already local → the copy goes straight to the manifest.
+        let local_blobs = local.join("blobs");
+        fs::create_dir_all(&local_blobs).unwrap();
+        fs::write(local_blobs.join("sha256-manicfg"), b"cfg").unwrap();
+        fs::write(local_blobs.join("sha256-mani0"), vec![b'x'; 64]).unwrap();
+
+        // A local manifest already at the destination path.
+        let dst_manifest = local.join("manifests/registry.ollama.ai/library/mani/1");
+        fs::create_dir_all(dst_manifest.parent().unwrap()).unwrap();
+        let victim = b"{\"config\":{},\"layers\":[]} the manifest Ollama is reading".to_vec();
+        fs::write(&dst_manifest, &victim).unwrap();
+
+        let src_manifest = plan.archive_manifest.clone();
+        if !fifoize(&src_manifest) {
+            return;
+        }
+
+        let cancel: CopyCancel = Arc::new(AtomicBool::new(false));
+        let copy = tokio::spawn(copy_model_files(plan, cancel.clone()));
+
+        let mut w = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&src_manifest)
+            .unwrap();
+        w.write_all(&vec![7u8; COPY_CHUNK_BYTES]).unwrap();
+        w.flush().unwrap();
+        cancel.store(true, Ordering::Relaxed);
+        let _ = w.write_all(&[7u8]);
+        drop(w);
+
+        let (_err, published) = copy.await.unwrap().unwrap_err();
+        assert!(published.is_empty(), "nothing was published: {published:?}");
+        assert_eq!(
+            fs::read(&dst_manifest).unwrap(),
+            victim,
+            "an existing local manifest must be byte-identical after a cancelled pull \
+             — it must never be truncated or partially overwritten in place"
+        );
+        assert!(
+            leftover_temps(dst_manifest.parent().unwrap()).is_empty(),
+            "a cancelled copy must remove its own scratch file"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn timed_out_pull_stops_the_copy_before_cleaning_up() {
+        // The end-to-end shape of the fix: on timeout `archive_pull` sets the
+        // cancel flag and AWAITS the copy, so by the time it returns the copy has
+        // genuinely stopped and cannot resurrect a file cleanup just removed.
+        //
+        // The FIFO parks the copy inside its read loop, so the timeout provably
+        // fires while a copy is in flight — the one thing a 1 ns timeout cannot
+        // demonstrate, because there the copy stops before opening anything.
+        use std::io::Write as _;
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        let (archive, local) = (base.join("archive"), base.join("local"));
+        make_model(&archive, "park", "1", &[64]);
+        let fifo = archive.join("blobs/sha256-park0");
+        if !fifoize(&fifo) {
+            return;
+        }
+
+        // Pre-seed the cfg blob locally (shared with another local manifest): the
+        // copy skips it, and cleanup must leave it alone.
+        let local_blobs = local.join("blobs");
+        fs::create_dir_all(&local_blobs).unwrap();
+        let victim = local_blobs.join("sha256-parkcfg");
+        fs::write(&victim, b"shared with another warm model").unwrap();
+
+        let (a, l) = (archive.clone(), local.clone());
+        let pull = tokio::spawn(async move {
+            archive_pull(
+                "park:1",
+                &a,
+                &l,
+                Duration::from_secs(1),
+                &FixedProbe(u64::MAX),
+                None,
+            )
+            .await
+        });
+
+        let mut w = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+        // One chunk consumed → the copy is staging, then parks awaiting more.
+        w.write_all(&vec![5u8; COPY_CHUNK_BYTES]).unwrap();
+        w.flush().unwrap();
+        // Outlast the 1 s pull timeout, so the cancel is set while the copy is
+        // parked mid-file, then release it. It must stop rather than publish.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let _ = w.write_all(&vec![5u8; 4096]);
+        drop(w);
+
+        let err = pull.await.unwrap().unwrap_err();
+        assert!(matches!(err, PullError::Timeout(_)), "got {err:?}");
+
+        // `archive_pull` only returns after the copy has stopped, so the
+        // assertions below are stable facts, not a snapshot of a still-moving
+        // filesystem. The settle window is therefore redundant for the correct
+        // implementation — it exists so this test also fails loudly against a
+        // shape that merely DROPS the copy future (where the abandoned writer
+        // would go on to publish into the local root shortly after this point).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !local.join("blobs/sha256-park0").exists(),
+            "a timed-out pull must not leave (or later publish) its blob locally"
+        );
+        assert!(
+            !local.join("manifests/registry.ollama.ai/library/park/1").exists(),
+            "a timed-out pull must not publish a manifest"
+        );
+        assert!(victim.is_file(), "the pre-existing shared blob must survive");
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"shared with another warm model",
+            "and must be byte-identical — nothing is written in place"
+        );
+        assert!(
+            leftover_temps(&local_blobs).is_empty(),
+            "a stopped copy must remove its own scratch file"
+        );
     }
 
     #[tokio::test]
