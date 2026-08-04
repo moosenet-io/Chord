@@ -11,4 +11,5 @@
 pub mod assistant_profile;
 pub mod lumina_alias;
 pub mod residency_snapshot;
+pub mod route_catalog;
 pub mod resident_set;
