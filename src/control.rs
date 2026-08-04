@@ -1249,17 +1249,23 @@ async fn apply_liveness(
     let probed = crate::routing::route_catalog::probe_always_on(&state.http_client, &urls).await;
 
     for (id, b) in backends {
-        // The credential check reads only PRESENCE of the env var the backend
-        // itself names (`api_key_env`) — never the value, which is never
-        // returned, logged, or compared. A remote route with no provisioned key
-        // would fail on first use, and publishing it as available would be a
-        // lie a user only discovers mid-conversation.
+        // Presence-oriented credential read. `var_os` is used rather than
+        // `var` so the value is never decoded into a `String`, and the
+        // `OsString` is reduced to a bool inside the closure without ever being
+        // bound to a name, logged, returned, or compared against anything.
+        //
+        // The residual is stated rather than glossed: Rust's standard library
+        // has no presence-only environment read — `var_os` still materializes
+        // the value — so "presence only" is a property of what this code DOES
+        // with it, not of the API it calls. What matters operationally is that
+        // a remote route with no provisioned key would fail on first use, and
+        // publishing it as available would be a lie the user only discovers
+        // mid-conversation.
         let live = classify_liveness(
             b,
             |env_key| {
-                std::env::var(env_key)
-                    .map(|v| !v.trim().is_empty())
-                    .unwrap_or(false)
+                std::env::var_os(env_key)
+                    .is_some_and(|v| !v.as_encoded_bytes().iter().all(u8::is_ascii_whitespace))
             },
             |url| probed.get(url).copied().unwrap_or(false),
         );

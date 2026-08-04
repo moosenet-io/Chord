@@ -319,9 +319,19 @@ pub fn parse_declarations(raw: &str) -> HashMap<String, RouteDeclaration> {
         return out;
     };
 
-    for (id, v) in obj {
+    // The declaration KEY is never logged. A reviewer was right that
+    // `CHORD_ROUTE_CATALOG` is operator-authored config whose keys can be
+    // anything at all, including a model or provider name — and the id gate in
+    // `route_ids` does not protect this path, because declarations are parsed
+    // independently of the alias table. A log line is still a place a name ends
+    // up, so the warnings below identify an entry by POSITION, exactly as the
+    // consumer identifies an omitted route.
+    for (position, (id, v)) in obj.iter().enumerate() {
         let Some(entry) = v.as_object() else {
-            tracing::warn!(route = %id, "{ROUTE_CATALOG_ENV} entry is not an object — dropped");
+            tracing::warn!(
+                position,
+                "{ROUTE_CATALOG_ENV}: entry is not an object — dropped"
+            );
             continue;
         };
         let str_field = |k: &str| {
@@ -346,7 +356,7 @@ pub fn parse_declarations(raw: &str) -> HashMap<String, RouteDeclaration> {
                         Some(t)
                     } else {
                         tracing::warn!(
-                            route = %id,
+                            position,
                             "{ROUTE_CATALOG_ENV}: cost_tier is not one of {COST_TIERS:?} — \
                              dropped rather than published as free text"
                         );
@@ -987,11 +997,19 @@ mod tests {
         assert!(is_route_id(&"a".repeat(64)));
     }
 
+    /// Pins [`is_route_id`] to the rule this build BELIEVES the consumer
+    /// (Harmony SCOUT-02 `validate_route`) enforces.
+    ///
+    /// Stated plainly, because a reviewer was right to push on it: this is a
+    /// REPLICA of the consumer's rule, not the consumer's rule. It cannot
+    /// detect drift on the Harmony side — it can only detect drift on THIS
+    /// side, away from the rule as written here. A real agreement test needs
+    /// the two repos to share the predicate (a shared crate, or a contract
+    /// fixture both build against), which is a cross-repo change and is filed
+    /// rather than faked here. What this test does buy is that a future edit to
+    /// `is_route_id` has to consciously edit this replica too.
     #[test]
-    fn the_id_rule_is_the_same_one_the_consumer_enforces() {
-        // Harmony SCOUT-02 `validate_route`: non-empty, <= 64, first char
-        // lowercase-alnum, body lowercase-alnum/-/_. If these two rules drift,
-        // the producer publishes routes the consumer silently drops.
+    fn the_id_rule_matches_the_consumer_rule_this_build_believes_in() {
         fn consumer_rule(r: &str) -> bool {
             !r.is_empty()
                 && r.len() <= 64
