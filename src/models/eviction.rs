@@ -39,7 +39,7 @@ use super::registry::{
 };
 use super::transfer::{
     blob_filename, cleanup_partial, copy_file_cancellable, find_manifest_leaf, CopyCancel,
-    DiskSpaceProbe,
+    DiskSpaceProbe, COPY_TEMP_INFIX,
 };
 
 /// How long a timed-out eviction waits for its cancelled copy to actually stop
@@ -274,11 +274,13 @@ pub struct Evicted {
 /// 1. Validate the model is Warm, non-protected (else a typed error/skip).
 /// 2. Copy its manifest + referenced blobs local → archive (skipping blobs that
 ///    already exist in the archive with a matching size), bounded by
-///    `copy_timeout` (MSM-02). On timeout or a mid-copy I/O error, any archive
-///    files *this* copy wrote are removed (best-effort) and the model is left
-///    Warm — never Cold, and the local copy is never touched. On timeout the
-///    copy is **cancelled and awaited** before cleanup runs, so cleanup can
-///    never be undone by a copy that is still in flight.
+///    `copy_timeout` (MSM-02). Each file is staged in a temp file and published
+///    with `rename`, so the archive only ever contains complete files and an
+///    existing archive blob is never mutated in place. On timeout or a mid-copy
+///    I/O error the blobs this attempt published are reclaimed (best-effort) and
+///    the model is left Warm — never Cold, and the local copy is never touched.
+///    On timeout the copy is **cancelled and awaited** before cleanup runs, so
+///    cleanup can never be undone by a copy that is still in flight.
 /// 3. **Verify** every referenced blob + the manifest exist in the archive with
 ///    matching sizes. On failure: do NOT delete locally; return [`EvictError`].
 /// 4. Remove the local copy via the injected [`LocalEvictor`] (GC-aware).
@@ -323,28 +325,30 @@ pub async fn evict_to_archive(
     let blobs = parse_manifest_blobs(&local_manifest);
     let planned = planned_archive_paths(&blobs, &local_manifest, &local_root, &archive_root);
     // Snapshot which of the planned archive paths ALREADY exist before we start
-    // copying — e.g. a blob shared with another already-archived model. Cleanup
-    // on ANY failure path removes only what *this* attempt could plausibly have
-    // created, never a pre-existing/shared archive file (GC-aware, mirrors the
-    // "never delete a blob referenced elsewhere" invariant from the local side).
+    // copying — e.g. a blob shared with another already-archived model.
     //
-    // ## Why a snapshot is sufficient ownership evidence here — and where it isn't
+    // This snapshot governs DELETION only. It is not, and no longer needs to be,
+    // ownership evidence for writing: `copy_file_cancellable` stages every copy
+    // in a per-attempt temp file and publishes it with `rename`, so an existing
+    // archive file is never mutated in place and a failed attempt cannot corrupt
+    // one. What the snapshot still buys is the "never delete a blob referenced
+    // elsewhere" invariant (mirroring the local side): if a path was already
+    // there, it is someone else's data — possibly the only copy of a blob another
+    // archived model depends on — and this attempt must not remove it even though
+    // it may have atomically replaced it with a correct copy of the same digest.
     //
-    // This snapshot is only trustworthy while nothing else can write to the
-    // archive. Every production caller of `evict_to_archive` (`cooldown_pass`,
-    // the `run_eviction_sweep_at` disk-pressure pass, `evict_for_space`) holds
-    // `DiskOpLock` across this whole function, and `gc::run_gc` /
-    // `PullCoordinator::ensure_local` take the same lock — so no concurrent
-    // eviction, pull or GC can create an archive file between this snapshot and
-    // any cleanup that runs before we return. **All inline cleanup below depends
-    // on that.** If someone ever parallelises evictions or drops the lock around
-    // a copy, "absent at snapshot time" stops proving ownership (the
-    // `exists()`-then-create sequence is a TOCTOU race against any concurrent
-    // archive writer) and this needs to become a real ownership token — a
-    // per-attempt temp name plus an atomic publish is the usual answer.
+    // For that deletion rule the snapshot is only accurate while nothing else can
+    // write to the archive. Every production caller of `evict_to_archive`
+    // (`cooldown_pass`, the `run_eviction_sweep_at` disk-pressure pass,
+    // `evict_for_space`) holds `DiskOpLock` across this whole function, as do
+    // `gc::run_gc` and `PullCoordinator::ensure_local` — so nothing can create an
+    // archive file between this snapshot and the inline cleanup below, which runs
+    // before we return and therefore before the lock is released. If evictions
+    // are ever parallelised, or the lock dropped around a copy, this snapshot
+    // stops being accurate and `cleanup_attempt` must stop being used.
     //
-    // Cleanup that would run AFTER the lock is released cannot rely on this at
-    // all, and therefore never deletes — see the cancellation-grace branch below.
+    // Cleanup that would run AFTER the lock is released cannot rely on it at all,
+    // and therefore never deletes — see the cancellation-grace branch below.
     let pre_existing: HashSet<PathBuf> = planned.iter().filter(|p| p.exists()).cloned().collect();
 
     // ── Copy local → archive (reverse pull), bounded by copy_timeout (MSM-02) ──
@@ -373,12 +377,12 @@ pub async fn evict_to_archive(
             // so the sweep is never wedged.
             cancel.store(true, Ordering::Relaxed);
             match tokio::time::timeout(COPY_CANCEL_GRACE, &mut copy_task).await {
-                // Stopped early: we have the precise list of what it wrote. Still
-                // inside the caller's DiskOpLock, so the snapshot still holds.
-                Ok(Ok(Err((_, written)))) => cleanup_attempt(model, &written, &pre_existing),
+                // Stopped early: we have the precise list of what it published.
+                // Still inside the caller's DiskOpLock, so the snapshot holds.
+                Ok(Ok(Err((_, published)))) => cleanup_attempt(model, &published, &pre_existing),
                 // Finished (or panicked) before it saw the cancel: we don't have
-                // an exact in-flight list, so fall back to every planned archive
-                // path that did not exist before this attempt started.
+                // an exact list, so fall back to every planned archive path that
+                // did not exist before this attempt started.
                 Ok(Ok(Ok(()))) | Ok(Err(_)) => cleanup_attempt(model, &planned, &pre_existing),
                 Err(_) => {
                     // The copy is wedged inside a single chunk write (only
@@ -386,35 +390,34 @@ pub async fn evict_to_archive(
                     // on it — so we return, and the caller's DiskOpLock is
                     // released while this copy is still alive.
                     //
-                    // **Therefore we do not delete anything, now or later.** Once
-                    // the lock is gone, a subsequent eviction may legitimately
-                    // create — or come to depend on — any of our planned paths:
-                    // it could write one itself, or skip-match one *we* wrote and
-                    // then delete its local copy trusting it. A deferred cleanup
+                    // **Therefore we delete nothing, now or later.** Once the lock
+                    // is gone a subsequent eviction may legitimately create — or
+                    // come to depend on — any of our planned paths: it could write
+                    // one itself, or skip-match one this attempt published and then
+                    // delete its local copy trusting it. A deferred cleanup
                     // carrying this attempt's stale `pre_existing` snapshot would
-                    // happily delete that file. Ownership is simply not provable
-                    // from here, and the asymmetry is not close: an orphan blob
-                    // costs disk and is reconciled by the next eviction of this
-                    // model under the lock (it becomes `pre_existing`, and is
-                    // either size-skipped as valid content-addressed data or
-                    // rewritten), whereas a wrongly deleted archive blob is
-                    // unrecoverable. So: log loudly, delete nothing.
+                    // happily delete that file. Ownership is not provable from
+                    // here, and the asymmetry is not close: an orphan blob costs
+                    // disk and is reconciled by the next eviction of this model
+                    // under the lock (it becomes `pre_existing`, and is either
+                    // size-skipped as valid content-addressed data or replaced),
+                    // whereas a wrongly deleted archive blob is unrecoverable.
                     //
-                    // The copy task is deliberately left detached rather than
-                    // aborted — it stops itself at its next chunk check.
-                    let orphans: Vec<String> = planned
-                        .iter()
-                        .filter(|p| !pre_existing.contains(*p))
-                        .map(|p| p.display().to_string())
-                        .collect();
+                    // Thanks to temp-file staging this now costs very little: the
+                    // abandoned writer is confined to its own temp path, cannot
+                    // mutate any archive file, and will not publish at all once it
+                    // observes the cancel flag. Worst case it leaves one
+                    // `COPY_TEMP_INFIX` scratch file, which is reapable by name.
+                    // The task is left detached rather than aborted — it stops
+                    // itself at its next chunk check and removes its own temp.
                     warn!(
                         model = %model,
                         grace_secs = COPY_CANCEL_GRACE.as_secs(),
-                        possible_orphans = ?orphans,
+                        temp_infix = COPY_TEMP_INFIX,
                         "archive copy did not stop within the cancellation grace period; \
                          NOT cleaning up — ownership of these archive paths can no longer be \
-                         proven once the disk-op lock is released. They may be left behind and \
-                         will be reconciled by the next eviction of this model."
+                         proven once the disk-op lock is released. The abandoned copy cannot \
+                         corrupt or publish anything; it may leave one scratch file behind."
                     );
                 }
             }
@@ -424,18 +427,25 @@ pub async fn evict_to_archive(
 
     match copy_res {
         Ok(Ok(())) => {}
-        Ok(Err((e, written))) => {
-            // Mid-copy failure: clean up the files this attempt wrote — through
-            // the SAME ownership check as the timeout path. `written` can contain
-            // a path that already existed (a shared archive blob whose size did
-            // not match, which this attempt overwrote); deleting that would
+        Ok(Err((e, published))) => {
+            // Mid-copy failure: reclaim the blobs this attempt published, through
+            // the SAME route as the timeout path. `published` can contain a path
+            // that already existed (a shared archive blob whose size did not
+            // match, which this attempt atomically replaced); removing that would
             // destroy data this attempt did not create, so `cleanup_attempt`
             // filters it out. Two cleanup routes with different safety rules is
             // how one of them ends up wrong — there is exactly one route.
-            cleanup_attempt(model, &written, &pre_existing);
+            cleanup_attempt(model, &published, &pre_existing);
             return Err(EvictError::ArchiveCopy(model.to_string(), e));
         }
         Err(join_err) => {
+            // The copy task panicked. Its inner `spawn_blocking` closure is NOT
+            // stopped by that panic and may still be running, so set the cancel
+            // flag first: it will then abandon its temp file rather than publish
+            // after we have cleaned up. Even without that it could only ever
+            // publish one complete, correct blob — never a partial or corrupt one
+            // — because it writes solely into its own temp path.
+            cancel.store(true, Ordering::Relaxed);
             cleanup_attempt(model, &planned, &pre_existing);
             return Err(EvictError::ArchiveCopy(
                 model.to_string(),
@@ -470,19 +480,20 @@ pub async fn evict_to_archive(
 /// Copy a model's manifest + referenced blobs from the local root to the archive
 /// root, preserving the `manifests/.../<tag>` + `blobs/sha256-…` layout. Blobs
 /// already present in the archive with a matching size are skipped (and never
-/// added to the returned `written` list, so a mid-copy failure never causes a
+/// added to the returned `published` list, so a failure never causes a
 /// pre-existing/shared archive blob to be cleaned up). Blobs are copied before
 /// the manifest so the archive never has a manifest whose blobs are missing.
 ///
-/// On error, returns `(message, written)` where `written` is every archive path
-/// *this* call actually created — used by [`evict_to_archive`] to clean up
-/// precisely on a mid-copy failure (MSM-02).
+/// On error, returns `(message, published)` where `published` is every archive
+/// path this call successfully **published** — used by [`evict_to_archive`] to
+/// reclaim them (MSM-02). Each copy is staged in a temp file and `rename`d into
+/// place, so a path that is not in `published` was not modified at all: the list
+/// is exact, not a best guess, and there is no partial file anywhere to find.
 ///
-/// `cancel` makes the copy stoppable: it is checked between blobs and between
-/// 4 MiB chunks within a blob, so [`evict_to_archive`]'s timeout path can bring
-/// the copy to a genuine stop (and then clean up) instead of cleaning up while
-/// it is still writing. Observing cancellation is reported as an error carrying
-/// the `written` list, exactly like any other mid-copy failure.
+/// `cancel` makes the copy stoppable: it is checked between blobs, between 4 MiB
+/// chunks within a blob, and once more immediately before publishing — so a
+/// cancelled copy never surfaces a blob into the archive. Observing cancellation
+/// is reported as an error carrying the `published` list, like any other failure.
 ///
 /// Takes owned paths so it can be driven as a `tokio::spawn`ed task the caller
 /// can await after cancelling.
@@ -492,12 +503,12 @@ async fn copy_model_to_archive(
     archive_root: PathBuf,
     cancel: CopyCancel,
 ) -> Result<(), (String, Vec<PathBuf>)> {
-    let mut written: Vec<PathBuf> = Vec::new();
+    let mut published: Vec<PathBuf> = Vec::new();
     let blobs = parse_manifest_blobs(&local_manifest);
     let local_blobs = local_root.join("blobs");
     let archive_blobs = archive_root.join("blobs");
     if let Err(e) = tokio::fs::create_dir_all(&archive_blobs).await {
-        return Err((format!("create archive blobs dir: {e}"), written));
+        return Err((format!("create archive blobs dir: {e}"), published));
     }
 
     for digest in &blobs.digests {
@@ -505,24 +516,22 @@ async fn copy_model_to_archive(
         let src = local_blobs.join(&fname);
         let dst = archive_blobs.join(&fname);
         // Skip if already in archive with matching size (content-addressed →
-        // identical content for the same digest + size). NOT added to `written`
-        // — a pre-existing archive blob (possibly shared with another already
-        // archived model) must never be deleted by this copy's cleanup path.
+        // identical content for the same digest + size). NOT added to
+        // `published` — a pre-existing archive blob (possibly shared with another
+        // already archived model) must never be deleted by this copy's cleanup.
         if let (Ok(s), Ok(d)) = (tokio::fs::metadata(&src).await, tokio::fs::metadata(&dst).await) {
             if s.len() == d.len() {
                 continue;
             }
         }
         match copy_file_cancellable(&src, &dst, &cancel).await {
-            Ok(true) => written.push(dst),
-            Ok(false) => {
-                // Cancelled: `dst` may be a partial file this attempt created.
-                written.push(dst);
-                return Err((CANCELLED.to_string(), written));
-            }
+            Ok(true) => published.push(dst),
+            // Cancelled or failed → `dst` was never touched (the copy only ever
+            // wrote its own temp file, which it has already removed). Nothing to
+            // record and nothing to clean up for this path.
+            Ok(false) => return Err((CANCELLED.to_string(), published)),
             Err(e) => {
-                written.push(dst);
-                return Err((format!("copy blob {fname}: {e}"), written));
+                return Err((format!("copy blob {fname}: {e}"), published));
             }
         }
     }
@@ -534,25 +543,21 @@ async fn copy_model_to_archive(
         Err(_) => {
             return Err((
                 "local manifest path outside manifests root".to_string(),
-                written,
+                published,
             ))
         }
     };
     let dst_manifest = archive_root.join("manifests").join(rel);
     if let Some(parent) = dst_manifest.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return Err((format!("create archive manifest dir: {e}"), written));
+            return Err((format!("create archive manifest dir: {e}"), published));
         }
     }
     match copy_file_cancellable(&local_manifest, &dst_manifest, &cancel).await {
-        Ok(true) => written.push(dst_manifest),
-        Ok(false) => {
-            written.push(dst_manifest);
-            return Err((CANCELLED.to_string(), written));
-        }
+        Ok(true) => published.push(dst_manifest),
+        Ok(false) => return Err((CANCELLED.to_string(), published)),
         Err(e) => {
-            written.push(dst_manifest);
-            return Err((format!("copy manifest: {e}"), written));
+            return Err((format!("copy manifest: {e}"), published));
         }
     }
     Ok(())
@@ -565,13 +570,19 @@ const CANCELLED: &str = "archive copy cancelled by timeout";
 
 /// The **one** route by which a failed eviction attempt removes archive files.
 ///
-/// Removes every candidate path that did **not** exist in `pre_existing` — the
-/// snapshot taken, under the caller's `DiskOpLock`, before this attempt wrote
-/// anything. A path that was already there is data this attempt did not create
-/// (a blob shared with another archived model, possibly the only remaining copy)
-/// and is never removed, even if this attempt overwrote it.
+/// Every path handed here is a *complete* file — `copy_file_cancellable` stages
+/// into a temp file and publishes with `rename`, so a partial or corrupt archive
+/// file cannot exist. This is therefore purely about reclaiming disk from blobs
+/// an abandoned eviction published, never about scrubbing damage.
 ///
-/// Two preconditions, both required for the snapshot to prove ownership:
+/// Removes every candidate that did **not** exist in `pre_existing` — the
+/// snapshot taken, under the caller's `DiskOpLock`, before this attempt published
+/// anything. A path that was already there is data this attempt did not create (a
+/// blob shared with another archived model, possibly its only copy) and is never
+/// removed, even though this attempt may have atomically replaced it with a
+/// correct copy of the same digest.
+///
+/// Two preconditions, both required for the snapshot to be accurate:
 /// 1. the copy has genuinely stopped (cancelled and awaited, or finished), and
 /// 2. the caller still holds `DiskOpLock`, so nothing else can have created an
 ///    archive file since the snapshot.
@@ -597,14 +608,15 @@ fn cleanup_attempt(model: &str, candidates: &[PathBuf], pre_existing: &HashSet<P
 
 /// Every archive path a warm→cold copy of `local_manifest`'s model *would*
 /// create (every referenced blob + the manifest), used for best-effort cleanup
-/// when a copy times out and the precise in-flight `written` list is
-/// unavailable (mirrors TIER-02's `archive_pull`/`planned_local_paths` for the
-/// opposite direction — see transfer.rs). Only paths that exist are ever
-/// removed by [`cleanup_partial`]; a blob that already existed in the archive
-/// before this copy started is included here too (same accepted trade-off
-/// `archive_pull`'s timeout cleanup makes for the local side: a half-copied
-/// blob is corrupt and must go, and a real collision on a content-addressed
-/// digest+size is not expected in practice).
+/// when the precise `published` list is unavailable (the copy task finished or
+/// panicked rather than reporting back). Only paths that exist are ever removed
+/// by [`cleanup_partial`], and [`cleanup_attempt`] additionally drops any path
+/// that already existed before this attempt started, so a pre-existing/shared
+/// archive blob is never removed via this list.
+///
+/// Note this is a *superset* fallback, not evidence of what was written. Because
+/// every copy is published atomically, none of these paths can be half-written;
+/// the only question cleanup answers is which complete blobs to reclaim.
 fn planned_archive_paths(
     blobs: &ManifestBlobs,
     local_manifest: &Path,
@@ -1203,6 +1215,76 @@ mod tests {
         assert!(
             base.join("archive/blobs/sha256-sharedblob").is_file(),
             "pre-existing archive blob must survive another model's copy timeout"
+        );
+    }
+
+    /// Any `COPY_TEMP_INFIX` scratch files left under `dir` (recursively).
+    fn leftover_temps(dir: &Path) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = fs::read_dir(&d) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().contains(COPY_TEMP_INFIX))
+                    .unwrap_or(false)
+                {
+                    found.push(p.display().to_string());
+                }
+            }
+        }
+        found
+    }
+
+    #[tokio::test]
+    async fn timed_out_copy_leaves_a_preexisting_blob_byte_identical() {
+        // End-to-end: a timed-out eviction must leave a pre-existing archive blob
+        // (here at a MISMATCHED size, so it is NOT skip-matched and this attempt
+        // would re-copy it) exactly as it found it, and leave no scratch file.
+        //
+        // Note on what this does and does not prove: at a 1 ns timeout the cancel
+        // flag is set while the copy task is still creating the archive directory,
+        // so the copy stops at its first cancel check without opening any file —
+        // this test would also pass against an in-place-writing copy. The
+        // mid-flight mutation case is the one that distinguishes them, and it is
+        // pinned deterministically by
+        // `transfer::tests::cancelled_midcopy_never_mutates_an_existing_destination`.
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        fs::create_dir_all(base.join("archive/blobs")).unwrap();
+        // Local blob: 8 MiB of 'x' (make_model's filler) so the copy can't finish
+        // within a ~1ns timeout.
+        let model = make_model(&base.join("local"), "slow", "1", &[8 * 1024 * 1024]);
+        // Archive already holds a DIFFERENT, smaller file at that path — distinct
+        // content so any partial overwrite is detectable byte-for-byte.
+        let victim: Vec<u8> = vec![b'Z'; 4 * 1024 * 1024];
+        let victim_path = base.join("archive/blobs/sha256-slow0");
+        fs::write(&victim_path, &victim).unwrap();
+
+        let mut reg = reg_with(base, vec![]);
+        reg.reconcile();
+        let registry = Arc::new(Mutex::new(reg));
+        let evictor = fs_evictor(base);
+
+        let err = evict_to_archive(&registry, &model, &evictor, Duration::from_nanos(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EvictError::Timeout(..)), "got {err:?}");
+
+        assert_eq!(
+            fs::read(&victim_path).unwrap(),
+            victim,
+            "a pre-existing archive blob must be byte-identical after a timed-out copy \
+             — it must never be truncated or partially overwritten in place"
+        );
+        assert!(
+            leftover_temps(&base.join("archive")).is_empty(),
+            "a stopped copy must remove its own scratch file: {:?}",
+            leftover_temps(&base.join("archive"))
         );
     }
 
