@@ -14,6 +14,29 @@
 //! early, not fails) if not — so an accidental `--ignored` run on an unprivileged
 //! host is a no-op rather than a spurious failure. The assertions only run when the
 //! namespace was genuinely created.
+//!
+//! ## CHRD-97 — why THIS suite may create real namespaces and the unit tests may not
+//! These are the one place that CANNOT be faked: what they assert is the KERNEL's
+//! behaviour, not Chord's. "A `Denied` namespace has no path off the box" is a claim
+//! about what `connect()` does inside a real netns with no route; a fake namespace
+//! would only prove that the fake behaves as written. So the real path stays here,
+//! and it is opt-in twice over — `#[ignore]` keeps it out of every ordinary
+//! `cargo test`, and `privileged()` skips if the capability is absent.
+//!
+//! Every OTHER test that touches isolation lives in the crate's unit tests, where
+//! the `cfg(test)` arms of `netns::prepare` AND `netns::teardown_named` make both
+//! namespace creation and namespace DELETION structurally impossible. Deletion is
+//! fenced off for its own reason: the existence check is not an ownership check, so
+//! a test could otherwise remove a live namespace that happened to carry a name
+//! derived from a test token. The decision logic in `supervisor::launch_isolation`
+//! and the teardown idempotency contract are both exercised there through injected
+//! operations, so they need no privilege and mutate no host state. Do not move a
+//! decision-logic test into this file to "make it realistic": this file is for
+//! kernel behaviour only.
+//!
+//! Each test below tears its namespace down before it can leak, including on the
+//! assertion path (teardown is captured BEFORE the asserts, so a failing assertion
+//! cannot skip the cleanup).
 
 #![cfg(target_os = "linux")]
 

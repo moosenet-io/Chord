@@ -1909,9 +1909,9 @@ mod tests {
         let rec = CountingRecorder { failures: Mutex::new(vec![]) };
         let resi = NeverResidency;
         let cfg = Config::test_default();
-        // ISO-02: on this unprivileged host the netns can't be created. Use the dev
-        // opt-out so the ISO-01 env scrub is still exercised end-to-end (the
-        // isolation fail-closed path is asserted by its own tests below).
+        // ISO-02: use the dev opt-out so the ISO-01 env scrub is exercised end-to-end
+        // without involving isolation at all (the isolation fail-closed path is
+        // asserted by its own tests below).
         std::env::set_var("CHORD_NETNS_ISOLATION", "0");
         let l = Launcher::with_scrub(&spawner, &health, &rec, &resi, &cfg);
         let e = entry("m", ServingBackend::LlamaGpu, Runtime::LlamaCpp, "{}", false, None);
@@ -1927,10 +1927,16 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn with_scrub_fails_closed_when_isolation_unavailable_and_no_override() {
-        // NEGATIVE TEST (the load-bearing one): a `with_scrub` launcher on a host
-        // WITHOUT CAP_NET_ADMIN and with isolation ON and NO override must REFUSE to
+        // NEGATIVE TEST (the load-bearing one): a `with_scrub` launcher that cannot
+        // create a namespace, with isolation ON and NO override, must REFUSE to
         // launch (IsolationRefused) — it must NEVER spawn the runtime with full host
         // egress. We assert the spawner was never called.
+        //
+        // CHRD-97: "cannot create a namespace" is now a property of the TEST BUILD,
+        // not an assumption about the host. `netns::prepare`'s `cfg(test)` arm fails
+        // closed at the capability gate with a panicking create seam, so this test
+        // means the same thing on the root build host as on an unprivileged one —
+        // and, unlike before, it no longer creates and leaks a real namespace here.
         let _endpoints = set_runtime_endpoints();
         std::env::remove_var("CHORD_NETNS_ISOLATION"); // default ON
         std::env::remove_var("CHORD_ALLOW_UNISOLATED"); // no override
@@ -1961,9 +1967,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn with_scrub_override_permits_unisolated_spawn_loudly() {
-        // With the explicit operator override, the same unprivileged host DOES
-        // spawn (unisolated) — the sanctioned bypass. The serve handle carries no
-        // namespace (none was created).
+        // With the explicit operator override, the same unavailable-isolation
+        // condition DOES spawn (unisolated) — the sanctioned bypass. The serve handle
+        // carries no namespace (none was created; see the CHRD-97 note above).
         let _endpoints = set_runtime_endpoints();
         std::env::remove_var("CHORD_NETNS_ISOLATION");
         std::env::set_var("CHORD_ALLOW_UNISOLATED", "1");
