@@ -1112,10 +1112,32 @@ impl crate::models::ingest::IngestOps for NoopIngestOps {
 
 /// Every route id Chord currently serves: the static alias table plus the
 /// runtime-mutable lumina tiers. A `BTreeSet` so the catalog order is stable.
+/// Every route id Chord currently serves: the static alias table plus the
+/// runtime-mutable lumina tiers. A `BTreeSet` so the catalog order is stable.
+///
+/// Alias keys that are not shaped like a ROUTE NAME are omitted, not published.
+/// An alias table is free to contain a key like `qwen2.5:7b`; that is a
+/// pass-through, not a logical route, and publishing it would put a model
+/// reference into the one field resolution cannot reach (`id`). Fail-closed,
+/// counted in the log so a missing route is explained rather than mysterious.
 fn route_ids(state: &AppState) -> std::collections::BTreeSet<String> {
-    let mut ids: std::collections::BTreeSet<String> =
+    let mut all: std::collections::BTreeSet<String> =
         state.model_aliases.keys().cloned().collect();
-    ids.extend(state.lumina_aliases.snapshot().into_keys());
+    all.extend(state.lumina_aliases.snapshot().into_keys());
+    let total = all.len();
+    let ids: std::collections::BTreeSet<String> = all
+        .into_iter()
+        .filter(|id| crate::routing::route_catalog::is_route_id(id))
+        .collect();
+    if ids.len() != total {
+        // The rejected keys are NOT logged: they are exactly the strings most
+        // likely to be model references, and a log line is still a place a name
+        // ends up. The count is what an operator needs to go look.
+        tracing::warn!(
+            omitted = total - ids.len(),
+            "route catalog: alias keys that are not route names were omitted — a route id              must be lowercase alphanumerics/-/_ so it cannot be a model reference"
+        );
+    }
     ids
 }
 
@@ -1279,11 +1301,26 @@ pub async fn get_route(
     }
     let (mut facts, backends) = collect_route_facts(&state).await;
     if !facts.contains_key(&id) {
-        // The id is echoed back because the caller supplied it — no upstream
-        // string is introduced here.
-        return error_response(StatusCode::NOT_FOUND, format!("unknown route: {id}"));
+        // The requested id is NOT echoed. It was caller-supplied, so echoing it
+        // introduces no NEW information — but it does make this endpoint a
+        // reflector, and a reflector on an endpoint whose entire contract is
+        // "no model or provider name appears in my responses" is a hole
+        // somebody will eventually walk a model id through. The status code is
+        // the whole answer; the caller already knows what it asked for.
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "unknown route".to_string(),
+        );
     }
-    apply_liveness(&state, &mut facts, &backends).await;
+    // Probe ONLY this route's backend. The list endpoint fans out across every
+    // always-on backend because it has to; a single-route read that did the
+    // same would make one route's page load depend on every other backend's
+    // liveness, which is both slower and a worse answer.
+    let mine: std::collections::BTreeMap<String, crate::models::backends::Backend> = backends
+        .into_iter()
+        .filter(|(k, _)| k == &id)
+        .collect();
+    apply_liveness(&state, &mut facts, &mine).await;
     let decls = crate::routing::route_catalog::declarations_from_env();
     let view = crate::routing::route_catalog::build_view(&facts[&id], decls.get(&id));
     Json(view).into_response()
@@ -2502,5 +2539,176 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         let (status, _) = get_json(app, "/api/routes/lumina-fast").await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn an_alias_key_that_is_a_model_reference_is_not_published_as_a_route() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        make_model(&base.join("local"), "alpha", "1", &[100]);
+        let mut reg = reg_at(base, vec![]);
+        reg.upsert_backend(on_demand_backend("llama-gpu"));
+        reg.reconcile();
+        let registry = Arc::new(Mutex::new(reg));
+        let state = control_state_with_aliases(
+            registry,
+            base.join("local"),
+            &[("lumina-fast", "alpha:1"), ("alpha:1", "alpha:1")],
+        );
+        let (_, json) = get_json(build_control_router(state), "/api/routes").await;
+        assert_eq!(json["count"], 1, "the model-shaped alias key must be omitted");
+        assert_eq!(route_of(&json, "lumina-fast")["id"], "lumina-fast");
+        assert!(
+            !serde_json::to_string(&json).unwrap().contains("alpha"),
+            "`id` is the one string resolution cannot reach — it must not carry a model \
+             reference either"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_404_does_not_reflect_the_requested_id_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let reg = reg_at(base, vec![]);
+        let registry = Arc::new(Mutex::new(reg));
+        let state = control_state_with_aliases(registry, base.join("local"), &[]);
+        let (status, json) = get_json(
+            build_control_router(state),
+            "/api/routes/qwen-something-distinctive",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            !serde_json::to_string(&json)
+                .unwrap()
+                .contains("qwen-something-distinctive"),
+            "an endpoint whose contract is 'no model name appears in my responses' must not \
+             be a reflector"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_string_in_the_response_comes_from_the_route_id_or_a_declaration() {
+        // A value-level allowlist, not a list of four fixture substrings: walk
+        // the whole response and prove each string is one this endpoint is
+        // entitled to emit. A refactor that leaked some OTHER model or backend
+        // name — not just the ones this test happens to name — fails here.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        make_model(&base.join("local"), "zephyrine", "9", &[100]);
+        let mut reg = reg_at(base, vec![]);
+        reg.upsert_backend(on_demand_backend("bespoke-serving-process"));
+        reg.reconcile();
+        assert!(reg.set_model_backend("zephyrine:9", Some("bespoke-serving-process".to_string())));
+        let registry = Arc::new(Mutex::new(reg));
+        let state = control_state_with_aliases(
+            registry,
+            base.join("local"),
+            &[("lumina-deep", "zephyrine:9")],
+        );
+        let (_, json) = get_json(build_control_router(state), "/api/routes").await;
+
+        let allowed: std::collections::BTreeSet<String> = ["lumina-deep", "local", "cloud"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .chain(
+                crate::routing::route_catalog::declarations_from_env()
+                    .values()
+                    .filter_map(|d| d.label.clone()),
+            )
+            .chain(
+                crate::routing::route_catalog::COST_TIERS
+                    .iter()
+                    .map(|s| (*s).to_string()),
+            )
+            .chain(
+                ["no_target", "unknown_model", "no_backend", "unreachable", "disabled"]
+                    .iter()
+                    .map(|s| (*s).to_string()),
+            )
+            .collect();
+
+        fn strings(v: &Value, out: &mut Vec<String>) {
+            match v {
+                Value::String(s) => out.push(s.clone()),
+                Value::Array(a) => a.iter().for_each(|x| strings(x, out)),
+                Value::Object(o) => o.values().for_each(|x| strings(x, out)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        strings(&json, &mut found);
+        assert!(!found.is_empty());
+        for s in found {
+            assert!(
+                allowed.contains(&s),
+                "the catalog emitted the string {s:?}, which is neither a route id, a \
+                 declared label/cost tier, a locality, nor a reason code"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_runtime_lumina_target_wins_over_the_static_alias_entry() {
+        // The chat hot path resolves the lumina store FIRST. A catalog that
+        // resolved the static map first would describe a route pointing
+        // somewhere the traffic does not go.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        make_model(&base.join("local"), "stale", "1", &[100]);
+        let mut reg = reg_at(base, vec![]);
+        reg.upsert_backend(on_demand_backend("llama-gpu"));
+        reg.reconcile();
+        let registry = Arc::new(Mutex::new(reg));
+        // Static map points at a KNOWN model; the runtime store has been
+        // repointed at one the registry does not have. Hot-path order means the
+        // route must report the RUNTIME target's fault, not the stale success.
+        let state = control_state_with_aliases(
+            registry,
+            base.join("local"),
+            &[("lumina-fast", "stale:1")],
+        );
+        state
+            .lumina_aliases
+            .set("lumina-fast", "freshly-promoted:1".to_string())
+            .await;
+        let (_, json) = get_json(build_control_router(state), "/api/routes").await;
+        let r = route_of(&json, "lumina-fast");
+        assert_eq!(
+            r["unavailable_reason"], "unknown_model",
+            "the runtime lumina target must win — resolving the static map first would have \
+             reported this route as available"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exact_registry_key_wins_over_the_latest_normalization() {
+        // Both shapes exist for the same bare name, tagged to backends of
+        // DIFFERENT locality. Preferring the normalized key would report the
+        // wrong side of the local/cloud line — the one fact SCOUT cannot check.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        make_model(&base.join("local"), "duo", "latest", &[100]);
+        let mut reg = reg_at(base, vec![]);
+        reg.upsert_backend(on_demand_backend("llama-gpu"));
+        let mut remote = on_demand_backend("openrouter");
+        remote.kind = crate::models::backends::BackendKind::OpenRouter;
+        remote.always_on = true;
+        remote.api_key_env = Some("CHRD100_TEST_KEY_THAT_IS_NEVER_SET".to_string());
+        reg.upsert_backend(remote);
+        reg.reconcile();
+        assert!(reg.set_model_backend("duo:latest", Some("llama-gpu".to_string())));
+        // The bare name is a remote-API record — a different model that merely
+        // shares a prefix.
+        assert!(reg.register_remote_api_model("duo", "remote-api", "openrouter"));
+        let registry = Arc::new(Mutex::new(reg));
+        let state =
+            control_state_with_aliases(registry, base.join("local"), &[("ambiguous", "duo")]);
+        let (_, json) = get_json(build_control_router(state), "/api/routes").await;
+        assert_eq!(
+            route_of(&json, "ambiguous")["locality"], "cloud",
+            "the exact key must win; falling through to `duo:latest` would report a cloud \
+             route as local"
+        );
     }
 }

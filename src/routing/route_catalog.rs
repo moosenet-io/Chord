@@ -163,6 +163,47 @@ pub enum BackendLiveness {
 
 // ── Declared, non-derivable metadata ─────────────────────────────────────────
 
+/// Is `id` shaped like a ROUTE NAME rather than a model reference?
+///
+/// Fail-closed, and it exists because of a real gap a reviewer found: the
+/// catalog's ids are alias-table KEYS, and nothing stops an operator writing
+/// `qwen2.5:7b` as an alias key. Publishing that as a "route id" would put a
+/// model reference in a browser through the one string field resolution cannot
+/// reach — the struct-shape guarantee says no field carries a name, and this is
+/// what keeps `id` honest.
+///
+/// The rule is deliberately the same one the consumer (Harmony SCOUT-02's
+/// `validate_route`) enforces, so the producer and the consumer agree instead of
+/// the consumer silently dropping entries the producer thought it had published:
+/// lowercase ASCII alphanumerics, `-` and `_`, starting alphanumeric, ≤ 64
+/// chars. That excludes the `family:size` and `provider/model` shapes.
+///
+/// Stated plainly rather than implied: this cannot catch a bare `llama3`, which
+/// is shaped exactly like a route name. No check can. What it does is close
+/// every shape that is UNAMBIGUOUSLY a model reference, and leave the rest to
+/// the operator who wrote the alias table.
+pub fn is_route_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+/// The closed vocabulary a declared `cost_tier` may use.
+///
+/// A reviewer was right that `cost_tier` was the one place an engine tier could
+/// walk in as free text — "runs on the a100 pool" is a cost tier only if you
+/// squint. Everything else this endpoint publishes as a category is an
+/// enumeration, so this is too. A declaration outside the vocabulary is dropped
+/// with a warning rather than passed through: an unrecognised tier is a config
+/// error to fix, not a string to forward.
+pub const COST_TIERS: &[&str] = &["free", "metered", "paid"];
+
 /// The parts of a route that Chord genuinely cannot derive and will not invent.
 ///
 /// A route's PURPOSE, its cost tier, its usable context window and whether it
@@ -174,7 +215,18 @@ pub enum BackendLiveness {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RouteDeclaration {
     /// What the route is FOR, in the operator's words. Never an id.
+    ///
+    /// This is the ONE deliberately-free string this endpoint publishes, and it
+    /// is not policed. A purpose is a sentence a human writes, and there is no
+    /// filter that can tell "Quick conversational answers" from a sentence that
+    /// names an engine — a blocklist over prose is a blocklist pretending to be
+    /// an allowlist (the same reasoning that made the consumer stop scrubbing
+    /// upstream reason text). What makes it safe is its PROVENANCE: it comes
+    /// from operator-authored local config, never from an upstream response, a
+    /// model record, or a backend. Chord will not invent one, and will not
+    /// substitute an id for a missing one.
     pub label: Option<String>,
+    /// Constrained to [`COST_TIERS`]. See that constant for why.
     pub cost_tier: Option<String>,
     pub context_window: Option<u64>,
     pub supports_tools: Option<bool>,
@@ -288,7 +340,19 @@ pub fn parse_declarations(raw: &str) -> HashMap<String, RouteDeclaration> {
             id.clone(),
             RouteDeclaration {
                 label: str_field("label"),
-                cost_tier: str_field("cost_tier"),
+                cost_tier: str_field("cost_tier").and_then(|t| {
+                    let t = t.to_ascii_lowercase();
+                    if COST_TIERS.contains(&t.as_str()) {
+                        Some(t)
+                    } else {
+                        tracing::warn!(
+                            route = %id,
+                            "{ROUTE_CATALOG_ENV}: cost_tier is not one of {COST_TIERS:?} — \
+                             dropped rather than published as free text"
+                        );
+                        None
+                    }
+                }),
                 context_window: entry.get("context_window").and_then(serde_json::Value::as_u64),
                 supports_tools: entry
                     .get("supports_tools")
@@ -896,6 +960,73 @@ mod tests {
     }
 
     // ── the catalog as a whole ───────────────────────────────────────────────
+
+    // ── the id shape gate (reviewer finding: `id` was the one unguarded string) ─
+
+    #[test]
+    fn a_model_shaped_alias_key_is_not_a_route_id() {
+        for bad in [
+            "qwen2.5:7b",
+            "meta-llama/Llama-3-8B",
+            "granite4.1:small",
+            "Lumina-Fast",
+            "-leading-dash",
+            "",
+            "has space",
+            "trailing:",
+        ] {
+            assert!(
+                !is_route_id(bad),
+                "{bad:?} is not a route name and must never be published as a route id"
+            );
+        }
+        for good in ["lumina-fast", "scout_deep", "r2", "a"] {
+            assert!(is_route_id(good), "{good:?} is a route name");
+        }
+        assert!(!is_route_id(&"a".repeat(65)));
+        assert!(is_route_id(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn the_id_rule_is_the_same_one_the_consumer_enforces() {
+        // Harmony SCOUT-02 `validate_route`: non-empty, <= 64, first char
+        // lowercase-alnum, body lowercase-alnum/-/_. If these two rules drift,
+        // the producer publishes routes the consumer silently drops.
+        fn consumer_rule(r: &str) -> bool {
+            !r.is_empty()
+                && r.len() <= 64
+                && r.chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                && r.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+        }
+        for s in [
+            "lumina-fast", "qwen2.5:7b", "A", "", "x_y-1", "a/b", "a".repeat(65).as_str(),
+        ] {
+            assert_eq!(is_route_id(s), consumer_rule(s), "producer/consumer disagree on {s:?}");
+        }
+    }
+
+    // ── cost_tier is a closed vocabulary, not free text ──────────────────────
+
+    #[test]
+    fn an_unrecognised_cost_tier_is_dropped_rather_than_forwarded() {
+        let d = parse_declarations(
+            r#"{"a":{"cost_tier":"free"},"b":{"cost_tier":"PAID"},
+                "c":{"cost_tier":"runs on the big gpu pool"}}"#,
+        );
+        assert_eq!(d["a"].cost_tier.as_deref(), Some("free"));
+        assert_eq!(
+            d["b"].cost_tier.as_deref(),
+            Some("paid"),
+            "the vocabulary is case-insensitive on input and normalised on output"
+        );
+        assert_eq!(
+            d["c"].cost_tier, None,
+            "an out-of-vocabulary tier is a config error to fix, not a string to forward —              this was the one field an engine tier could have walked in through"
+        );
+    }
 
     #[test]
     fn the_catalog_is_sorted_by_id_so_two_identical_reads_match() {
