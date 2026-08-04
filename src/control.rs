@@ -16,6 +16,8 @@
 //! | POST   | `/api/models/:name/pull`     | yes  | pull a cold model (cold → warm) |
 //! | POST   | `/api/models/ingest`          | yes  | ASK4-P2A: pull a HuggingFace model into cold storage (default-OFF gate) |
 //! | POST   | `/api/models/:name/protect`  | yes  | toggle/set the protected flag |
+//! | GET    | `/api/routes`                 | yes  | CHRD-100: the logical ROUTE catalog (named routes, locality, availability) |
+//! | GET    | `/api/routes/:id`             | yes  | CHRD-100: one route (404 = no such route, which is not "unavailable") |
 //! | GET    | `/api/storage`                | yes  | disk usage summary (local + archive) |
 //! | POST   | `/api/models/sweep`           | yes  | trigger a disk-pressure eviction sweep |
 //! | POST   | `/api/models/reconcile`       | yes  | MSM-04: reconcile + persist the registry, return before/after tier counts |
@@ -1089,6 +1091,204 @@ impl crate::models::ingest::IngestOps for NoopIngestOps {
     }
 }
 
+// ── GET /api/routes, GET /api/routes/:id (CHRD-100) ──────────────────────────
+//
+// The LOGICAL route catalog. `/api/models` publishes the model INVENTORY — what
+// is on disk, how big it is, which tier it sits in. That is an operator's view
+// of storage, and it is the wrong list to put in front of anyone choosing where
+// to send a conversation: it names models, it changes when a sweep archives
+// something, and it says nothing about whether a name is one a caller may
+// target. This endpoint publishes the other thing: the named routes, what each
+// is FOR, whether it runs on fleet hardware or leaves it, and whether it works
+// right now.
+//
+// The two endpoints are deliberately not merged. A route's identity outlives
+// its target — the assistant-fit updater repoints the lumina tiers at runtime —
+// so a catalog that was a projection of the model list would change identity
+// under its consumers every time a model was promoted.
+//
+// All resolution logic and the no-names guarantee live in
+// `crate::routing::route_catalog`; this handler is the I/O around it.
+
+/// Every route id Chord currently serves: the static alias table plus the
+/// runtime-mutable lumina tiers. A `BTreeSet` so the catalog order is stable.
+fn route_ids(state: &AppState) -> std::collections::BTreeSet<String> {
+    let mut ids: std::collections::BTreeSet<String> =
+        state.model_aliases.keys().cloned().collect();
+    ids.extend(state.lumina_aliases.snapshot().into_keys());
+    ids
+}
+
+/// Resolve a route id to its current target model, in exactly the order the
+/// chat hot path uses (`routes::chat_completions`): the runtime lumina store
+/// first, then the static alias map. A catalog that resolved differently from
+/// the hot path would describe a system that does not exist.
+fn route_target(state: &AppState, id: &str) -> Option<String> {
+    state
+        .lumina_aliases
+        .resolve(id)
+        .or_else(|| state.model_aliases.get(id).cloned())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+}
+
+/// Gather per-route facts. Takes the registry lock ONCE for the whole catalog
+/// and returns owned data, so the lock is released before any probe I/O.
+async fn collect_route_facts(
+    state: &Arc<AppState>,
+) -> (
+    std::collections::BTreeMap<String, crate::routing::route_catalog::RouteFacts>,
+    std::collections::BTreeMap<String, crate::models::backends::Backend>,
+) {
+    use crate::routing::route_catalog::RouteFacts;
+
+    let ids = route_ids(state);
+    let mut facts = std::collections::BTreeMap::new();
+    let mut backends: std::collections::BTreeMap<String, crate::models::backends::Backend> =
+        std::collections::BTreeMap::new();
+
+    let reg = state.model_registry.lock().await;
+    for id in ids {
+        let target = route_target(state, &id);
+        let (target_known, backend) = match target.as_deref() {
+            None => (false, None),
+            Some(t) => {
+                // Two key shapes live in one registry, and a lookup that knows
+                // only one of them reports a perfectly good route as broken.
+                //
+                //  * Ollama-managed records are keyed by the FULLY-TAGGED name,
+                //    and an untagged reference means `:latest` — the same
+                //    normalization `chat_completions` does before its own
+                //    registry lookup. Without it every untagged alias target
+                //    would report `unknown_model`.
+                //  * Remote-API records (`register_remote_api_model`) are keyed
+                //    by the bare name they were registered under, with no tag
+                //    at all — a `:latest` suffix would never match one. This
+                //    was found by the cloud-route test failing, not reasoned
+                //    about in advance.
+                //
+                // So: exact first, then the Ollama normalization.
+                let key = if reg.get(t).is_some() {
+                    t.to_string()
+                } else if t.contains(':') {
+                    t.to_string()
+                } else {
+                    format!("{t}:latest")
+                };
+                let known = reg.get(&key).is_some();
+                // `backend_for` falls back to the default backend for a model
+                // it does not know, which would let an unknown target answer
+                // "local and available". Only ask about a target the registry
+                // actually has.
+                let b = if known {
+                    reg.backend_for(&key).cloned()
+                } else {
+                    None
+                };
+                (known, b)
+            }
+        };
+        if let Some(b) = &backend {
+            backends.insert(id.clone(), b.clone());
+        }
+        facts.insert(
+            id.clone(),
+            RouteFacts {
+                id,
+                has_target: target.is_some(),
+                target_known,
+                backend_kind: backend.as_ref().map(|b| b.kind),
+                // Filled in after the probes below — resolution and liveness are
+                // two different questions and are answered in that order.
+                liveness: None,
+            },
+        );
+    }
+    drop(reg);
+    (facts, backends)
+}
+
+/// Resolve liveness for every route's backend and fold it into the facts.
+async fn apply_liveness(
+    state: &Arc<AppState>,
+    facts: &mut std::collections::BTreeMap<String, crate::routing::route_catalog::RouteFacts>,
+    backends: &std::collections::BTreeMap<String, crate::models::backends::Backend>,
+) {
+    use crate::routing::route_catalog::classify_liveness;
+
+    // Probe each DISTINCT always-on local backend once, not once per route.
+    let urls: std::collections::BTreeSet<String> = backends
+        .values()
+        .filter(|b| {
+            b.kind != crate::models::backends::BackendKind::OpenRouter && !b.on_demand()
+        })
+        .map(|b| b.url.clone())
+        .collect();
+    let probed = crate::routing::route_catalog::probe_always_on(&state.http_client, &urls).await;
+
+    for (id, b) in backends {
+        // The credential check reads only PRESENCE of the env var the backend
+        // itself names (`api_key_env`) — never the value, which is never
+        // returned, logged, or compared. A remote route with no provisioned key
+        // would fail on first use, and publishing it as available would be a
+        // lie a user only discovers mid-conversation.
+        let live = classify_liveness(
+            b,
+            |env_key| {
+                std::env::var(env_key)
+                    .map(|v| !v.trim().is_empty())
+                    .unwrap_or(false)
+            },
+            |url| probed.get(url).copied().unwrap_or(false),
+        );
+        if let Some(f) = facts.get_mut(id) {
+            f.liveness = Some(live);
+        }
+    }
+}
+
+/// `GET /api/routes` — the route catalog.
+///
+/// Same JWT auth as every other `/api/*` route (checked in-handler): the
+/// catalog describes the fleet's serving topology, and it is gated for the same
+/// reason `/api/models` is.
+pub async fn list_routes(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(e) = auth_check(&headers, &state.jwt_secret) {
+        return auth_error_response(e);
+    }
+    let (mut facts, backends) = collect_route_facts(&state).await;
+    apply_liveness(&state, &mut facts, &backends).await;
+    let decls = crate::routing::route_catalog::declarations_from_env();
+    let routes = crate::routing::route_catalog::build_catalog(&facts, &decls);
+    let count = routes.len();
+    Json(serde_json::json!({ "routes": routes, "count": count })).into_response()
+}
+
+/// `GET /api/routes/:id` — one route, or a 404.
+///
+/// The 404 is the point: "no such route" is a different answer from "the route
+/// exists and is unavailable", and a client that cannot tell them apart will
+/// eventually render a typo as an outage.
+pub async fn get_route(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(e) = auth_check(&headers, &state.jwt_secret) {
+        return auth_error_response(e);
+    }
+    let (mut facts, backends) = collect_route_facts(&state).await;
+    if !facts.contains_key(&id) {
+        // The id is echoed back because the caller supplied it — no upstream
+        // string is introduced here.
+        return error_response(StatusCode::NOT_FOUND, format!("unknown route: {id}"));
+    }
+    apply_liveness(&state, &mut facts, &backends).await;
+    let decls = crate::routing::route_catalog::declarations_from_env();
+    let view = crate::routing::route_catalog::build_view(&facts[&id], decls.get(&id));
+    Json(view).into_response()
+}
+
 // ── Router ───────────────────────────────────────────────────────────────────
 
 /// Build the TIER-05 control router over the shared [`AppState`].
@@ -1107,6 +1307,12 @@ pub fn build_control_router(state: Arc<AppState>) -> axum::Router {
         .route("/api/models/:name/protect", post(protect_model))
         // ASK4-P2A: pull a HuggingFace model into cold storage (default-OFF gate).
         .route("/api/models/ingest", post(ingest_model))
+        // CHRD-100: the LOGICAL route catalog — the named routes a caller may
+        // target, with locality/availability resolved BY Chord. Distinct from
+        // `/api/models` (the on-disk model inventory) by design; see the
+        // handler docs. Same JWT auth (checked in-handler).
+        .route("/api/routes", get(list_routes))
+        .route("/api/routes/:id", get(get_route))
         .route("/api/storage", get(storage_summary))
         .route("/api/storage/gc", post(trigger_gc))
         // RESIL-02: sweep action-queue cache (durable resume).
@@ -2069,5 +2275,232 @@ mod tests {
             .unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["status"], "disabled");
+    }
+
+    // ── CHRD-100: the route catalog ──────────────────────────────────────────
+
+    /// A control state whose alias table (and therefore route set) is seeded.
+    fn control_state_with_aliases(
+        registry: Arc<Mutex<ModelRegistry>>,
+        local_root: std::path::PathBuf,
+        aliases: &[(&str, &str)],
+    ) -> Arc<AppState> {
+        let state = control_state(registry, local_root, Arc::new(StatvfsProbe));
+        let mut owned = Arc::try_unwrap(state).ok().expect("sole Arc owner");
+        owned.model_aliases = aliases
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        Arc::new(owned)
+    }
+
+    /// An ON-DEMAND local backend. On-demand on purpose: these tests must never
+    /// make a network call, and `classify_liveness` never probes an on-demand
+    /// backend (being stopped is its resting state).
+    fn on_demand_backend(name: &str) -> crate::models::backends::Backend {
+        crate::models::backends::Backend {
+            name: name.to_string(),
+            url: format!("http://127.0.0.1:1/{name}"),
+            hardware: crate::models::backends::Hardware::Gpu,
+            kind: crate::models::backends::BackendKind::LlamaServer,
+            unit: None,
+            always_on: false,
+            idle_stop_secs: 600,
+            launch: None,
+            api_key_env: None,
+        }
+    }
+
+    async fn get_json(app: axum::Router, uri: &str) -> (StatusCode, Value) {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, json)
+    }
+
+    fn route_of<'a>(json: &'a Value, id: &str) -> &'a Value {
+        json["routes"]
+            .as_array()
+            .expect("a catalog always has a routes array")
+            .iter()
+            .find(|r| r["id"] == id)
+            .unwrap_or_else(|| panic!("route {id} missing from the catalog"))
+    }
+
+    #[tokio::test]
+    async fn an_alias_is_published_as_a_route_with_locality_derived_from_its_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        make_model(&base.join("local"), "alpha", "1", &[100]);
+        let mut reg = reg_at(base, vec![]);
+        reg.upsert_backend(on_demand_backend("llama-gpu"));
+        reg.reconcile();
+        let registry = Arc::new(Mutex::new(reg));
+        let state = control_state_with_aliases(
+            registry,
+            base.join("local"),
+            &[("lumina-fast", "alpha:1")],
+        );
+        let (status, json) = get_json(build_control_router(state), "/api/routes").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["count"], 1);
+        let r = route_of(&json, "lumina-fast");
+        assert_eq!(r["available"], true);
+        assert_eq!(
+            r["locality"], "local",
+            "locality must come from the resolved backend's kind"
+        );
+        assert!(r.get("unavailable_reason").is_none());
+        // Chord's own tier has a purpose it can state; it is not the id.
+        assert_eq!(r["label"], "Quick conversational answers");
+    }
+
+    #[tokio::test]
+    async fn a_route_whose_target_the_registry_never_heard_of_is_a_fault_not_an_available_local_route()
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        make_model(&base.join("local"), "alpha", "1", &[100]);
+        let mut reg = reg_at(base, vec![]);
+        reg.upsert_backend(on_demand_backend("llama-gpu"));
+        reg.reconcile();
+        let registry = Arc::new(Mutex::new(reg));
+        let state = control_state_with_aliases(
+            registry,
+            base.join("local"),
+            &[("ghost-route", "not-a-model:9")],
+        );
+        let (_, json) = get_json(build_control_router(state), "/api/routes").await;
+        let r = route_of(&json, "ghost-route");
+        assert_eq!(r["available"], false);
+        assert_eq!(r["unavailable_reason"], "unknown_model");
+        assert!(
+            r.get("locality").is_none(),
+            "a route whose target cannot be placed has NO locality — the registry's default \
+             backend must not be borrowed to manufacture one"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_untagged_alias_target_resolves_the_same_way_the_chat_hot_path_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        make_model(&base.join("local"), "alpha", "latest", &[100]);
+        let mut reg = reg_at(base, vec![]);
+        reg.upsert_backend(on_demand_backend("llama-gpu"));
+        reg.reconcile();
+        let registry = Arc::new(Mutex::new(reg));
+        // The alias target carries no tag, exactly as an operator would write it.
+        let state =
+            control_state_with_aliases(registry, base.join("local"), &[("untagged", "alpha")]);
+        let (_, json) = get_json(build_control_router(state), "/api/routes").await;
+        let r = route_of(&json, "untagged");
+        assert_eq!(
+            r["available"], true,
+            "the registry is keyed by the fully-tagged name; without the `:latest` \
+             normalization every untagged alias would falsely report unknown_model"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remote_route_is_reported_cloud_and_disabled_when_its_credential_is_unprovisioned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let mut reg = reg_at(base, vec![]);
+        let mut remote = on_demand_backend("openrouter");
+        remote.kind = crate::models::backends::BackendKind::OpenRouter;
+        remote.always_on = true;
+        remote.api_key_env = Some("CHRD100_TEST_KEY_THAT_IS_NEVER_SET".to_string());
+        reg.upsert_backend(remote);
+        assert!(reg.register_remote_api_model("owl-alpha", "remote-api", "openrouter"));
+        let registry = Arc::new(Mutex::new(reg));
+        let state = control_state_with_aliases(
+            registry,
+            base.join("local"),
+            &[("frontier", "owl-alpha")],
+        );
+        let (_, json) = get_json(build_control_router(state), "/api/routes").await;
+        let r = route_of(&json, "frontier");
+        assert_eq!(
+            r["locality"], "cloud",
+            "a remote bearer-authenticated backend is cloud — this is the fact SCOUT cannot \
+             derive for itself"
+        );
+        assert_eq!(r["available"], false);
+        assert_eq!(r["unavailable_reason"], "disabled");
+    }
+
+    #[tokio::test]
+    async fn the_published_catalog_contains_no_model_backend_or_url_string() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        make_model(&base.join("local"), "alpha", "1", &[100]);
+        let mut reg = reg_at(base, vec![]);
+        reg.upsert_backend(on_demand_backend("llama-gpu"));
+        reg.reconcile();
+        assert!(reg.set_model_backend("alpha:1", Some("llama-gpu".to_string())));
+        let registry = Arc::new(Mutex::new(reg));
+        let state = control_state_with_aliases(
+            registry,
+            base.join("local"),
+            &[("lumina-deep", "alpha:1")],
+        );
+        let (_, json) = get_json(build_control_router(state), "/api/routes").await;
+        let body = serde_json::to_string(&json).unwrap();
+        for leak in ["alpha", "llama-gpu", "127.0.0.1", "http://"] {
+            assert!(
+                !body.contains(leak),
+                "the route catalog leaked {leak:?} into its response: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_route_id_is_404_which_is_not_the_same_as_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        make_model(&base.join("local"), "alpha", "1", &[100]);
+        let mut reg = reg_at(base, vec![]);
+        reg.upsert_backend(on_demand_backend("llama-gpu"));
+        reg.reconcile();
+        let registry = Arc::new(Mutex::new(reg));
+        let state = control_state_with_aliases(
+            registry,
+            base.join("local"),
+            &[("lumina-fast", "alpha:1")],
+        );
+        let app = build_control_router(state);
+        let (status, _) = get_json(app.clone(), "/api/routes/no-such-route").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, json) = get_json(app, "/api/routes/lumina-fast").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["id"], "lumina-fast");
+        assert_eq!(json["available"], true);
+    }
+
+    #[tokio::test]
+    async fn the_route_catalog_is_auth_gated_like_every_other_api_route() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let reg = reg_at(base, vec![]);
+        let registry = Arc::new(Mutex::new(reg));
+        let state = control_state_with_secret(registry, base.join("local"), "a-secret");
+        let app = build_control_router(state);
+        let (status, _) = get_json(app.clone(), "/api/routes").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = get_json(app, "/api/routes/lumina-fast").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 }
