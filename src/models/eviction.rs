@@ -323,10 +323,28 @@ pub async fn evict_to_archive(
     let blobs = parse_manifest_blobs(&local_manifest);
     let planned = planned_archive_paths(&blobs, &local_manifest, &local_root, &archive_root);
     // Snapshot which of the planned archive paths ALREADY exist before we start
-    // copying — e.g. a blob shared with another already-archived model. On a
-    // timeout we must clean up only what *this* attempt could plausibly have
-    // written, never a pre-existing/shared archive file (GC-aware, mirrors the
+    // copying — e.g. a blob shared with another already-archived model. Cleanup
+    // on ANY failure path removes only what *this* attempt could plausibly have
+    // created, never a pre-existing/shared archive file (GC-aware, mirrors the
     // "never delete a blob referenced elsewhere" invariant from the local side).
+    //
+    // ## Why a snapshot is sufficient ownership evidence here — and where it isn't
+    //
+    // This snapshot is only trustworthy while nothing else can write to the
+    // archive. Every production caller of `evict_to_archive` (`cooldown_pass`,
+    // the `run_eviction_sweep_at` disk-pressure pass, `evict_for_space`) holds
+    // `DiskOpLock` across this whole function, and `gc::run_gc` /
+    // `PullCoordinator::ensure_local` take the same lock — so no concurrent
+    // eviction, pull or GC can create an archive file between this snapshot and
+    // any cleanup that runs before we return. **All inline cleanup below depends
+    // on that.** If someone ever parallelises evictions or drops the lock around
+    // a copy, "absent at snapshot time" stops proving ownership (the
+    // `exists()`-then-create sequence is a TOCTOU race against any concurrent
+    // archive writer) and this needs to become a real ownership token — a
+    // per-attempt temp name plus an atomic publish is the usual answer.
+    //
+    // Cleanup that would run AFTER the lock is released cannot rely on this at
+    // all, and therefore never deletes — see the cancellation-grace branch below.
     let pre_existing: HashSet<PathBuf> = planned.iter().filter(|p| p.exists()).cloned().collect();
 
     // ── Copy local → archive (reverse pull), bounded by copy_timeout (MSM-02) ──
@@ -355,27 +373,49 @@ pub async fn evict_to_archive(
             // so the sweep is never wedged.
             cancel.store(true, Ordering::Relaxed);
             match tokio::time::timeout(COPY_CANCEL_GRACE, &mut copy_task).await {
-                // Stopped early: we have the precise list of what it wrote.
-                Ok(Ok(Err((_, written)))) => cleanup_timeout(&written, &pre_existing),
+                // Stopped early: we have the precise list of what it wrote. Still
+                // inside the caller's DiskOpLock, so the snapshot still holds.
+                Ok(Ok(Err((_, written)))) => cleanup_attempt(model, &written, &pre_existing),
                 // Finished (or panicked) before it saw the cancel: we don't have
                 // an exact in-flight list, so fall back to every planned archive
-                // path that did not exist before this attempt started — never a
-                // pre-existing/shared archive file.
-                Ok(Ok(Ok(()))) | Ok(Err(_)) => cleanup_timeout(&planned, &pre_existing),
+                // path that did not exist before this attempt started.
+                Ok(Ok(Ok(()))) | Ok(Err(_)) => cleanup_attempt(model, &planned, &pre_existing),
                 Err(_) => {
-                    // The copy is wedged inside a single chunk write. Don't block
-                    // the sweep on it and don't clean up underneath a live
-                    // writer — hand cleanup to a detached task that runs once the
-                    // copy actually stops.
+                    // The copy is wedged inside a single chunk write (only
+                    // reachable on a stalled mount). We must not block the sweep
+                    // on it — so we return, and the caller's DiskOpLock is
+                    // released while this copy is still alive.
+                    //
+                    // **Therefore we do not delete anything, now or later.** Once
+                    // the lock is gone, a subsequent eviction may legitimately
+                    // create — or come to depend on — any of our planned paths:
+                    // it could write one itself, or skip-match one *we* wrote and
+                    // then delete its local copy trusting it. A deferred cleanup
+                    // carrying this attempt's stale `pre_existing` snapshot would
+                    // happily delete that file. Ownership is simply not provable
+                    // from here, and the asymmetry is not close: an orphan blob
+                    // costs disk and is reconciled by the next eviction of this
+                    // model under the lock (it becomes `pre_existing`, and is
+                    // either size-skipped as valid content-addressed data or
+                    // rewritten), whereas a wrongly deleted archive blob is
+                    // unrecoverable. So: log loudly, delete nothing.
+                    //
+                    // The copy task is deliberately left detached rather than
+                    // aborted — it stops itself at its next chunk check.
+                    let orphans: Vec<String> = planned
+                        .iter()
+                        .filter(|p| !pre_existing.contains(*p))
+                        .map(|p| p.display().to_string())
+                        .collect();
                     warn!(
                         model = %model,
+                        grace_secs = COPY_CANCEL_GRACE.as_secs(),
+                        possible_orphans = ?orphans,
                         "archive copy did not stop within the cancellation grace period; \
-                         deferring partial-archive cleanup until it does"
+                         NOT cleaning up — ownership of these archive paths can no longer be \
+                         proven once the disk-op lock is released. They may be left behind and \
+                         will be reconciled by the next eviction of this model."
                     );
-                    tokio::spawn(async move {
-                        let _ = copy_task.await;
-                        cleanup_timeout(&planned, &pre_existing);
-                    });
                 }
             }
             return Err(EvictError::Timeout(model.to_string(), copy_timeout));
@@ -385,12 +425,18 @@ pub async fn evict_to_archive(
     match copy_res {
         Ok(Ok(())) => {}
         Ok(Err((e, written))) => {
-            // Mid-copy failure: clean up exactly the files this attempt wrote.
-            cleanup_partial(&written);
+            // Mid-copy failure: clean up the files this attempt wrote — through
+            // the SAME ownership check as the timeout path. `written` can contain
+            // a path that already existed (a shared archive blob whose size did
+            // not match, which this attempt overwrote); deleting that would
+            // destroy data this attempt did not create, so `cleanup_attempt`
+            // filters it out. Two cleanup routes with different safety rules is
+            // how one of them ends up wrong — there is exactly one route.
+            cleanup_attempt(model, &written, &pre_existing);
             return Err(EvictError::ArchiveCopy(model.to_string(), e));
         }
         Err(join_err) => {
-            cleanup_timeout(&planned, &pre_existing);
+            cleanup_attempt(model, &planned, &pre_existing);
             return Err(EvictError::ArchiveCopy(
                 model.to_string(),
                 format!("archive copy task failed to join: {join_err}"),
@@ -517,17 +563,35 @@ async fn copy_model_to_archive(
 /// never surfaces as a user-visible `ArchiveCopy` error.
 const CANCELLED: &str = "archive copy cancelled by timeout";
 
-/// Remove the archive files a timed-out attempt may have left behind: every
-/// candidate path that did **not** exist before this attempt started. A
-/// pre-existing (possibly shared) archive file is never removed.
+/// The **one** route by which a failed eviction attempt removes archive files.
 ///
-/// Only ever called once the copy has genuinely stopped.
-fn cleanup_timeout(candidates: &[PathBuf], pre_existing: &HashSet<PathBuf>) {
-    let to_clean: Vec<PathBuf> = candidates
+/// Removes every candidate path that did **not** exist in `pre_existing` — the
+/// snapshot taken, under the caller's `DiskOpLock`, before this attempt wrote
+/// anything. A path that was already there is data this attempt did not create
+/// (a blob shared with another archived model, possibly the only remaining copy)
+/// and is never removed, even if this attempt overwrote it.
+///
+/// Two preconditions, both required for the snapshot to prove ownership:
+/// 1. the copy has genuinely stopped (cancelled and awaited, or finished), and
+/// 2. the caller still holds `DiskOpLock`, so nothing else can have created an
+///    archive file since the snapshot.
+///
+/// Every failure path — mid-copy I/O error, timeout, copy-task panic — goes
+/// through here. The one path that cannot satisfy precondition 2 (the
+/// cancellation-grace expiry, which returns while the copy is still alive)
+/// deletes nothing at all and logs instead.
+fn cleanup_attempt(model: &str, candidates: &[PathBuf], pre_existing: &HashSet<PathBuf>) {
+    let (to_clean, kept): (Vec<PathBuf>, Vec<PathBuf>) = candidates
         .iter()
-        .filter(|p| !pre_existing.contains(*p))
         .cloned()
-        .collect();
+        .partition(|p| !pre_existing.contains(p));
+    if !kept.is_empty() {
+        info!(
+            model = %model,
+            kept = ?kept.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            "leaving pre-existing archive files in place during cleanup of a failed eviction"
+        );
+    }
     cleanup_partial(&to_clean);
 }
 
@@ -1139,6 +1203,50 @@ mod tests {
         assert!(
             base.join("archive/blobs/sha256-sharedblob").is_file(),
             "pre-existing archive blob must survive another model's copy timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn midcopy_failure_never_deletes_a_preexisting_archive_blob() {
+        // The mid-copy-error path must obey the same ownership rule as the
+        // timeout path. A blob already in the archive (shared with a model
+        // archived earlier) whose size does NOT match is re-copied by this
+        // attempt — so it lands in the copy's `written` list. If a LATER blob
+        // then fails, cleaning up `written` verbatim would delete a file this
+        // attempt did not create, and which may be the only remaining copy.
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        fs::create_dir_all(base.join("archive/blobs")).unwrap();
+        let model = make_model(&base.join("local"), "mix", "1", &[1024, 2048]);
+
+        // `sha256-mix0` is already in the archive at a different size → not
+        // skip-matched, so this attempt overwrites it and records it as written.
+        fs::write(base.join("archive/blobs/sha256-mix0"), b"older").unwrap();
+        // Make the SECOND blob's copy fail: its local source is gone.
+        fs::remove_file(base.join("local/blobs/sha256-mix1")).unwrap();
+
+        let mut reg = reg_with(base, vec![]);
+        reg.reconcile();
+        let registry = Arc::new(Mutex::new(reg));
+        let evictor = fs_evictor(base);
+
+        let err = evict_to_archive(&registry, &model, &evictor, TEST_COPY_TIMEOUT)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EvictError::ArchiveCopy(..)), "got {err:?}");
+
+        assert!(
+            base.join("archive/blobs/sha256-mix0").is_file(),
+            "a pre-existing archive blob must survive this attempt's mid-copy failure"
+        );
+        assert!(
+            !base.join("archive/blobs/sha256-mix1").is_file(),
+            "the failed blob this attempt created must be cleaned up"
+        );
+        // Model stays Warm; local copy untouched.
+        assert_eq!(
+            registry.lock().await.get(&model).unwrap().tier,
+            StorageTier::Warm
         );
     }
 
