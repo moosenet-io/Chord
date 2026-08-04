@@ -1,10 +1,36 @@
 # Chord — Serving & Coordinator Subsystem
 
+> **CORRECTION (CHRD-98).** The "Memory Coordinator" described below —
+> `serving::residency::VramResidencyManager` — **has been deleted.** It was a
+> bulk-vendored SRV-13 import that was *never constructed anywhere in Chord's
+> history*, so nothing it describes was ever behaviour of a running Chord. Live
+> VRAM residency is owned solely by
+> [`routing::resident_set::ResidentSet`](../src/routing/resident_set.rs)
+> (CHRD-PIN-01), and the residency snapshot Terminus reads is written by
+> [`routing::residency_snapshot`](../src/routing/residency_snapshot.rs)
+> (CHRD-95). Treat every `serving::residency` reference below as HISTORICAL
+> DESIGN, not as code you can call — and do not revive it: a second residency
+> owner fighting the first over one idle-reaped GPU is the exact bug
+> CHRD-PIN-01 eliminated.
+
+
 The [architecture diagram](../assets/architecture.svg) names three serving boxes —
 **Memory Coordinator**, **Clean-Swap Launcher**, and **Mode Controller** — under
-the headings SRV-11/12/13. As of chord-proxy **1.1.0** all three ship as real
-code in [`src/serving/`](../src/serving). This document maps each box to its
-modules, structs, and functions.
+the headings SRV-11/12/13.
+
+**Only two of those three ever ran.** The Clean-Swap Launcher and the Mode
+Controller ship as real code. The **Memory Coordinator** (`VramResidencyManager`)
+did not: it arrived as a bulk-vendored import, was never constructed anywhere in
+`src/` in the repository's entire history, and was deleted in CHRD-98. VRAM
+residency is owned solely by [`routing::resident_set`](../src/routing/resident_set.rs)
+per CHRD-PIN-01, which exists precisely because two mechanisms fighting over one
+GPU is the bug this architecture must not have.
+
+The earlier claim here that "all three ship as real code" was wrong when written
+and is corrected rather than deleted, because it is the specific sentence that
+would send the next reader to wire the dead manager back in.
+
+This document maps the remaining boxes to their modules, structs, and functions.
 
 The serving module ([`serving::mod`](../src/serving/mod.rs)) is the *consume* side
 of the S85 serving dimension: the shared profile/runtime types live in

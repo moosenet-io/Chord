@@ -14,8 +14,13 @@
 //! be cold-launched inline; SRV-04 delegates those to the
 //! [`launcher::ResidencyManager`] trait it DEFINES here, and ships a trivial
 //! [`launcher::PassThroughResidency`] stub so the crate compiles + tests today.
-//! SRV-05 implements that trait with the real admission/eviction behind the same
-//! seam — without changing SRV-04.
+//!
+//! SRV-05's implementation of that trait (`serving::residency::VramResidencyManager`)
+//! was DELETED by CHRD-98: it was never constructed anywhere in chord's history, and
+//! `routing::resident_set::ResidentSet` (CHRD-PIN-01) is the single owner of VRAM
+//! residency on the live host. Do not reintroduce a second one behind this seam —
+//! two independent residency owners fighting over one idle-reaped GPU is the exact
+//! bug CHRD-PIN-01 was written to eliminate.
 
 pub mod eviction;
 pub mod launcher;
@@ -23,7 +28,6 @@ pub mod memory_model;
 pub mod mode;
 pub mod profile;
 pub mod release_verify;
-pub mod residency;
 pub mod swap;
 
 pub use eviction::{plan_admission, EvictTarget, EvictionPlan, ResidentView, Tier};
@@ -43,10 +47,6 @@ pub use launcher::{
     build_launch_command, scrub_launch_env, teardown_netns, FailureRecorder, HealthChecker,
     LaunchCommand, LaunchError, Launcher, NoopFailureRecorder, PassThroughResidency,
     ResidencyError, ResidencyManager, RuntimeSpawner, ServeHandle, Slot,
-};
-pub use residency::{
-    EventSink, NoopEventSink, Resident, ResidencyEvent, SysfsFreeVram, VramResidencyManager,
-    WarmLauncher,
 };
 pub use profile::{
     DbProfileSource, EnvSpec, ProfileLoadError, ProfileSource, RouteEntry, RoutingMap,
