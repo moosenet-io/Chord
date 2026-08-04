@@ -429,24 +429,45 @@ fn configure_namespace(name: &str, cfg: &NetnsConfig) -> Result<(), NetnsError> 
 /// Tear down a named namespace idempotently: `ip netns del <name>` (deleting an
 /// absent namespace is treated as success). Linux-only; on other platforms this is
 /// a no-op success (nothing was ever created).
+///
+/// ## CHRD-97: why a unit-test build cannot DELETE either
+/// Making creation structurally impossible in a test build while leaving deletion
+/// real is an inconsistent boundary. The existence check below is not an OWNERSHIP
+/// check: it only answers "does `/run/netns/<name>` exist", not "did we create it".
+/// The names are a hash of a slot token, so a real namespace could in principle
+/// carry a name a test derives — and then the test would DELETE a live namespace
+/// instead of treating it as not-ours. The odds are small; the cost is not
+/// symmetric, and this build host also runs production services. The rule is the
+/// same one that applies to any destructive path: **when you cannot prove
+/// ownership, do not delete.**
+///
+/// So `teardown_named` mirrors [`prepare`]: the two host-touching operations —
+/// the existence probe and the delete — are injected through
+/// [`teardown_named_with`], and the `cfg(test)` arm pins the probe to `false` with
+/// an `unreachable!()` delete. The idempotency CONTRACT keeps full unit coverage
+/// against injected fakes (see the tests); what is given up is only the exercise of
+/// the two-line `ip netns del` shell-out itself, which is host behaviour and is
+/// covered by the `#[ignore]`d `tests/netns_integration.rs` suite.
 fn teardown_named(name: &str) -> Result<(), NetnsError> {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(test)))]
     {
-        let ip = match crate::config::ip_bin() {
-            Some(b) => b,
-            // No tool ⇒ nothing could have been created by us ⇒ idempotent success.
-            None => return Ok(()),
-        };
-        // `ip netns del` on a missing namespace returns non-zero; we treat that as
-        // success (idempotency) by checking existence first.
-        if !named_netns_exists(name) {
-            return Ok(());
-        }
-        let _ = run_priv(&ip, &["netns", "del", name]);
-        // The veth host-side peer is auto-removed with the namespace; nft rules
-        // lived inside the namespace and die with it. Nothing else to reap.
-        Ok(())
+        teardown_named_with(name, named_netns_exists, delete_named_netns)
     }
+
+    #[cfg(all(target_os = "linux", test))]
+    {
+        // TEST BUILD ONLY. Nothing exists as far as a test is concerned, so the
+        // delete is never reached; if a refactor ever reordered the guard, this
+        // panics loudly instead of removing a namespace off the shared host.
+        teardown_named_with(name, |_| false, |_| {
+            unreachable!(
+                "CHRD-97: the privileged namespace-delete path must be unreachable in a \
+                 unit-test build; an existence check is not an ownership check, and the \
+                 real path is covered by the #[ignore]d tests/netns_integration.rs suite"
+            )
+        })
+    }
+
     #[cfg(not(target_os = "linux"))]
     {
         let _ = name;
@@ -454,8 +475,62 @@ fn teardown_named(name: &str) -> Result<(), NetnsError> {
     }
 }
 
+/// [`teardown_named`] with both host-touching operations INJECTED (CHRD-97).
+///
+/// This function IS the idempotency contract, and it is pure decision logic:
+///
+///   * an ABSENT namespace is `Ok(())` and the delete is **never invoked** — that
+///     is what makes a crashed runtime (which left nothing behind) safe to reap,
+///     and it is asserted structurally rather than by inspecting `/run/netns`;
+///   * a FAILED delete is still `Ok(())` — teardown is best-effort by contract, so
+///     the SRV-12 clean swap can always call it without a failure path;
+///   * the delete, when invoked, gets the namespace name unmodified.
+///
+/// Production passes [`named_netns_exists`] and [`delete_named_netns`], so
+/// `teardown_named`'s shipped behavior is unchanged. One ordering note: production
+/// used to resolve `ip` BEFORE the existence check and return `Ok` if it was
+/// missing; now the existence check runs first and a missing `ip` surfaces as the
+/// delete returning `ToolUnavailable`, which is swallowed into the same `Ok(())`.
+/// Same observable result, and the ordering now matches "don't touch the host until
+/// you know there is something to touch".
+#[cfg(target_os = "linux")]
+pub(crate) fn teardown_named_with<E, D>(
+    name: &str,
+    exists: E,
+    delete: D,
+) -> Result<(), NetnsError>
+where
+    E: FnOnce(&str) -> bool,
+    D: FnOnce(&str) -> Result<(), NetnsError>,
+{
+    // `ip netns del` on a missing namespace returns non-zero; we treat an absent
+    // namespace as success (idempotency) by checking existence first — and, more
+    // importantly, by NOT issuing a delete for something that is not there.
+    if !exists(name) {
+        return Ok(());
+    }
+    // Best effort: a delete that fails is still an idempotent success. The veth
+    // host-side peer is auto-removed with the namespace; nft rules lived inside the
+    // namespace and die with it. Nothing else to reap.
+    let _ = delete(name);
+    Ok(())
+}
+
+/// The privileged delete: `ip netns del <name>`. Production half of the
+/// [`teardown_named_with`] seam.
+#[cfg(target_os = "linux")]
+// CHRD-97: unreferenced in a unit-test build (the delete seam is a panicking stub).
+// Still the production delete path, exercised by tests/netns_integration.rs.
+#[cfg_attr(test, allow(dead_code))]
+fn delete_named_netns(name: &str) -> Result<(), NetnsError> {
+    let ip = crate::config::ip_bin().ok_or(NetnsError::ToolUnavailable)?;
+    run_priv(&ip, &["netns", "del", name])
+}
+
 /// Whether a named netns currently exists (`/run/netns/<name>`). Used to make
 /// teardown idempotent without shelling out to a delete that errors on absence.
+/// Read-only — it never mutates host state, so the CHRD-97 tests may call it
+/// directly to confirm the absence of a namespace they must not have created.
 #[cfg(target_os = "linux")]
 fn named_netns_exists(name: &str) -> bool {
     std::path::Path::new("/run/netns").join(name).exists()
@@ -528,9 +603,14 @@ mod tests {
 
     #[test]
     fn teardown_of_absent_namespace_is_idempotent_ok() {
-        // On this unprivileged/CI host nothing was created; teardown of a
-        // never-created namespace must be Ok (no leak, no error). This exercises
-        // the idempotency contract the SRV-12 clean swap relies on.
+        // Teardown of a never-created namespace must be Ok (no leak, no error).
+        // This is the contract the SRV-12 clean swap relies on, asserted at the
+        // level the launcher actually calls (`NetnsHandle::teardown`).
+        //
+        // CHRD-97: this used to rest on "nothing was created on this unprivileged
+        // CI host" — false on the root build host, where it drove a real
+        // `ip netns del`. The handle-level call is now inert by construction; the
+        // DECISION logic it delegates to is covered against injected fakes below.
         let h = NetnsHandle {
             name: namespace_name("never-created"),
             posture: EgressPosture::Denied,
@@ -538,6 +618,123 @@ mod tests {
         assert!(h.teardown().is_ok(), "tearing down an absent namespace must be idempotent");
         // A second teardown is also Ok.
         assert!(h.teardown().is_ok());
+    }
+
+    /// CHRD-97 — the idempotency contract itself, against injected operations.
+    ///
+    /// The load-bearing half is the FIRST assertion: an absent namespace must not
+    /// merely return `Ok`, it must never issue a delete. "Deleting something that
+    /// is not there is harmless" is not the invariant; "we do not delete what we
+    /// did not find" is, and it is what keeps a crashed-runtime reap from acting on
+    /// a namespace that is not ours. Asserted structurally — the delete operation is
+    /// never entered — rather than by inspecting `/run/netns` afterwards.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn teardown_never_deletes_a_namespace_it_did_not_find() {
+        use std::cell::Cell;
+
+        let exists_calls = Cell::new(0u32);
+        let delete_calls = Cell::new(0u32);
+        let res = teardown_named_with(
+            "chord-absent",
+            |_name| {
+                exists_calls.set(exists_calls.get() + 1);
+                false
+            },
+            |_name| {
+                // Deliberately reports SUCCESS: if the guard ever regressed, the
+                // call lands here and the regression shows up as an invoked delete,
+                // not as an incidental error from a stubbed failure.
+                delete_calls.set(delete_calls.get() + 1);
+                Ok(())
+            },
+        );
+
+        // CONDITION-DETECTION SELF-CHECK: a guard that never asks is not a guard.
+        assert_eq!(
+            exists_calls.get(),
+            1,
+            "teardown MUST consult the existence probe exactly once"
+        );
+        assert_eq!(
+            delete_calls.get(),
+            0,
+            "an absent namespace must NOT be deleted — teardown must never issue a \
+             delete for something it did not find"
+        );
+        assert!(res.is_ok(), "tearing down an absent namespace must be Ok (idempotent)");
+    }
+
+    /// A PRESENT namespace is deleted exactly once, with its name unmodified.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn teardown_deletes_a_present_namespace_exactly_once_by_name() {
+        use std::cell::RefCell;
+
+        let deleted: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let res = teardown_named_with(
+            "chord-present",
+            |_name| true,
+            |name| {
+                deleted.borrow_mut().push(name.to_string());
+                Ok(())
+            },
+        );
+        assert!(res.is_ok());
+        assert_eq!(
+            *deleted.borrow(),
+            vec!["chord-present".to_string()],
+            "a present namespace must be deleted exactly once, by the name given"
+        );
+    }
+
+    /// A FAILED delete is still an idempotent success — the SRV-12 clean swap calls
+    /// teardown unconditionally and must never acquire a failure path from it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn teardown_swallows_a_failed_delete_and_still_reports_ok() {
+        let res = teardown_named_with(
+            "chord-stubborn",
+            |_name| true,
+            |_name| Err(NetnsError::ConfigureFailed),
+        );
+        assert!(
+            res.is_ok(),
+            "teardown is best-effort by contract: a failed delete must not surface as \
+             an error the clean swap has to handle"
+        );
+        // And a missing `ip` (the other real failure mode) is the same: Ok.
+        let res = teardown_named_with(
+            "chord-no-tooling",
+            |_name| true,
+            |_name| Err(NetnsError::ToolUnavailable),
+        );
+        assert!(res.is_ok(), "a missing ip binary must not fail a teardown either");
+    }
+
+    /// CHRD-97 — the TEST-SUITE SAFETY invariant for the destructive path, the
+    /// counterpart of `prepare_cannot_create_a_namespace_in_a_unit_test_build_even_as_root`.
+    ///
+    /// Creation being structurally impossible while deletion stays real is an
+    /// inconsistent boundary. This pins the other half: the entry point production
+    /// and every other test module call (`NetnsHandle::teardown` → `teardown_named`)
+    /// cannot remove a namespace from the host in a unit-test build. The
+    /// `unreachable!()` delete seam means a regression panics rather than reaping
+    /// something live.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn teardown_cannot_delete_a_namespace_in_a_unit_test_build_even_as_root() {
+        // Names derived from test-only tokens, INCLUDING ones other tests in this
+        // crate really do pass to teardown. None of these may reach `ip netns del`.
+        for token in ["never-created", "outgoing-model", "old", "slot", "m"] {
+            let h = NetnsHandle::for_teardown(&namespace_name(token));
+            assert!(
+                h.teardown().is_ok(),
+                "teardown must stay idempotent-Ok in a test build"
+            );
+        }
+        // The delete seam is `unreachable!()`, so reaching this line at all is the
+        // proof: no `ip netns del` was issued for any of those names.
     }
 
     // ── fail-closed: prepare on a host without the capability ──────────────────

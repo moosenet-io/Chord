@@ -24,11 +24,15 @@
 //! `cargo test`, and `privileged()` skips if the capability is absent.
 //!
 //! Every OTHER test that touches isolation lives in the crate's unit tests, where
-//! `netns::prepare`'s `cfg(test)` arm makes namespace creation structurally
-//! impossible. The decision logic in `supervisor::launch_isolation` is exercised
-//! there through injected outcomes, so it needs no privilege and mutates no host
-//! state. Do not move a decision-logic test into this file to "make it realistic":
-//! this file is for kernel behaviour only.
+//! the `cfg(test)` arms of `netns::prepare` AND `netns::teardown_named` make both
+//! namespace creation and namespace DELETION structurally impossible. Deletion is
+//! fenced off for its own reason: the existence check is not an ownership check, so
+//! a test could otherwise remove a live namespace that happened to carry a name
+//! derived from a test token. The decision logic in `supervisor::launch_isolation`
+//! and the teardown idempotency contract are both exercised there through injected
+//! operations, so they need no privilege and mutate no host state. Do not move a
+//! decision-logic test into this file to "make it realistic": this file is for
+//! kernel behaviour only.
 //!
 //! Each test below tears its namespace down before it can leak, including on the
 //! assertion path (teardown is captured BEFORE the asserts, so a failing assertion
