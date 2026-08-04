@@ -20,9 +20,9 @@ page is the symbol-level summary.
 | `serving::profile::RopeScalingMethod::as_str` | function | `src/serving/profile.rs` | RoPE scaling method names for llama.cpp `--rope-scaling` args |
 | `serving::launcher::entry` | function | `src/serving/launcher.rs` | The launch entry: build command + env for the profiled runtime, spawn, health-check, fall back to `fallback_runtime` |
 | `serving::launcher::build_launch_command` / `scrub_launch_env` | functions | `src/serving/launcher.rs` | Command/arg assembly from the profile row; env scrubbing via the supervisor |
-| `serving::launcher::ResidencyManager` (trait) + `PassThroughResidency` | trait / struct | `src/serving/launcher.rs` | The admission seam SRV-04 defines and SRV-05 implements |
-| `serving::residency::VramResidencyManager` | struct | `src/serving/residency.rs` | Owns the resident set, in-flight reservations, the pinned chat model, and the operating mode behind one lock |
-| `serving::residency::ResidencyEvent::new` | function | `src/serving/residency.rs` | Residency event records (observability + persisted state) |
+| `serving::launcher::ResidencyManager` (trait) + `PassThroughResidency` | trait / struct | `src/serving/launcher.rs` | The admission seam SRV-04 defines. SRV-05's implementation was deleted by CHRD-98 (never constructed); only the `PassThroughResidency` stub remains. |
+| ~~`serving::residency::VramResidencyManager`~~ | **DELETED (CHRD-98)** | — | Never constructed in Chord's history. Live residency is `routing::resident_set::ResidentSet` (CHRD-PIN-01); the snapshot writer is `routing::residency_snapshot` (CHRD-95). Do not revive — a second residency owner is the bug CHRD-PIN-01 fixed. |
+| ~~`serving::residency::ResidencyEvent::new`~~ | **DELETED (CHRD-98)** | — | Deleted with the manager above |
 | `serving::memory_model::select_memory_model` / `SeparateCeilings` / `UnifiedPool` | function / structs | `src/serving/memory_model.rs` | Substrate-aware VRAM accounting: fixed carveout vs dynamic-GTT unified pool |
 | `serving::eviction::plan_admission` | function | `src/serving/eviction.rs` | Tier-aware admission plan: transient → keep-warm LRU; the `Tier::Chat` pin is never evicted |
 | `serving::swap::clean_swap` | function | `src/serving/swap.rs` | The swap barrier: teardown → verify-release → launch, with explicit `-c` ctx |

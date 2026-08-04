@@ -227,6 +227,20 @@ or the configured `MODEL_PROTECTED` set — are never demoted to `Cold`
 
 ### Memory / residency management
 
+> **CORRECTION (CHRD-98).** The "Memory Coordinator" described below —
+> `serving::residency::VramResidencyManager` — **has been deleted.** It was a
+> bulk-vendored SRV-13 import that was *never constructed anywhere in Chord's
+> history*, so nothing it describes was ever behaviour of a running Chord. Live
+> VRAM residency is owned solely by
+> [`routing::resident_set::ResidentSet`](../src/routing/resident_set.rs)
+> (CHRD-PIN-01), and the residency snapshot Terminus reads is written by
+> [`routing::residency_snapshot`](../src/routing/residency_snapshot.rs)
+> (CHRD-95). Treat every `serving::residency` reference below as HISTORICAL
+> DESIGN, not as code you can call — and do not revive it: a second residency
+> owner fighting the first over one idle-reaped GPU is the exact bug
+> CHRD-PIN-01 eliminated.
+
+
 Residency / memory behaviour spans the VRAM serving layer and the storage layer
 (all in [`src/serving/`](../src/serving) and [`src/models/`](../src/models)):
 
