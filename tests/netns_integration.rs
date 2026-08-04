@@ -14,6 +14,25 @@
 //! early, not fails) if not — so an accidental `--ignored` run on an unprivileged
 //! host is a no-op rather than a spurious failure. The assertions only run when the
 //! namespace was genuinely created.
+//!
+//! ## CHRD-97 — why THIS suite may create real namespaces and the unit tests may not
+//! These are the one place that CANNOT be faked: what they assert is the KERNEL's
+//! behaviour, not Chord's. "A `Denied` namespace has no path off the box" is a claim
+//! about what `connect()` does inside a real netns with no route; a fake namespace
+//! would only prove that the fake behaves as written. So the real path stays here,
+//! and it is opt-in twice over — `#[ignore]` keeps it out of every ordinary
+//! `cargo test`, and `privileged()` skips if the capability is absent.
+//!
+//! Every OTHER test that touches isolation lives in the crate's unit tests, where
+//! `netns::prepare`'s `cfg(test)` arm makes namespace creation structurally
+//! impossible. The decision logic in `supervisor::launch_isolation` is exercised
+//! there through injected outcomes, so it needs no privilege and mutates no host
+//! state. Do not move a decision-logic test into this file to "make it realistic":
+//! this file is for kernel behaviour only.
+//!
+//! Each test below tears its namespace down before it can leak, including on the
+//! assertion path (teardown is captured BEFORE the asserts, so a failing assertion
+//! cannot skip the cleanup).
 
 #![cfg(target_os = "linux")]
 

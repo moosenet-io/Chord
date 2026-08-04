@@ -248,10 +248,41 @@ impl NetnsConfig {
 /// meaning the guard it claims to cover was never actually exercised anywhere. The
 /// probe is now injected through [`prepare_with_probe`] so the decision is provable
 /// on ANY host with zero side effects; [`prepare`] itself is behaviorally unchanged.
+///
+/// ## CHRD-97: why a unit-test build can never reach the privileged path
+/// Chord's build/test host runs as ROOT, so on that host the real probe passes and
+/// this function used to actually create `/run/netns/chord-<hash>` whenever a unit
+/// test reached it — `supervisor::launch_isolation::tests` and
+/// `serving::launcher::tests` both drive it through `decide_isolation`. That leaked
+/// live namespaces onto the build host (three were found after one run), and a test
+/// suite that mutates host network state is a hazard well past the leak: it can
+/// collide with a concurrent run, and this build host also runs live services.
+///
+/// The fix reuses the seam that already existed: under `cfg(test)` `prepare` calls
+/// [`prepare_with_probe`] with a probe pinned to `false` and a create operation that
+/// is `unreachable!()`, so the privileged branch is not merely unlikely — it cannot
+/// be entered, and entering it would panic loudly rather than silently touch the
+/// host. `cfg(test)` applies ONLY to the crate's own unit-test build; a production
+/// build (and the `tests/` integration build, where the real path is deliberately
+/// exercised) compiles the unchanged privileged branch.
 pub fn prepare(slot_token: &str, posture: &EgressPosture) -> Result<NetnsHandle, NetnsError> {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(test)))]
     {
         prepare_with_probe(slot_token, posture, has_net_admin, configure_namespace)
+    }
+
+    #[cfg(all(target_os = "linux", test))]
+    {
+        // TEST BUILD ONLY. Same seam, side-effect-free arguments: fail closed at the
+        // capability gate, and make the create path a hard panic so a future refactor
+        // that reorders the guard is caught here instead of on the host's `ip netns`.
+        prepare_with_probe(slot_token, posture, || false, |_name, _cfg| {
+            unreachable!(
+                "CHRD-97: the privileged namespace-create path must be unreachable in a \
+                 unit-test build; the real path is covered by the #[ignore]d \
+                 tests/netns_integration.rs suite on a privileged host"
+            )
+        })
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -277,8 +308,12 @@ pub fn prepare(slot_token: &str, posture: &EgressPosture) -> Result<NetnsHandle,
 /// **before touching the kernel or the `ip` binary**, so no namespace can be created
 /// and no handle can escape. Production always passes [`has_net_admin`] and
 /// [`configure_namespace`], so `prepare`'s behavior is unchanged.
+///
+/// CHRD-97: this is `pub(crate)` rather than module-private so
+/// [`super::launch_isolation`]'s tests can build a side-effect-free fake `prepare`
+/// out of the seam that already exists here, instead of inventing a second one.
 #[cfg(target_os = "linux")]
-fn prepare_with_probe<F, G>(
+pub(crate) fn prepare_with_probe<F, G>(
     slot_token: &str,
     posture: &EgressPosture,
     has_cap: F,
@@ -357,6 +392,10 @@ fn has_net_admin() -> bool {
 /// Create + configure the named namespace per `cfg`. On ANY failure the partially
 /// created namespace is torn down before returning `ConfigureFailed` (no leak).
 #[cfg(target_os = "linux")]
+// CHRD-97: in a unit-test build `prepare` no longer references this (the create seam
+// is a panicking stub), so it is legitimately unreachable there. It is still the
+// production create path and is exercised by tests/netns_integration.rs.
+#[cfg_attr(test, allow(dead_code))]
 fn configure_namespace(name: &str, cfg: &NetnsConfig) -> Result<(), NetnsError> {
     let ip = crate::config::ip_bin().ok_or(NetnsError::ToolUnavailable)?;
 
@@ -587,6 +626,37 @@ mod tests {
         // And the error string carries no infra.
         let s = err.to_string();
         assert!(!s.contains("192.168.") && !s.contains("/run/netns"));
+    }
+
+    /// CHRD-97 — the TEST-SUITE SAFETY invariant itself.
+    ///
+    /// Every unit test that reaches `prepare` (directly, or via `decide_isolation`
+    /// from `launch_isolation` / `serving::launcher`) must be structurally incapable
+    /// of creating a namespace on the host. `prepare`'s `cfg(test)` arm makes the
+    /// create operation an `unreachable!()`, so if the fail-closed guard were ever
+    /// reordered this test PANICS rather than quietly creating `/run/netns/<name>`.
+    ///
+    /// This is asserted on the real `prepare` on purpose: injecting a fake here
+    /// would test the fake. The point is that the entry point production and the
+    /// other test modules call is inert in a unit-test build.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_cannot_create_a_namespace_in_a_unit_test_build_even_as_root() {
+        let slot = "chrd97-no-host-mutation-slot";
+        let name = namespace_name(slot);
+        let res = prepare(slot, &EgressPosture::Denied);
+        assert!(
+            matches!(res, Err(NetnsError::CapabilityUnavailable)),
+            "in a unit-test build prepare must fail closed at the capability gate \
+             regardless of the host's real privilege, got {res:?}"
+        );
+        // Belt-and-braces on the observable side effect: nothing landed on the host.
+        // (The `unreachable!()` create seam is the primary, deterministic guarantee;
+        // this only confirms the seam is wired to the path that would have created.)
+        assert!(
+            !named_netns_exists(&name),
+            "a unit test must never leave a network namespace on the build host"
+        );
     }
 
     /// Non-Linux counterpart: netns is a Linux primitive, so `prepare` must return

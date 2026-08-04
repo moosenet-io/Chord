@@ -50,6 +50,30 @@ pub enum IsolationDecision {
 ///   3. failure + `CHORD_ALLOW_UNISOLATED=1` → `UnisolatedOverride` (logged `warn`),
 ///   4. failure + no override → `Refused` (FAIL CLOSED).
 pub fn decide_isolation(slot_token: &str, posture: &EgressPosture) -> IsolationDecision {
+    decide_isolation_with(slot_token, posture, netns::prepare)
+}
+
+/// [`decide_isolation`] with the namespace-preparing operation INJECTED (CHRD-97).
+///
+/// The valuable, host-independent part of this module is the DECISION — which of the
+/// four [`IsolationDecision`] variants a given (config flag, prepare outcome,
+/// override flag) triple produces. That decision does not need a real namespace to
+/// be exercised, but until now the only way in was [`netns::prepare`], so the tests
+/// drove the privileged create path and leaked live namespaces on the (root) build
+/// host. Passing the operation in lets the tests supply an outcome directly, which
+/// also makes the `Isolated` branch testable at all — it previously was not, because
+/// it required a real namespace.
+///
+/// Production calls [`decide_isolation`], which passes [`netns::prepare`], so the
+/// behavior of the shipped path is unchanged.
+pub(crate) fn decide_isolation_with<P>(
+    slot_token: &str,
+    posture: &EgressPosture,
+    prepare_ns: P,
+) -> IsolationDecision
+where
+    P: FnOnce(&str, &EgressPosture) -> Result<NetnsHandle, NetnsError>,
+{
     if !netns::isolation_enabled() {
         tracing::debug!(
             target: "chord.supervisor.netns",
@@ -58,7 +82,7 @@ pub fn decide_isolation(slot_token: &str, posture: &EgressPosture) -> IsolationD
         return IsolationDecision::DisabledByConfig;
     }
 
-    match netns::prepare(slot_token, posture) {
+    match prepare_ns(slot_token, posture) {
         Ok(handle) => IsolationDecision::Isolated(handle),
         Err(e) => {
             if netns::unisolated_override() {
@@ -107,10 +131,59 @@ impl IsolationDecision {
 mod tests {
     use super::*;
     use serial_test::serial;
+    use std::cell::Cell;
 
     fn clear_flags() {
         std::env::remove_var("CHORD_NETNS_ISOLATION");
         std::env::remove_var("CHORD_ALLOW_UNISOLATED");
+    }
+
+    // ── CHRD-97: the tests drive the DECISION, never the host ────────────────────
+    //
+    // These tests used to call `decide_isolation`, which called the real
+    // `netns::prepare`. Their comments claimed "on this unprivileged build
+    // prepare() fails" — but Chord's build/test host runs as ROOT, so the claim was
+    // false and each of these tests actually created a live network namespace on the
+    // build host and leaked it (`ip netns list` showed the residue after a run). The
+    // assertions below are UNCHANGED; only the way the prepare OUTCOME is obtained
+    // has moved, from "whatever this host happens to do" to "what this test states".
+    //
+    // The fake outcomes are built from `netns::prepare_with_probe` — the injectable
+    // seam netns.rs already exposes — rather than from a hand-rolled `Ok`/`Err`, so
+    // the values flowing into the decision are produced by the same code production
+    // runs, just with the privileged probe and create operation supplied.
+
+    /// A `prepare` that reports NO capability. Real `prepare_with_probe`, false
+    /// probe, panicking create ⇒ the create path is provably not entered and nothing
+    /// can land on the host.
+    #[cfg(target_os = "linux")]
+    fn prepare_unprivileged(
+        slot: &str,
+        posture: &EgressPosture,
+    ) -> Result<NetnsHandle, NetnsError> {
+        netns::prepare_with_probe(slot, posture, || false, |_name, _cfg| {
+            unreachable!("fail-closed prepare must never enter the create path")
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn prepare_unprivileged(
+        _slot: &str,
+        _posture: &EgressPosture,
+    ) -> Result<NetnsHandle, NetnsError> {
+        Err(NetnsError::Unsupported)
+    }
+
+    /// A `prepare` that SUCCEEDS, without touching the kernel: the probe reports the
+    /// capability and the create operation is a no-op that returns `Ok`. This is what
+    /// makes the `Isolated` branch testable at all — it previously required a real
+    /// privileged host, so it had no unit coverage.
+    #[cfg(target_os = "linux")]
+    fn prepare_succeeding(
+        slot: &str,
+        posture: &EgressPosture,
+    ) -> Result<NetnsHandle, NetnsError> {
+        netns::prepare_with_probe(slot, posture, || true, |_name, _cfg| Ok(()))
     }
 
     #[test]
@@ -118,7 +191,11 @@ mod tests {
     fn disabled_by_config_takes_the_legacy_path() {
         clear_flags();
         std::env::set_var("CHORD_NETNS_ISOLATION", "0");
-        let d = decide_isolation("slot", &EgressPosture::Denied);
+        // The config opt-out must short-circuit BEFORE prepare is attempted — assert
+        // that structurally: a prepare that panics if called proves it was not.
+        let d = decide_isolation_with("slot", &EgressPosture::Denied, |_, _| {
+            panic!("the CHORD_NETNS_ISOLATION=0 opt-out must not attempt to prepare a namespace")
+        });
         assert!(matches!(d, IsolationDecision::DisabledByConfig));
         assert!(!d.must_abort(), "the dev opt-out must not abort the launch");
         assert!(d.handle().is_none());
@@ -128,12 +205,11 @@ mod tests {
     #[test]
     #[serial]
     fn fails_closed_when_capability_absent_and_no_override() {
-        // NEGATIVE TEST. On this unprivileged build prepare() fails; with isolation
-        // ON and NO override, the decision MUST be Refused (abort), never a silent
-        // full-egress launch.
+        // NEGATIVE TEST. When prepare fails, with isolation ON and NO override, the
+        // decision MUST be Refused (abort), never a silent full-egress launch.
         clear_flags();
         std::env::set_var("CHORD_NETNS_ISOLATION", "1"); // explicit ON
-        let d = decide_isolation("slot", &EgressPosture::Denied);
+        let d = decide_isolation_with("slot", &EgressPosture::Denied, prepare_unprivileged);
         assert!(
             matches!(d, IsolationDecision::Refused(_)),
             "missing capability + no override MUST fail closed (Refused)"
@@ -146,12 +222,12 @@ mod tests {
     #[test]
     #[serial]
     fn explicit_override_permits_unisolated_launch_loudly() {
-        // With the explicit operator override, the same missing-capability host
+        // With the explicit operator override, the same missing-capability outcome
         // yields UnisolatedOverride (NOT Refused) — the only sanctioned bypass.
         clear_flags();
         std::env::set_var("CHORD_NETNS_ISOLATION", "1");
         std::env::set_var("CHORD_ALLOW_UNISOLATED", "1");
-        let d = decide_isolation("slot", &EgressPosture::Denied);
+        let d = decide_isolation_with("slot", &EgressPosture::Denied, prepare_unprivileged);
         assert!(
             matches!(d, IsolationDecision::UnisolatedOverride(_)),
             "explicit override must permit an unisolated launch"
@@ -168,10 +244,79 @@ mod tests {
         clear_flags();
         std::env::set_var("CHORD_NETNS_ISOLATION", "1");
         std::env::set_var("CHORD_ALLOW_UNISOLATED", "yes");
-        let d = decide_isolation("slot", &EgressPosture::Denied);
+        let d = decide_isolation_with("slot", &EgressPosture::Denied, prepare_unprivileged);
         assert!(
             matches!(d, IsolationDecision::Refused(_)),
             "only an exact CHORD_ALLOW_UNISOLATED=1 may bypass fail-closed"
+        );
+        clear_flags();
+    }
+
+    /// NEW COVERAGE (CHRD-97). The happy path — isolation ON and prepare SUCCEEDS —
+    /// must yield `Isolated` carrying a spawnable handle, and must NOT abort. This
+    /// branch was previously unreachable in a unit test because it needed a real
+    /// namespace; with the outcome injected it is a normal test.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn successful_prepare_yields_an_isolated_decision_with_a_spawnable_handle() {
+        clear_flags();
+        std::env::set_var("CHORD_NETNS_ISOLATION", "1");
+        let d = decide_isolation_with("slot", &EgressPosture::Denied, prepare_succeeding);
+        assert!(
+            matches!(d, IsolationDecision::Isolated(_)),
+            "a successful prepare must produce Isolated"
+        );
+        assert!(!d.must_abort(), "an isolated launch must not abort");
+        let h = d.handle().expect("Isolated must carry the handle to spawn into");
+        assert_eq!(
+            h.name(),
+            netns::namespace_name("slot"),
+            "the handle must name the namespace derived from the slot token"
+        );
+        clear_flags();
+    }
+
+    /// The override must NOT be consulted when isolation succeeded — a successful
+    /// prepare is `Isolated` even with `CHORD_ALLOW_UNISOLATED=1` set. Guards against
+    /// a refactor that checks the bypass before the outcome.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn override_does_not_downgrade_a_successful_isolation() {
+        clear_flags();
+        std::env::set_var("CHORD_NETNS_ISOLATION", "1");
+        std::env::set_var("CHORD_ALLOW_UNISOLATED", "1");
+        let d = decide_isolation_with("slot", &EgressPosture::Denied, prepare_succeeding);
+        assert!(
+            matches!(d, IsolationDecision::Isolated(_)),
+            "the override is a fallback for a FAILED prepare, never a downgrade of a \
+             successful one"
+        );
+        clear_flags();
+    }
+
+    /// The decision must pass the caller's slot token and posture through to prepare
+    /// unmodified — otherwise a runtime could be isolated under the wrong posture.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn slot_token_and_posture_reach_prepare_unmodified() {
+        clear_flags();
+        std::env::set_var("CHORD_NETNS_ISOLATION", "1");
+        let seen = Cell::new(None);
+        let posture = EgressPosture::AllowList(vec!["huggingface.co".to_string()]);
+        let d = decide_isolation_with("slot-XYZ", &posture, |slot, p| {
+            seen.set(Some((slot.to_string(), p.clone())));
+            netns::prepare_with_probe(slot, p, || true, |_n, _c| Ok(()))
+        });
+        let (slot, p) = seen.take().expect("prepare must be called when isolation is on");
+        assert_eq!(slot, "slot-XYZ");
+        assert_eq!(p, EgressPosture::AllowList(vec!["huggingface.co".to_string()]));
+        assert_eq!(
+            d.handle().expect("Isolated").posture(),
+            &EgressPosture::AllowList(vec!["huggingface.co".to_string()]),
+            "the handle must record the posture it was prepared for"
         );
         clear_flags();
     }

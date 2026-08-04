@@ -413,8 +413,9 @@ mod tests {
     #[tokio::test]
     async fn netns_reaping_teardown_reaps_after_inner_teardown_succeeds() {
         // The decorator runs the inner backend teardown, then reaps the namespace.
-        // On this unprivileged host the namespace was never created, so the reap is
-        // an idempotent no-op — but the inner teardown MUST have run, and the whole
+        // The namespace named here was never created (CHRD-97: no unit test can
+        // create one), so the reap hits `teardown_named`'s existence check and is an
+        // idempotent no-op — but the inner teardown MUST have run, and the whole
         // thing returns Ok (a verified clean swap never leaks a netns).
         let inner = MockTeardown { ok: true, torn: Mutex::new(vec![]) };
         let reaping = NetnsReapingTeardown::new(&inner);
