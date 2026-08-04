@@ -402,6 +402,17 @@ pub struct ResidentSetConfig {
     /// blocks for at most `release_drain + cancel_grace` (35s by default) — a
     /// release that hangs is its own outage on a shared GPU.
     pub cancel_grace: Duration,
+    /// `CHORD_RESIDENCY_STATE_PATH` — where this set publishes its residency
+    /// snapshot (CHRD-95). `None` ⇒ no snapshot is written; that is a
+    /// configuration state, not an error, and the path is never guessed.
+    ///
+    /// It lives HERE, on the set's own config, rather than being read from the
+    /// environment down inside the writer. The destination is then a property of
+    /// one resident set instead of a process-wide ambient, which is what makes two
+    /// sets in one process write to two different files. See
+    /// `residency_snapshot::Shared::path` for the interference this removes — it
+    /// was measured, not theorised.
+    pub snapshot_path: Option<String>,
 }
 
 fn env_flag(key: &str, default: bool) -> bool {
@@ -442,6 +453,11 @@ impl Default for ResidentSetConfig {
             reassert: Duration::from_secs(3600),
             release_drain: Duration::from_secs(30),
             cancel_grace: Duration::from_secs(5),
+            // Deliberately off by default rather than resolved from the
+            // environment: a `Default` that reached for a process-global would
+            // reintroduce exactly the ambient coupling this field exists to
+            // remove. Production goes through `from_env`.
+            snapshot_path: None,
         }
     }
 }
@@ -461,6 +477,9 @@ impl ResidentSetConfig {
             reassert: env_secs("CHORD_RESIDENT_REASSERT_SECS", 3600),
             release_drain: env_secs("CHORD_RESIDENT_RELEASE_DRAIN_SECS", 30),
             cancel_grace: env_secs("CHORD_RESIDENT_RELEASE_CANCEL_GRACE_SECS", 5),
+            // The ONE place `CHORD_RESIDENCY_STATE_PATH` is read for the live
+            // owner. Everything downstream takes it as a parameter.
+            snapshot_path: crate::config::residency_state_path(),
         }
     }
 
@@ -1051,6 +1070,9 @@ pub fn global() -> &'static ResidentSet {
 
 impl ResidentSet {
     pub fn new(cfg: ResidentSetConfig) -> Self {
+        // Taken from the config, not looked up: `cfg` is moved into the set below,
+        // and the writer's destination must be THIS set's, decided once, here.
+        let snapshot_path = cfg.snapshot_path.clone();
         let slots = cfg
             .aliases
             .iter()
@@ -1083,7 +1105,9 @@ impl ResidentSet {
                 cancel: CancelToken::new(),
                 pending: Vec::new(),
             }),
-            snapshot: crate::routing::residency_snapshot::SnapshotWriter::new(),
+            snapshot: crate::routing::residency_snapshot::SnapshotWriter::to_path(
+                snapshot_path,
+            ),
         }
     }
 
@@ -1117,6 +1141,7 @@ impl ResidentSet {
         &self,
         env: &dyn ResidentEnv,
         residents: Vec<crate::routing::residency_snapshot::ResidentEntry>,
+        generation: u64,
         reason: &str,
     ) {
         use crate::routing::residency_snapshot::ResidencySnapshot;
@@ -1132,6 +1157,7 @@ impl ResidentSet {
 
         self.snapshot.publish(
             &ResidencySnapshot::new(residents, env.free_vram_gb(), pinned_chat_model),
+            generation,
             reason,
         );
     }
@@ -1849,7 +1875,7 @@ impl ResidentSet {
         // CHRD-95: a STATE CHANGE — the pass committed a new held set. Cannot
         // fail the pass: `publish_snapshot` swallows every IO error, and `report`
         // is already final at this point either way.
-        self.publish_snapshot(env, snapshot_residents, trigger);
+        self.publish_snapshot(env, snapshot_residents, generation, trigger);
         report
     }
 
@@ -2140,7 +2166,7 @@ impl ResidentSet {
         // the state the snapshot used to LIE about (an absent file read as an idle
         // GPU). A release holds nothing, so the resident list is empty BY
         // CONSTRUCTION, not by a re-read. Cannot fail the release.
-        self.publish_snapshot(env, Vec::new(), reason);
+        self.publish_snapshot(env, Vec::new(), report.generation, reason);
         report
     }
 
@@ -6979,18 +7005,27 @@ mod tests {
     // caught by an error-only test, which is why the latency half is tested with
     // an actual slow sink.
 
-    /// Sets `CHORD_RESIDENCY_STATE_PATH` for the duration of one (serialized) test
-    /// and restores the environment afterwards, panic or not.
-    struct SnapshotPathGuard;
-    impl SnapshotPathGuard {
-        fn set(path: &str) -> Self {
-            std::env::set_var("CHORD_RESIDENCY_STATE_PATH", path);
-            Self
-        }
-    }
-    impl Drop for SnapshotPathGuard {
-        fn drop(&mut self) {
-            std::env::remove_var("CHORD_RESIDENCY_STATE_PATH");
+    /// A `live_cfg` that publishes its snapshot to a destination THIS test owns.
+    ///
+    /// This replaced a `SnapshotPathGuard` that set `CHORD_RESIDENCY_STATE_PATH`
+    /// for the duration of a serialized test, and the replacement is the whole fix
+    /// for a 1-in-~10 flake in
+    /// `an_unchanged_pass_does_not_rewrite_the_snapshot`. `#[serial]` orders these
+    /// tests against EACH OTHER; it does nothing about the ~68 non-serial tests in
+    /// this module running in parallel with them, and many of those build a
+    /// `ResidentSet` and warm it. Every one of them read the same process-global
+    /// env var, so they all published into whichever tempdir the serial test
+    /// currently held. Instrumenting the writer showed a dozen distinct writers
+    /// aiming at one test's file, and the file that "must not be rewritten"
+    /// reappearing with a byte-identical body written by a stranger.
+    ///
+    /// Carrying the destination on the config makes it unreachable by anyone else:
+    /// a set only ever writes where its own config points, and the default is
+    /// `None`, so a test that says nothing about snapshots writes nothing anywhere.
+    fn snapshotting_cfg(path: &std::path::Path) -> ResidentSetConfig {
+        ResidentSetConfig {
+            snapshot_path: Some(path.to_string_lossy().into_owned()),
+            ..live_cfg()
         }
     }
 
@@ -7014,9 +7049,7 @@ mod tests {
     async fn a_warm_pass_writes_the_residency_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("residency.json");
-        let _guard = SnapshotPathGuard::set(path.to_str().unwrap());
-
-        let set = ResidentSet::new(live_cfg());
+        let set = ResidentSet::new(snapshotting_cfg(&path));
         let (env, _entered) = FakeEnv::new(three_roles(), Some(96.0));
         let report = set.warm_with(env.as_ref(), "startup", true, None).await;
         assert_eq!(report.warmed, 3);
@@ -7079,9 +7112,7 @@ mod tests {
     async fn a_release_writes_an_empty_residency_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("residency.json");
-        let _guard = SnapshotPathGuard::set(path.to_str().unwrap());
-
-        let set = ResidentSet::new(live_cfg());
+        let set = ResidentSet::new(snapshotting_cfg(&path));
         let (env, _entered) = FakeEnv::new(three_roles(), Some(96.0));
         set.warm_with(env.as_ref(), "startup", true, None).await;
         drain_snapshot(&set);
@@ -7107,9 +7138,7 @@ mod tests {
     async fn an_unchanged_pass_does_not_rewrite_the_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("residency.json");
-        let _guard = SnapshotPathGuard::set(path.to_str().unwrap());
-
-        let set = ResidentSet::new(live_cfg());
+        let set = ResidentSet::new(snapshotting_cfg(&path));
         let (env, _entered) = FakeEnv::new(three_roles(), Some(96.0));
         set.warm_with(env.as_ref(), "startup", true, None).await;
         drain_snapshot(&set);
@@ -7144,7 +7173,7 @@ mod tests {
     async fn a_snapshot_write_failure_never_breaks_a_warm_or_a_release() {
         // Baseline: the same operations with snapshotting switched off entirely.
         let (base_warm, base_roles_after_warm, base_exempt, base_release, base_roles_after_release) = {
-            std::env::remove_var("CHORD_RESIDENCY_STATE_PATH");
+            // Snapshotting genuinely OFF — `live_cfg` carries no destination.
             let set = ResidentSet::new(live_cfg());
             let (env, _entered) = FakeEnv::new(three_roles(), Some(96.0));
             let w = set.warm_with(env.as_ref(), "startup", true, None).await;
@@ -7155,8 +7184,9 @@ mod tests {
             (w, roles_warm, exempt, r, roles_rel)
         };
 
-        let _guard = SnapshotPathGuard::set("/nonexistent-dir-chrd95/nope/residency.json");
-        let set = ResidentSet::new(live_cfg());
+        let set = ResidentSet::new(snapshotting_cfg(std::path::Path::new(
+            "/nonexistent-dir-chrd95/nope/residency.json",
+        )));
         let (env, _entered) = FakeEnv::new(three_roles(), Some(96.0));
 
         let warm = set.warm_with(env.as_ref(), "startup", true, None).await;
@@ -7210,18 +7240,20 @@ mod tests {
     #[serial_test::serial]
     async fn a_blocking_snapshot_write_never_slows_a_warm_or_a_release() {
         let dir = tempfile::tempdir().unwrap();
-        let _guard = SnapshotPathGuard::set(dir.path().join("residency.json").to_str().unwrap());
+        let path = dir.path().join("residency.json");
 
         let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let w = writes.clone();
-        let mut set = ResidentSet::new(live_cfg());
-        set.snapshot = crate::routing::residency_snapshot::SnapshotWriter::with_sink(Box::new(
-            move |_, _| {
+        let cfg = snapshotting_cfg(&path);
+        let mut set = ResidentSet::new(cfg.clone());
+        set.snapshot = crate::routing::residency_snapshot::SnapshotWriter::with_path_and_sink(
+            cfg.snapshot_path.clone(),
+            Box::new(move |_, _| {
                 w.fetch_add(1, Ordering::SeqCst);
                 std::thread::sleep(Duration::from_secs(2));
                 Ok(())
-            },
-        ));
+            }),
+        );
         let (env, _entered) = FakeEnv::new(three_roles(), Some(96.0));
 
         let t0 = std::time::Instant::now();

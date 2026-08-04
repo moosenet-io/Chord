@@ -177,6 +177,17 @@ type Sink = Box<dyn Fn(&str, &serde_json::Value) -> std::io::Result<()> + Send +
 struct Job {
     path: String,
     body: serde_json::Value,
+    /// The resident-set lifecycle generation this snapshot describes, captured
+    /// under the SAME lock that committed the state change it reports.
+    ///
+    /// Publication happens after that lock is dropped — deliberately, so a slow
+    /// disk cannot stall a warm — but dropping the lock also drops the ordering
+    /// it used to give us for free. Without this, a warm that captures a
+    /// non-empty set, is descheduled, and publishes after a release has already
+    /// published an empty one leaves stale residents on disk as the final word.
+    /// `written_at` cannot detect that: the stale write carries the LATER
+    /// wall-clock stamp and so looks fresher than the truth.
+    generation: u64,
     /// `body` minus `written_at` — the change key. `written_at` moves on every
     /// call by construction and would defeat change detection on its own.
     key: serde_json::Value,
@@ -198,6 +209,26 @@ struct Shared {
     queue: Mutex<Queue>,
     cv: Condvar,
     sink: Sink,
+    /// The destination, supplied when the writer is built and never re-read.
+    ///
+    /// Deliberately not resolved from the environment here — not per publish, and
+    /// not per construction either. In production the value cannot change
+    /// (`CHORD_RESIDENCY_STATE_PATH` is process-lifetime config), so an ambient
+    /// read bought nothing and cost correctness: EVERY writer in the process
+    /// silently targets whatever path is configured at the instant it reads.
+    ///
+    /// That is not a hypothetical. It was measured: with the resolution ambient,
+    /// one test's tempdir path was written by the writers of a dozen unrelated
+    /// tests running in parallel, because the env var it set was visible to all of
+    /// them. Moving the read from publish-time to construction-time narrowed the
+    /// window but did not close it — a writer merely had to be CONSTRUCTED inside
+    /// the window instead of publishing inside it. Only making the destination a
+    /// parameter closes it, because then there is no instant at which a writer
+    /// consults shared state at all.
+    ///
+    /// `None` ⇒ snapshot persistence is off for this writer. Not an error: the
+    /// path is never guessed (pii_gate).
+    path: Option<String>,
 }
 
 /// Publishes the snapshot on a STATE CHANGE, never on every reconcile tick, and
@@ -215,21 +246,30 @@ pub struct SnapshotWriter {
     spawn: Once,
 }
 
-impl Default for SnapshotWriter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// Deliberately NO `Default`. A default writer would have to invent a
+// destination, and the only one available to invent is the process-global env
+// var — the exact ambient this type no longer consults. Callers say where.
 
 impl SnapshotWriter {
-    pub fn new() -> Self {
-        Self::with_sink(Box::new(write_state_file))
+    /// A writer bound to an EXPLICIT destination.
+    ///
+    /// The path is a parameter, not something this type goes and looks up. The
+    /// ambient `CHORD_RESIDENCY_STATE_PATH` is read in exactly one place — the
+    /// owner's config, once, at construction — and travels from there. That is
+    /// what makes two writers in one process independent of each other; see the
+    /// `path` field for the failure this prevents.
+    ///
+    /// `None` ⇒ snapshot persistence is off for this writer.
+    pub fn to_path(path: Option<String>) -> Self {
+        Self::with_path_and_sink(path, Box::new(write_state_file))
     }
 
-    /// A writer with a substituted sink. Test seam — see [`Sink`].
-    pub fn with_sink(sink: Sink) -> Self {
+    /// A writer with an explicit destination and a substituted sink. Test seam —
+    /// see [`Sink`].
+    pub fn with_path_and_sink(path: Option<String>, sink: Sink) -> Self {
         Self {
             shared: Arc::new(Shared {
+                path,
                 queue: Mutex::new(Queue::default()),
                 cv: Condvar::new(),
                 sink,
@@ -248,11 +288,11 @@ impl SnapshotWriter {
     /// on behalf of, a warm or a release.
     ///
     /// `reason` is only for the log line.
-    pub fn publish(&self, snapshot: &ResidencySnapshot, reason: &str) {
-        // No path configured ⇒ snapshot persistence is off. Not an error: the
-        // path is never guessed (pii_gate). Checked BEFORE the thread is spawned,
-        // so a set with no snapshot path never starts one.
-        let Some(path) = crate::config::residency_state_path() else {
+    pub fn publish(&self, snapshot: &ResidencySnapshot, generation: u64, reason: &str) {
+        // No path bound at construction ⇒ persistence is off for this writer.
+        // Checked BEFORE the thread is spawned, so a set with no snapshot path
+        // never starts one.
+        let Some(path) = self.shared.path.clone() else {
             return;
         };
 
@@ -310,6 +350,7 @@ impl SnapshotWriter {
         q.next = Some(Job {
             path,
             body,
+            generation,
             key,
             reason: reason.to_string(),
         });
@@ -372,6 +413,9 @@ struct Worker {
     /// changed at runtime. If the path ever becomes dynamic, this key must
     /// include it, or an unchanged body would skip the first write to a NEW file.
     last_written: Option<serde_json::Value>,
+    /// Highest generation actually written. A job older than this is stale and is
+    /// dropped without a trace — see `handle`.
+    high_generation: Option<u64>,
     /// Last key that FAILED, and when. Kept separate from `last_written` so a
     /// repeated identical payload does not re-attempt doomed IO on every state
     /// change, while a retry still happens once [`RETRY_BACKOFF`] has elapsed —
@@ -384,6 +428,7 @@ impl Worker {
         Self {
             shared,
             last_written: None,
+            high_generation: None,
             last_failed: None,
         }
     }
@@ -413,6 +458,29 @@ impl Worker {
     }
 
     fn handle(&mut self, job: Job) {
+        // ORDERING. Publication is off the serving path, so two commits can reach
+        // this thread out of order: a warm captures a non-empty set, is
+        // descheduled, and arrives AFTER a release that already published an empty
+        // one. Writing it would leave residents on disk as the last word after the
+        // GPU was emptied — a durable wrong answer, and the exact class of lie
+        // CHRD-95 exists to remove.
+        //
+        // The generation is captured under the same lock that commits the state,
+        // so it orders commits even though the writes race. A stale job is dropped
+        // WITHOUT A TRACE: it must not touch `last_written` or `last_failed`
+        // either, or it would suppress or mis-attribute the write that supersedes
+        // it.
+        if let Some(high) = self.high_generation {
+            if job.generation < high {
+                debug!(
+                    reason = %job.reason,
+                    job_generation = job.generation,
+                    written_generation = high,
+                    "residency snapshot: superseded by a newer commit — dropping the stale write"
+                );
+                return;
+            }
+        }
         if self.last_written.as_ref() == Some(&job.key) {
             debug!(
                 reason = %job.reason,
@@ -464,6 +532,10 @@ impl Worker {
         match result {
             Ok(()) => {
                 self.last_written = Some(job.key);
+                // Only a SUCCESSFUL write advances the ordering high-water mark. A
+                // failed or panicking write must not raise it, or the retry that
+                // supersedes it would itself be judged stale and dropped.
+                self.high_generation = Some(job.generation);
                 self.last_failed = None;
                 debug!(reason = %job.reason, "residency snapshot: written");
             }
@@ -546,19 +618,16 @@ mod tests {
         )
     }
 
-    /// Sets `CHORD_RESIDENCY_STATE_PATH` for one (serialized) test and restores
-    /// the environment afterwards, panic or not.
-    struct PathGuard;
-    impl PathGuard {
-        fn set(path: &str) -> Self {
-            std::env::set_var("CHORD_RESIDENCY_STATE_PATH", path);
-            Self
-        }
-    }
-    impl Drop for PathGuard {
-        fn drop(&mut self) {
-            std::env::remove_var("CHORD_RESIDENCY_STATE_PATH");
-        }
+    /// A destination inside a tempdir owned by the calling test.
+    ///
+    /// There used to be a `PathGuard` here that set `CHORD_RESIDENCY_STATE_PATH`
+    /// instead, and it was the wrong shape: a process-global that every OTHER
+    /// concurrently-running test's writer could read. The destination is a
+    /// parameter now, so a test's file is reachable by exactly one writer — its
+    /// own — and these tests need no serialization to stay isolated from each
+    /// other.
+    fn dest(dir: &tempfile::TempDir) -> Option<String> {
+        Some(dir.path().join("residency.json").to_string_lossy().into_owned())
     }
 
     /// The four fields with no live source are `null` — never `0.0`, never a
@@ -650,18 +719,16 @@ mod tests {
     /// takes seconds, publishing still returns immediately. This is the latency
     /// half of the safety property — a slow disk must not be able to slow a warm.
     #[test]
-    #[serial_test::serial]
     fn publish_does_not_wait_for_the_sink() {
         let dir = tempfile::tempdir().unwrap();
-        let _g = PathGuard::set(dir.path().join("residency.json").to_str().unwrap());
 
-        let writer = SnapshotWriter::with_sink(Box::new(|_, _| {
+        let writer = SnapshotWriter::with_path_and_sink(dest(&dir), Box::new(|_, _| {
             std::thread::sleep(Duration::from_secs(2));
             Ok(())
         }));
 
         let t0 = Instant::now();
-        writer.publish(&snap(), "test");
+        writer.publish(&snap(), 1, "test");
         let elapsed = t0.elapsed();
         assert!(
             elapsed < Duration::from_millis(250),
@@ -673,14 +740,12 @@ mod tests {
     /// memory: 200 publishes behind a slow sink reach the disk a handful of times,
     /// not 200.
     #[test]
-    #[serial_test::serial]
     fn a_stalled_writer_drops_superseded_snapshots_instead_of_queueing_them() {
         let dir = tempfile::tempdir().unwrap();
-        let _g = PathGuard::set(dir.path().join("residency.json").to_str().unwrap());
 
         let seen = Arc::new(AtomicUsize::new(0));
         let s = seen.clone();
-        let writer = SnapshotWriter::with_sink(Box::new(move |_, _| {
+        let writer = SnapshotWriter::with_path_and_sink(dest(&dir), Box::new(move |_, _| {
             s.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(200));
             Ok(())
@@ -697,6 +762,7 @@ mod tests {
                     None,
                     None,
                 ),
+                i as u64 + 1,
                 "test",
             );
         }
@@ -710,20 +776,18 @@ mod tests {
 
     /// Change detection: an identical payload is not rewritten.
     #[test]
-    #[serial_test::serial]
     fn an_identical_payload_is_not_rewritten() {
         let dir = tempfile::tempdir().unwrap();
-        let _g = PathGuard::set(dir.path().join("residency.json").to_str().unwrap());
 
         let writes = Arc::new(AtomicUsize::new(0));
         let w = writes.clone();
-        let writer = SnapshotWriter::with_sink(Box::new(move |_, _| {
+        let writer = SnapshotWriter::with_path_and_sink(dest(&dir), Box::new(move |_, _| {
             w.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }));
 
         for _ in 0..3 {
-            writer.publish(&snap(), "test");
+            writer.publish(&snap(), 1, "test");
             assert!(writer.flush(Duration::from_secs(5)));
         }
         assert_eq!(
@@ -733,21 +797,149 @@ mod tests {
         );
     }
 
+    /// ORDERING. Publication is off the serving path, so commits can reach the
+    /// writer out of order. A stale one must be DROPPED, not written.
+    ///
+    /// The case that motivated this: a warm captures a non-empty resident set, is
+    /// descheduled, and arrives after a release has already published an empty
+    /// one. Writing it leaves residents on disk as the final word after the GPU
+    /// was emptied. `written_at` cannot catch it — the stale write carries the
+    /// LATER wall-clock stamp, so it looks fresher than the truth.
+    #[test]
+    fn a_superseded_commit_is_dropped_not_written() {
+        // The residency path is a process-global env var, so these need the
+        // same guard + serialization every other test in this module uses.
+        // Without it `publish` returns early (no path configured) and the sink
+        // never runs — which reads as "nothing was written", i.e. exactly the
+        // assertion these make, passing or failing for the wrong reason.
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let s2 = seen.clone();
+        let writer = SnapshotWriter::with_path_and_sink(dest(&dir), Box::new(move |_p: &str, body: &serde_json::Value| {
+            s2.lock().unwrap().push(body.clone());
+            Ok(())
+        }));
+
+        // Generation 5 lands first (the release), then generation 3 arrives late
+        // (the descheduled warm). The late one is older and must not be written.
+        writer.publish(&ResidencySnapshot::new(Vec::new(), None, None), 5, "release");
+        assert!(writer.flush(Duration::from_secs(20)), "writer never drained");
+        writer.publish(&snap(), 3, "late-warm");
+        assert!(writer.flush(Duration::from_secs(20)), "writer never drained");
+
+        let writes = seen.lock().unwrap();
+        assert_eq!(writes.len(), 1, "the superseded commit must not have been written");
+        assert_eq!(
+            writes[0]["residents"].as_array().map(|a| a.len()),
+            Some(0),
+            "the file must still hold the RELEASE's empty set, not the stale warm's"
+        );
+    }
+
+    /// POSITIVE CONTROL for the above. In the RIGHT order the later commit is
+    /// written — so a build that rejected everything, or that dropped every
+    /// second job, could not pass the pair.
+    #[test]
+    fn a_newer_commit_is_written() {
+        // The residency path is a process-global env var, so these need the
+        // same guard + serialization every other test in this module uses.
+        // Without it `publish` returns early (no path configured) and the sink
+        // never runs — which reads as "nothing was written", i.e. exactly the
+        // assertion these make, passing or failing for the wrong reason.
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let s2 = seen.clone();
+        let writer = SnapshotWriter::with_path_and_sink(dest(&dir), Box::new(move |_p: &str, body: &serde_json::Value| {
+            s2.lock().unwrap().push(body.clone());
+            Ok(())
+        }));
+
+        writer.publish(&snap(), 3, "warm");
+        assert!(writer.flush(Duration::from_secs(20)), "writer never drained");
+        writer.publish(&ResidencySnapshot::new(Vec::new(), None, None), 5, "release");
+        assert!(writer.flush(Duration::from_secs(20)), "writer never drained");
+
+        let writes = seen.lock().unwrap();
+        assert_eq!(writes.len(), 2, "a newer commit must be written");
+        assert_eq!(
+            writes[1]["residents"].as_array().map(|a| a.len()),
+            Some(0),
+            "and the LAST word must be the release"
+        );
+    }
+
+    /// An EQUAL generation is not stale — a warm and its own follow-up report the
+    /// same commit, and the second must not be silently swallowed by the ordering
+    /// guard (change detection, not ordering, is what suppresses a true duplicate).
+    #[test]
+    fn an_equal_generation_is_not_treated_as_stale() {
+        // The residency path is a process-global env var, so these need the
+        // same guard + serialization every other test in this module uses.
+        // Without it `publish` returns early (no path configured) and the sink
+        // never runs — which reads as "nothing was written", i.e. exactly the
+        // assertion these make, passing or failing for the wrong reason.
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let s2 = seen.clone();
+        let writer = SnapshotWriter::with_path_and_sink(dest(&dir), Box::new(move |_p: &str, _b: &serde_json::Value| {
+            s2.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+
+        writer.publish(&snap(), 7, "warm");
+        assert!(writer.flush(Duration::from_secs(20)), "writer never drained");
+        // Same generation, DIFFERENT body — must still be written.
+        writer.publish(&ResidencySnapshot::new(Vec::new(), None, None), 7, "warm-followup");
+        assert!(writer.flush(Duration::from_secs(20)), "writer never drained");
+        assert_eq!(seen.load(Ordering::SeqCst), 2, "an equal generation must not be dropped");
+    }
+
+    /// A FAILED write must not advance the high-water mark, or the retry that
+    /// supersedes it would itself be judged stale and dropped — leaving the file
+    /// permanently behind with no way to catch up.
+    #[test]
+    fn a_failed_write_does_not_advance_the_ordering_mark() {
+        // The residency path is a process-global env var, so these need the
+        // same guard + serialization every other test in this module uses.
+        // Without it `publish` returns early (no path configured) and the sink
+        // never runs — which reads as "nothing was written", i.e. exactly the
+        // assertion these make, passing or failing for the wrong reason.
+        let dir = tempfile::tempdir().unwrap();
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (f2, s2) = (fail.clone(), seen.clone());
+        let writer = SnapshotWriter::with_path_and_sink(dest(&dir), Box::new(move |_p: &str, _b: &serde_json::Value| {
+            if f2.load(Ordering::SeqCst) {
+                Err(std::io::Error::other("disk full"))
+            } else {
+                s2.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }));
+
+        writer.publish(&snap(), 9, "warm-fails");
+        assert!(writer.flush(Duration::from_secs(20)), "writer never drained");
+        fail.store(false, Ordering::SeqCst);
+        // A LOWER generation than the failed one would still be stale, but an equal
+        // or newer one must go through — the failure must not have raised the mark.
+        writer.publish(&ResidencySnapshot::new(Vec::new(), None, None), 9, "retry");
+        assert!(writer.flush(Duration::from_secs(20)), "writer never drained");
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "the retry after a failure must be written");
+    }
+
     /// A PANICKING sink must not latch the writer dead. The thread is spawned
     /// once, so an escaping panic would detach the mechanism permanently and the
     /// only symptom would be snapshots quietly ceasing — the same "stopped working
     /// while looking fine" failure this whole change exists to remove.
     #[test]
-    #[serial_test::serial]
     fn a_panicking_sink_does_not_kill_the_writer() {
         let dir = tempfile::tempdir().unwrap();
-        let _g = PathGuard::set(dir.path().join("residency.json").to_str().unwrap());
 
         let calls = Arc::new(AtomicUsize::new(0));
         let c = calls.clone();
         let landed = Arc::new(AtomicUsize::new(0));
         let l = landed.clone();
-        let writer = SnapshotWriter::with_sink(Box::new(move |_, _| {
+        let writer = SnapshotWriter::with_path_and_sink(dest(&dir), Box::new(move |_, _| {
             if c.fetch_add(1, Ordering::SeqCst) == 0 {
                 panic!("sink panicked on its first call");
             }
@@ -755,11 +947,11 @@ mod tests {
             Ok(())
         }));
 
-        writer.publish(&snap(), "first");
+        writer.publish(&snap(), 1, "first");
         assert!(writer.flush(Duration::from_secs(5)), "a panic must not wedge the queue");
 
         // A DIFFERENT payload, so the failure backoff does not apply.
-        writer.publish(&ResidencySnapshot::new(Vec::new(), None, None), "second");
+        writer.publish(&ResidencySnapshot::new(Vec::new(), None, None), 2, "second");
         assert!(writer.flush(Duration::from_secs(5)));
 
         assert_eq!(
@@ -778,20 +970,18 @@ mod tests {
     /// doomed attempt: an identical payload backs off, while a genuinely new one
     /// is still attempted (so a cleared disk heals on the next real change).
     #[test]
-    #[serial_test::serial]
     fn a_failed_identical_payload_backs_off_but_a_new_one_is_still_attempted() {
         let dir = tempfile::tempdir().unwrap();
-        let _g = PathGuard::set(dir.path().join("residency.json").to_str().unwrap());
 
         let attempts = Arc::new(AtomicUsize::new(0));
         let a = attempts.clone();
-        let writer = SnapshotWriter::with_sink(Box::new(move |_, _| {
+        let writer = SnapshotWriter::with_path_and_sink(dest(&dir), Box::new(move |_, _| {
             a.fetch_add(1, Ordering::SeqCst);
             Err(std::io::Error::other("disk full"))
         }));
 
         for _ in 0..5 {
-            writer.publish(&snap(), "test");
+            writer.publish(&snap(), 1, "test");
             assert!(writer.flush(Duration::from_secs(5)));
         }
         assert_eq!(
@@ -800,7 +990,7 @@ mod tests {
             "an identical payload that just failed must back off, not retry on every state change"
         );
 
-        writer.publish(&ResidencySnapshot::new(Vec::new(), None, None), "mode-swap");
+        writer.publish(&ResidencySnapshot::new(Vec::new(), None, None), 2, "mode-swap");
         assert!(writer.flush(Duration::from_secs(5)));
         assert_eq!(
             attempts.load(Ordering::SeqCst),
