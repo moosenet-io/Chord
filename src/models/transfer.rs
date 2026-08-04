@@ -450,6 +450,76 @@ pub(crate) fn cleanup_partial(paths: &[PathBuf]) {
     }
 }
 
+/// Cooperative cancellation flag for an in-flight [`copy_file_cancellable`].
+///
+/// `tokio::fs::*` operations are **not cancellable**: they run `std::fs` calls on
+/// the blocking pool via `spawn_blocking`, and dropping the future (which is all
+/// `tokio::time::timeout` does on expiry) detaches the `JoinHandle` without
+/// stopping the blocking work. The copy keeps running — and keeps *creating and
+/// writing its destination file* — after the timeout branch has already returned
+/// and cleaned up. Cleanup then races the still-live writer, and when the
+/// blocking task is dispatched late (a busy blocking pool / a loaded box) the
+/// writer wins and leaves the very file cleanup was supposed to remove.
+///
+/// A copy driven through this flag is stoppable: the caller sets it, then
+/// **awaits the copy task** so cleanup is ordered strictly after the last write.
+pub(crate) type CopyCancel = Arc<std::sync::atomic::AtomicBool>;
+
+/// Chunk size for [`copy_file_cancellable`]. Cancellation is observed at most one
+/// chunk late, which bounds how long a cancelled copy can keep touching the
+/// filesystem (rather than "until this multi-GB blob finishes", which is what an
+/// uncancellable `std::fs::copy` costs).
+const COPY_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+/// Copy `src` → `dst` on the blocking pool in chunks, checking `cancel` between
+/// chunks.
+///
+/// Returns `Ok(true)` when the file was copied in full, `Ok(false)` when the copy
+/// observed cancellation and stopped early — in which case `dst` is a partial
+/// file the caller must clean up (and can now clean up safely, because the copy
+/// has genuinely stopped by the time this future resolves).
+pub(crate) async fn copy_file_cancellable(
+    src: &Path,
+    dst: &Path,
+    cancel: &CopyCancel,
+) -> std::io::Result<bool> {
+    use std::io::{Read, Write};
+    use std::sync::atomic::Ordering;
+
+    let (src, dst, cancel) = (src.to_path_buf(), dst.to_path_buf(), cancel.clone());
+    tokio::task::spawn_blocking(move || {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let mut reader = std::fs::File::open(&src)?;
+        let perms = reader.metadata().ok().map(|m| m.permissions());
+        let mut writer = std::fs::File::create(&dst)?;
+        let mut buf = vec![0u8; COPY_CHUNK_BYTES];
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(false);
+            }
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            writer.write_all(&buf[..n])?;
+        }
+        writer.flush()?;
+        if let Some(perms) = perms {
+            // Best-effort: match `std::fs::copy`, which carries source permissions.
+            let _ = writer.set_permissions(perms);
+        }
+        Ok(true)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        Err(std::io::Error::other(format!(
+            "copy task failed to join: {e}"
+        )))
+    })
+}
+
 /// Walk up from `path` until an existing directory is found (for the disk probe,
 /// since the local tree may not exist before the first pull). Falls back to `/`.
 /// Shared with the eviction module so the sweep and pre-pull path anchor disk
@@ -687,8 +757,44 @@ mod tests {
     use super::*;
     use crate::models::registry::ModelRegistry;
     use std::fs;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn cancellable_copy_copies_in_full_when_not_cancelled() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src.bin");
+        let dst = tmp.path().join("dst.bin");
+        // Larger than one chunk, so the cancel check runs mid-copy on the happy path.
+        let payload: Vec<u8> = (0..(COPY_CHUNK_BYTES * 2 + 12345)).map(|i| i as u8).collect();
+        fs::write(&src, &payload).unwrap();
+
+        let cancel: CopyCancel = Arc::new(AtomicBool::new(false));
+        let completed = copy_file_cancellable(&src, &dst, &cancel).await.unwrap();
+
+        assert!(completed, "an uncancelled copy must report completion");
+        assert_eq!(fs::read(&dst).unwrap(), payload, "copy must be byte-identical");
+    }
+
+    #[tokio::test]
+    async fn cancelled_copy_stops_and_has_finished_when_it_resolves() {
+        // The whole point of `CopyCancel`: unlike a dropped `tokio::fs::copy`
+        // future (which leaves an uncancellable `std::fs::copy` running on the
+        // blocking pool), a cancelled copy has *genuinely stopped* by the time
+        // its future resolves — so the caller can clean up without racing it.
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src.bin");
+        let dst = tmp.path().join("dst.bin");
+        fs::write(&src, vec![7u8; COPY_CHUNK_BYTES * 2]).unwrap();
+
+        let cancel: CopyCancel = Arc::new(AtomicBool::new(true));
+        let completed = copy_file_cancellable(&src, &dst, &cancel).await.unwrap();
+
+        assert!(!completed, "a cancelled copy must not report completion");
+        // Cancelled before the first chunk → it never even created the file, and
+        // (having resolved) it never will.
+        assert!(!dst.exists(), "a copy cancelled before it started must write nothing");
+    }
 
     /// Write a manifest + its referenced blob files under `root`, returning the
     /// model name. Blob digests are derived from `model`+index so distinct models

@@ -26,6 +26,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,7 +37,19 @@ use tracing::{info, warn};
 use super::registry::{
     collect_manifest_leaves, parse_manifest_blobs, ManifestBlobs, ModelRegistry, StorageTier,
 };
-use super::transfer::{blob_filename, cleanup_partial, find_manifest_leaf, DiskSpaceProbe};
+use super::transfer::{
+    blob_filename, cleanup_partial, copy_file_cancellable, find_manifest_leaf, CopyCancel,
+    DiskSpaceProbe,
+};
+
+/// How long a timed-out eviction waits for its cancelled copy to actually stop
+/// before giving up on cleaning up inline.
+///
+/// Cancellation is checked between 4 MiB chunks, so this is only ever reached
+/// when the filesystem itself is wedged (a stalled NFS write inside a single
+/// chunk). In that case cleanup is handed to a detached task that runs once the
+/// copy really stops — the sweep is never blocked on a wedged mount.
+const COPY_CANCEL_GRACE: Duration = Duration::from_secs(30);
 
 const BYTES_PER_GB: f64 = 1_073_741_824.0; // 1 GiB
 const SECS_PER_HOUR: i64 = 3_600;
@@ -263,7 +276,9 @@ pub struct Evicted {
 ///    already exist in the archive with a matching size), bounded by
 ///    `copy_timeout` (MSM-02). On timeout or a mid-copy I/O error, any archive
 ///    files *this* copy wrote are removed (best-effort) and the model is left
-///    Warm — never Cold, and the local copy is never touched.
+///    Warm — never Cold, and the local copy is never touched. On timeout the
+///    copy is **cancelled and awaited** before cleanup runs, so cleanup can
+///    never be undone by a copy that is still in flight.
 /// 3. **Verify** every referenced blob + the manifest exist in the archive with
 ///    matching sizes. On failure: do NOT delete locally; return [`EvictError`].
 /// 4. Remove the local copy via the injected [`LocalEvictor`] (GC-aware).
@@ -315,25 +330,71 @@ pub async fn evict_to_archive(
     let pre_existing: HashSet<PathBuf> = planned.iter().filter(|p| p.exists()).cloned().collect();
 
     // ── Copy local → archive (reverse pull), bounded by copy_timeout (MSM-02) ──
-    let copy_fut = copy_model_to_archive(model, &local_root, &local_manifest, &archive_root);
-    match tokio::time::timeout(copy_timeout, copy_fut).await {
+    //
+    // The copy runs as an owned task with a cancellation flag rather than as a
+    // bare future handed to `tokio::time::timeout`. Timing out on a future only
+    // *drops* it, and a dropped `tokio::fs::copy` keeps running on the blocking
+    // pool — so the old shape ran its cleanup while the copy was still live and
+    // could still create the file being cleaned up. See `CopyCancel`.
+    let cancel: CopyCancel = Arc::new(AtomicBool::new(false));
+    let mut copy_task = tokio::spawn(copy_model_to_archive(
+        local_root.clone(),
+        local_manifest.clone(),
+        archive_root.clone(),
+        cancel.clone(),
+    ));
+
+    let copy_res = match tokio::time::timeout(copy_timeout, &mut copy_task).await {
+        Ok(joined) => joined,
+        Err(_elapsed) => {
+            // Timed out (e.g. a stalled NFS write). Ask the copy to stop, then
+            // WAIT until it has genuinely stopped before touching the archive —
+            // cleanup must happen-after the last write, not merely after the
+            // timer fired. The disk-op lock held by the caller
+            // (cooldown_pass/sweep loop) is released when this function returns,
+            // so the sweep is never wedged.
+            cancel.store(true, Ordering::Relaxed);
+            match tokio::time::timeout(COPY_CANCEL_GRACE, &mut copy_task).await {
+                // Stopped early: we have the precise list of what it wrote.
+                Ok(Ok(Err((_, written)))) => cleanup_timeout(&written, &pre_existing),
+                // Finished (or panicked) before it saw the cancel: we don't have
+                // an exact in-flight list, so fall back to every planned archive
+                // path that did not exist before this attempt started — never a
+                // pre-existing/shared archive file.
+                Ok(Ok(Ok(()))) | Ok(Err(_)) => cleanup_timeout(&planned, &pre_existing),
+                Err(_) => {
+                    // The copy is wedged inside a single chunk write. Don't block
+                    // the sweep on it and don't clean up underneath a live
+                    // writer — hand cleanup to a detached task that runs once the
+                    // copy actually stops.
+                    warn!(
+                        model = %model,
+                        "archive copy did not stop within the cancellation grace period; \
+                         deferring partial-archive cleanup until it does"
+                    );
+                    tokio::spawn(async move {
+                        let _ = copy_task.await;
+                        cleanup_timeout(&planned, &pre_existing);
+                    });
+                }
+            }
+            return Err(EvictError::Timeout(model.to_string(), copy_timeout));
+        }
+    };
+
+    match copy_res {
         Ok(Ok(())) => {}
         Ok(Err((e, written))) => {
             // Mid-copy failure: clean up exactly the files this attempt wrote.
             cleanup_partial(&written);
             return Err(EvictError::ArchiveCopy(model.to_string(), e));
         }
-        Err(_elapsed) => {
-            // Timed out (e.g. a stalled NFS write): we don't have the precise
-            // in-flight written list, so remove every planned archive path that
-            // now exists AND did not exist before this attempt started — never a
-            // pre-existing/shared archive file. The disk-op lock held by the
-            // caller (cooldown_pass/sweep loop) is released when this function
-            // returns, so the sweep is never wedged.
-            let to_clean: Vec<PathBuf> =
-                planned.into_iter().filter(|p| !pre_existing.contains(p)).collect();
-            cleanup_partial(&to_clean);
-            return Err(EvictError::Timeout(model.to_string(), copy_timeout));
+        Err(join_err) => {
+            cleanup_timeout(&planned, &pre_existing);
+            return Err(EvictError::ArchiveCopy(
+                model.to_string(),
+                format!("archive copy task failed to join: {join_err}"),
+            ));
         }
     }
 
@@ -370,14 +431,23 @@ pub async fn evict_to_archive(
 /// On error, returns `(message, written)` where `written` is every archive path
 /// *this* call actually created — used by [`evict_to_archive`] to clean up
 /// precisely on a mid-copy failure (MSM-02).
+///
+/// `cancel` makes the copy stoppable: it is checked between blobs and between
+/// 4 MiB chunks within a blob, so [`evict_to_archive`]'s timeout path can bring
+/// the copy to a genuine stop (and then clean up) instead of cleaning up while
+/// it is still writing. Observing cancellation is reported as an error carrying
+/// the `written` list, exactly like any other mid-copy failure.
+///
+/// Takes owned paths so it can be driven as a `tokio::spawn`ed task the caller
+/// can await after cancelling.
 async fn copy_model_to_archive(
-    _model: &str,
-    local_root: &Path,
-    local_manifest: &Path,
-    archive_root: &Path,
+    local_root: PathBuf,
+    local_manifest: PathBuf,
+    archive_root: PathBuf,
+    cancel: CopyCancel,
 ) -> Result<(), (String, Vec<PathBuf>)> {
     let mut written: Vec<PathBuf> = Vec::new();
-    let blobs = parse_manifest_blobs(local_manifest);
+    let blobs = parse_manifest_blobs(&local_manifest);
     let local_blobs = local_root.join("blobs");
     let archive_blobs = archive_root.join("blobs");
     if let Err(e) = tokio::fs::create_dir_all(&archive_blobs).await {
@@ -397,11 +467,18 @@ async fn copy_model_to_archive(
                 continue;
             }
         }
-        if let Err(e) = tokio::fs::copy(&src, &dst).await {
-            written.push(dst);
-            return Err((format!("copy blob {fname}: {e}"), written));
+        match copy_file_cancellable(&src, &dst, &cancel).await {
+            Ok(true) => written.push(dst),
+            Ok(false) => {
+                // Cancelled: `dst` may be a partial file this attempt created.
+                written.push(dst);
+                return Err((CANCELLED.to_string(), written));
+            }
+            Err(e) => {
+                written.push(dst);
+                return Err((format!("copy blob {fname}: {e}"), written));
+            }
         }
-        written.push(dst);
     }
 
     // Manifest leaf — mirror its path relative to the local manifests root.
@@ -421,12 +498,37 @@ async fn copy_model_to_archive(
             return Err((format!("create archive manifest dir: {e}"), written));
         }
     }
-    if let Err(e) = tokio::fs::copy(local_manifest, &dst_manifest).await {
-        written.push(dst_manifest);
-        return Err((format!("copy manifest: {e}"), written));
+    match copy_file_cancellable(&local_manifest, &dst_manifest, &cancel).await {
+        Ok(true) => written.push(dst_manifest),
+        Ok(false) => {
+            written.push(dst_manifest);
+            return Err((CANCELLED.to_string(), written));
+        }
+        Err(e) => {
+            written.push(dst_manifest);
+            return Err((format!("copy manifest: {e}"), written));
+        }
     }
-    written.push(dst_manifest);
     Ok(())
+}
+
+/// Error message a copy returns when it stopped because its [`CopyCancel`] flag
+/// was set. Only [`evict_to_archive`]'s timeout path sets that flag, so this
+/// never surfaces as a user-visible `ArchiveCopy` error.
+const CANCELLED: &str = "archive copy cancelled by timeout";
+
+/// Remove the archive files a timed-out attempt may have left behind: every
+/// candidate path that did **not** exist before this attempt started. A
+/// pre-existing (possibly shared) archive file is never removed.
+///
+/// Only ever called once the copy has genuinely stopped.
+fn cleanup_timeout(candidates: &[PathBuf], pre_existing: &HashSet<PathBuf>) {
+    let to_clean: Vec<PathBuf> = candidates
+        .iter()
+        .filter(|p| !pre_existing.contains(*p))
+        .cloned()
+        .collect();
+    cleanup_partial(&to_clean);
 }
 
 /// Every archive path a warm→cold copy of `local_manifest`'s model *would*
