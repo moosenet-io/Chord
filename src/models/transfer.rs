@@ -372,7 +372,14 @@ pub async fn archive_pull(
     // create the very file being cleaned up — into the local Ollama root, which
     // Ollama itself watches. See [`CopyCancel`].
     let cancel: CopyCancel = Arc::new(AtomicBool::new(false));
-    let mut copy_task = tokio::spawn(copy_model_files(plan.clone(), cancel.clone()));
+    // Proves quiescence on the one path where awaiting the task does not: see
+    // [`CopyActivity`] and [`cleanup_after_join_error`].
+    let activity = CopyActivity::default();
+    let mut copy_task = tokio::spawn(copy_model_files(
+        plan.clone(),
+        cancel.clone(),
+        activity.clone(),
+    ));
 
     let copy_res = match tokio::time::timeout(timeout, &mut copy_task).await {
         Ok(joined) => joined,
@@ -433,12 +440,22 @@ pub async fn archive_pull(
             Err(e)
         }
         Err(join_err) => {
-            // The copy task panicked. Its inner `spawn_blocking` closure is NOT
-            // stopped by that panic and may still be running, so set the cancel
-            // flag before cleaning up: it will then abandon its temp file rather
-            // than publish after cleanup has run.
-            cancel.store(true, Ordering::Relaxed);
-            cleanup_attempt(PULL_OP, &plan.name, &planned, &pre_existing);
+            // The copy task panicked (or was aborted). Its inner `spawn_blocking`
+            // closure is NOT stopped by that, so the flag alone is not enough:
+            // cancel, then WAIT for the writer to actually stop before deleting
+            // anything, and delete nothing at all if it does not. A live writer
+            // that reaches its `rename` after cleanup would republish the manifest
+            // over blobs cleanup just removed.
+            cleanup_after_join_error(
+                PULL_OP,
+                &plan.name,
+                &cancel,
+                &activity,
+                COPY_CANCEL_GRACE,
+                &planned,
+                &pre_existing,
+            )
+            .await;
             Err(PullError::Io(format!(
                 "archive pull copy task failed to join: {join_err}"
             )))
@@ -468,6 +485,7 @@ const PULL_OP: &str = "archive pull (cold→warm)";
 async fn copy_model_files(
     plan: PullPlan,
     cancel: CopyCancel,
+    activity: CopyActivity,
 ) -> Result<(), (PullError, Vec<PathBuf>)> {
     let mut published: Vec<PathBuf> = Vec::new();
 
@@ -489,7 +507,7 @@ async fn copy_model_files(
         if dst.exists() {
             continue;
         }
-        match copy_file_cancellable(&src, &dst, &cancel).await {
+        match copy_file_cancellable(&src, &dst, &cancel, &activity).await {
             Ok(true) => published.push(dst),
             // Cancelled → `dst` was never touched (the copy only ever wrote its
             // own temp file, which it has already removed).
@@ -517,7 +535,7 @@ async fn copy_model_files(
             return Err((PullError::Io(e.to_string()), published));
         }
     }
-    match copy_file_cancellable(&plan.archive_manifest, &dst_manifest, &cancel).await {
+    match copy_file_cancellable(&plan.archive_manifest, &dst_manifest, &cancel, &activity).await {
         Ok(true) => published.push(dst_manifest),
         Ok(false) => return Err((PullError::Io(CANCELLED.to_string()), published)),
         Err(e) => return Err((PullError::Io(format!("copy manifest: {e}")), published)),
@@ -610,6 +628,67 @@ pub(crate) fn cleanup_attempt(
     cleanup_partial(&to_clean);
 }
 
+/// Handle a copy task that ended in a [`tokio::task::JoinError`] — a panic in the
+/// outer copy task, or an abort.
+///
+/// A `JoinError` is the one outcome that carries **no evidence about the
+/// filesystem**. The outer task unwinding drops the `JoinHandle` of the nested
+/// `spawn_blocking` closure, which detaches it: the blocking writer may still be
+/// live, mid-file, and able to reach its `rename` *after* cleanup has run. Every
+/// other outcome is safe because the outer task returned normally, which means
+/// each `copy_file_cancellable` inside it completed its own await.
+///
+/// Why that matters more on the pull side than the eviction side, and why this is
+/// not merely tidy: a late publish into the archive restores a complete,
+/// content-addressed blob — harmless. A late publish into the LOCAL root can
+/// restore the **manifest**, and the manifest is copied last precisely so it never
+/// exists without its blobs. A manifest resurrected after cleanup removed those
+/// blobs is a model entry Ollama will read and act on, pointing at files that are
+/// gone. Blobs-first-manifest-last is defeated by exactly one late `rename`.
+///
+/// So: cancel, then *prove* the writer stopped before deleting anything.
+/// - Quiescent within `grace` → cleanup is provably safe; run the normal filtered
+///   [`cleanup_attempt`] and return `true`.
+/// - Not quiescent → we cannot prove ownership of a single path, so **delete
+///   nothing** and log the candidates, exactly as the cancellation-grace expiry
+///   does. An orphan blob or a stale scratch file costs disk and is reclaimed by
+///   the next transfer of this model under the lock; a resurrected manifest is a
+///   broken model entry that something else acts on.
+///
+/// `grace` is a parameter rather than [`COPY_CANCEL_GRACE`] so the not-quiescent
+/// branch is reachable in a test without a 30 s wait.
+pub(crate) async fn cleanup_after_join_error(
+    op: &str,
+    model: &str,
+    cancel: &CopyCancel,
+    activity: &CopyActivity,
+    grace: Duration,
+    candidates: &[PathBuf],
+    pre_existing: &HashSet<PathBuf>,
+) -> bool {
+    // Ask first, so the writer is already stopping while we wait — and so that if
+    // it is between its final cancel check and its `rename`, that is the only
+    // window left rather than the whole remainder of the file.
+    cancel.store(true, Ordering::Relaxed);
+    if activity.wait_quiescent(grace).await {
+        cleanup_attempt(op, model, candidates, pre_existing);
+        return true;
+    }
+    tracing::warn!(
+        op = %op,
+        model = %model,
+        grace_secs = grace.as_secs(),
+        temp_infix = COPY_TEMP_INFIX,
+        candidates = ?candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        "copy task ended in a JoinError and its blocking writer did not stop within \
+         the grace period; NOT cleaning up — a still-live writer can publish after \
+         cleanup, and a manifest republished over removed blobs is worse than an \
+         orphan blob. These paths are reconciled by the next transfer of this model \
+         under the disk-op lock."
+    );
+    false
+}
+
 /// Remove files left by a failed/timed-out transfer (best-effort).
 ///
 /// **Not a public cleanup entry point**: it applies no ownership filter, so
@@ -641,6 +720,75 @@ pub(crate) fn cleanup_partial(paths: &[PathBuf]) {
 /// **awaits the copy task** so any cleanup is ordered strictly after the last
 /// write.
 pub(crate) type CopyCancel = Arc<std::sync::atomic::AtomicBool>;
+
+/// Tracks how many blocking copy closures are still touching the filesystem.
+///
+/// A [`CopyCancel`] flag asks a copy to stop; this counter is what proves it
+/// *has*. The two are not interchangeable, and the difference is the whole reason
+/// this type exists: a `JoinError` from the outer copy task — a panic, or an
+/// abort — tells you only that the OUTER future is finished. The nested
+/// `spawn_blocking` closure is not stopped by the outer task unwinding; unwinding
+/// drops its `JoinHandle`, which *detaches* the closure and leaves it running.
+/// So "the task I awaited is done" is not evidence that nothing is writing.
+///
+/// Awaiting the copy task to a normal `Ok`/`Err` return IS such evidence, because
+/// every `copy_file_cancellable` call inside it completed its own `.await` on the
+/// blocking handle. Only the `JoinError` path lacks it, and that is the one place
+/// this counter is consulted.
+///
+/// The counter is incremented before the closure is spawned (never after, so
+/// there is no window where a closure is pending but uncounted) and decremented
+/// by a guard the closure owns — so it drops on the normal path, on a panic
+/// inside the closure, and even if the runtime discards the closure unrun.
+#[derive(Clone, Default)]
+pub(crate) struct CopyActivity(Arc<std::sync::atomic::AtomicUsize>);
+
+/// Decrements a [`CopyActivity`] when the blocking closure holding it ends, by
+/// any route.
+struct ActivityGuard(CopyActivity);
+
+impl Drop for ActivityGuard {
+    fn drop(&mut self) {
+        self.0 .0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl CopyActivity {
+    /// How many blocking copy closures are still live. Non-zero means at least
+    /// one writer may still touch the filesystem.
+    pub(crate) fn in_flight(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// Test-only: take the same count a live blocking closure holds, released
+    /// when the returned guard drops. Lets a test put the counter in the
+    /// "a writer is live" state without depending on where a real copy has got
+    /// to — which is not observable without a hook, and not race-free to guess.
+    #[cfg(test)]
+    fn hold_for_test(&self) -> ActivityGuard {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        ActivityGuard(self.clone())
+    }
+
+    /// Wait until no blocking copy closure is live, bounded by `grace`.
+    ///
+    /// Returns `true` only when quiescence was actually observed. A `false`
+    /// return is not "probably fine" — it is the caller's signal that it cannot
+    /// prove anything about the filesystem and must not delete.
+    pub(crate) async fn wait_quiescent(&self, grace: Duration) -> bool {
+        const POLL: Duration = Duration::from_millis(10);
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            if self.in_flight() == 0 {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    }
+}
 
 /// Chunk size for [`copy_file_cancellable`]. Cancellation is observed at most one
 /// chunk late, which bounds how long a cancelled copy can keep touching the
@@ -697,12 +845,20 @@ pub(crate) async fn copy_file_cancellable(
     src: &Path,
     dst: &Path,
     cancel: &CopyCancel,
+    activity: &CopyActivity,
 ) -> std::io::Result<bool> {
     use std::io::{Read, Write};
-    use std::sync::atomic::Ordering;
 
     let (src, dst, cancel) = (src.to_path_buf(), dst.to_path_buf(), cancel.clone());
+    // Count the closure BEFORE spawning it: a caller that observes zero must be
+    // able to conclude nothing is pending, and an increment inside the closure
+    // would leave a window where it is queued but invisible.
+    activity.0.fetch_add(1, Ordering::SeqCst);
+    let guard = ActivityGuard(activity.clone());
     tokio::task::spawn_blocking(move || {
+        // Dropped when this closure ends by ANY route — normal return, panic, or
+        // the runtime discarding it unrun.
+        let _guard = guard;
         if cancel.load(Ordering::Relaxed) {
             return Ok(false);
         }
@@ -1006,7 +1162,9 @@ mod tests {
         fs::write(&dst, vec![b'Z'; 128]).unwrap();
 
         let cancel: CopyCancel = Arc::new(AtomicBool::new(false));
-        let completed = copy_file_cancellable(&src, &dst, &cancel).await.unwrap();
+        let completed = copy_file_cancellable(&src, &dst, &cancel, &CopyActivity::default())
+            .await
+            .unwrap();
 
         assert!(completed, "an uncancelled copy must report completion");
         assert_eq!(fs::read(&dst).unwrap(), payload, "copy must be byte-identical");
@@ -1045,7 +1203,7 @@ mod tests {
         let cancel: CopyCancel = Arc::new(AtomicBool::new(false));
         let copy = tokio::spawn({
             let (src, dst, cancel) = (src.clone(), dst.clone(), cancel.clone());
-            async move { copy_file_cancellable(&src, &dst, &cancel).await }
+            async move { copy_file_cancellable(&src, &dst, &cancel, &CopyActivity::default()).await }
         });
 
         // Opening the write end releases the copy's blocking `File::open`.
@@ -1107,7 +1265,9 @@ mod tests {
         let cancel: CopyCancel = Arc::new(AtomicBool::new(true));
 
         // Over an existing destination: untouched, not truncated.
-        let completed = copy_file_cancellable(&src, &dst, &cancel).await.unwrap();
+        let completed = copy_file_cancellable(&src, &dst, &cancel, &CopyActivity::default())
+            .await
+            .unwrap();
         assert!(!completed, "a cancelled copy must not report completion");
         assert_eq!(
             fs::read(&dst).unwrap(),
@@ -1116,7 +1276,9 @@ mod tests {
         );
 
         // Over an absent destination: still absent — it never publishes.
-        let completed = copy_file_cancellable(&src, &absent, &cancel).await.unwrap();
+        let completed = copy_file_cancellable(&src, &absent, &cancel, &CopyActivity::default())
+            .await
+            .unwrap();
         assert!(!completed);
         assert!(!absent.exists(), "a cancelled copy must not publish anything");
 
@@ -1351,6 +1513,48 @@ mod tests {
         assert!(!manifest.exists(), "manifest must not exist after timeout");
     }
 
+    /// One non-blocking attempt to open the write end of `fifo`.
+    ///
+    /// `O_WRONLY|O_NONBLOCK` on a FIFO succeeds only when a reader is already
+    /// present and fails with `ENXIO` otherwise, so this doubles as a probe for
+    /// "has the copy reached `File::open` yet".
+    fn try_open_fifo_writer(fifo: &Path) -> Option<std::fs::File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_NONBLOCK: i32 = 0o4000;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(O_NONBLOCK)
+            .open(fifo)
+            .ok()
+    }
+
+    /// Open the write end of `fifo` without ever blocking on a reader that may
+    /// never arrive, returning `None` if none appears within `deadline`.
+    ///
+    /// A plain blocking open here is a test deadlock, and not a theoretical one:
+    /// the copy closure can legitimately exit at its first cancel check WITHOUT
+    /// opening its source, which happens whenever the blocking pool is saturated
+    /// enough that the closure starts after the cancel is set. The 100x stress run
+    /// hung a test on exactly that for 15 minutes. So probe non-blockingly, and
+    /// only once a reader exists take a normal blocking handle — which cannot
+    /// block, because the probe handle is holding the reader — so that `write_all`
+    /// still blocks until the copy consumes it, which is what makes these tests
+    /// structural rather than timed.
+    async fn open_fifo_writer(fifo: &Path, deadline: Duration) -> Option<std::fs::File> {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(probe) = try_open_fifo_writer(fifo) {
+                let w = std::fs::OpenOptions::new().write(true).open(fifo).ok();
+                drop(probe);
+                return w;
+            }
+            if start.elapsed() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
     /// Replace `path` with a FIFO of the same name, so a copy reading it advances
     /// exactly as far as the test feeds it. Returns false when `mkfifo` isn't
     /// available (the caller then skips).
@@ -1469,13 +1673,15 @@ mod tests {
 
         let plan = plan_pull("fif:1", &archive, &local).unwrap();
         let cancel: CopyCancel = Arc::new(AtomicBool::new(false));
-        let copy = tokio::spawn(copy_model_files(plan, cancel.clone()));
+        let copy = tokio::spawn(copy_model_files(plan, cancel.clone(), CopyActivity::default()));
 
         // Opening the write end releases the copy's blocking `File::open`. The
         // pipe buffer is far smaller than a chunk, so `write_all` cannot return
         // until the copy has consumed most of it — it has provably created its
         // scratch file and written into it. That is the mid-flight moment.
-        let mut w = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+        let mut w = open_fifo_writer(&fifo, Duration::from_secs(60))
+            .await
+            .expect("cancel is false here, so the copy cannot exit without opening its source");
         w.write_all(&vec![3u8; COPY_CHUNK_BYTES]).unwrap();
         w.flush().unwrap();
         cancel.store(true, Ordering::Relaxed);
@@ -1503,6 +1709,176 @@ mod tests {
         assert!(
             leftover_temps(&local.join("blobs")).is_empty(),
             "a cancelled copy must remove its own scratch file"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_join_error_does_not_stop_the_blocking_writer() {
+        // Half one of the hazard, proven on its own: a `JoinError` — a panic, or
+        // an abort — finishes the OUTER task and tells you NOTHING about the
+        // nested `spawn_blocking` closure. Unwinding drops that closure's
+        // `JoinHandle`, which detaches it and leaves it live and writing.
+        //
+        // Deterministic because the cancel flag is never set here: the copy's
+        // source is a FIFO that never gets a writer, so the closure either has not
+        // started or is blocked in `File::open`, and in neither state can it
+        // finish. There is no interleaving in which the count reaches zero.
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src.fifo");
+        let dst = tmp.path().join("manifest-dst");
+        if !fifoize(&src) {
+            return;
+        }
+
+        let cancel: CopyCancel = Arc::new(AtomicBool::new(false));
+        let activity = CopyActivity::default();
+        // The task signals before calling the copy, and there is no await point
+        // between that signal and the activity increment + `spawn_blocking` — an
+        // abort can only land at an await, so receiving this guarantees the count
+        // was taken. (Aborting a task that has never been polled would cancel it
+        // before it counted anything.)
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn({
+            let (src, dst, cancel, activity) =
+                (src.clone(), dst.clone(), cancel.clone(), activity.clone());
+            async move {
+                let _ = started_tx.send(());
+                copy_file_cancellable(&src, &dst, &cancel, &activity).await
+            }
+        });
+        started_rx.await.unwrap();
+
+        task.abort();
+        assert!(
+            task.await.is_err(),
+            "the scenario under test is a JoinError, so we must actually have one"
+        );
+        assert_eq!(
+            activity.in_flight(),
+            1,
+            "the outer task is finished while its blocking writer is not — this gap \
+             IS the hazard, and a JoinError is the only outcome that has it"
+        );
+        assert!(
+            !activity.wait_quiescent(Duration::from_millis(200)).await,
+            "quiescence must not be reported while a detached writer is live"
+        );
+
+        // Cancel FIRST, then release the FIFO. The writer stops instead of
+        // publishing, which is why skipping cleanup costs at most an orphan.
+        //
+        // The release must not block: the closure is either parked in `File::open`
+        // (a reader — the probe succeeds, and dropping the handle gives it EOF) or
+        // has not started and will exit at its first cancel check without ever
+        // opening (no reader ever appears). A blocking open would hang forever in
+        // the second case, which is what the stress run caught.
+        cancel.store(true, Ordering::Relaxed);
+        let start = std::time::Instant::now();
+        while activity.in_flight() != 0 && start.elapsed() < Duration::from_secs(10) {
+            drop(try_open_fifo_writer(&src));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            activity.wait_quiescent(Duration::from_secs(10)).await,
+            "the writer must stop, and be seen to stop, once released"
+        );
+        assert!(
+            !dst.exists(),
+            "an abandoned writer must never publish, even after we stopped waiting"
+        );
+        assert!(leftover_temps(tmp.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn join_error_with_a_live_writer_deletes_nothing() {
+        // Half two: given a live writer, the decision must be to delete NOTHING.
+        //
+        // The writer is synthetic — a held activity guard, exactly what a live
+        // blocking closure holds. That is deliberate. Driving this with a real
+        // parked copy is not race-free: an earlier version fed a FIFO chunk and
+        // relied on the copy sitting in `read`, which flaked 1-in-~12 in the full
+        // suite. `write_all` returning means the PIPE took the bytes, not that the
+        // reader drained them, and under a saturated blocking pool the closure may
+        // not even start until after the cancel is set — in which case it exits at
+        // its first check and IS quiescent. "Parked mid-file" is not observable
+        // without a hook, so the test must not assert on it. The linkage this
+        // stands in for — that a detached writer really does hold the count — is
+        // proven independently by `a_join_error_does_not_stop_the_blocking_writer`.
+        let tmp = tempdir().unwrap();
+        let published = tmp.path().join("sha256-mine");
+        let shared = tmp.path().join("sha256-shared");
+        fs::write(&published, b"published by this attempt").unwrap();
+        fs::write(&shared, b"another manifest depends on this").unwrap();
+        let pre_existing: HashSet<PathBuf> = vec![shared.clone()].into_iter().collect();
+
+        let cancel: CopyCancel = Arc::new(AtomicBool::new(false));
+        let activity = CopyActivity::default();
+        let live_writer = activity.hold_for_test();
+
+        let cleaned = cleanup_after_join_error(
+            PULL_OP,
+            "m:1",
+            &cancel,
+            &activity,
+            Duration::from_millis(300),
+            &[published.clone(), shared.clone()],
+            &pre_existing,
+        )
+        .await;
+
+        // Filesystem first: the damage is the claim, the return value is bookkeeping.
+        assert!(
+            published.is_file(),
+            "when the writer cannot be proven stopped, cleanup must delete NOTHING \
+             — a live writer can republish over whatever we remove, and on the pull \
+             side the file it republishes is the manifest"
+        );
+        assert!(shared.is_file());
+        assert!(
+            !cleaned,
+            "quiescence cannot be proven while a writer is live"
+        );
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "the flag must still be set, so the live writer stops rather than publishes"
+        );
+        drop(live_writer);
+    }
+
+    #[tokio::test]
+    async fn join_error_with_a_quiescent_writer_still_cleans_up() {
+        // The other half: "delete nothing" applies only when quiescence cannot be
+        // PROVEN. Once it can, a JoinError must still reclaim what the attempt
+        // published — otherwise the fix would just be a disabled cleanup path.
+        let tmp = tempdir().unwrap();
+        let published = tmp.path().join("sha256-mine");
+        let shared = tmp.path().join("sha256-shared");
+        fs::write(&published, b"published by this attempt").unwrap();
+        fs::write(&shared, b"another manifest depends on this").unwrap();
+        let pre_existing: HashSet<PathBuf> = vec![shared.clone()].into_iter().collect();
+
+        let cancel: CopyCancel = Arc::new(AtomicBool::new(false));
+        let activity = CopyActivity::default(); // nothing in flight
+        let cleaned = cleanup_after_join_error(
+            PULL_OP,
+            "m:1",
+            &cancel,
+            &activity,
+            Duration::from_millis(300),
+            &[published.clone(), shared.clone()],
+            &pre_existing,
+        )
+        .await;
+
+        assert!(cleaned, "a quiescent writer makes cleanup provably safe");
+        assert!(!published.exists(), "this attempt's file must be reclaimed");
+        assert!(
+            shared.is_file(),
+            "the pre-existing filter still applies on this route"
+        );
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "the cancel flag must be set on every join-error path, quiescent or not"
         );
     }
 
@@ -1544,12 +1920,11 @@ mod tests {
         }
 
         let cancel: CopyCancel = Arc::new(AtomicBool::new(false));
-        let copy = tokio::spawn(copy_model_files(plan, cancel.clone()));
+        let copy = tokio::spawn(copy_model_files(plan, cancel.clone(), CopyActivity::default()));
 
-        let mut w = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&src_manifest)
-            .unwrap();
+        let mut w = open_fifo_writer(&src_manifest, Duration::from_secs(60))
+            .await
+            .expect("cancel is false here, so the copy cannot exit without opening its source");
         w.write_all(&vec![7u8; COPY_CHUNK_BYTES]).unwrap();
         w.flush().unwrap();
         cancel.store(true, Ordering::Relaxed);
@@ -1602,22 +1977,36 @@ mod tests {
                 "park:1",
                 &a,
                 &l,
-                Duration::from_secs(1),
+                Duration::from_secs(2),
                 &FixedProbe(u64::MAX),
                 None,
             )
             .await
         });
 
-        let mut w = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
-        // One chunk consumed → the copy is staging, then parks awaiting more.
-        w.write_all(&vec![5u8; COPY_CHUNK_BYTES]).unwrap();
-        w.flush().unwrap();
-        // Outlast the 1 s pull timeout, so the cancel is set while the copy is
-        // parked mid-file, then release it. It must stop rather than publish.
-        tokio::time::sleep(Duration::from_millis(2500)).await;
-        let _ = w.write_all(&vec![5u8; 4096]);
-        drop(w);
+        // May be None: if the blocking pool is saturated the pull's own 1 s timeout
+        // can set the cancel flag before the closure ever opens its source, and the
+        // closure then exits without becoming a reader. Both interleavings must
+        // reach the same assertions — in neither may anything be published — so the
+        // test never blocks waiting for a reader that will not arrive.
+        // Feed one chunk once the copy reaches its source. `open_fifo_writer`
+        // probes non-blockingly rather than blocking on a reader, because the copy
+        // is not guaranteed to become one: if the cancel flag beats it to its first
+        // check it exits without ever opening. Both interleavings must reach the
+        // same assertions — in neither may anything be published.
+        if let Some(mut w) = open_fifo_writer(&fifo, Duration::from_secs(2)).await {
+            // One chunk consumed → the copy is staging, then parks awaiting more.
+            w.write_all(&vec![5u8; COPY_CHUNK_BYTES]).unwrap();
+            w.flush().unwrap();
+            // Outlast the 2 s pull timeout, so the cancel is set while the copy is
+            // mid-file, then release it. It must stop rather than publish.
+            tokio::time::sleep(Duration::from_millis(3000)).await;
+            let _ = w.write_all(&vec![5u8; 4096]);
+            drop(w);
+        }
+        // Safety net: release a reader that only reached `open` after we gave up
+        // probing, so no blocking thread is ever left parked on this FIFO.
+        drop(try_open_fifo_writer(&fifo));
 
         let err = pull.await.unwrap().unwrap_err();
         assert!(matches!(err, PullError::Timeout(_)), "got {err:?}");

@@ -38,8 +38,9 @@ use super::registry::{
     collect_manifest_leaves, parse_manifest_blobs, ManifestBlobs, ModelRegistry, StorageTier,
 };
 use super::transfer::{
-    blob_filename, cleanup_attempt, copy_file_cancellable, find_manifest_leaf, CopyCancel,
-    DiskSpaceProbe, CANCELLED, COPY_CANCEL_GRACE, COPY_TEMP_INFIX,
+    blob_filename, cleanup_after_join_error, cleanup_attempt, copy_file_cancellable,
+    find_manifest_leaf, CopyActivity, CopyCancel, DiskSpaceProbe, CANCELLED, COPY_CANCEL_GRACE,
+    COPY_TEMP_INFIX,
 };
 
 /// Label used in `cleanup_attempt` logs for the warm→cold direction.
@@ -353,11 +354,15 @@ pub async fn evict_to_archive(
     // pool — so the old shape ran its cleanup while the copy was still live and
     // could still create the file being cleaned up. See `CopyCancel`.
     let cancel: CopyCancel = Arc::new(AtomicBool::new(false));
+    // Proves the blocking writer has stopped on the one path where awaiting the
+    // task does not — see `transfer::cleanup_after_join_error`.
+    let activity = CopyActivity::default();
     let mut copy_task = tokio::spawn(copy_model_to_archive(
         local_root.clone(),
         local_manifest.clone(),
         archive_root.clone(),
         cancel.clone(),
+        activity.clone(),
     ));
 
     let copy_res = match tokio::time::timeout(copy_timeout, &mut copy_task).await {
@@ -437,14 +442,23 @@ pub async fn evict_to_archive(
             return Err(EvictError::ArchiveCopy(model.to_string(), e));
         }
         Err(join_err) => {
-            // The copy task panicked. Its inner `spawn_blocking` closure is NOT
-            // stopped by that panic and may still be running, so set the cancel
-            // flag first: it will then abandon its temp file rather than publish
-            // after we have cleaned up. Even without that it could only ever
-            // publish one complete, correct blob — never a partial or corrupt one
-            // — because it writes solely into its own temp path.
-            cancel.store(true, Ordering::Relaxed);
-            cleanup_attempt(EVICT_OP, model, &planned, &pre_existing);
+            // The copy task panicked (or was aborted), which stops the OUTER task
+            // but not its inner `spawn_blocking` closure. Cancel, then prove the
+            // writer stopped before deleting anything — and delete nothing if it
+            // cannot be proven. A late publish here is more benign than on the
+            // pull side (it restores a complete, content-addressed archive blob
+            // rather than a manifest over removed blobs), but the rule is the
+            // same one, through the same shared route.
+            cleanup_after_join_error(
+                EVICT_OP,
+                model,
+                &cancel,
+                &activity,
+                COPY_CANCEL_GRACE,
+                &planned,
+                &pre_existing,
+            )
+            .await;
             return Err(EvictError::ArchiveCopy(
                 model.to_string(),
                 format!("archive copy task failed to join: {join_err}"),
@@ -500,6 +514,7 @@ async fn copy_model_to_archive(
     local_manifest: PathBuf,
     archive_root: PathBuf,
     cancel: CopyCancel,
+    activity: CopyActivity,
 ) -> Result<(), (String, Vec<PathBuf>)> {
     let mut published: Vec<PathBuf> = Vec::new();
     let blobs = parse_manifest_blobs(&local_manifest);
@@ -522,7 +537,7 @@ async fn copy_model_to_archive(
                 continue;
             }
         }
-        match copy_file_cancellable(&src, &dst, &cancel).await {
+        match copy_file_cancellable(&src, &dst, &cancel, &activity).await {
             Ok(true) => published.push(dst),
             // Cancelled or failed → `dst` was never touched (the copy only ever
             // wrote its own temp file, which it has already removed). Nothing to
@@ -551,7 +566,7 @@ async fn copy_model_to_archive(
             return Err((format!("create archive manifest dir: {e}"), published));
         }
     }
-    match copy_file_cancellable(&local_manifest, &dst_manifest, &cancel).await {
+    match copy_file_cancellable(&local_manifest, &dst_manifest, &cancel, &activity).await {
         Ok(true) => published.push(dst_manifest),
         Ok(false) => return Err((CANCELLED.to_string(), published)),
         Err(e) => {
