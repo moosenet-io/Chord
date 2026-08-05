@@ -9,27 +9,38 @@
 //! expired, or an idle-mode release unloaded them) and the memory is genuinely
 //! free.
 //!
-//! ## Measured, and why NO measurement is baked in
-//! Re-measured on the live host 2026-08-05 *after* a powercycle that recovered
-//! ~64 GB of leaked anonymous memory: total 125.1 GB, available 86.3 GB, models
-//! actually resident 14.8 GB. An earlier snapshot of the same host — taken while
-//! it was in the leaked state — showed roughly 16 GB of headroom, which would
-//! have made the coder look permanently infeasible. **That figure was an artifact
-//! of a leak, not a property of the machine.** The lesson is not "use the new
-//! number"; it is that a headroom constant written into code is a lie with a
-//! timestamp on it. So this module hardcodes **no** memory figure: it reads free
-//! memory through the existing counter at decision time, re-checks it while the
-//! coder is resident, and gives the window back the moment the reading says it
-//! should. If a build cache can eat 64 GB of this host overnight, the tier must
-//! never assume the memory it saw at load time is still there.
+//! ## Measured — and why the OBVIOUS sensors are all wrong here
+//! Three separate measurements on this host, each of which independently breaks
+//! a naive admission check. The detail lives in [`sensors`]; the summary:
 //!
-//! One measured RATIO is encoded, as a documented default rather than a
-//! constant-in-a-branch: a model's RUNTIME footprint materially exceeds its
-//! on-disk size (weights plus KV cache and context). Measured on this host,
-//! `granite4.1:8b` occupies 4.98 GiB on disk and 8.93 GiB resident — a factor of
-//! ~1.8. Sizing a load against the on-disk figure alone would under-count by most
-//! of a coder model, so [`CoderTierConfig::footprint_factor`] (default 1.8,
-//! overridable) inflates the registry size before the fit test.
+//! - **GTT is invisible to process RSS.** The models live in GTT on this
+//!   unified-memory APU. The ollama runners reported **0.52 and 0.40 GB** in `ps`
+//!   while holding **28.7 GB** of GTT; every process on the box summed to 10.2 GB
+//!   against that 28.7 GB. A fit check reading process memory does not see the
+//!   models at all.
+//! - **`MemFree` fails LOW** — page cache means near-zero is the healthy state of
+//!   a build host, so gating on it refuses forever.
+//! - **`MemAvailable` fails HIGH and is anti-correlated with danger** — it read
+//!   **89.4 GB while this host was ~10 minutes from hanging**, because the
+//!   reclaimable cache it counts is exactly what evaporates under pressure.
+//!
+//! So capacity is read from GTT, and pressure from `Committed_AS` plus the swap
+//! TREND — the two that actually moved during the real incident. An earlier
+//! version of this file sized on `MemAvailable`; that was wrong, and it looked
+//! right.
+//!
+//! **No absolute memory figure is hardcoded anywhere.** Fit is re-derived from a
+//! fresh reading at every arm-confirm tick and re-checked while resident. One
+//! measured RATIO is encoded as a config default: runtime footprint exceeds
+//! on-disk size (weights plus KV cache and context) — `granite4.1:8b` is 4.98 GiB
+//! on disk and 8.93 GiB resident, ~1.8x — so
+//! [`CoderTierConfig::footprint_factor`] inflates the registry size before the
+//! fit test. Sizing on the raw disk figure would under-count a 30B coder by most
+//! of a model.
+//!
+//! **A threshold is a claim, and claims need the same scrutiny as code.** Every
+//! one lives in [`policy`] with a documented rationale and an env override,
+//! because thresholds read as configuration and get waved through review.
 //!
 //! That is the whole item. This tier does NOT create the window: **it never
 //! evicts, releases, unpins, or otherwise touches the assistant cohort.** It
@@ -68,13 +79,14 @@
 //! - a **post-eviction cooldown** ([`CoderTierConfig::cooldown_secs`]) during
 //!   which no amount of idleness will reload.
 //!
-//! **3b. Headroom does not persist.** Something other than Chord can consume the
-//! window after the coder is loaded. While resident, every tick re-reads free
-//! memory and evicts on [`EvictReason::MemoryPressure`] if it has fallen below
-//! the margin. An UNREADABLE counter does not evict — a sensor gap is not
-//! evidence of pressure, and evicting on it would thrash on exactly the failure
-//! it cannot see. The assistant's protection does not depend on this path
-//! anyway: hazard 1 covers it unconditionally.
+//! **3b. Headroom does not persist.** Something other than Chord can take the
+//! window after the coder is loaded. While resident, every tick re-reads GTT and
+//! the pressure signals and evicts on [`EvictReason::GttPressure`] or
+//! [`EvictReason::SystemPressure`]. An UNREADABLE sensor does not evict — a
+//! sensor gap is not evidence, and evicting on it would thrash on exactly what it
+//! cannot see — but it DOES block a load, since taking the window on no
+//! information is the cheap thing to refuse. The assistant's protection never
+//! depends on this path: hazard 1 covers it unconditionally.
 //!
 //! ## What it consumes rather than reinvents
 //! There is deliberately **no second model list and no second residency rule**
@@ -85,16 +97,16 @@
 //! backend lifecycle in [`crate::models::backends`] /
 //! [`crate::models::routing`] (`resolve_and_ensure` /
 //! `stop_on_demand_backend`), the same machinery that already lazy-starts and
-//! idle-stops the coder backend. Free memory comes from the existing
-//! [`crate::config::read_free_vram_gb`]. A duplicated residency rule drifts from
-//! the original; this one has no copy to drift from.
+//! idle-stops the coder backend. A duplicated residency rule drifts from the
+//! original; this one has no copy to drift from.
 //!
 //! ## Fail-CLOSED on the load side (a deliberate inversion)
-//! [`super::resident_set::plan_warm`] fails SOFT on an unreadable VRAM counter —
+//! [`super::resident_set::plan_warm`] fails SOFT on an unreadable counter —
 //! attempting a warm that does not fit is cheap and self-reporting. Here the
-//! inversion is correct: loading 18.6 GB we cannot prove there is room for is how
-//! you push a live assistant into swap. So an unresolved alias, an unknown model
-//! footprint, or an unreadable free-memory counter all mean **do not load**.
+//! inversion is correct: loading tens of GB we cannot prove there is room for is
+//! how you push a live assistant into swap. So an unresolved alias, an unknown
+//! model footprint, an unreadable GTT counter, or an unreadable `Committed_AS`
+//! all mean **do not load**.
 //!
 //! ## Default OFF
 //! `CHORD_CODER_TIER_ENABLED` defaults to **false**. This touches a live
@@ -134,329 +146,25 @@ pub const INTERRUPT_REASON: &str = "inference engine interrupted by user";
 pub const INTERRUPT_CODE: &str = "inference_engine_interrupted";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Config
+// Pure layers, in their own files
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Env-driven config. No model names, no infrastructure literals — only an alias
-/// KEY and tunables with documented defaults.
-#[derive(Debug, Clone, PartialEq)]
-pub struct CoderTierConfig {
-    /// `CHORD_CODER_TIER_ENABLED` — **default FALSE**. Ships dark.
-    pub enabled: bool,
-    /// `CHORD_CODER_TIER_ALIAS` — the Chord ALIAS KEY the coder resolves through
-    /// (never a model name). Resolution is the resident set's own
-    /// [`super::resident_set::resolve_alias`]: dynamic store, then statics.
-    pub alias: String,
-    /// `CHORD_CODER_TIER_MIN_IDLE_SECS` (default 900) — how long assistant
-    /// traffic must have been absent before the tier will even arm.
-    pub min_idle_secs: u64,
-    /// `CHORD_CODER_TIER_ARM_CONFIRM_SECS` (default 120) — how long the tier must
-    /// stay armed, still idle, before it loads. This is what makes "never load on
-    /// the first idle tick" structural rather than incidental.
-    pub arm_confirm_secs: u64,
-    /// `CHORD_CODER_TIER_COOLDOWN_SECS` (default 600) — after an eviction, no
-    /// reload until this has elapsed, however idle the box looks.
-    pub cooldown_secs: u64,
-    /// `CHORD_CODER_TIER_HEADROOM_MARGIN_GB` (default 8.0) — memory that must be
-    /// left spare on top of the coder's own (inflated) footprint before a load is
-    /// allowed, and below which a resident coder is evicted for pressure.
-    pub headroom_margin_gb: f64,
-    /// `CHORD_CODER_TIER_FOOTPRINT_FACTOR` (default 1.8) — multiplier applied to
-    /// the registry's ON-DISK size to estimate RUNTIME footprint (weights + KV
-    /// cache + context). Measured on this host: `granite4.1:8b` is 4.98 GiB on
-    /// disk and 8.93 GiB resident. Sizing against the raw disk figure would
-    /// under-count a 30B coder by many gigabytes. Clamped to `>= 1.0` — a factor
-    /// below one would UNDER-estimate, which is the one direction that is unsafe.
-    pub footprint_factor: f64,
-    /// `CHORD_CODER_TIER_EVICT_BUDGET_SECS` (default 60) — if an eviction task
-    /// dies or wedges, the tick force-resolves the phase after this so the tier
-    /// can never be stuck in [`Phase::Evicting`] forever.
-    pub evict_budget_secs: u64,
-}
+/// The pure admission POLICY (config, phases, thresholds, `decide`). Split out
+/// with ZERO crate-internal dependencies so a standalone harness can
+/// `#[path]`-include the real file and mutation-test it without building the
+/// crate — the harness tests the shipped source, so it cannot drift from it.
+pub mod policy;
+/// Memory SENSING: GTT (the only thing that can see model residency) plus
+/// `Committed_AS` and the swap trend. Read its module docs before touching a
+/// threshold — three obvious-looking sensors are wrong here, and two of them
+/// were adopted before being measured.
+pub mod sensors;
 
-impl Default for CoderTierConfig {
-    fn default() -> Self {
-        CoderTierConfig {
-            enabled: false,
-            alias: "lumina-coder".to_string(),
-            min_idle_secs: 900,
-            arm_confirm_secs: 120,
-            cooldown_secs: 600,
-            headroom_margin_gb: 8.0,
-            footprint_factor: 1.8,
-            evict_budget_secs: 60,
-        }
-    }
-}
-
-fn env_flag(key: &str, default: bool) -> bool {
-    match std::env::var(key) {
-        Ok(v) => {
-            let v = v.trim().to_ascii_lowercase();
-            if v.is_empty() {
-                default
-            } else {
-                !matches!(v.as_str(), "0" | "false" | "no" | "off")
-            }
-        }
-        Err(_) => default,
-    }
-}
-
-fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(default)
-}
-
-fn env_f64(key: &str, default: f64) -> f64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.trim().parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v >= 0.0)
-        .unwrap_or(default)
-}
-
-fn env_string(key: &str, default: &str) -> String {
-    std::env::var(key)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| default.to_string())
-}
-
-impl CoderTierConfig {
-    pub fn from_env() -> Self {
-        let d = CoderTierConfig::default();
-        CoderTierConfig {
-            enabled: env_flag("CHORD_CODER_TIER_ENABLED", d.enabled),
-            alias: env_string("CHORD_CODER_TIER_ALIAS", &d.alias),
-            min_idle_secs: env_u64("CHORD_CODER_TIER_MIN_IDLE_SECS", d.min_idle_secs),
-            arm_confirm_secs: env_u64("CHORD_CODER_TIER_ARM_CONFIRM_SECS", d.arm_confirm_secs),
-            cooldown_secs: env_u64("CHORD_CODER_TIER_COOLDOWN_SECS", d.cooldown_secs),
-            headroom_margin_gb: env_f64(
-                "CHORD_CODER_TIER_HEADROOM_MARGIN_GB",
-                d.headroom_margin_gb,
-            ),
-            // Clamped: a factor < 1 would under-estimate the footprint, which is
-            // the only direction that can push a live assistant into swap.
-            footprint_factor: env_f64("CHORD_CODER_TIER_FOOTPRINT_FACTOR", d.footprint_factor)
-                .max(1.0),
-            evict_budget_secs: env_u64("CHORD_CODER_TIER_EVICT_BUDGET_SECS", d.evict_budget_secs),
-        }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Pure state machine
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// The tier's lifecycle phase. [`Phase::Assistant`] is the resting, always-safe
-/// state: no coder loaded, nothing borrowed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(tag = "phase", rename_all = "kebab-case")]
-pub enum Phase {
-    /// Nothing loaded. The safe resting state, and where every failure lands.
-    Assistant,
-    /// The idle dwell has been met once; the arm-confirm timer is running. The
-    /// coder is still NOT loaded.
-    Arming { armed_at: u64 },
-    /// A coder load is in flight.
-    Loading,
-    /// Coder resident; review leases may be issued.
-    Ready,
-    /// Tearing the coder down and handing capacity back.
-    Evicting { since: u64 },
-    /// Post-eviction anti-thrash cooldown; no load before `until`.
-    Cooldown { until: u64 },
-}
-
-impl Phase {
-    /// Is the coder loaded or being loaded (i.e. is memory borrowed)?
-    pub fn holds_memory(self) -> bool {
-        matches!(self, Phase::Loading | Phase::Ready | Phase::Evicting { .. })
-    }
-
-    pub fn id(self) -> &'static str {
-        match self {
-            Phase::Assistant => "assistant",
-            Phase::Arming { .. } => "arming",
-            Phase::Loading => "loading",
-            Phase::Ready => "ready",
-            Phase::Evicting { .. } => "evicting",
-            Phase::Cooldown { .. } => "cooldown",
-        }
-    }
-}
-
-/// Why an eviction fired. Only [`EvictReason::AssistantArrived`] is the fast
-/// path; the others are safety nets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum EvictReason {
-    /// A user/assistant request arrived. Immediate, synchronous, unconditional.
-    AssistantArrived,
-    /// The periodic tick observed assistant traffic the hot-path hook missed
-    /// (e.g. the tier was enabled mid-flight). Backstop, not the mechanism.
-    ActivityObserved,
-    /// The tier was disabled at runtime while holding memory.
-    Disabled,
-    /// Free memory fell below the margin while the coder was resident — something
-    /// other than Chord took the window. Give it back rather than contend.
-    MemoryPressure,
-}
-
-/// What one observation tells the tier to do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Decision {
-    /// Nothing to do.
-    Hold,
-    /// Return to the resting [`Phase::Assistant`] state (cooldown expired, or an
-    /// arming attempt was abandoned). Never touches the coder.
-    Rest,
-    /// Begin the dwell-confirm timer. Does NOT load.
-    Arm,
-    /// Dwell + confirm + fit all satisfied — load the coder.
-    Load,
-    /// Tear the coder down.
-    Evict(EvictReason),
-    /// An eviction has overrun its budget; force the phase back to cooldown so
-    /// the tier cannot wedge.
-    ForceResolveEvict,
-}
-
-/// Everything one tick observes. Clock is passed in, never read — so the whole
-/// state machine is exhaustively testable with no sleeping and no wall clock.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Observation {
-    pub now: u64,
-    /// Seconds since the last ASSISTANT (non-coder-lease) inference admission.
-    pub assistant_idle_secs: u64,
-    /// Is an assistant request in flight right now?
-    pub assistant_inflight: bool,
-    /// Free memory, GB. `None` ⇒ unreadable ⇒ never load (fail closed).
-    pub free_gb: Option<f64>,
-    /// Footprint of the resolved coder, GB. `None` ⇒ unknown ⇒ never load.
-    pub coder_gb: Option<f64>,
-    /// Did the coder alias resolve to a present model at all?
-    pub coder_resolved: bool,
-}
-
-/// Estimated RUNTIME footprint of the coder: its on-disk size inflated by the
-/// measured factor. See [`CoderTierConfig::footprint_factor`].
-pub fn runtime_footprint_gb(disk_gb: f64, factor: f64) -> f64 {
-    disk_gb * factor.max(1.0)
-}
-
-/// Does the coder fit, provably? Fail-CLOSED: any unknown is a "no".
-pub fn coder_fits(obs: &Observation, cfg: &CoderTierConfig) -> bool {
-    match (obs.coder_resolved, obs.free_gb, obs.coder_gb) {
-        (true, Some(free), Some(disk)) => {
-            if !free.is_finite() || !disk.is_finite() {
-                return false;
-            }
-            runtime_footprint_gb(disk, cfg.footprint_factor) + cfg.headroom_margin_gb <= free
-        }
-        _ => false,
-    }
-}
-
-/// Has the window been taken back out from under a resident coder? `None` (an
-/// unreadable counter) is NOT pressure — a sensor gap is not evidence, and
-/// evicting on it would thrash on precisely what it cannot see.
-pub fn under_memory_pressure(obs: &Observation, cfg: &CoderTierConfig) -> bool {
-    match obs.free_gb {
-        Some(free) if free.is_finite() => free < cfg.headroom_margin_gb,
-        _ => false,
-    }
-}
-
-/// Is the box quiet enough to consider borrowing the window?
-pub fn assistant_quiet(obs: &Observation, min_idle_secs: u64) -> bool {
-    !obs.assistant_inflight && obs.assistant_idle_secs >= min_idle_secs
-}
-
-/// The pure decision. No clock, no I/O, no globals.
-///
-/// Ordering matters and is deliberate:
-/// 1. a disabled tier that holds memory gives it back before anything else;
-/// 2. **assistant activity beats everything** — it evicts from any memory-holding
-///    phase and disarms an arming one, before fit or dwell is even consulted;
-/// 3. a cooldown is honoured even when the box is perfectly idle (anti-thrash);
-/// 4. only then can arming, and only after arm-confirm, loading, happen.
-pub fn decide(cfg: &CoderTierConfig, phase: Phase, obs: &Observation) -> Decision {
-    if !cfg.enabled {
-        return match phase {
-            Phase::Evicting { since } => {
-                if obs.now.saturating_sub(since) >= cfg.evict_budget_secs {
-                    Decision::ForceResolveEvict
-                } else {
-                    Decision::Hold
-                }
-            }
-            p if p.holds_memory() => Decision::Evict(EvictReason::Disabled),
-            Phase::Assistant => Decision::Hold,
-            _ => Decision::Rest,
-        };
-    }
-
-    // An eviction already in flight is never second-guessed — only bounded.
-    if let Phase::Evicting { since } = phase {
-        return if obs.now.saturating_sub(since) >= cfg.evict_budget_secs {
-            Decision::ForceResolveEvict
-        } else {
-            Decision::Hold
-        };
-    }
-
-    // Assistant activity beats everything else.
-    if !assistant_quiet(obs, cfg.min_idle_secs) {
-        return match phase {
-            Phase::Loading | Phase::Ready => Decision::Evict(EvictReason::ActivityObserved),
-            Phase::Arming { .. } => Decision::Rest,
-            _ => Decision::Hold,
-        };
-    }
-
-    match phase {
-        Phase::Cooldown { until } => {
-            if obs.now >= until {
-                // Cooldown over — return to rest. Note this does NOT arm in the
-                // same tick: leaving cooldown costs one more observation, which
-                // is one more chance for a user to show up first.
-                Decision::Rest
-            } else {
-                Decision::Hold
-            }
-        }
-        Phase::Assistant => {
-            // The FIRST qualifying observation only ever arms. It never loads.
-            Decision::Arm
-        }
-        Phase::Arming { armed_at } => {
-            if obs.now.saturating_sub(armed_at) < cfg.arm_confirm_secs {
-                Decision::Hold
-            } else if coder_fits(obs, cfg) {
-                Decision::Load
-            } else {
-                // Stay armed: the window may open (a reap may free memory) without
-                // any change in idleness. Re-arming from scratch would just add
-                // latency; it would not add safety.
-                Decision::Hold
-            }
-        }
-        // Resident: the box is quiet, but the window can still be taken by
-        // something that is not an inference request at all (a build cache, a
-        // sweep). Re-check every tick; never assume the headroom persisted.
-        Phase::Ready if under_memory_pressure(obs, cfg) => {
-            Decision::Evict(EvictReason::MemoryPressure)
-        }
-        Phase::Loading | Phase::Ready => Decision::Hold,
-        Phase::Evicting { .. } => unreachable!("handled above"),
-    }
-}
-
+pub use policy::{
+    assistant_quiet, can_admit, coder_fits, decide, pressure_reason, runtime_footprint_gb,
+    swap_growth_gb, CoderTierConfig, Decision, EvictReason, Observation, Phase,
+};
+pub use sensors::{CommitReading, GttReading};
 // ─────────────────────────────────────────────────────────────────────────────
 // Lease outcome — the signal RVXR-02 consumes
 // ─────────────────────────────────────────────────────────────────────────────
@@ -529,8 +237,13 @@ pub trait CoderTierEnv: Send + Sync {
     async fn resolve_coder(&self, alias: &str) -> Option<String>;
     /// Registry footprint (GB) of `model`. `None` ⇒ unknown ⇒ fail closed.
     async fn model_size_gb(&self, model: &str) -> Option<f64>;
-    /// Free memory (GB). `None` ⇒ unreadable ⇒ fail closed.
-    fn free_gb(&self) -> Option<f64>;
+    /// Live GTT capacity — the ONLY capacity signal, because it is the only one
+    /// that can see model residency (see `sensors`). `None` ⇒ unreadable ⇒ the
+    /// tier refuses to load.
+    fn gtt(&self) -> Option<GttReading>;
+    /// Live `Committed_AS`/`CommitLimit`/swap-used. `None` ⇒ unreadable ⇒ the
+    /// tier refuses to load (but does not evict — see `pressure_reason`).
+    fn commit(&self) -> Option<CommitReading>;
     /// Start the coder through the EXISTING on-demand backend lifecycle.
     async fn start_coder(&self, model: &str) -> Result<(), String>;
     /// Stop it through the EXISTING lifecycle stop. MUST be idempotent.
@@ -569,6 +282,9 @@ pub struct CoderTier {
     interrupts: AtomicU64,
     loads: AtomicU64,
     evictions: AtomicU64,
+    /// Previous swap-used reading, so the tick can derive a TREND. The level
+    /// alone is not a signal; the growth between two observations is.
+    last_swap_used_gb: Mutex<Option<f64>>,
 }
 
 /// Observable status for `GET /admin/coder-tier`.
@@ -602,6 +318,7 @@ impl CoderTier {
             interrupts: AtomicU64::new(0),
             loads: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
+            last_swap_used_gb: Mutex::new(None),
         })
     }
 
@@ -737,10 +454,37 @@ impl CoderTier {
 
     /// Commit decision for a lease: is `epoch` still current AND is the lease
     /// still registered? Either failing means pre-empted. Always deregisters.
+    ///
+    /// ## Three independent guards, deliberately, and each is tested ALONE
+    /// A pre-emption trips all three of: deregistration (the hot path drains the
+    /// lease map), the epoch bump, and the cancel token. Mutation testing showed
+    /// that removing any ONE of them left the other two and no test failed — the
+    /// redundancy was real but undefended, which is how a later refactor removes
+    /// two of them and nobody notices until the third goes too. So each mechanism
+    /// now has a test that isolates it (see `tests.rs`, the
+    /// `..._alone_is_sufficient` trio) and the redundancy is kept: this is the
+    /// path where a truncated review turns into a verdict, and it is worth
+    /// belt-and-braces.
     fn settle_lease(&self, id: u64, epoch: u64) -> bool {
         let mut inner = self.lock();
         let still_registered = inner.leases.remove(&id).is_some();
         still_registered && inner.epoch == epoch
+    }
+
+    /// Test-only: advance the epoch WITHOUT draining leases or cancelling tokens,
+    /// so the epoch guard can be exercised in isolation from the other two.
+    #[cfg(test)]
+    fn bump_epoch_only(&self) {
+        let mut inner = self.lock();
+        inner.epoch = inner.epoch.wrapping_add(1);
+    }
+
+    /// Test-only: deregister every lease WITHOUT bumping the epoch or cancelling,
+    /// so the deregistration guard can be exercised in isolation.
+    #[cfg(test)]
+    fn drain_leases_only(&self) {
+        let mut inner = self.lock();
+        inner.leases.clear();
     }
 
     // ── Load / evict ─────────────────────────────────────────────────────────
@@ -764,17 +508,40 @@ impl CoderTier {
             },
             _ => (false, None, None),
         };
+        // Sense while ARMING (may we take the window?) and while LOADING/READY (is
+        // it still ours, and is the host still healthy?). Other phases have no
+        // memory decision to make, so they do not pay for the reads.
+        let senses = matches!(
+            phase,
+            Phase::Arming { .. } | Phase::Loading | Phase::Ready
+        );
+        let (gtt_free_gb, commit_ratio, swap_growth) = if senses {
+            let gtt = self.env.gtt().map(|g| g.free_gb());
+            let commit = self.env.commit();
+            let growth = match &commit {
+                Some(c) => {
+                    let mut last = self
+                        .last_swap_used_gb
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let g = policy::swap_growth_gb(*last, c.swap_used_gb);
+                    *last = Some(c.swap_used_gb);
+                    g
+                }
+                None => None,
+            };
+            (gtt, commit.and_then(|c| c.commit_ratio()), growth)
+        } else {
+            (None, None, None)
+        };
+
         let obs = Observation {
             now,
             assistant_idle_secs,
             assistant_inflight,
-            // Read while ARMING (can we take the window?) and while READY (is the
-            // window still ours?). Every other phase has no memory decision to
-            // make, so it does not pay for the read.
-            free_gb: match phase {
-                Phase::Arming { .. } | Phase::Ready => self.env.free_gb(),
-                _ => None,
-            },
+            gtt_free_gb,
+            commit_ratio,
+            swap_growth_gb: swap_growth,
             coder_gb,
             coder_resolved,
         };
@@ -994,8 +761,12 @@ impl CoderTierEnv for AppStateCoderEnv {
             .filter(|gb| *gb > 0.0)
     }
 
-    fn free_gb(&self) -> Option<f64> {
-        crate::config::read_free_vram_gb()
+    fn gtt(&self) -> Option<GttReading> {
+        sensors::read_gtt()
+    }
+
+    fn commit(&self) -> Option<CommitReading> {
+        sensors::read_commit()
     }
 
     async fn start_coder(&self, model: &str) -> Result<(), String> {
@@ -1095,7 +866,7 @@ pub fn note_inference_request(headers: &axum::http::HeaderMap) {
 /// Background observation loop. Reads the SAME activity counters
 /// `GET /admin/activity` reports (CHORD-ACT-01) — one signal, not a second one.
 pub async fn tick_loop(tier: Arc<CoderTier>) {
-    let interval = std::time::Duration::from_secs(env_u64("CHORD_CODER_TIER_TICK_SECS", 60).max(1));
+    let interval = std::time::Duration::from_secs(policy::env_u64("CHORD_CODER_TIER_TICK_SECS", 60).max(1));
     loop {
         tokio::time::sleep(interval).await;
         let now = crate::gpu_exclusive::now_epoch();

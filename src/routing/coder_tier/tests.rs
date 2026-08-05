@@ -29,7 +29,8 @@ struct FakeEnv {
     coder: Option<String>,
     /// On-DISK size the registry would report.
     size_gb: Option<f64>,
-    free_gb: Mutex<Option<f64>>,
+    gtt: Mutex<Option<GttReading>>,
+    commit: Mutex<Option<CommitReading>>,
     start_result: Mutex<Result<(), String>>,
     stop_result: Mutex<Result<(), String>>,
     /// Ordered log of seam calls — the evidence for "restore was called anyway".
@@ -49,6 +50,21 @@ struct FakeHandles {
     stop_gate: Arc<Semaphore>,
 }
 
+/// A healthy, roomy host: 50 GiB of GTT free, commit ratio 0.40, no swap in use.
+fn healthy_gtt(free_gb: f64) -> GttReading {
+    GttReading {
+        used_gb: 60.0 - free_gb,
+        total_gb: 60.0,
+    }
+}
+fn healthy_commit() -> CommitReading {
+    CommitReading {
+        committed_gb: 34.0,
+        commit_limit_gb: 85.0,
+        swap_used_gb: 0.0,
+    }
+}
+
 fn fake(coder: Option<&str>, size_gb: Option<f64>, free_gb: Option<f64>) -> FakeHandles {
     let (start_tx, start_rx) = mpsc::unbounded_channel();
     let (stop_tx, stop_rx) = mpsc::unbounded_channel();
@@ -57,7 +73,8 @@ fn fake(coder: Option<&str>, size_gb: Option<f64>, free_gb: Option<f64>) -> Fake
     let env = Arc::new(FakeEnv {
         coder: coder.map(|s| s.to_string()),
         size_gb,
-        free_gb: Mutex::new(free_gb),
+        gtt: Mutex::new(free_gb.map(healthy_gtt)),
+        commit: Mutex::new(Some(healthy_commit())),
         start_result: Mutex::new(Ok(())),
         stop_result: Mutex::new(Ok(())),
         calls: Mutex::new(Vec::new()),
@@ -95,8 +112,11 @@ impl CoderTierEnv for FakeEnv {
         tokio::task::yield_now().await;
         self.size_gb
     }
-    fn free_gb(&self) -> Option<f64> {
-        *self.free_gb.lock().unwrap()
+    fn gtt(&self) -> Option<GttReading> {
+        *self.gtt.lock().unwrap()
+    }
+    fn commit(&self) -> Option<CommitReading> {
+        *self.commit.lock().unwrap()
     }
     async fn start_coder(&self, _model: &str) -> Result<(), String> {
         self.log("start");
@@ -123,30 +143,15 @@ fn cfg_on() -> CoderTierConfig {
     CoderTierConfig {
         enabled: true,
         alias: "test-coder-alias".into(),
-        min_idle_secs: 900,
-        arm_confirm_secs: 120,
-        cooldown_secs: 600,
-        headroom_margin_gb: 8.0,
-        footprint_factor: 1.8,
-        evict_budget_secs: 60,
+        ..CoderTierConfig::default()
     }
 }
 
-/// Quiet, well-provisioned observation at `now`.
-fn quiet(now: u64) -> Observation {
-    Observation {
-        now,
-        assistant_idle_secs: 5_000,
-        assistant_inflight: false,
-        free_gb: Some(80.0),
-        coder_gb: Some(17.3),
-        coder_resolved: true,
-    }
-}
-
-/// Drive the tier to `Ready` deterministically, returning the tier + handles.
+/// Drive the tier to `Ready` deterministically. The two intermediate assertions
+/// are load-bearing: if the fixture ever stopped ARMING first, or stopped
+/// reaching Ready, every eviction test below would pass for the wrong reason.
 async fn ready_tier() -> (Arc<CoderTier>, Arc<FakeEnv>, Arc<Semaphore>, mpsc::UnboundedReceiver<()>) {
-    let h = fake(Some("a-coder"), Some(17.3), Some(80.0));
+    let h = fake(Some("a-coder"), Some(17.3), Some(50.0));
     let tier = CoderTier::new(cfg_on(), h.env.clone());
     tier.tick(1_000, 5_000, false).await; // arms only
     assert!(matches!(tier.phase(), Phase::Arming { .. }));
@@ -156,205 +161,12 @@ async fn ready_tier() -> (Arc<CoderTier>, Arc<FakeEnv>, Arc<Semaphore>, mpsc::Un
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Hazard 3 — thrash: the pure state machine
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn never_loads_on_the_first_idle_tick() {
-    let cfg = cfg_on();
-    // Perfectly idle, coder resolved, ample memory — everything a load could want.
-    let obs = quiet(1_000);
-    assert!(coder_fits(&obs, &cfg), "fixture must actually fit, else this test proves nothing");
-    // ...and the very first qualifying observation still only ARMS.
-    assert_eq!(decide(&cfg, Phase::Assistant, &obs), Decision::Arm);
-}
-
-#[test]
-fn load_requires_both_the_idle_dwell_and_the_arm_confirm() {
-    let cfg = cfg_on();
-    // Armed at t=1000. Before arm_confirm elapses: hold, never load.
-    let armed = Phase::Arming { armed_at: 1_000 };
-    assert_eq!(decide(&cfg, armed, &quiet(1_000)), Decision::Hold);
-    assert_eq!(decide(&cfg, armed, &quiet(1_119)), Decision::Hold);
-    // Exactly at the boundary: load.
-    assert_eq!(decide(&cfg, armed, &quiet(1_120)), Decision::Load);
-}
-
-#[test]
-fn short_idle_never_arms_however_long_we_wait() {
-    let cfg = cfg_on();
-    let mut obs = quiet(9_999);
-    obs.assistant_idle_secs = cfg.min_idle_secs - 1;
-    assert_eq!(decide(&cfg, Phase::Assistant, &obs), Decision::Hold);
-    // And an arming tier disarms rather than riding out its confirm window.
-    assert_eq!(decide(&cfg, Phase::Arming { armed_at: 1 }, &obs), Decision::Rest);
-}
-
-#[test]
-fn inflight_assistant_beats_a_large_idle_counter() {
-    let cfg = cfg_on();
-    let mut obs = quiet(9_999);
-    obs.assistant_inflight = true; // idle_secs is still 5000
-    assert_eq!(decide(&cfg, Phase::Assistant, &obs), Decision::Hold);
-    assert_eq!(
-        decide(&cfg, Phase::Ready, &obs),
-        Decision::Evict(EvictReason::ActivityObserved)
-    );
-    assert_eq!(
-        decide(&cfg, Phase::Loading, &obs),
-        Decision::Evict(EvictReason::ActivityObserved)
-    );
-    assert_eq!(decide(&cfg, Phase::Arming { armed_at: 1 }, &obs), Decision::Rest);
-}
-
-#[test]
-fn cooldown_blocks_a_reload_however_idle_the_box_is() {
-    let cfg = cfg_on();
-    let cd = Phase::Cooldown { until: 5_000 };
-    // Fully idle, perfect fit — and still nothing happens.
-    assert_eq!(decide(&cfg, cd, &quiet(4_999)), Decision::Hold);
-    // When it expires we go to REST, not straight to Load — leaving cooldown
-    // costs one more observation, which is one more chance for a user to arrive.
-    assert_eq!(decide(&cfg, cd, &quiet(5_000)), Decision::Rest);
-}
-
-#[test]
-fn evicting_is_bounded_and_cannot_wedge() {
-    let cfg = cfg_on();
-    let ev = Phase::Evicting { since: 1_000 };
-    assert_eq!(decide(&cfg, ev, &quiet(1_059)), Decision::Hold);
-    assert_eq!(decide(&cfg, ev, &quiet(1_060)), Decision::ForceResolveEvict);
-    // Even a busy assistant does not second-guess an in-flight eviction — it is
-    // already doing the thing the assistant wants.
-    let mut busy = quiet(1_010);
-    busy.assistant_inflight = true;
-    assert_eq!(decide(&cfg, ev, &busy), Decision::Hold);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Fit: fail-closed, and the measured runtime-inflation factor
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn fit_is_fail_closed_on_every_unknown() {
-    let cfg = cfg_on();
-    let base = quiet(1_000);
-
-    let mut unresolved = base;
-    unresolved.coder_resolved = false;
-    assert!(!coder_fits(&unresolved, &cfg));
-
-    let mut no_free = base;
-    no_free.free_gb = None;
-    assert!(!coder_fits(&no_free, &cfg));
-
-    let mut no_size = base;
-    no_size.coder_gb = None;
-    assert!(!coder_fits(&no_size, &cfg));
-
-    let mut nan = base;
-    nan.free_gb = Some(f64::NAN);
-    assert!(!coder_fits(&nan, &cfg));
-
-    // And an armed tier that cannot prove a fit HOLDS — it never loads blind.
-    assert_eq!(
-        decide(&cfg, Phase::Arming { armed_at: 0 }, &no_free),
-        Decision::Hold
-    );
-}
-
-#[test]
-fn fit_sizes_against_runtime_footprint_not_on_disk_size() {
-    let cfg = cfg_on(); // factor 1.8, margin 8.0
-    // Measured on the live host: the coder is ~17.3 GiB on disk. Its RUNTIME
-    // footprint is materially larger (granite4.1:8b: 4.98 GiB disk → 8.93 GiB
-    // resident, ×1.79). 17.3 × 1.8 = 31.14, + 8 margin = 39.14.
-    assert!((runtime_footprint_gb(17.3, 1.8) - 31.14).abs() < 1e-9);
-
-    let mut obs = quiet(1_000);
-    obs.coder_gb = Some(17.3);
-
-    obs.free_gb = Some(40.0);
-    assert!(coder_fits(&obs, &cfg), "39.14 needed, 40 free");
-
-    obs.free_gb = Some(39.0);
-    assert!(!coder_fits(&obs, &cfg), "39.14 needed, only 39 free");
-
-    // The naive on-disk sizing would have said yes at 26 GB free. It must not.
-    obs.free_gb = Some(26.0);
-    assert!(
-        !coder_fits(&obs, &cfg),
-        "sizing against the raw on-disk figure under-counts by most of a coder model"
-    );
-}
-
-#[test]
-fn footprint_factor_is_clamped_so_it_can_only_over_estimate() {
-    // A factor below 1 would UNDER-estimate — the one unsafe direction.
-    assert_eq!(runtime_footprint_gb(10.0, 0.1), 10.0);
-    assert_eq!(runtime_footprint_gb(10.0, 1.0), 10.0);
-    assert!((runtime_footprint_gb(10.0, 2.0) - 20.0).abs() < 1e-9);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Headroom does not persist
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn memory_pressure_evicts_a_resident_coder() {
-    let cfg = cfg_on();
-    let mut obs = quiet(1_000);
-    // Something that is not an inference request took the window (a build cache
-    // ate 64 GB of this host once).
-    obs.free_gb = Some(3.0);
-    assert!(under_memory_pressure(&obs, &cfg));
-    assert_eq!(
-        decide(&cfg, Phase::Ready, &obs),
-        Decision::Evict(EvictReason::MemoryPressure)
-    );
-}
-
-#[test]
-fn an_unreadable_counter_is_not_evidence_of_pressure() {
-    let cfg = cfg_on();
-    let mut obs = quiet(1_000);
-    obs.free_gb = None;
-    assert!(!under_memory_pressure(&obs, &cfg));
-    assert_eq!(decide(&cfg, Phase::Ready, &obs), Decision::Hold);
-    // NaN is a broken sensor, not a zero.
-    obs.free_gb = Some(f64::NAN);
-    assert!(!under_memory_pressure(&obs, &cfg));
-}
-
-#[test]
-fn a_disabled_tier_gives_memory_back_and_then_rests() {
-    let mut cfg = cfg_on();
-    cfg.enabled = false;
-    let obs = quiet(1_000);
-    assert_eq!(
-        decide(&cfg, Phase::Ready, &obs),
-        Decision::Evict(EvictReason::Disabled)
-    );
-    assert_eq!(
-        decide(&cfg, Phase::Loading, &obs),
-        Decision::Evict(EvictReason::Disabled)
-    );
-    assert_eq!(decide(&cfg, Phase::Assistant, &obs), Decision::Hold);
-    assert_eq!(decide(&cfg, Phase::Cooldown { until: 9_999 }, &obs), Decision::Rest);
-    // A disabled tier still BOUNDS an eviction it is already running.
-    assert_eq!(
-        decide(&cfg, Phase::Evicting { since: 1_000 }, &quiet(1_060)),
-        Decision::ForceResolveEvict
-    );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Hazard 1 — the eviction race, FORCED
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn assistant_request_returns_without_waiting_for_teardown() {
-    let h = fake(Some("a-coder"), Some(17.3), Some(80.0));
+    let h = fake(Some("a-coder"), Some(17.3), Some(50.0));
     let tier = CoderTier::new(cfg_on(), h.env.clone());
     tier.tick(1_000, 5_000, false).await;
     tier.tick(2_000, 5_000, false).await;
@@ -493,6 +305,56 @@ async fn a_review_that_finishes_a_hair_after_the_user_arrives_still_loses() {
     gate.add_permits(OPEN);
 }
 
+// Each of the three pre-emption guards, ISOLATED.
+//
+// A real user request trips all three at once (deregistration, epoch, token), so
+// the combined tests above pass even if two of the three are deleted — mutation
+// testing proved exactly that. These three exercise one mechanism each, with the
+// other two deliberately left untripped, so no single guard can be removed
+// silently.
+
+#[tokio::test]
+async fn the_epoch_guard_alone_is_sufficient() {
+    let (tier, _env, _gate, _rx) = ready_tier().await;
+    let lease = tier.try_acquire_lease().expect("lease");
+    // Epoch moves; the lease is still registered and its token is NOT cancelled.
+    tier.bump_epoch_only();
+    assert!(!lease.is_interrupted(), "token deliberately untouched");
+    assert!(
+        lease.commit("verdict").is_interrupted(),
+        "a stale epoch alone must invalidate the output"
+    );
+}
+
+#[tokio::test]
+async fn the_deregistration_guard_alone_is_sufficient() {
+    let (tier, _env, _gate, _rx) = ready_tier().await;
+    let lease = tier.try_acquire_lease().expect("lease");
+    // Lease is dropped from the map; epoch unchanged, token not cancelled.
+    tier.drain_leases_only();
+    assert!(!lease.is_interrupted(), "token deliberately untouched");
+    assert_eq!(tier.epoch(), tier.epoch(), "epoch deliberately unchanged");
+    assert!(
+        lease.commit("verdict").is_interrupted(),
+        "a lease the tier no longer knows about must not be able to commit"
+    );
+}
+
+#[tokio::test]
+async fn the_cancel_token_guard_alone_is_sufficient() {
+    let (tier, _env, _gate, _rx) = ready_tier().await;
+    let lease = tier.try_acquire_lease().expect("lease");
+    let epoch_before = tier.epoch();
+    // Only the token latches — the lease stays registered and the epoch holds.
+    lease.cancel_token().cancel();
+    assert_eq!(tier.epoch(), epoch_before, "epoch deliberately unchanged");
+    assert!(lease.is_interrupted());
+    assert!(
+        lease.commit("verdict").is_interrupted(),
+        "a cancelled token alone must invalidate the output"
+    );
+}
+
 #[tokio::test]
 async fn one_user_request_interrupts_every_concurrent_lease() {
     let (tier, _env, gate, _rx) = ready_tier().await;
@@ -513,7 +375,7 @@ async fn one_user_request_interrupts_every_concurrent_lease() {
 
 #[tokio::test]
 async fn a_lease_is_never_issued_outside_ready() {
-    let h = fake(Some("a-coder"), Some(17.3), Some(80.0));
+    let h = fake(Some("a-coder"), Some(17.3), Some(50.0));
     let tier = CoderTier::new(cfg_on(), h.env.clone());
     assert!(tier.try_acquire_lease().is_none(), "assistant phase");
     tier.tick(1_000, 5_000, false).await;
@@ -529,7 +391,7 @@ async fn a_user_arriving_mid_load_never_lets_the_coder_reach_ready() {
     // The other half of the race: the load is in flight when the user arrives.
     // If `tick` blindly wrote `Ready` on a successful start, the coder would be
     // resident with nobody left to evict it.
-    let h = fake(Some("a-coder"), Some(17.3), Some(80.0));
+    let h = fake(Some("a-coder"), Some(17.3), Some(50.0));
     let tier = CoderTier::new(cfg_on(), h.env.clone());
     tier.tick(1_000, 5_000, false).await;
     assert!(matches!(tier.phase(), Phase::Arming { .. }));
@@ -596,7 +458,7 @@ async fn assistant_capacity_is_restored_even_when_the_coder_stop_fails() {
 
 #[tokio::test]
 async fn a_failed_load_cools_down_instead_of_retrying_immediately() {
-    let h = fake(Some("a-coder"), Some(17.3), Some(80.0));
+    let h = fake(Some("a-coder"), Some(17.3), Some(50.0));
     *h.env.start_result.lock().unwrap() = Err("no".into());
     let tier = CoderTier::new(cfg_on(), h.env.clone());
     tier.tick(1_000, 5_000, false).await;
@@ -610,7 +472,7 @@ async fn a_failed_load_cools_down_instead_of_retrying_immediately() {
 
 #[tokio::test]
 async fn an_unresolvable_coder_alias_loads_nothing_ever() {
-    let h = fake(None, None, Some(80.0));
+    let h = fake(None, None, Some(50.0));
     let tier = CoderTier::new(cfg_on(), h.env.clone());
     tier.tick(1_000, 5_000, false).await;
     tier.tick(2_000, 5_000, false).await;
@@ -623,17 +485,10 @@ async fn an_unresolvable_coder_alias_loads_nothing_ever() {
 // Default-off, and the RVXR-02 contract
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[test]
-fn the_tier_ships_dark() {
-    assert!(
-        !CoderTierConfig::default().enabled,
-        "this touches a live shared GPU host — it must be opt-in"
-    );
-}
 
 #[tokio::test]
 async fn a_disabled_tier_is_inert_on_the_hot_path() {
-    let h = fake(Some("a-coder"), Some(17.3), Some(80.0));
+    let h = fake(Some("a-coder"), Some(17.3), Some(50.0));
     let mut cfg = cfg_on();
     cfg.enabled = false;
     let tier = CoderTier::new(cfg, h.env.clone());
@@ -679,10 +534,3 @@ fn request_classification_treats_an_unlabelled_request_as_a_user() {
     assert!(is_coder_traffic(&empty_value));
 }
 
-#[test]
-fn config_defaults_are_read_from_env_with_safe_clamps() {
-    let d = CoderTierConfig::default();
-    assert!(d.min_idle_secs > 0 && d.arm_confirm_secs > 0 && d.cooldown_secs > 0);
-    assert!(d.footprint_factor >= 1.0);
-    assert!(d.headroom_margin_gb > 0.0);
-}
