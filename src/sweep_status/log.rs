@@ -83,16 +83,26 @@ impl SweepStatusLog {
         // CHRD #113 — THE FLUSH IS LOAD-BEARING, not hygiene.
         //
         // `tokio::fs::File` is BUFFERED: `write_all` copies into an internal
-        // buffer and schedules the real write on the blocking pool. Dropping the
-        // handle does not await that write, so without this flush an append is
-        // intermittently LOST — and the loss is silent, because `append` has
-        // already returned `Ok(())`.
+        // buffer and SCHEDULES the real write on the blocking pool, then
+        // returns. Dropping the handle does not await it. So without this flush
+        // `append` returns `Ok(())` while the bytes are not yet visible to a
+        // reader that opens the file — and a reader that opens it in that window
+        // sees a short file with no error anywhere.
         //
-        // This is the root cause of the build-door flake: a test would fail and
-        // then pass on the identical commit. Measured with a standalone
+        // Stated precisely, because the distinction matters: what is measured
+        // below is a VISIBILITY RACE at read time, not proof of permanent loss.
+        // The scheduled write does normally run. (It is also a real loss if the
+        // process exits first — but that is not what was measured, so it is not
+        // claimed.) A visibility race is entirely sufficient to explain the
+        // symptom: a test that appends then immediately reads back.
+        //
+        // This is the root cause of the build-door flake — a test that failed
+        // and then passed on the identical commit. Measured with a standalone
         // reproducer of exactly this open/write/drop shape, 8-worker runtime,
-        // append-twice-then-read: WITHOUT flush 30 losses in 60,000 iterations
-        // (~1 in 2,000); WITH flush 0 in 60,000. Both directions run.
+        // append-twice-then-read-back: WITHOUT flush 30 short reads in 60,000
+        // iterations (~1 in 2,000); WITH flush 0 in 60,000. Both directions run.
+        // The missing line was always the SECOND one, matching a test that
+        // asserted 2 rows and saw 1.
         //
         // `flush` (not `sync_all`) is the right level: it gets the bytes to the
         // OS, which is what any subsequent reader — including the live status
@@ -235,44 +245,72 @@ mod tests {
     }
 
     /// CHRD #113 SOURCE RATCHET — every buffered async write in this module must
-    /// be flushed.
+    /// be flushed before the next one.
     ///
-    /// `tokio::fs::File` buffers, and dropping the handle does not await the
-    /// write, so a missing `flush` silently loses data while `append` still
-    /// returns `Ok(())`. A behavioural test cannot pin that down: the loss is
-    /// racy (~1 in 2,000 measured), so a test that exercises it passes almost
-    /// always whether the bug is present or not. This checks the property that
-    /// actually prevents it, and does so deterministically.
+    /// A behavioural test cannot pin this down: the failure is racy (~1 short
+    /// read in 2,000 measured), so a test that exercises it passes almost always
+    /// whether the bug is present or not. This checks the property that actually
+    /// prevents it, deterministically, against the REAL source of this file so it
+    /// cannot drift from what ships.
     ///
-    /// Reads the REAL source of this file, so it cannot drift from what ships.
+    /// WHAT IT DOES NOT PROVE, stated so nobody mistakes it for more (raised by
+    /// codex and gpt56 in review): it is textual. It does not prove the flush
+    /// targets the same handle, nor that it is on the same control-flow path. It
+    /// pins three things that together make an accidental regression very hard:
+    /// the module has exactly ONE async write site, it has exactly ONE
+    /// `.flush().await`, and the flush comes after the write. A second write
+    /// appearing at all fails the test and forces a human to look — which is the
+    /// realistic regression, not an adversary constructing a decoy flush.
+    /// Comment-only lines are excluded so a `.flush()` in prose cannot satisfy it.
     #[test]
-    fn every_async_write_in_this_module_is_flushed() {
+    fn the_single_async_write_in_this_module_is_flushed() {
         const SRC: &str = include_str!("log.rs");
-        // Assembled at runtime so this test does not match itself.
-        let needle = format!("{}{}", "write_all", "(");
-        let sites: Vec<usize> = SRC.match_indices(needle.as_str()).map(|(i, _)| i).collect();
-        assert!(
-            !sites.is_empty(),
-            "the ratchet found no writes at all — it has stopped measuring \
-             anything; fix the needle rather than deleting the test"
+        // Comment-only lines are dropped: a flush mentioned in prose must not
+        // count as a flush performed. Needles are assembled at runtime so this
+        // test does not match itself.
+        let code: String = SRC
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let write = format!("{}{}", "write_all", "(");
+        let flush = format!("{}{}", ".flush()", ".await");
+
+        let writes: Vec<usize> = code.match_indices(write.as_str()).map(|(i, _)| i).collect();
+        let flushes: Vec<usize> = code.match_indices(flush.as_str()).map(|(i, _)| i).collect();
+
+        assert_eq!(
+            writes.len(),
+            1,
+            "this module must have exactly ONE async write site (found {}). A new \
+             one is not automatically wrong, but tokio::fs::File is buffered and \
+             every write needs its own flush — update this test in the same commit \
+             that adds it (CHRD #113).",
+            writes.len()
         );
-        for site in sites {
-            let window = &SRC[site..SRC.len().min(site + 1200)];
-            assert!(
-                window.contains(".flush()"),
-                "a write_all at byte {site} is not followed by a flush. \
-                 tokio::fs::File is buffered and Drop does not await the write, so \
-                 the data is silently lost some fraction of the time (CHRD #113)."
-            );
-        }
+        assert_eq!(
+            flushes.len(),
+            1,
+            "expected exactly one awaited flush to pair with the one write \
+             (found {}) — if that changed, the pairing this test asserts no longer \
+             means what it says (CHRD #113).",
+            flushes.len()
+        );
+        assert!(
+            flushes[0] > writes[0],
+            "the flush must come AFTER the write it is flushing (CHRD #113)"
+        );
     }
 
     /// Complements the ratchet from the other side: a real append round-trip.
     ///
-    /// Deliberately weak, and labelled so. At ~1 loss in 2,000 appends this
-    /// catches a regression only sometimes — but it can only ever fail WRONGLY
-    /// silent, never fail spuriously, so it costs nothing to keep and it
-    /// exercises the real code path the ratchet only reads.
+    /// Deliberately weak, and labelled so. At ~1 short read in 2,000 appends it
+    /// catches a regression only sometimes. Its failure mode is overwhelmingly
+    /// "fails to notice" rather than "cries wolf" — though like any test that
+    /// touches the filesystem it can still fail for an unrelated I/O or tempdir
+    /// reason, so it is not literally incapable of a spurious failure (gpt56 was
+    /// right to flag the earlier wording). It is kept because it exercises the
+    /// real code path the ratchet only reads.
     #[tokio::test]
     async fn many_appends_all_survive() {
         let tmp = tempfile::tempdir().unwrap();
