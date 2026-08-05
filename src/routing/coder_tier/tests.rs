@@ -702,6 +702,61 @@ async fn a_dropped_lease_does_not_leave_its_secret_valid_forever() {
     );
 }
 
+/// Deliberately NOT `#[tokio::test]` — this is the documented no-runtime path.
+///
+/// The counter is incremented under the phase lock, but nothing is spawned when
+/// there is no runtime, so nothing would ever decrement it. A leaked count blocks
+/// EVERY future load permanently: a silent, unrecoverable disabling of the
+/// feature rather than a visible failure.
+#[test]
+fn the_teardown_counter_does_not_leak_without_a_runtime() {
+    let h = fake(Some("a-coder"), Some(17.3), Some(50.0));
+    let tier = CoderTier::new(cfg_on(), h.env.clone());
+    tier.set_phase_for_test(Phase::Ready, Some("a-coder".into()));
+
+    let evicted = tier.note_assistant_request();
+    assert!(evicted, "CONTROL: it must still register the eviction");
+    assert_eq!(
+        tier.teardowns_inflight(),
+        0,
+        "no task was spawned, so the increment must have been undone"
+    );
+}
+
+#[tokio::test]
+async fn a_wedged_teardown_does_not_wedge_the_tick_loop() {
+    // A tick-originated eviction must be DETACHED. Awaited inline, a stuck
+    // `stop_coder` wedges the whole tick loop — so the very tick that would
+    // force-resolve it can never run, and the budget backstop is unreachable.
+    let h = fake(Some("a-coder"), Some(17.3), Some(50.0));
+    let tier = CoderTier::new(cfg_on(), h.env.clone());
+    tier.tick(1_000, 5_000, false).await;
+    tier.tick(2_000, 5_000, false).await;
+    assert_eq!(tier.phase(), Phase::Ready);
+
+    // Wedge the teardown, then provoke a TICK-originated eviction (assistant
+    // activity observed by the tick, not the hot-path hook).
+    h.stop_gate.acquire_many(OPEN as u32).await.unwrap().forget();
+    let evicting = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tier.tick(3_000, 0, true),
+    )
+    .await;
+    assert!(
+        evicting.is_ok(),
+        "tick must return promptly; awaiting the teardown inline wedges the loop"
+    );
+    assert!(matches!(tier.phase(), Phase::Evicting { .. }));
+
+    // And because the loop is free, the budget backstop can still fire.
+    let after = crate::gpu_exclusive::now_epoch() + cfg_on().evict_budget_secs + 1;
+    tokio::time::timeout(std::time::Duration::from_secs(5), tier.tick(after, 5_000, false))
+        .await
+        .expect("the force-resolving tick must also be able to run");
+    assert!(matches!(tier.phase(), Phase::Cooldown { .. }));
+    h.stop_gate.add_permits(OPEN);
+}
+
 #[tokio::test]
 async fn a_new_load_waits_for_an_outstanding_teardown() {
     // The defect the generation guard could NOT reach: an abandoned teardown that

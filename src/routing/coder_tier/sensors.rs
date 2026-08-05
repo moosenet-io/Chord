@@ -232,8 +232,15 @@ impl CommitReading {
     /// Committed as a fraction of the commit limit. `None` when the limit is
     /// zero/absent (overcommit accounting off) — fail-closed at the caller.
     pub fn commit_ratio(&self) -> Option<f64> {
-        if self.commit_limit_gb > 0.0 {
-            Some(self.committed_gb / self.commit_limit_gb)
+        // ONE check, deliberately. `r.is_finite() && r >= 0.0` subsumes every
+        // guard on the inputs: a zero limit gives inf or NaN, a negative limit or
+        // a negative numerator gives a negative ratio. Separate guards on
+        // `commit_limit_gb`/`committed_gb` were redundant — each survived
+        // mutation because the other still caught it, which is how dead
+        // belt-and-braces hides behind a passing suite.
+        let r = self.committed_gb / self.commit_limit_gb;
+        if r.is_finite() && r >= 0.0 {
+            Some(r)
         } else {
             None
         }
@@ -251,7 +258,15 @@ pub fn parse_meminfo(raw: &str) -> Option<CommitReading> {
         let Some((key, rest)) = line.split_once(':') else {
             continue;
         };
-        let value = rest.split_whitespace().next().and_then(|v| v.parse::<f64>().ok());
+        // Reject non-finite AND NEGATIVE values. A negative `Committed_AS`
+        // yields a finite NEGATIVE commit ratio, which sails past both
+        // `pressure_reason` (not > the max) and a bare `is_finite()` check — a
+        // corrupt sensor reading as "plenty of headroom". Fail closed.
+        let value = rest
+            .split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0);
         let Some(value) = value else { continue };
         match key.trim() {
             "Committed_AS" => committed_kb = Some(value),
@@ -380,6 +395,21 @@ Committed_AS:    41943040 kB
             parse_meminfo(missing).is_none(),
             "missing swap fields must fail closed, not read as zero"
         );
+    }
+
+    #[test]
+    fn a_negative_counter_fails_closed_rather_than_reading_as_headroom() {
+        // A negative Committed_AS produces a finite NEGATIVE ratio, which is not
+        // "> max" and IS finite — so it would pass a naive pressure check and a
+        // naive admission check as though the host were empty.
+        let corrupt = "Committed_AS: -1 kB\nCommitLimit: 100000 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n";
+        assert!(
+            parse_meminfo(corrupt).is_none(),
+            "a negative counter is a corrupt sensor, not headroom"
+        );
+        // And the ratio itself refuses a negative committed value directly.
+        let c = CommitReading { committed_gb: -1.0, commit_limit_gb: 100.0, swap_used_gb: 0.0 };
+        assert!(c.commit_ratio().is_none());
     }
 
     #[test]

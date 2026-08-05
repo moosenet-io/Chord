@@ -292,6 +292,61 @@ pub fn on_demand_backend_to_stop(
 /// will (correctly) refuse to stop it — so it could never be evicted. Uses the
 /// SAME arch-aware resolution as [`stop_on_demand_backend_for_model`], so start
 /// and stop can never disagree about which backend they mean.
+/// RVXR-01 — env var by which an operator ACKNOWLEDGES that this host's
+/// `terminus-rs` lifecycle no longer stops always-on GPU backends when starting
+/// an on-demand one. See [`free_gpu_would_stop_an_always_on_backend`].
+pub const FREE_GPU_ACK_ENV: &str = "CHORD_CODER_TIER_ACK_FREE_GPU_SAFE";
+
+/// RVXR-01 SAFETY GATE — would starting an on-demand GPU backend take the
+/// ASSISTANT'S OWN ENGINE down with it?
+///
+/// **Verified against terminus-rs 1.3.1 source, not inferred.**
+/// `intake::lifecycle::ensure_up` calls `free_gpu(keep)` for any backend with
+/// `hardware == "gpu"`, and `free_gpu` does:
+///
+/// ```text
+/// for (name, unit) in infer::gpu_backends() { if name == keep { continue }
+///     if let Some(unit) = unit { systemctl stop <unit> } ... }
+/// ```
+///
+/// `infer::gpu_backends()` reads Chord's OWN `model-registry.json` and filters
+/// only on `hardware == "gpu"` — there is **no `always_on` check**. Chord seeds
+/// the primary Ollama serve as `hardware: Gpu, unit: Some("ollama.service")`
+/// (`models::backends::seed_from_env`). So a cold coder start would run
+/// `systemctl stop ollama.service` and take live Lumina down to make room for a
+/// review — the exact thing this feature must never do.
+///
+/// This is a REAL, PRE-EXISTING, cross-repo defect: it already fires for any chat
+/// request routed to a GPU on-demand backend. RVXR-01 does not introduce it, but
+/// it would be the first thing to trigger it AUTOMATICALLY and UNATTENDED, on a
+/// timer, which is materially worse than a rare operator-driven path. So the
+/// coder tier refuses to load while the hazard exists.
+///
+/// Returns the name of an always-on GPU backend that would be stopped, if any.
+/// The operator clears this by fixing `free_gpu` upstream to skip `always_on`
+/// backends and then setting [`FREE_GPU_ACK_ENV`] — a deliberate acknowledgement,
+/// never an inference.
+pub fn free_gpu_would_stop_an_always_on_backend(reg: &ModelRegistry) -> Option<String> {
+    if std::env::var(FREE_GPU_ACK_ENV)
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && !matches!(v.as_str(), "0" | "false" | "no" | "off")
+        })
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    reg.backends()
+        .values()
+        .find(|b| {
+            b.always_on
+                && b.hardware == crate::models::backends::Hardware::Gpu
+                && b.unit.is_some()
+        })
+        .map(|b| b.name.clone())
+}
+
 pub async fn model_has_on_demand_backend(
     registry: &Arc<Mutex<ModelRegistry>>,
     routing_map: &Arc<Mutex<RoutingMap>>,
@@ -306,6 +361,15 @@ pub async fn model_has_on_demand_backend(
         )
     };
     let reg = registry.lock().await;
+    if let Some(victim) = free_gpu_would_stop_an_always_on_backend(&reg) {
+        tracing::warn!(
+            would_stop = %victim,
+            ack_env = FREE_GPU_ACK_ENV,
+            "coder tier: refusing to load — starting an on-demand GPU backend would stop the \
+             always-on assistant engine (terminus-rs free_gpu has no always_on check)"
+        );
+        return false;
+    }
     on_demand_backend_to_stop(&reg, model, &excluded_tiers, chosen_tier).is_some()
 }
 
@@ -421,6 +485,131 @@ mod tests {
     /// real coder stays resident and holding memory. Raised by the review panel;
     /// this is the fixture where the two resolutions actually diverge (an empty
     /// exclusion set makes them agree, which is why the first test missed it).
+    /// RVXR-01: the tier must refuse to load while starting an on-demand GPU
+    /// backend would `systemctl stop` the always-on assistant engine. Verified
+    /// against terminus-rs 1.3.1 `free_gpu`, which has no `always_on` check.
+    #[test]
+    #[serial]
+    fn loading_is_refused_while_free_gpu_would_stop_the_assistant_engine() {
+        use crate::models::backends::Hardware;
+        use std::collections::HashMap;
+
+        let always_on_gpu = Backend {
+            name: "ollama".into(),
+            url: "http://localhost:11434".into(),
+            hardware: Hardware::Gpu,
+            kind: BackendKind::Ollama,
+            unit: Some("ollama.service".into()),
+            always_on: true,
+            idle_stop_secs: 0,
+            launch: None,
+            api_key_env: None,
+        };
+        let mut catalogue = HashMap::new();
+        catalogue.insert(always_on_gpu.name.clone(), always_on_gpu.clone());
+        let dir = std::env::temp_dir().join(format!("rvxr01-freegpu-{}", std::process::id()));
+        let mk = |cat: HashMap<String, Backend>| {
+            ModelRegistry::new_with_backends(
+                dir.join("registry.json"),
+                dir.join("local"),
+                dir.join("archive"),
+                vec![],
+                cat,
+            )
+        };
+
+        std::env::remove_var(FREE_GPU_ACK_ENV);
+        let reg = mk(catalogue.clone());
+        assert_eq!(
+            free_gpu_would_stop_an_always_on_backend(&reg).as_deref(),
+            Some("ollama"),
+            "an always-on GPU backend WITH a unit is exactly what free_gpu stops"
+        );
+
+        // CONTROL 1: a host with no always-on GPU unit is not blocked.
+        let mut no_unit = catalogue.clone();
+        no_unit.insert(
+            "ollama".into(),
+            Backend { unit: None, ..always_on_gpu.clone() },
+        );
+        assert!(free_gpu_would_stop_an_always_on_backend(&mk(no_unit)).is_none());
+
+        // CONTROL 2: an explicit operator acknowledgement clears it.
+        std::env::set_var(FREE_GPU_ACK_ENV, "1");
+        assert!(free_gpu_would_stop_an_always_on_backend(&mk(catalogue.clone())).is_none());
+        // ...and only a real value does; "0"/blank must NOT acknowledge.
+        std::env::set_var(FREE_GPU_ACK_ENV, "0");
+        assert!(free_gpu_would_stop_an_always_on_backend(&mk(catalogue.clone())).is_some());
+        std::env::remove_var(FREE_GPU_ACK_ENV);
+    }
+
+    /// RVXR-01: the LOAD precondition must actually consult the free_gpu gate —
+    /// not merely have one available. Testing the gate in isolation left this
+    /// wiring undefended (a mutant that ignored it survived).
+    #[tokio::test]
+    #[serial]
+    async fn the_load_precondition_consults_the_free_gpu_gate() {
+        use crate::models::backends::Hardware;
+        use std::collections::HashMap;
+
+        let coder_backend = Backend {
+            name: "llama-gpu".into(),
+            url: "http://localhost:8082".into(),
+            hardware: Hardware::Gpu,
+            kind: BackendKind::LlamaServer,
+            unit: None,
+            always_on: false,
+            idle_stop_secs: 600,
+            launch: None,
+            api_key_env: None,
+        };
+        let assistant_engine = Backend {
+            name: "ollama".into(),
+            url: "http://localhost:11434".into(),
+            hardware: Hardware::Gpu,
+            kind: BackendKind::Ollama,
+            unit: Some("ollama.service".into()),
+            always_on: true,
+            idle_stop_secs: 0,
+            launch: None,
+            api_key_env: None,
+        };
+        let dir = std::env::temp_dir().join(format!("rvxr01-precond-{}", std::process::id()));
+        let build = |cat: HashMap<String, Backend>| {
+            let mut reg = ModelRegistry::new_with_backends(
+                dir.join("registry.json"),
+                dir.join("local"),
+                dir.join("archive"),
+                vec![],
+                cat,
+            );
+            assert!(reg.register_remote_api_model("a-coder", "test", "llama-gpu"));
+            Arc::new(Mutex::new(reg))
+        };
+        let routing = Arc::new(Mutex::new(crate::serving::profile::RoutingMap::empty()));
+
+        std::env::remove_var(FREE_GPU_ACK_ENV);
+
+        // CONTROL: with no always-on GPU unit to clobber, the precondition passes.
+        let mut safe = HashMap::new();
+        safe.insert(coder_backend.name.clone(), coder_backend.clone());
+        assert!(
+            model_has_on_demand_backend(&build(safe), &routing, "a-coder").await,
+            "CONTROL: an on-demand coder is loadable when nothing would be stopped"
+        );
+
+        // THE GATE: add the always-on assistant engine and the SAME coder is now
+        // refused, because starting it would `systemctl stop ollama.service`.
+        let mut hazardous = HashMap::new();
+        hazardous.insert(coder_backend.name.clone(), coder_backend.clone());
+        hazardous.insert(assistant_engine.name.clone(), assistant_engine.clone());
+        assert!(
+            !model_has_on_demand_backend(&build(hazardous), &routing, "a-coder").await,
+            "the precondition must consult the free_gpu gate, not just the backend kind"
+        );
+        std::env::remove_var(FREE_GPU_ACK_ENV);
+    }
+
     #[test]
     fn the_stop_gate_resolves_the_same_backend_arch_aware_start_would() {
         use crate::models::backends::Hardware;

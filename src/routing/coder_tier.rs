@@ -487,6 +487,13 @@ impl CoderTier {
                         .await;
                 });
             } else {
+                // Nothing was spawned, so nothing will ever decrement — undo the
+                // increment here or the counter leaks and blocks every future
+                // load forever.
+                {
+                    let mut inner = self.lock();
+                    inner.teardowns_inflight = inner.teardowns_inflight.saturating_sub(1);
+                }
                 warn!(
                     "coder tier: no runtime on the eviction path; teardown deferred to the tick"
                 );
@@ -588,6 +595,21 @@ impl CoderTier {
     #[cfg(test)]
     fn set_last_assistant_for_test(&self, unix: i64) {
         self.last_assistant_unix.store(unix, Ordering::Relaxed);
+    }
+
+    /// Test-only: how many teardown tasks the tier believes are running.
+    #[cfg(test)]
+    fn teardowns_inflight(&self) -> usize {
+        self.lock().teardowns_inflight
+    }
+
+    /// Test-only: install a phase directly, so a path can be exercised without a
+    /// runtime (the no-runtime eviction path cannot use the async setup).
+    #[cfg(test)]
+    fn set_phase_for_test(&self, phase: Phase, model: Option<String>) {
+        let mut inner = self.lock();
+        inner.phase = phase;
+        inner.model = model;
     }
 
     /// Test-only: the current eviction generation.
@@ -790,7 +812,18 @@ impl CoderTier {
                 if n > 0 {
                     self.interrupts.fetch_add(n, Ordering::Relaxed);
                 }
-                self.run_eviction(reason, my_evict_epoch).await;
+                // DETACHED, exactly like the hot path. Awaiting it inline wedged
+                // the whole tick loop behind a stuck `stop_coder`, so the very
+                // tick that would have force-resolved it could never run — the
+                // budget backstop was unreachable for tick-originated evictions.
+                let me = self.clone();
+                if tokio::runtime::Handle::try_current().is_ok() {
+                    tokio::spawn(async move {
+                        me.run_eviction(reason, my_evict_epoch).await;
+                    });
+                } else {
+                    self.run_eviction(reason, my_evict_epoch).await;
+                }
             }
             Decision::ForceResolveEvict => {
                 // Take ownership of the abandonment FIRST: bumping `evict_epoch`
@@ -835,12 +868,12 @@ impl CoderTier {
     /// counter, and this task would then capture the NEW value and consider
     /// itself current. Capturing at request time closes that window.
     pub async fn run_eviction(self: &Arc<Self>, reason: EvictReason, my_evict_epoch: u64) {
+        // RAII, not a trailing statement: the decrement must survive an early
+        // return AND a panic inside the teardown. A leaked count would block every
+        // future load permanently, which is a silent, unrecoverable disabling of
+        // the feature rather than a visible failure.
+        let _guard = TeardownGuard { tier: self.clone() };
         self.run_eviction_inner(reason, my_evict_epoch).await;
-        // ALWAYS, on every exit path: only once this decrements can a new load
-        // begin, which is what stops a late `stop_coder` from hitting a newer
-        // cycle's coder.
-        let mut inner = self.lock();
-        inner.teardowns_inflight = inner.teardowns_inflight.saturating_sub(1);
     }
 
     async fn run_eviction_inner(self: &Arc<Self>, reason: EvictReason, my_evict_epoch: u64) {
@@ -882,6 +915,20 @@ impl CoderTier {
             until: now.saturating_add(self.cfg.cooldown_secs),
         };
         info!(reason = ?reason, "coder tier: window returned to assistant mode");
+    }
+}
+
+/// Decrements [`Inner::teardowns_inflight`] on drop — on the normal path, on an
+/// early return, and on unwind. Only once it does can a new load begin, which is
+/// what makes a late `stop_coder` from an abandoned teardown harmless.
+struct TeardownGuard {
+    tier: Arc<CoderTier>,
+}
+
+impl Drop for TeardownGuard {
+    fn drop(&mut self) {
+        let mut inner = self.tier.lock();
+        inner.teardowns_inflight = inner.teardowns_inflight.saturating_sub(1);
     }
 }
 

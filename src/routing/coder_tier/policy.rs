@@ -317,7 +317,9 @@ pub fn can_admit(obs: &Observation, cfg: &CoderTierConfig) -> bool {
     }
     // Loading is the risky direction: require the pressure sensor to have
     // actually reported, rather than admitting on its silence.
-    obs.commit_ratio.is_some_and(|r| r.is_finite())
+    // Finite AND non-negative: a negative ratio is a corrupt sensor, and it is
+    // never "> max", so a finiteness-only check would admit on it.
+    obs.commit_ratio.is_some_and(|r| r.is_finite() && r >= 0.0)
 }
 
 /// Is the box quiet enough to consider borrowing the window?
@@ -653,6 +655,12 @@ mod tests {
         obs.commit_ratio = Some(f64::NAN);
         assert_eq!(pressure_reason(&obs, &cfg), None);
         assert!(!can_admit(&obs, &cfg));
+
+        // A NEGATIVE ratio is corrupt too, and it is never "> max" — so a
+        // finiteness-only admission check would wave it straight through.
+        obs.commit_ratio = Some(-0.5);
+        assert_eq!(pressure_reason(&obs, &cfg), None);
+        assert!(!can_admit(&obs, &cfg), "a negative ratio must not admit a load");
     }
 
     #[test]
