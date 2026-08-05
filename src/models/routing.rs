@@ -327,14 +327,36 @@ pub const FREE_GPU_ACK_ENV: &str = "CHORD_CODER_TIER_ACK_FREE_GPU_SAFE";
 /// backends and then setting [`FREE_GPU_ACK_ENV`] — a deliberate acknowledgement,
 /// never an inference.
 pub fn free_gpu_would_stop_an_always_on_backend(reg: &ModelRegistry) -> Option<String> {
-    if std::env::var(FREE_GPU_ACK_ENV)
-        .ok()
-        .map(|v| {
+    let acked = free_gpu_ack_from(std::env::var(FREE_GPU_ACK_ENV).ok().as_deref());
+    free_gpu_would_stop_an_always_on_backend_with(acked, reg)
+}
+
+/// Pure parser for the acknowledgement value. A missing, blank, or explicitly
+/// false-y value does NOT acknowledge.
+///
+/// Factored out — like `backends::parse_arch_denylist` — so tests exercise it
+/// WITHOUT mutating the shared process env. `std::env::set_var` races every
+/// concurrent `getenv` in the process: it reallocates `environ`, so another test
+/// thread calling `tempfile::tempdir()` (which reads `TMPDIR`) can read freed
+/// memory. That is not theoretical — env-mutating tests added here broke an
+/// unrelated `sweep_status::log` test on the build host while passing locally.
+pub fn free_gpu_ack_from(raw: Option<&str>) -> bool {
+    match raw {
+        Some(v) => {
             let v = v.trim().to_ascii_lowercase();
             !v.is_empty() && !matches!(v.as_str(), "0" | "false" | "no" | "off")
-        })
-        .unwrap_or(false)
-    {
+        }
+        None => false,
+    }
+}
+
+/// Pure core of [`free_gpu_would_stop_an_always_on_backend`], with the
+/// acknowledgement passed in explicitly so it is testable with no global env.
+pub fn free_gpu_would_stop_an_always_on_backend_with(
+    acked: bool,
+    reg: &ModelRegistry,
+) -> Option<String> {
+    if acked {
         return None;
     }
     reg.backends()
@@ -360,8 +382,9 @@ pub async fn model_has_on_demand_backend(
             routing.chosen_backend(&model_id),
         )
     };
+    let acked = free_gpu_ack_from(std::env::var(FREE_GPU_ACK_ENV).ok().as_deref());
     let reg = registry.lock().await;
-    if let Some(victim) = free_gpu_would_stop_an_always_on_backend(&reg) {
+    if let Some(victim) = free_gpu_would_stop_an_always_on_backend_with(acked, &reg) {
         tracing::warn!(
             would_stop = %victim,
             ack_env = FREE_GPU_ACK_ENV,
@@ -488,8 +511,10 @@ mod tests {
     /// RVXR-01: the tier must refuse to load while starting an on-demand GPU
     /// backend would `systemctl stop` the always-on assistant engine. Verified
     /// against terminus-rs 1.3.1 `free_gpu`, which has no `always_on` check.
+    ///
+    /// Uses the PURE cores — no `std::env::set_var` anywhere. See
+    /// `free_gpu_ack_from` for why that matters.
     #[test]
-    #[serial]
     fn loading_is_refused_while_free_gpu_would_stop_the_assistant_engine() {
         use crate::models::backends::Hardware;
         use std::collections::HashMap;
@@ -518,10 +543,9 @@ mod tests {
             )
         };
 
-        std::env::remove_var(FREE_GPU_ACK_ENV);
         let reg = mk(catalogue.clone());
         assert_eq!(
-            free_gpu_would_stop_an_always_on_backend(&reg).as_deref(),
+            free_gpu_would_stop_an_always_on_backend_with(false, &reg).as_deref(),
             Some("ollama"),
             "an always-on GPU backend WITH a unit is exactly what free_gpu stops"
         );
@@ -532,22 +556,36 @@ mod tests {
             "ollama".into(),
             Backend { unit: None, ..always_on_gpu.clone() },
         );
-        assert!(free_gpu_would_stop_an_always_on_backend(&mk(no_unit)).is_none());
+        assert!(
+            free_gpu_would_stop_an_always_on_backend_with(false, &mk(no_unit)).is_none()
+        );
 
         // CONTROL 2: an explicit operator acknowledgement clears it.
-        std::env::set_var(FREE_GPU_ACK_ENV, "1");
-        assert!(free_gpu_would_stop_an_always_on_backend(&mk(catalogue.clone())).is_none());
-        // ...and only a real value does; "0"/blank must NOT acknowledge.
-        std::env::set_var(FREE_GPU_ACK_ENV, "0");
-        assert!(free_gpu_would_stop_an_always_on_backend(&mk(catalogue.clone())).is_some());
-        std::env::remove_var(FREE_GPU_ACK_ENV);
+        assert!(
+            free_gpu_would_stop_an_always_on_backend_with(true, &mk(catalogue.clone())).is_none()
+        );
+    }
+
+    #[test]
+    fn only_an_explicit_value_acknowledges_the_free_gpu_hazard() {
+        assert!(free_gpu_ack_from(Some("1")));
+        assert!(free_gpu_ack_from(Some("true")));
+        assert!(free_gpu_ack_from(Some(" yes ")));
+        // Absent, blank, or explicitly false-y must NOT acknowledge a hazard that
+        // can stop the assistant's engine.
+        assert!(!free_gpu_ack_from(None));
+        assert!(!free_gpu_ack_from(Some("")));
+        assert!(!free_gpu_ack_from(Some("   ")));
+        assert!(!free_gpu_ack_from(Some("0")));
+        assert!(!free_gpu_ack_from(Some("false")));
+        assert!(!free_gpu_ack_from(Some("off")));
+        assert!(!free_gpu_ack_from(Some("no")));
     }
 
     /// RVXR-01: the LOAD precondition must actually consult the free_gpu gate —
     /// not merely have one available. Testing the gate in isolation left this
     /// wiring undefended (a mutant that ignored it survived).
     #[tokio::test]
-    #[serial]
     async fn the_load_precondition_consults_the_free_gpu_gate() {
         use crate::models::backends::Hardware;
         use std::collections::HashMap;
@@ -588,8 +626,6 @@ mod tests {
         };
         let routing = Arc::new(Mutex::new(crate::serving::profile::RoutingMap::empty()));
 
-        std::env::remove_var(FREE_GPU_ACK_ENV);
-
         // CONTROL: with no always-on GPU unit to clobber, the precondition passes.
         let mut safe = HashMap::new();
         safe.insert(coder_backend.name.clone(), coder_backend.clone());
@@ -607,7 +643,6 @@ mod tests {
             !model_has_on_demand_backend(&build(hazardous), &routing, "a-coder").await,
             "the precondition must consult the free_gpu gate, not just the backend kind"
         );
-        std::env::remove_var(FREE_GPU_ACK_ENV);
     }
 
     #[test]
