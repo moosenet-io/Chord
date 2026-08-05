@@ -435,14 +435,6 @@ mod tests {
         );
     }
 
-    /// RVXR-01: STOP must resolve the SAME backend START did.
-    ///
-    /// `resolve_and_ensure` starts the coder through arch-aware selection, so a
-    /// plain `backend_for` here would resolve a DIFFERENT backend whenever the
-    /// registry tag is arch-excluded — stopping something unrelated while the
-    /// real coder stays resident and holding memory. Raised by the review panel;
-    /// this is the fixture where the two resolutions actually diverge (an empty
-    /// exclusion set makes them agree, which is why the first test missed it).
     /// CHRD #112: the fix now lives UPSTREAM, so assert the upstream contract
     /// against the `terminus-rs` actually linked into THIS build.
     ///
@@ -569,6 +561,14 @@ mod tests {
         );
     }
 
+    /// RVXR-01: STOP must resolve the SAME backend START did.
+    ///
+    /// `resolve_and_ensure` starts the coder through arch-aware selection, so a
+    /// plain `backend_for` here would resolve a DIFFERENT backend whenever the
+    /// registry tag is arch-excluded — stopping something unrelated while the
+    /// real coder stays resident and holding memory. Raised by the review panel;
+    /// this is the fixture where the two resolutions actually diverge (an empty
+    /// exclusion set makes them agree, which is why the first test missed it).
     #[test]
     fn the_stop_gate_resolves_the_same_backend_arch_aware_start_would() {
         use crate::models::backends::Hardware;
