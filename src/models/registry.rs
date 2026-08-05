@@ -832,17 +832,6 @@ impl ModelRegistry {
         }
     }
 
-    /// The on-disk path this registry serializes to.
-    ///
-    /// Added for the RVXR-01 `free_gpu` guard, which had to read the same FILE
-    /// terminus-rs re-reads rather than any in-memory snapshot. That guard is gone
-    /// (CHRD #112 fixed `free_gpu` upstream), but the accessor is kept: the fact
-    /// that terminus-rs consumes this file, not our in-memory state, is a real
-    /// property of the boundary and the next guard-shaped question will need it.
-    pub fn path(&self) -> &std::path::Path {
-        &self.path
-    }
-
     /// Insert or replace a backend definition.
     pub fn upsert_backend(&mut self, b: Backend) {
         self.backends.insert(b.name.clone(), b);
