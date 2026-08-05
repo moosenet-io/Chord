@@ -48,6 +48,12 @@ fn to_resolved(
         }
         .to_string(),
         always_on: b.always_on,
+        // terminus-rs >= 1.3.2: `ResolvedBackend` carries the backend's
+        // api-key ENV VAR NAME (never a value), so the lower crate can read the
+        // key fresh at its own call boundary exactly as `resolve_and_ensure`
+        // does below. Threading Chord's own `api_key_env` through keeps the two
+        // sides naming the same variable instead of silently disagreeing.
+        api_key_env: b.api_key_env.clone(),
         unit: b.unit.clone(),
         launch: b.launch.as_ref().map(|l| TLaunch {
             bin: l.bin.clone(),
