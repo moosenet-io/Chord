@@ -832,13 +832,6 @@ impl ModelRegistry {
         }
     }
 
-    /// The on-disk path this registry serializes to. Needed because terminus-rs's
-    /// `free_gpu` re-reads THIS FILE rather than any in-memory state, so a guard
-    /// against it must consult the same source of truth.
-    pub fn path(&self) -> &std::path::Path {
-        &self.path
-    }
-
     /// Insert or replace a backend definition.
     pub fn upsert_backend(&mut self, b: Backend) {
         self.backends.insert(b.name.clone(), b);
