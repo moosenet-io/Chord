@@ -76,6 +76,13 @@ pub struct CoderTierConfig {
     /// swap is fine, while a host swapping *right now* is in trouble regardless of
     /// the absolute figure. This moved during the real incident.
     pub max_swap_growth_gb: f64,
+    /// `CHORD_CODER_TIER_MAX_LEASES` (default 8) — hard cap on concurrent review
+    /// leases.
+    ///
+    /// The user hot path cancels EVERY live lease, so an unbounded lease set puts
+    /// unbounded work on the request that must be fastest. A cap makes that work
+    /// O(1) in the worst case. Eight is comfortably above any real review panel.
+    pub max_leases: usize,
     /// `CHORD_CODER_TIER_EVICT_BUDGET_SECS` (default 60) — if an eviction task
     /// dies or wedges, the tick force-resolves the phase so the tier cannot stick.
     pub evict_budget_secs: u64,
@@ -93,6 +100,7 @@ impl Default for CoderTierConfig {
             footprint_factor: 1.8,
             max_commit_ratio: 0.85,
             max_swap_growth_gb: 0.5,
+            max_leases: 8,
             evict_budget_secs: 60,
         }
     }
@@ -152,6 +160,7 @@ impl CoderTierConfig {
                 "CHORD_CODER_TIER_MAX_SWAP_GROWTH_GB",
                 d.max_swap_growth_gb,
             ),
+            max_leases: env_u64("CHORD_CODER_TIER_MAX_LEASES", d.max_leases as u64).max(1) as usize,
             evict_budget_secs: env_u64("CHORD_CODER_TIER_EVICT_BUDGET_SECS", d.evict_budget_secs),
         }
     }
@@ -712,6 +721,7 @@ mod tests {
         assert!(d.gtt_margin_gb > 0.0);
         assert!(d.max_commit_ratio > 0.0 && d.max_commit_ratio < 1.0);
         assert!(d.max_swap_growth_gb > 0.0);
+        assert!(d.max_leases > 0, "an unbounded lease set puts unbounded work on the user path");
         assert!(d.evict_budget_secs > 0);
     }
 }

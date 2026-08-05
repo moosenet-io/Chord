@@ -511,15 +511,24 @@ impl CoderTier {
         if !self.enabled.load(Ordering::Relaxed) {
             return None;
         }
+        // Mint the credential and the token BEFORE taking the lock. Both allocate
+        // (and one draws randomness), and the user hot path contends for this
+        // same mutex — the critical section must stay bounded field updates.
+        let secret = uuid::Uuid::new_v4().to_string();
+        let token = CancelToken::new();
         let mut inner = self.lock();
         if inner.phase != Phase::Ready {
             return None;
         }
-        // An unguessable, single-use credential. It is what the review dispatch
-        // puts in the `x-chord-coder-lease` header, and the ONLY thing that makes
-        // a request count as coder traffic.
-        let secret = uuid::Uuid::new_v4().to_string();
-        let token = CancelToken::new();
+        // Bounded: the user hot path cancels EVERY live lease, so an unbounded
+        // lease set would put unbounded work on the request that must be fastest.
+        if inner.leases.len() >= self.cfg.max_leases {
+            warn!(
+                max = self.cfg.max_leases,
+                "coder tier: refusing a lease — concurrent lease cap reached"
+            );
+            return None;
+        }
         inner.leases.insert(secret.clone(), token.clone());
         let epoch = inner.epoch;
         let model = inner.model.clone();
@@ -637,7 +646,7 @@ impl CoderTier {
         let phase = self.phase();
 
         // Only pay for resolution/sizing when the phase could actually act on it.
-        let (coder_resolved, coder_gb, model) = match phase {
+        let (coder_resolved, coder_gb, _model) = match phase {
             Phase::Arming { .. } => match self.env.resolve_coder(&self.cfg.alias).await {
                 Some(m) => {
                     let gb = self.env.model_size_gb(&m).await;
@@ -703,93 +712,29 @@ impl CoderTier {
                 }
             }
             Decision::Load => {
-                let Some(model) = model else { return };
-                // PRECONDITION: never take the window on the assistant's own
-                // engine. Checked before the phase moves, so a refusal is a clean
-                // no-op rather than a load that must be unwound.
-                if !self.env.coder_is_on_demand(&model).await {
-                    warn!(
-                        model = %model,
-                        "coder tier: resolved coder would run on the always-on assistant engine — refusing"
-                    );
-                    let mut inner = self.lock();
-                    if inner.phase == phase {
-                        inner.phase = Phase::Cooldown {
-                            until: now.saturating_add(self.cfg.cooldown_secs),
-                        };
-                    }
-                    return;
-                }
+                // DETACHED, for the same reason evictions are. `start_coder` can
+                // wedge, and `tick_loop` awaits `tick` serially — so an inline
+                // load blocks every later tick, including the one that would
+                // force-resolve an eviction that landed on top of it. That made
+                // the eviction budget unreachable through the load branch, which
+                // is the identical structural defect already fixed for evictions.
+                // Claim the phase SYNCHRONOUSLY before dispatching. The work is
+                // detached, but "a load is underway" must be true the moment we
+                // decide it, or a later tick could decide `Load` again and two
+                // loads would race.
                 {
                     let mut inner = self.lock();
                     if inner.phase != phase {
                         return; // pre-empted between decide and act
                     }
                     inner.phase = Phase::Loading;
-                    inner.model = Some(model.clone());
                 }
-                let started = self.env.start_coder(&model).await;
-                // ONE lock acquisition decides everything about this load.
-                //
-                // This used to be two — "did I lose the race?" and then, after
-                // dropping and retaking the lock, "am I still Loading?" — which
-                // left a window between them that no test could force, and a
-                // mutant that deleted the second check survived precisely because
-                // the window is unreachable from a test seam. The fix is to remove
-                // the window rather than to write a test that cannot see it.
-                // NOTE: no logging inside this critical section. `tracing` macros
-                // can block on a synchronous subscriber's writer, and an incoming
-                // user acquires this same mutex on the hot path — so the section is
-                // strictly bounded field updates, and the logs happen after.
-                let outcome = {
-                    let mut inner = self.lock();
-                    if inner.phase == Phase::Loading {
-                        match &started {
-                            Ok(()) => {
-                                inner.phase = Phase::Ready;
-                                self.loads.fetch_add(1, Ordering::Relaxed);
-                                Some(true)
-                            }
-                            Err(_) => {
-                                inner.phase = Phase::Cooldown {
-                                    until: now.saturating_add(self.cfg.cooldown_secs),
-                                };
-                                inner.model = None;
-                                Some(false)
-                            }
-                        }
-                    } else {
-                        None
-                    }
-                };
-                match (&outcome, &started) {
-                    (Some(true), _) => {
-                        info!(model = %model, "coder tier: coder loaded into the reaped window")
-                    }
-                    (Some(false), Err(e)) => {
-                        warn!(error = %e, "coder tier: coder load failed — cooling down")
-                    }
-                    _ => {}
-                }
-                let lost_the_race = outcome.is_none();
-                if lost_the_race && started.is_ok() {
-                    // A user arrived DURING the load and the eviction task has
-                    // already run. Declining to install `Ready` is NOT enough: the
-                    // eviction's `stop_coder` may have run BEFORE this
-                    // `start_coder` actually launched the backend, in which case
-                    // the coder is now running with the tier recording
-                    // `model: None` — borrowed memory nobody will ever give back.
-                    // So compensate, exactly as the resident set compensates for a
-                    // warm request it could not un-issue. Idempotent: stopping an
-                    // already-stopped backend is a no-op.
-                    warn!(
-                        model = %model,
-                        "coder tier: load completed after losing the race — compensating with a stop"
-                    );
-                    if let Err(e) = self.env.stop_coder(&model).await {
-                        warn!(error = %e, model = %model,
-                            "coder tier: compensating stop failed");
-                    }
+                let me = self.clone();
+                let fut = async move { me.run_load(now).await };
+                if tokio::runtime::Handle::try_current().is_ok() {
+                    tokio::spawn(fut);
+                } else {
+                    fut.await;
                 }
             }
             Decision::Evict(reason) => {
@@ -847,6 +792,89 @@ impl CoderTier {
                 inner.phase = Phase::Cooldown {
                     until: now.saturating_add(self.cfg.cooldown_secs),
                 };
+            }
+        }
+    }
+
+    /// The (potentially slow) load, run DETACHED so it can never block the tick
+    /// loop. Re-checks the phase it was dispatched under before doing anything,
+    /// so a user who arrived in between wins.
+    async fn run_load(self: &Arc<Self>, now: u64) {
+        // The caller has already installed `Loading`. Every early exit below must
+        // therefore leave a resting phase behind, never `Loading`.
+        let cool_down = |me: &Arc<Self>| {
+            let mut inner = me.lock();
+            if inner.phase == Phase::Loading {
+                inner.model = None;
+                inner.phase = Phase::Cooldown {
+                    until: now.saturating_add(me.cfg.cooldown_secs),
+                };
+            }
+        };
+        let Some(model) = self.env.resolve_coder(&self.cfg.alias).await else {
+            cool_down(self);
+            return;
+        };
+        // PRECONDITION: never take the window on the assistant's own engine.
+        if !self.env.coder_is_on_demand(&model).await {
+            warn!(
+                model = %model,
+                "coder tier: resolved coder would run on the always-on assistant engine — refusing"
+            );
+            cool_down(self);
+            return;
+        }
+        {
+            let mut inner = self.lock();
+            if inner.phase != Phase::Loading {
+                return; // a user arrived while we were resolving
+            }
+            inner.model = Some(model.clone());
+        }
+        let started = self.env.start_coder(&model).await;
+        // NOTE: no logging inside this critical section. `tracing` macros can
+        // block on a synchronous subscriber's writer, and an incoming user
+        // acquires this same mutex on the hot path.
+        let outcome = {
+            let mut inner = self.lock();
+            if inner.phase == Phase::Loading {
+                match &started {
+                    Ok(()) => {
+                        inner.phase = Phase::Ready;
+                        self.loads.fetch_add(1, Ordering::Relaxed);
+                        Some(true)
+                    }
+                    Err(_) => {
+                        inner.phase = Phase::Cooldown {
+                            until: now.saturating_add(self.cfg.cooldown_secs),
+                        };
+                        inner.model = None;
+                        Some(false)
+                    }
+                }
+            } else {
+                None
+            }
+        };
+        match (&outcome, &started) {
+            (Some(true), _) => {
+                info!(model = %model, "coder tier: coder loaded into the reaped window")
+            }
+            (Some(false), Err(e)) => {
+                warn!(error = %e, "coder tier: coder load failed — cooling down")
+            }
+            _ => {}
+        }
+        if outcome.is_none() && started.is_ok() {
+            // Lost the race: the eviction's `stop_coder` may have run BEFORE this
+            // start actually launched, leaving the coder running with the tier
+            // recording `model: None`. Compensate — idempotent.
+            warn!(
+                model = %model,
+                "coder tier: load completed after losing the race — compensating with a stop"
+            );
+            if let Err(e) = self.env.stop_coder(&model).await {
+                warn!(error = %e, model = %model, "coder tier: compensating stop failed");
             }
         }
     }

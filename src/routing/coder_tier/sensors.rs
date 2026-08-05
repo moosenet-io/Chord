@@ -284,7 +284,14 @@ pub fn parse_meminfo(raw: &str) -> Option<CommitReading> {
     // So their ABSENCE is a sensor failure, not evidence of zero usage, and
     // treating it as zero would authorise a load with no readable swap-pressure
     // signal. Fail closed.
-    let swap_used_gb = kb_to_gb((swap_total_kb? - swap_free_kb?).max(0.0));
+    // `SwapFree > SwapTotal` is impossible on a healthy kernel, so it is a
+    // CORRUPT reading, not "zero used". Clamping it to zero would report the
+    // most reassuring possible answer for the most broken possible sensor.
+    let (swap_total, swap_free) = (swap_total_kb?, swap_free_kb?);
+    if swap_free > swap_total {
+        return None;
+    }
+    let swap_used_gb = kb_to_gb(swap_total - swap_free);
     Some(CommitReading {
         committed_gb,
         commit_limit_gb,
@@ -394,6 +401,16 @@ Committed_AS:    41943040 kB
         assert!(
             parse_meminfo(missing).is_none(),
             "missing swap fields must fail closed, not read as zero"
+        );
+
+        // SwapFree > SwapTotal is impossible on a healthy kernel — a corrupt
+        // reading, not zero used. Clamping would hand back the most reassuring
+        // answer for the most broken sensor.
+        let corrupt = "CommitLimit: 90748446 kB\nCommitted_AS: 41943040 kB\n\
+                       SwapTotal: 100 kB\nSwapFree: 200 kB\n";
+        assert!(
+            parse_meminfo(corrupt).is_none(),
+            "SwapFree > SwapTotal must fail closed"
         );
     }
 

@@ -153,15 +153,35 @@ fn cfg_on() -> CoderTierConfig {
     }
 }
 
+/// Wait (bounded) for the tier to leave the transient `Loading` phase.
+///
+/// The load runs DETACHED — an inline load blocks the tick loop and makes the
+/// eviction budget unreachable through the load branch — so a tick that decides
+/// `Load` returns before the load has happened. Tests must settle, not assume.
+async fn settle(tier: &Arc<CoderTier>) {
+    for _ in 0..5_000 {
+        if !matches!(tier.phase(), Phase::Loading) {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Tick, then wait for any detached load it dispatched to settle.
+async fn tick_settled(tier: &Arc<CoderTier>, now: u64, idle: u64, inflight: bool) {
+    tier.tick(now, idle, inflight).await;
+    settle(tier).await;
+}
+
 /// Drive the tier to `Ready` deterministically. The two intermediate assertions
 /// are load-bearing: if the fixture ever stopped ARMING first, or stopped
 /// reaching Ready, every eviction test below would pass for the wrong reason.
 async fn ready_tier() -> (Arc<CoderTier>, Arc<FakeEnv>, Arc<Semaphore>, mpsc::UnboundedReceiver<()>) {
     let h = fake(Some("a-coder"), Some(17.3), Some(50.0));
     let tier = CoderTier::new(cfg_on(), h.env.clone());
-    tier.tick(1_000, 5_000, false).await; // arms only
+    tick_settled(&tier, 1_000, 5_000, false).await; // arms only
     assert!(matches!(tier.phase(), Phase::Arming { .. }));
-    tier.tick(2_000, 5_000, false).await; // confirm elapsed → load
+    tick_settled(&tier, 2_000, 5_000, false).await; // confirm elapsed → load
     assert_eq!(tier.phase(), Phase::Ready);
     (tier, h.env, h.stop_gate, h.stop_entered)
 }
@@ -174,8 +194,8 @@ async fn ready_tier() -> (Arc<CoderTier>, Arc<FakeEnv>, Arc<Semaphore>, mpsc::Un
 async fn assistant_request_returns_without_waiting_for_teardown() {
     let h = fake(Some("a-coder"), Some(17.3), Some(50.0));
     let tier = CoderTier::new(cfg_on(), h.env.clone());
-    tier.tick(1_000, 5_000, false).await;
-    tier.tick(2_000, 5_000, false).await;
+    tick_settled(&tier, 1_000, 5_000, false).await;
+    tick_settled(&tier, 2_000, 5_000, false).await;
     assert_eq!(tier.phase(), Phase::Ready);
 
     // CLOSE the stop gate: any teardown that starts will block inside the seam
@@ -384,9 +404,9 @@ async fn a_lease_is_never_issued_outside_ready() {
     let h = fake(Some("a-coder"), Some(17.3), Some(50.0));
     let tier = CoderTier::new(cfg_on(), h.env.clone());
     assert!(tier.try_acquire_lease().is_none(), "assistant phase");
-    tier.tick(1_000, 5_000, false).await;
+    tick_settled(&tier, 1_000, 5_000, false).await;
     assert!(tier.try_acquire_lease().is_none(), "arming phase");
-    tier.tick(2_000, 5_000, false).await;
+    tick_settled(&tier, 2_000, 5_000, false).await;
     assert!(tier.try_acquire_lease().is_some(), "ready phase");
     tier.note_assistant_request();
     assert!(tier.try_acquire_lease().is_none(), "evicting phase");
@@ -399,7 +419,7 @@ async fn a_user_arriving_mid_load_never_lets_the_coder_reach_ready() {
     // resident with nobody left to evict it.
     let h = fake(Some("a-coder"), Some(17.3), Some(50.0));
     let tier = CoderTier::new(cfg_on(), h.env.clone());
-    tier.tick(1_000, 5_000, false).await;
+    tick_settled(&tier, 1_000, 5_000, false).await;
     assert!(matches!(tier.phase(), Phase::Arming { .. }));
 
     // Park the load inside the seam.
@@ -472,8 +492,8 @@ async fn a_force_resolved_eviction_still_restores_assistant_capacity() {
     // restoring anything, leaving the assistant permanently degraded.
     let h = fake(Some("a-coder"), Some(17.3), Some(50.0));
     let tier = CoderTier::new(cfg_on(), h.env.clone());
-    tier.tick(1_000, 5_000, false).await;
-    tier.tick(2_000, 5_000, false).await;
+    tick_settled(&tier, 1_000, 5_000, false).await;
+    tick_settled(&tier, 2_000, 5_000, false).await;
     assert_eq!(tier.phase(), Phase::Ready);
 
     // Wedge the teardown inside the seam, forever.
@@ -506,22 +526,22 @@ async fn an_abandoned_teardown_cannot_clobber_a_newer_cycle() {
     let cfg = cfg_on();
     let t0 = crate::gpu_exclusive::now_epoch();
 
-    tier.tick(t0, 5_000, false).await;
-    tier.tick(t0 + 200, 5_000, false).await;
+    tick_settled(&tier, t0, 5_000, false).await;
+    tick_settled(&tier, t0 + 200, 5_000, false).await;
     assert_eq!(tier.phase(), Phase::Ready);
 
     // Wedge the teardown, then force-resolve past its budget so it is abandoned.
     h.stop_gate.acquire_many(OPEN as u32).await.unwrap().forget();
     tier.note_assistant_request();
     assert!(matches!(tier.phase(), Phase::Evicting { .. }));
-    tier.tick(t0 + cfg.evict_budget_secs + 1, 5_000, false).await;
+    tick_settled(&tier, t0 + cfg.evict_budget_secs + 1, 5_000, false).await;
     assert!(matches!(tier.phase(), Phase::Cooldown { .. }));
 
     // A WHOLE NEW CYCLE: cooldown expires, re-arm, re-load.
     let after_cd = t0 + cfg.evict_budget_secs + cfg.cooldown_secs + 10;
-    tier.tick(after_cd, 5_000, false).await; // Rest
-    tier.tick(after_cd + 10, 5_000, false).await; // Arm
-    tier.tick(after_cd + 10 + cfg.arm_confirm_secs, 5_000, false).await; // Load
+    tick_settled(&tier, after_cd, 5_000, false).await; // Rest
+    tick_settled(&tier, after_cd + 10, 5_000, false).await; // Arm
+    tick_settled(&tier, after_cd + 10 + cfg.arm_confirm_secs, 5_000, false).await; // Load
     assert_eq!(
         tier.phase(),
         Phase::Ready,
@@ -620,8 +640,8 @@ async fn the_tier_refuses_to_load_onto_the_always_on_assistant_engine() {
         .coder_on_demand
         .store(false, std::sync::atomic::Ordering::SeqCst);
     let tier = CoderTier::new(cfg_on(), h.env.clone());
-    tier.tick(1_000, 5_000, false).await;
-    tier.tick(2_000, 5_000, false).await;
+    tick_settled(&tier, 1_000, 5_000, false).await;
+    tick_settled(&tier, 2_000, 5_000, false).await;
 
     assert_ne!(tier.phase(), Phase::Ready);
     assert!(
@@ -632,8 +652,8 @@ async fn the_tier_refuses_to_load_onto_the_always_on_assistant_engine() {
     // CONTROL: the identical fixture loads once the backend is on-demand.
     let h2 = fake(Some("a-coder"), Some(17.3), Some(50.0));
     let tier2 = CoderTier::new(cfg_on(), h2.env.clone());
-    tier2.tick(1_000, 5_000, false).await;
-    tier2.tick(2_000, 5_000, false).await;
+    tick_settled(&tier2, 1_000, 5_000, false).await;
+    tick_settled(&tier2, 2_000, 5_000, false).await;
     assert_eq!(tier2.phase(), Phase::Ready);
 }
 
@@ -669,6 +689,96 @@ async fn the_tick_idle_age_comes_from_the_tiers_own_stamp() {
         "the hot-path hook must actually stamp"
     );
     drop(lease);
+}
+
+#[tokio::test]
+async fn a_wedged_load_does_not_block_the_tick_loop() {
+    // The same structural defect that was fixed for evictions, through the LOAD
+    // branch: `tick_loop` awaits `tick` serially, so an inline load that wedges
+    // blocks every later tick — including the one that would force-resolve an
+    // eviction landing on top of it. The load must be detached.
+    let h = fake(Some("a-coder"), Some(17.3), Some(50.0));
+    let tier = CoderTier::new(cfg_on(), h.env.clone());
+    tick_settled(&tier, 1_000, 5_000, false).await;
+
+    // Wedge the load inside the seam.
+    h.start_gate.acquire_many(OPEN as u32).await.unwrap().forget();
+    let dispatched = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tier.tick(2_000, 5_000, false),
+    )
+    .await;
+    assert!(
+        dispatched.is_ok(),
+        "tick must return promptly; an inline load wedges the whole loop"
+    );
+    assert_eq!(tier.phase(), Phase::Loading, "and must claim the phase synchronously");
+
+    // The loop is free, so a user can still be served and the tier still evicts.
+    assert!(tier.note_assistant_request());
+    assert!(matches!(tier.phase(), Phase::Evicting { .. }));
+    h.start_gate.add_permits(OPEN);
+}
+
+// Every early exit in the DETACHED load must leave a RESTING phase.
+//
+// Stranding `Loading` blocks admission forever — a load "in progress" that will
+// never finish — an invisible, permanent disabling of the feature. These call
+// `run_load` DIRECTLY with `Loading` already installed, because reaching those
+// branches through `tick` is impossible: `tick` only decides `Load` when the
+// coder already resolved, so a fixture routed through `tick` never exercises the
+// resolve-failure path at all (the first version of this test did exactly that
+// and proved nothing).
+
+#[tokio::test]
+async fn a_load_that_cannot_resolve_a_coder_never_strands_the_loading_phase() {
+    let h = fake(None, None, Some(50.0));
+    let tier = CoderTier::new(cfg_on(), h.env.clone());
+    tier.set_phase_for_test(Phase::Loading, None);
+
+    tier.run_load(10_000).await;
+
+    assert_ne!(tier.phase(), Phase::Loading, "must not strand Loading");
+    assert!(matches!(tier.phase(), Phase::Cooldown { .. }));
+    assert!(h.env.calls().is_empty(), "and must not have started anything");
+}
+
+#[tokio::test]
+async fn refusing_the_always_on_engine_never_strands_the_loading_phase() {
+    let h = fake(Some("a-coder"), Some(17.3), Some(50.0));
+    h.env
+        .coder_on_demand
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let tier = CoderTier::new(cfg_on(), h.env.clone());
+    tier.set_phase_for_test(Phase::Loading, None);
+
+    tier.run_load(10_000).await;
+
+    assert_ne!(tier.phase(), Phase::Loading, "must not strand Loading");
+    assert!(matches!(tier.phase(), Phase::Cooldown { .. }));
+    assert!(
+        !h.env.calls().contains(&"start"),
+        "and must refuse BEFORE starting anything"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_leases_are_capped_so_the_user_path_stays_bounded() {
+    // The user hot path cancels EVERY live lease, so an unbounded lease set puts
+    // unbounded work on the request that must be fastest.
+    let (tier, _env, _gate, _rx) = ready_tier().await;
+    let cap = cfg_on().max_leases;
+    let leases: Vec<Lease> = (0..cap)
+        .map(|_| tier.try_acquire_lease().expect("within the cap"))
+        .collect();
+    assert_eq!(leases.len(), cap);
+    assert!(
+        tier.try_acquire_lease().is_none(),
+        "the cap must actually refuse, not merely be configured"
+    );
+    // Releasing one frees a slot, so the cap is a bound and not a one-way latch.
+    drop(leases.into_iter().next().unwrap());
+    assert!(tier.try_acquire_lease().is_some());
 }
 
 #[tokio::test]
@@ -730,8 +840,8 @@ async fn a_wedged_teardown_does_not_wedge_the_tick_loop() {
     // force-resolve it can never run, and the budget backstop is unreachable.
     let h = fake(Some("a-coder"), Some(17.3), Some(50.0));
     let tier = CoderTier::new(cfg_on(), h.env.clone());
-    tier.tick(1_000, 5_000, false).await;
-    tier.tick(2_000, 5_000, false).await;
+    tick_settled(&tier, 1_000, 5_000, false).await;
+    tick_settled(&tier, 2_000, 5_000, false).await;
     assert_eq!(tier.phase(), Phase::Ready);
 
     // Wedge the teardown, then provoke a TICK-originated eviction (assistant
@@ -767,8 +877,8 @@ async fn a_new_load_waits_for_an_outstanding_teardown() {
     let tier = CoderTier::new(cfg_on(), h.env.clone());
     let cfg = cfg_on();
     let t0 = crate::gpu_exclusive::now_epoch();
-    tier.tick(t0, 5_000, false).await;
-    tier.tick(t0 + 200, 5_000, false).await;
+    tick_settled(&tier, t0, 5_000, false).await;
+    tick_settled(&tier, t0 + 200, 5_000, false).await;
     assert_eq!(tier.phase(), Phase::Ready);
 
     // Wedge the teardown and force-resolve past its budget.
@@ -783,15 +893,15 @@ async fn a_new_load_waits_for_an_outstanding_teardown() {
         .await
         .expect("teardown reached the stop seam")
         .expect("entered");
-    tier.tick(t0 + cfg.evict_budget_secs + 1, 5_000, false).await;
+    tick_settled(&tier, t0 + cfg.evict_budget_secs + 1, 5_000, false).await;
     assert!(matches!(tier.phase(), Phase::Cooldown { .. }));
 
     // Cooldown expires; the tier tries to run a whole new cycle while the old
     // teardown is STILL wedged inside stop_coder.
     let after = t0 + cfg.evict_budget_secs + cfg.cooldown_secs + 10;
-    tier.tick(after, 5_000, false).await; // Rest
-    tier.tick(after + 10, 5_000, false).await; // Arm
-    tier.tick(after + 10 + cfg.arm_confirm_secs, 5_000, false).await; // would Load
+    tick_settled(&tier, after, 5_000, false).await; // Rest
+    tick_settled(&tier, after + 10, 5_000, false).await; // Arm
+    tick_settled(&tier, after + 10 + cfg.arm_confirm_secs, 5_000, false).await; // would Load
     assert_ne!(
         tier.phase(),
         Phase::Ready,
@@ -803,8 +913,8 @@ async fn a_new_load_waits_for_an_outstanding_teardown() {
     for _ in 0..500 {
         tokio::task::yield_now().await;
     }
-    tier.tick(after + 400, 5_000, false).await; // Arm
-    tier.tick(after + 400 + cfg.arm_confirm_secs, 5_000, false).await;
+    tick_settled(&tier, after + 400, 5_000, false).await; // Arm
+    tick_settled(&tier, after + 400 + cfg.arm_confirm_secs, 5_000, false).await;
     assert_eq!(
         tier.phase(),
         Phase::Ready,
@@ -820,7 +930,7 @@ async fn a_load_that_lost_the_race_compensates_with_a_stop() {
     // tier records `model: None`, i.e. borrowed memory nobody gives back.
     let h = fake(Some("a-coder"), Some(17.3), Some(50.0));
     let tier = CoderTier::new(cfg_on(), h.env.clone());
-    tier.tick(1_000, 5_000, false).await;
+    tick_settled(&tier, 1_000, 5_000, false).await;
 
     let start_gate = h.start_gate.clone();
     start_gate.acquire_many(OPEN as u32).await.unwrap().forget();
@@ -854,8 +964,8 @@ async fn a_failed_load_cools_down_instead_of_retrying_immediately() {
     let h = fake(Some("a-coder"), Some(17.3), Some(50.0));
     *h.env.start_result.lock().unwrap() = Err("no".into());
     let tier = CoderTier::new(cfg_on(), h.env.clone());
-    tier.tick(1_000, 5_000, false).await;
-    tier.tick(2_000, 5_000, false).await;
+    tick_settled(&tier, 1_000, 5_000, false).await;
+    tick_settled(&tier, 2_000, 5_000, false).await;
     match tier.phase() {
         Phase::Cooldown { until } => assert_eq!(until, 2_000 + cfg_on().cooldown_secs),
         p => panic!("expected cooldown after a failed load, got {p:?}"),
@@ -867,9 +977,9 @@ async fn a_failed_load_cools_down_instead_of_retrying_immediately() {
 async fn an_unresolvable_coder_alias_loads_nothing_ever() {
     let h = fake(None, None, Some(50.0));
     let tier = CoderTier::new(cfg_on(), h.env.clone());
-    tier.tick(1_000, 5_000, false).await;
-    tier.tick(2_000, 5_000, false).await;
-    tier.tick(3_000, 5_000, false).await;
+    tick_settled(&tier, 1_000, 5_000, false).await;
+    tick_settled(&tier, 2_000, 5_000, false).await;
+    tick_settled(&tier, 3_000, 5_000, false).await;
     assert!(matches!(tier.phase(), Phase::Arming { .. }));
     assert!(h.env.calls().is_empty(), "nothing was started");
 }
@@ -887,8 +997,8 @@ async fn a_disabled_tier_is_inert_on_the_hot_path() {
     let tier = CoderTier::new(cfg, h.env.clone());
     assert!(!tier.note_assistant_request());
     assert!(tier.try_acquire_lease().is_none());
-    tier.tick(1_000, 5_000, false).await;
-    tier.tick(2_000, 5_000, false).await;
+    tick_settled(&tier, 1_000, 5_000, false).await;
+    tick_settled(&tier, 2_000, 5_000, false).await;
     assert_eq!(tier.phase(), Phase::Assistant);
     assert!(h.env.calls().is_empty());
 }

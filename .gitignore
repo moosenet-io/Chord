@@ -5,3 +5,7 @@ Cargo.lock
 # Not committed: keeps infra endpoints out of the repo; the build host
 # supplies the gitea registry index.
 /.cargo/
+
+# RVXR-01: review/gate output artifacts must never be committed (one was, once).
+OUT_*.txt
+ARGS_*.json
