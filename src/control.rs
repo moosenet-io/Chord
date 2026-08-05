@@ -383,6 +383,30 @@ pub async fn protect_model(
 /// release and the next re-warm) and the residency exemption in force.
 ///
 /// Read-only and auth-gated with the same posture as `/admin/idle`.
+/// RVXR-01 `GET /admin/coder-tier` — the opportunistic coder tier's observable
+/// state: phase, epoch, live review leases, and the interrupt/load/eviction
+/// counters. Reports `installed: false` when the tier was never initialised, so a
+/// missing tier is visible rather than indistinguishable from a resting one.
+pub async fn coder_tier_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = auth_check(&headers, &state.jwt_secret) {
+        return auth_error_response(e);
+    }
+    match crate::routing::coder_tier::global() {
+        Some(tier) => {
+            let mut body =
+                serde_json::to_value(tier.status()).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("installed".to_string(), serde_json::json!(true));
+            }
+            Json(body).into_response()
+        }
+        None => Json(serde_json::json!({ "installed": false })).into_response(),
+    }
+}
+
 pub async fn resident_set_status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1385,6 +1409,7 @@ pub fn build_control_router(state: Arc<AppState>) -> axum::Router {
         // used. Residency is OBSERVABLE rather than inferred from `/api/models`.
         // Same JWT auth as every route above (checked inside the handler).
         .route("/admin/resident-set", get(resident_set_status))
+        .route("/admin/coder-tier", get(coder_tier_status))
         // SNAP observability routes (additive; distinct paths, same JWT auth):
         // /api/vram, /api/activity, /api/inventory, /api/analytics/*.
         .merge(crate::snap::api::snap_routes())

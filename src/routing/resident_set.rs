@@ -182,9 +182,26 @@ use super::lumina_alias::LuminaAliasStore;
 /// Hand-rolled on `tokio::sync::watch` rather than adding a `tokio-util`
 /// dependency for one type: the semantics needed here are exactly "latch a flag
 /// once, wake everyone waiting, never un-latch".
+///
+/// **The token OWNS a receiver, and that is load-bearing (RVXR-01).**
+/// `watch::Sender::send` returns `Err` and — critically — **does not update the
+/// value** when every receiver has been dropped. The original shape created the
+/// channel and dropped its receiver immediately, so `cancel()` only actually
+/// latched while some task happened to be sitting in [`CancelToken::cancelled`]
+/// at that instant. On the warm path that was masked, because `warm_one`
+/// `select!`s on `cancelled()` and therefore holds a subscription for exactly the
+/// window that matters. It is NOT masked for a caller that latches a token
+/// nobody is awaiting and then asks [`CancelToken::is_cancelled`] — which read
+/// `false` forever. Keeping a receiver alive inside the token makes `send`
+/// unconditionally succeed, so "latch once, never un-latch" is true for every
+/// caller rather than only the one that inspired it. Found by forcing the race
+/// in the RVXR-01 lease tests.
 #[derive(Clone, Debug)]
 pub struct CancelToken {
     tx: Arc<watch::Sender<bool>>,
+    /// Never read. Held solely so the channel always has ≥1 receiver and
+    /// `tx.send` can never fail — see the type docs.
+    _keepalive: Arc<watch::Receiver<bool>>,
 }
 
 impl Default for CancelToken {
@@ -195,13 +212,22 @@ impl Default for CancelToken {
 
 impl CancelToken {
     pub fn new() -> Self {
-        let (tx, _rx) = watch::channel(false);
-        CancelToken { tx: Arc::new(tx) }
+        let (tx, rx) = watch::channel(false);
+        CancelToken {
+            tx: Arc::new(tx),
+            _keepalive: Arc::new(rx),
+        }
     }
 
-    /// Latch the token. Idempotent.
+    /// Latch the token. Idempotent, and effective whether or not anyone is
+    /// currently awaiting [`CancelToken::cancelled`] — see the type docs for why
+    /// that qualification is not obvious.
     pub fn cancel(&self) {
-        let _ = self.tx.send(true);
+        // `send_replace` cannot fail on a dropped-receiver channel; the keepalive
+        // receiver makes plain `send` safe too, and this makes the intent explicit
+        // rather than relying on a `let _ =` to swallow an error that must never
+        // happen.
+        self.tx.send_replace(true);
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -3052,6 +3078,42 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex as StdMutex;
     use tokio::sync::{mpsc, Semaphore};
+
+    /// RVXR-01 regression: `cancel()` must latch even when NOBODY is awaiting.
+    ///
+    /// This is the defect that motivated the keepalive receiver: with the old
+    /// shape (`let (tx, _rx) = watch::channel(false)`), `tx.send` failed on a
+    /// receiverless channel and left the value at `false`, so a token latched
+    /// outside a `select!` read as un-cancelled forever. The warm path masked it
+    /// because `warm_one` holds a subscription across exactly that window.
+    #[test]
+    fn cancel_latches_with_no_live_subscriber() {
+        let t = CancelToken::new();
+        assert!(!t.is_cancelled());
+        t.cancel(); // no `cancelled()` future in existence anywhere
+        assert!(
+            t.is_cancelled(),
+            "cancel must latch unconditionally, not only while someone is awaiting"
+        );
+        // Idempotent, and never un-latches.
+        t.cancel();
+        assert!(t.is_cancelled());
+        // A clone made BEFORE the latch sees it too (shared sender).
+        let t2 = CancelToken::new();
+        let clone = t2.clone();
+        t2.cancel();
+        assert!(clone.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancelled_resolves_for_a_token_latched_before_anyone_awaited() {
+        let t = CancelToken::new();
+        t.cancel();
+        // Subscribing AFTER the latch must still resolve immediately.
+        tokio::time::timeout(std::time::Duration::from_secs(5), t.cancelled())
+            .await
+            .expect("a token latched before subscription must still resolve");
+    }
 
     fn resolved(role: Role, model: Option<&str>, size: Option<f64>, present: bool) -> Resolved {
         Resolved {
