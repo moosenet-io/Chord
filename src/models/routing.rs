@@ -323,6 +323,24 @@ pub fn on_demand_backend_to_stop(
 /// missing or unparseable file, where it yields NO backends and therefore stops
 /// nothing, which is genuinely safe rather than merely assumed to be.
 ///
+/// ## KNOWN RESIDUAL: this is a check, not a lock (tracked on CHRD #112)
+/// The gate reads the registry file; `ensure_up`/`free_gpu` re-reads it moments
+/// later. A writer that adds an always-on GPU unit in that window would defeat
+/// the check. This is acknowledged, not overlooked — raised by the review panel,
+/// and **irreducible from inside Chord**: re-reading immediately before the start
+/// only narrows the window, because the start itself is what re-reads the file.
+/// Closing it properly requires the upstream fix (`free_gpu` must skip
+/// `always_on` backends), which is precisely why CHRD #112 exists and why this
+/// gate has no override.
+///
+/// Two things bound the residual today. First, the always-on entry is seeded at
+/// startup and is static in practice; nothing adds an always-on GPU unit at
+/// runtime. Second, and more decisively: on any host where the hazard is real
+/// (ollama registered always_on + gpu + unit) this gate ALREADY refuses every
+/// load, so there is no start to race. The window can only open on a host where
+/// no such backend is registered — where `free_gpu` would have nothing to stop
+/// either.
+///
 /// ## There is no override, deliberately
 /// An earlier version had an operator acknowledgement env var. It asserted an
 /// unverified claim — that the installed terminus-rs carries the upstream fix —
