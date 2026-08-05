@@ -456,6 +456,190 @@ async fn assistant_capacity_is_restored_even_when_the_coder_stop_fails() {
     assert!(matches!(tier.phase(), Phase::Cooldown { .. }));
 }
 
+// Defects found by the review panel (codex + opus), each now defended.
+
+#[tokio::test]
+async fn a_force_resolved_eviction_still_restores_assistant_capacity() {
+    // SAFETY 3. The tick force-resolves a teardown that overran its budget. That
+    // is PRECISELY the wedged case, so it is the last place that can hand the
+    // cohort back — and the original code cleared `model` and cooled down without
+    // restoring anything, leaving the assistant permanently degraded.
+    let h = fake(Some("a-coder"), Some(17.3), Some(50.0));
+    let tier = CoderTier::new(cfg_on(), h.env.clone());
+    tier.tick(1_000, 5_000, false).await;
+    tier.tick(2_000, 5_000, false).await;
+    assert_eq!(tier.phase(), Phase::Ready);
+
+    // Wedge the teardown inside the seam, forever.
+    h.stop_gate.acquire_many(OPEN as u32).await.unwrap().forget();
+    tier.note_assistant_request();
+    assert!(matches!(tier.phase(), Phase::Evicting { .. }));
+    let restores_before = h.env.restores.load(Ordering::SeqCst);
+
+    // Tick past the eviction budget.
+    let now = crate::gpu_exclusive::now_epoch() + cfg_on().evict_budget_secs + 1;
+    tier.tick(now, 5_000, false).await;
+
+    assert!(matches!(tier.phase(), Phase::Cooldown { .. }));
+    assert!(
+        h.env.restores.load(Ordering::SeqCst) > restores_before,
+        "a force-resolved eviction must still restore assistant capacity"
+    );
+}
+
+#[tokio::test]
+async fn an_abandoned_teardown_cannot_clobber_a_newer_cycle() {
+    // NOTE ON THIS TEST'S FIRST VERSION — it was a LYING FIXTURE. It asserted the
+    // phase was still `Cooldown{..}` after the abandoned teardown woke up, but an
+    // UNGUARDED teardown also writes `Cooldown`, so the assertion held whether or
+    // not the guard existed and the mutant survived. The fixture has to reach a
+    // state the stale write would visibly destroy — so it now drives a whole new
+    // cycle back to `Ready` and asserts THAT survives.
+    let h = fake(Some("a-coder"), Some(17.3), Some(50.0));
+    let tier = CoderTier::new(cfg_on(), h.env.clone());
+    let cfg = cfg_on();
+    let t0 = crate::gpu_exclusive::now_epoch();
+
+    tier.tick(t0, 5_000, false).await;
+    tier.tick(t0 + 200, 5_000, false).await;
+    assert_eq!(tier.phase(), Phase::Ready);
+
+    // Wedge the teardown, then force-resolve past its budget so it is abandoned.
+    h.stop_gate.acquire_many(OPEN as u32).await.unwrap().forget();
+    tier.note_assistant_request();
+    assert!(matches!(tier.phase(), Phase::Evicting { .. }));
+    tier.tick(t0 + cfg.evict_budget_secs + 1, 5_000, false).await;
+    assert!(matches!(tier.phase(), Phase::Cooldown { .. }));
+
+    // A WHOLE NEW CYCLE: cooldown expires, re-arm, re-load.
+    let after_cd = t0 + cfg.evict_budget_secs + cfg.cooldown_secs + 10;
+    tier.tick(after_cd, 5_000, false).await; // Rest
+    tier.tick(after_cd + 10, 5_000, false).await; // Arm
+    tier.tick(after_cd + 10 + cfg.arm_confirm_secs, 5_000, false).await; // Load
+    assert_eq!(
+        tier.phase(),
+        Phase::Ready,
+        "fixture must genuinely reach a NEW Ready, or this proves nothing"
+    );
+    let model_before = tier.status().model.clone();
+    assert!(model_before.is_some());
+
+    // NOW release the long-abandoned teardown and let it run to completion.
+    h.stop_gate.add_permits(OPEN);
+    for _ in 0..500 {
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(
+        tier.phase(),
+        Phase::Ready,
+        "a teardown that was abandoned must not cool down a NEWLY loaded coder"
+    );
+    assert_eq!(
+        tier.status().model,
+        model_before,
+        "nor may it clear the new cycle's model"
+    );
+}
+
+// The two abandonment guards, ISOLATED.
+//
+// End-to-end, the EARLY guard short-circuits before the LATE one ever runs, so a
+// single scenario cannot distinguish them and mutants of each survived. These
+// drive `run_eviction` directly with a chosen generation.
+
+#[tokio::test]
+async fn an_abandoned_teardown_stops_nothing_at_all() {
+    // THE EARLY GUARD. A teardown whose generation is already stale must not even
+    // read `model` — by the time it is polled, a newer cycle may have loaded its
+    // own coder, and `inner.model` would name THAT one.
+    let (tier, env, _gate, _rx) = ready_tier().await;
+    let stale = tier.evict_epoch().wrapping_sub(1);
+    let calls_before = env.calls().len();
+
+    tier.run_eviction(EvictReason::AssistantArrived, stale).await;
+
+    assert_eq!(
+        env.calls().len(),
+        calls_before,
+        "a pre-abandoned teardown must not stop or restore anything"
+    );
+    assert_eq!(tier.phase(), Phase::Ready, "and must not touch the phase");
+}
+
+#[tokio::test]
+async fn a_teardown_abandoned_mid_flight_does_not_write_the_phase() {
+    // THE LATE GUARD. This teardown starts legitimately, and is abandoned while
+    // it is inside `stop_coder`. It must still restore (idempotent, and the
+    // cohort must never be stranded) but must NOT write phase/model, because a
+    // newer cycle may already own them.
+    let (tier, env, gate, mut stop_entered) = ready_tier().await;
+    gate.acquire_many(OPEN as u32).await.unwrap().forget();
+    let gen = tier.evict_epoch();
+
+    let t = tier.clone();
+    let teardown = tokio::spawn(async move {
+        t.run_eviction(EvictReason::AssistantArrived, gen).await;
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), stop_entered.recv())
+        .await
+        .expect("teardown reached the stop seam")
+        .expect("entered");
+
+    // Abandon it mid-flight, then let it finish.
+    tier.bump_evict_epoch_only();
+    gate.add_permits(OPEN);
+    teardown.await.expect("teardown completes");
+
+    assert!(
+        env.calls().contains(&"restore"),
+        "an abandoned teardown must STILL restore — the cohort is never stranded"
+    );
+    assert_eq!(
+        tier.phase(),
+        Phase::Ready,
+        "but it must not write a phase a newer cycle now owns"
+    );
+    assert!(tier.status().model.is_some(), "nor clear the newer model");
+}
+
+#[tokio::test]
+async fn a_load_that_lost_the_race_compensates_with_a_stop() {
+    // The leak the panel found: eviction's stop can run BEFORE the in-flight
+    // start actually launched the backend. Declining to install `Ready` is not
+    // enough — without a compensating stop the coder is left running while the
+    // tier records `model: None`, i.e. borrowed memory nobody gives back.
+    let h = fake(Some("a-coder"), Some(17.3), Some(50.0));
+    let tier = CoderTier::new(cfg_on(), h.env.clone());
+    tier.tick(1_000, 5_000, false).await;
+
+    let start_gate = h.start_gate.clone();
+    start_gate.acquire_many(OPEN as u32).await.unwrap().forget();
+    let mut start_entered = h.start_entered;
+
+    let t = tier.clone();
+    let loading = tokio::spawn(async move { t.tick(2_000, 5_000, false).await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), start_entered.recv())
+        .await
+        .expect("load started")
+        .expect("entered");
+    assert_eq!(tier.phase(), Phase::Loading);
+
+    tier.note_assistant_request();
+    start_gate.add_permits(OPEN); // the load now SUCCEEDS, after losing
+    loading.await.expect("tick completes");
+    for _ in 0..300 {
+        tokio::task::yield_now().await;
+    }
+
+    assert_ne!(tier.phase(), Phase::Ready);
+    let stops = h.env.calls().iter().filter(|c| **c == "stop").count();
+    assert!(
+        stops >= 2,
+        "expected the eviction stop AND a compensating stop for the late load, saw {stops}"
+    );
+}
+
 #[tokio::test]
 async fn a_failed_load_cools_down_instead_of_retrying_immediately() {
     let h = fake(Some("a-coder"), Some(17.3), Some(50.0));
@@ -515,22 +699,55 @@ fn the_interrupt_signal_is_stable_and_machine_readable() {
     );
 }
 
-#[test]
-fn request_classification_treats_an_unlabelled_request_as_a_user() {
+#[tokio::test]
+async fn only_a_live_lease_secret_counts_as_coder_traffic() {
     use axum::http::{HeaderMap, HeaderValue};
-    let mut coder = HeaderMap::new();
-    coder.insert(LEASE_HEADER, HeaderValue::from_static("1"));
-    assert!(is_coder_traffic(&coder), "a review on a lease is coder traffic");
+    let (tier, _env, _gate, _rx) = ready_tier().await;
+    let lease = tier.try_acquire_lease().expect("lease");
 
-    // The safe default is in the right direction: an unlabelled request counts as
-    // a user, so the worst case is an unnecessary eviction — never a missed one.
-    assert!(!is_coder_traffic(&HeaderMap::new()));
+    let with = |v: &str| {
+        let mut h = HeaderMap::new();
+        h.insert(LEASE_HEADER, HeaderValue::from_str(v).unwrap());
+        h
+    };
+
+    // THE CONTROL: a genuine, live lease secret IS coder traffic. Without this
+    // the negative cases below would pass against a function that always says
+    // "user".
+    assert!(is_coder_traffic(&tier, &with(lease.header_value())));
+
+    // THE HOLE THAT REVIEW FOUND: mere header PRESENCE must not be enough, or any
+    // authenticated caller could label itself a review and exempt itself from
+    // pre-emption — a user request that leaves the coder resident.
+    assert!(!is_coder_traffic(&tier, &with("1")));
+    assert!(!is_coder_traffic(&tier, &with("00000000-0000-0000-0000-000000000000")));
+    assert!(!is_coder_traffic(&tier, &with("")));
+    assert!(!is_coder_traffic(&tier, &HeaderMap::new()));
     let mut other = HeaderMap::new();
     other.insert("x-something-else", HeaderValue::from_static("1"));
-    assert!(!is_coder_traffic(&other));
-    // Presence, not value — the header is a classification, not a credential.
-    let mut empty_value = HeaderMap::new();
-    empty_value.insert(LEASE_HEADER, HeaderValue::from_static(""));
-    assert!(is_coder_traffic(&empty_value));
+    assert!(!is_coder_traffic(&tier, &other));
+
+    // A SETTLED lease's secret is dead — no replay.
+    let secret = lease.header_value().to_string();
+    let _ = lease.commit("done");
+    assert!(!is_coder_traffic(&tier, &with(&secret)));
+}
+
+#[tokio::test]
+async fn a_forged_lease_header_does_not_stop_a_user_evicting_the_coder() {
+    use axum::http::{HeaderMap, HeaderValue};
+    let (tier, _env, gate, _rx) = ready_tier().await;
+    gate.acquire_many(OPEN as u32).await.unwrap().forget();
+    let mut forged = HeaderMap::new();
+    forged.insert(LEASE_HEADER, HeaderValue::from_static("not-a-real-lease"));
+
+    // Classified as a user, so the eviction path is the one that must run.
+    assert!(!is_coder_traffic(&tier, &forged));
+    assert!(
+        tier.note_assistant_request(),
+        "a request carrying a forged lease header is a USER and must evict"
+    );
+    assert!(matches!(tier.phase(), Phase::Evicting { .. }));
+    gate.add_permits(OPEN);
 }
 

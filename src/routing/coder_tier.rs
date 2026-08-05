@@ -264,9 +264,19 @@ struct Inner {
     /// Bumped by EVERY pre-emption. A lease whose captured epoch no longer
     /// matches is invalid, no matter what it has produced.
     epoch: u64,
-    /// Live leases' cancel tokens, by lease id.
-    leases: HashMap<u64, CancelToken>,
-    next_lease_id: u64,
+    /// Bumped by every eviction ATTEMPT. A `run_eviction` whose captured value is
+    /// stale has been abandoned (force-resolved by the tick budget) and must not
+    /// write phase/model — otherwise a wedged teardown can wake up long after a
+    /// NEW load and stop the new backend / clobber the new phase.
+    evict_epoch: u64,
+    /// Live leases' cancel tokens, keyed by the lease's UNGUESSABLE SECRET.
+    ///
+    /// Keyed by the secret rather than a counter because the key doubles as the
+    /// bearer credential that identifies coder traffic on the hot path: a
+    /// sequential id would be trivially guessable, letting any authenticated
+    /// caller label itself as a review and thereby exempt itself from
+    /// pre-emption (see [`is_coder_traffic`]).
+    leases: HashMap<String, CancelToken>,
     /// The model currently loaded/loading, when any.
     model: Option<String>,
 }
@@ -310,8 +320,8 @@ impl CoderTier {
             inner: Mutex::new(Inner {
                 phase: Phase::Assistant,
                 epoch: 0,
+                evict_epoch: 0,
                 leases: HashMap::new(),
-                next_lease_id: 0,
                 model: None,
             }),
             env,
@@ -387,6 +397,20 @@ impl CoderTier {
             let evict = match inner.phase {
                 Phase::Loading | Phase::Ready => {
                     inner.phase = Phase::Evicting { since: now };
+                    // Belt-and-braces, and PROVABLY REDUNDANT TODAY — kept
+                    // deliberately, and flagged so nobody "fixes" it.
+                    //
+                    // What actually makes the abandonment guard work is (a) the
+                    // generation being captured HERE, at REQUEST time, and (b)
+                    // `ForceResolveEvict` bumping it. This extra bump changes
+                    // nothing observable while at most ONE teardown can be in
+                    // flight — the `Evicting` phase gates every other eviction
+                    // decision, so generations are already serialized. Removing
+                    // it is an EQUIVALENT MUTANT (verified: it survives the
+                    // suite, and the equivalence is the phase gate, not a missing
+                    // test). It exists so that if concurrent teardowns ever become
+                    // possible, each still gets a distinct generation.
+                    inner.evict_epoch = inner.evict_epoch.wrapping_add(1);
                     true
                 }
                 Phase::Arming { .. } => {
@@ -395,7 +419,7 @@ impl CoderTier {
                 }
                 _ => false,
             };
-            (tokens, evict)
+            (tokens, evict.then_some(inner.evict_epoch))
         };
         // Latching is cheap and lock-free; do it outside the critical section.
         let interrupted = tokens.len() as u64;
@@ -405,14 +429,15 @@ impl CoderTier {
         if interrupted > 0 {
             self.interrupts.fetch_add(interrupted, Ordering::Relaxed);
         }
-        if evict {
+        if let Some(my_evict_epoch) = evict {
             let me = self.clone();
             // Detached: the user's request must not wait on teardown. If we are
             // somehow not on a runtime, the tick's budget backstop resolves the
             // phase instead — we still never block here.
             if tokio::runtime::Handle::try_current().is_ok() {
                 tokio::spawn(async move {
-                    me.run_eviction(EvictReason::AssistantArrived).await;
+                    me.run_eviction(EvictReason::AssistantArrived, my_evict_epoch)
+                        .await;
                 });
             } else {
                 warn!(
@@ -420,7 +445,7 @@ impl CoderTier {
                 );
             }
         }
-        evict
+        evict.is_some()
     }
 
     // ── Leases ───────────────────────────────────────────────────────────────
@@ -436,15 +461,17 @@ impl CoderTier {
         if inner.phase != Phase::Ready {
             return None;
         }
-        let id = inner.next_lease_id;
-        inner.next_lease_id += 1;
+        // An unguessable, single-use credential. It is what the review dispatch
+        // puts in the `x-chord-coder-lease` header, and the ONLY thing that makes
+        // a request count as coder traffic.
+        let secret = uuid::Uuid::new_v4().to_string();
         let token = CancelToken::new();
-        inner.leases.insert(id, token.clone());
+        inner.leases.insert(secret.clone(), token.clone());
         let epoch = inner.epoch;
         let model = inner.model.clone();
         drop(inner);
         Some(Lease {
-            id,
+            secret,
             epoch,
             model,
             token,
@@ -465,10 +492,23 @@ impl CoderTier {
     /// `..._alone_is_sufficient` trio) and the redundancy is kept: this is the
     /// path where a truncated review turns into a verdict, and it is worth
     /// belt-and-braces.
-    fn settle_lease(&self, id: u64, epoch: u64) -> bool {
+    fn settle_lease(&self, secret: &str, epoch: u64, token: &CancelToken) -> bool {
         let mut inner = self.lock();
-        let still_registered = inner.leases.remove(&id).is_some();
-        still_registered && inner.epoch == epoch
+        // ALL THREE guards are evaluated under the SAME lock acquisition, so the
+        // commit has a single linearization point. Checking the token after
+        // releasing the lock left a window in which a pre-emption could land
+        // between the epoch check and the token read, and the commit would then
+        // observe neither — raised in review, closed by making the decision
+        // atomic rather than by arguing about whether the window was reachable.
+        let still_registered = inner.leases.remove(secret).is_some();
+        still_registered && inner.epoch == epoch && !token.is_cancelled()
+    }
+
+    /// Is `secret` a LIVE lease? This is what distinguishes coder traffic from a
+    /// user on the hot path, and it is deliberately a membership test against
+    /// minted secrets rather than mere header presence.
+    pub fn is_live_lease(&self, secret: &str) -> bool {
+        !secret.is_empty() && self.lock().leases.contains_key(secret)
     }
 
     /// Test-only: advance the epoch WITHOUT draining leases or cancelling tokens,
@@ -485,6 +525,26 @@ impl CoderTier {
     fn drain_leases_only(&self) {
         let mut inner = self.lock();
         inner.leases.clear();
+    }
+
+    /// Test-only: how many leases the tier currently tracks.
+    #[cfg(test)]
+    fn live_lease_count(&self) -> usize {
+        self.lock().leases.len()
+    }
+
+    /// Test-only: the current eviction generation.
+    #[cfg(test)]
+    fn evict_epoch(&self) -> u64 {
+        self.lock().evict_epoch
+    }
+
+    /// Test-only: abandon any outstanding teardown WITHOUT running the rest of
+    /// the force-resolve path, so each abandonment guard can be exercised alone.
+    #[cfg(test)]
+    fn bump_evict_epoch_only(&self) {
+        let mut inner = self.lock();
+        inner.evict_epoch = inner.evict_epoch.wrapping_add(1);
     }
 
     // ── Load / evict ─────────────────────────────────────────────────────────
@@ -573,36 +633,68 @@ impl CoderTier {
                     inner.model = Some(model.clone());
                 }
                 let started = self.env.start_coder(&model).await;
-                let mut inner = self.lock();
-                // A user may have arrived DURING the load. If so the phase is
-                // already Evicting and the eviction task owns the teardown — do
-                // not resurrect Ready over it.
-                if inner.phase == Phase::Loading {
-                    match started {
-                        Ok(()) => {
-                            inner.phase = Phase::Ready;
-                            self.loads.fetch_add(1, Ordering::Relaxed);
-                            info!(model = %model, "coder tier: coder loaded into the reaped window");
+                // ONE lock acquisition decides everything about this load.
+                //
+                // This used to be two — "did I lose the race?" and then, after
+                // dropping and retaking the lock, "am I still Loading?" — which
+                // left a window between them that no test could force, and a
+                // mutant that deleted the second check survived precisely because
+                // the window is unreachable from a test seam. The fix is to remove
+                // the window rather than to write a test that cannot see it.
+                let lost_the_race = {
+                    let mut inner = self.lock();
+                    if inner.phase == Phase::Loading {
+                        match &started {
+                            Ok(()) => {
+                                inner.phase = Phase::Ready;
+                                self.loads.fetch_add(1, Ordering::Relaxed);
+                                info!(model = %model,
+                                    "coder tier: coder loaded into the reaped window");
+                            }
+                            Err(e) => {
+                                inner.phase = Phase::Cooldown {
+                                    until: now.saturating_add(self.cfg.cooldown_secs),
+                                };
+                                inner.model = None;
+                                warn!(error = %e, "coder tier: coder load failed — cooling down");
+                            }
                         }
-                        Err(e) => {
-                            inner.phase = Phase::Cooldown {
-                                until: now.saturating_add(self.cfg.cooldown_secs),
-                            };
-                            inner.model = None;
-                            warn!(error = %e, "coder tier: coder load failed — cooling down");
-                        }
+                        false
+                    } else {
+                        true
+                    }
+                };
+                if lost_the_race && started.is_ok() {
+                    // A user arrived DURING the load and the eviction task has
+                    // already run. Declining to install `Ready` is NOT enough: the
+                    // eviction's `stop_coder` may have run BEFORE this
+                    // `start_coder` actually launched the backend, in which case
+                    // the coder is now running with the tier recording
+                    // `model: None` — borrowed memory nobody will ever give back.
+                    // So compensate, exactly as the resident set compensates for a
+                    // warm request it could not un-issue. Idempotent: stopping an
+                    // already-stopped backend is a no-op.
+                    warn!(
+                        model = %model,
+                        "coder tier: load completed after losing the race — compensating with a stop"
+                    );
+                    if let Err(e) = self.env.stop_coder(&model).await {
+                        warn!(error = %e, model = %model,
+                            "coder tier: compensating stop failed");
                     }
                 }
             }
             Decision::Evict(reason) => {
-                let tokens: Vec<CancelToken> = {
+                let (tokens, my_evict_epoch): (Vec<CancelToken>, u64) = {
                     let mut inner = self.lock();
                     if inner.phase != phase {
                         return; // pre-empted between decide and act
                     }
                     inner.phase = Phase::Evicting { since: now };
                     inner.epoch = inner.epoch.wrapping_add(1);
-                    inner.leases.drain().map(|(_, t)| t).collect()
+                    inner.evict_epoch = inner.evict_epoch.wrapping_add(1);
+                    let gen = inner.evict_epoch;
+                    (inner.leases.drain().map(|(_, t)| t).collect(), gen)
                 };
                 let n = tokens.len() as u64;
                 for t in &tokens {
@@ -611,17 +703,30 @@ impl CoderTier {
                 if n > 0 {
                     self.interrupts.fetch_add(n, Ordering::Relaxed);
                 }
-                self.run_eviction(reason).await;
+                self.run_eviction(reason, my_evict_epoch).await;
             }
             Decision::ForceResolveEvict => {
-                let mut inner = self.lock();
-                if inner.phase == phase {
-                    warn!("coder tier: eviction overran its budget — forcing cooldown");
-                    inner.model = None;
-                    inner.phase = Phase::Cooldown {
-                        until: now.saturating_add(self.cfg.cooldown_secs),
-                    };
+                // Take ownership of the abandonment FIRST: bumping `evict_epoch`
+                // makes the wedged `run_eviction` a no-op if it ever wakes, so it
+                // cannot later stop a NEWLY loaded coder or clobber a newer phase.
+                {
+                    let mut inner = self.lock();
+                    if inner.phase != phase {
+                        return;
+                    }
+                    inner.evict_epoch = inner.evict_epoch.wrapping_add(1);
                 }
+                warn!("coder tier: eviction overran its budget — restoring and forcing cooldown");
+                // SAFETY 3: the cohort must never be left unrestored. This is
+                // PRECISELY the wedged-teardown case, so it is the last place that
+                // can restore — and it is idempotent, so doing it here as well as
+                // in a teardown that later completes is harmless.
+                self.env.restore_assistant_capacity().await;
+                let mut inner = self.lock();
+                inner.model = None;
+                inner.phase = Phase::Cooldown {
+                    until: now.saturating_add(self.cfg.cooldown_secs),
+                };
             }
         }
     }
@@ -633,8 +738,27 @@ impl CoderTier {
     /// The caller has already flipped the phase to [`Phase::Evicting`] and
     /// cancelled the leases — that is the part that must be instantaneous. This is
     /// the slow part, and nothing on the assistant path waits for it.
-    pub async fn run_eviction(self: &Arc<Self>, reason: EvictReason) {
-        let model = { self.lock().model.clone() };
+    /// `my_evict_epoch` is captured by the CALLER at the instant the eviction is
+    /// REQUESTED, and passed in — it is deliberately not read here.
+    ///
+    /// Reading it at the top of this function was a real bug (caught by a test,
+    /// after a mutant survived a fixture that could not see it): this body does
+    /// not run until the spawned task is first polled, so a tick that
+    /// force-resolved the eviction in between would already have bumped the
+    /// counter, and this task would then capture the NEW value and consider
+    /// itself current. Capturing at request time closes that window.
+    pub async fn run_eviction(self: &Arc<Self>, reason: EvictReason, my_evict_epoch: u64) {
+        let model = {
+            let inner = self.lock();
+            // Already abandoned before we even started: do NOT stop anything. By
+            // now a newer cycle may have loaded its own coder, and `inner.model`
+            // would name THAT one.
+            if inner.evict_epoch != my_evict_epoch {
+                warn!("coder tier: teardown abandoned before it began — standing down");
+                return;
+            }
+            inner.model.clone()
+        };
         if let Some(model) = model.as_deref() {
             if let Err(e) = self.env.stop_coder(model).await {
                 // Deliberately not fatal, and deliberately not a reason to skip
@@ -646,6 +770,14 @@ impl CoderTier {
         self.env.restore_assistant_capacity().await;
         self.evictions.fetch_add(1, Ordering::Relaxed);
         let mut inner = self.lock();
+        // If this teardown was ABANDONED (force-resolved past its budget) the
+        // eviction epoch has moved and a newer cycle may already own the tier.
+        // Restoring capacity above was still correct and idempotent; writing
+        // phase/model here would not be.
+        if inner.evict_epoch != my_evict_epoch {
+            warn!("coder tier: abandoned teardown completed late — not touching newer state");
+            return;
+        }
         inner.model = None;
         // Cooldown is measured from NOW (eviction complete), not from when it was
         // requested — the anti-thrash window must cover the whole move.
@@ -663,7 +795,7 @@ impl CoderTier {
 /// lease is what turns "the engine went away mid-generation" from a silent
 /// truncation into an explicit, machine-readable absence.
 pub struct Lease {
-    id: u64,
+    secret: String,
     epoch: u64,
     model: Option<String>,
     token: CancelToken,
@@ -700,7 +832,7 @@ impl Lease {
     /// window, not just its end — the epoch was bumped the moment the user
     /// arrived, so a lease that finished a microsecond later still loses.
     pub fn commit<T>(self, output: T) -> LeaseOutcome<T> {
-        let ok = self.tier.settle_lease(self.id, self.epoch) && !self.token.is_cancelled();
+        let ok = self.tier.settle_lease(&self.secret, self.epoch, &self.token);
         if ok {
             LeaseOutcome::Completed(output)
         } else {
@@ -711,7 +843,13 @@ impl Lease {
 
     /// Abandon the lease without output (e.g. the generation itself errored).
     pub fn abandon(self) {
-        let _ = self.tier.settle_lease(self.id, self.epoch);
+        let _ = self.tier.settle_lease(&self.secret, self.epoch, &self.token);
+    }
+
+    /// The bearer credential this lease's inference calls must send in
+    /// [`LEASE_HEADER`] so they are recognised as coder traffic.
+    pub fn header_value(&self) -> &str {
+        &self.secret
     }
 }
 
@@ -788,9 +926,12 @@ impl CoderTierEnv for AppStateCoderEnv {
         // The EXISTING lifecycle stop, addressed at the one backend this model
         // routes to. Idempotent by construction (stopping a stopped backend is a
         // no-op in `lifecycle::stop`).
-        let stopped =
-            crate::models::routing::stop_on_demand_backend_for_model(&self.state.model_registry, model)
-                .await;
+        let stopped = crate::models::routing::stop_on_demand_backend_for_model(
+            &self.state.model_registry,
+            &self.state.routing_map,
+            model,
+        )
+        .await;
         if stopped {
             Ok(())
         } else {
@@ -845,11 +986,24 @@ pub fn global() -> Option<&'static Arc<CoderTier>> {
     GLOBAL.get()
 }
 
-/// Is this request CODER traffic (i.e. a review running on a lease), rather than
-/// a user? Header-presence only — the value is not a credential and is never
-/// trusted for anything but this classification.
-pub fn is_coder_traffic(headers: &axum::http::HeaderMap) -> bool {
-    headers.contains_key(LEASE_HEADER)
+/// Is this request CODER traffic (a review running on a LIVE lease), rather than
+/// a user?
+///
+/// **Header PRESENCE is not sufficient and was a real hole.** The first version
+/// tested only that the header existed, which let any authenticated caller label
+/// itself a review and exempt itself from pre-emption — i.e. a user request could
+/// leave the coder resident, defeating the whole safety property. The header must
+/// now carry the unguessable secret minted by [`CoderTier::try_acquire_lease`],
+/// and it is checked for MEMBERSHIP against the live lease set.
+///
+/// Everything else is a user. Absence, a stale secret, a forged secret, and a
+/// malformed value all classify as a user — the safe direction, since the worst
+/// case is an unnecessary eviction rather than a missed one.
+pub fn is_coder_traffic(tier: &CoderTier, headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(LEASE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|secret| tier.is_live_lease(secret))
 }
 
 /// **The one call the inference hot path makes.** Classify the request and, if it
@@ -857,7 +1011,7 @@ pub fn is_coder_traffic(headers: &axum::http::HeaderMap) -> bool {
 /// the common path, and a single relaxed atomic load when the tier is off.
 pub fn note_inference_request(headers: &axum::http::HeaderMap) {
     if let Some(tier) = global() {
-        if !is_coder_traffic(headers) {
+        if !is_coder_traffic(tier, headers) {
             tier.note_assistant_request();
         }
     }

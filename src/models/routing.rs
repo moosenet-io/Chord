@@ -253,8 +253,18 @@ pub async fn stop_all_on_demand_backends(registry: &Arc<Mutex<ModelRegistry>>) -
 /// a coder's memory would take live Lumina down to make room for a review. That
 /// is the single most damaging thing this whole feature could do, so the gate is
 /// its own named, tested function rather than a condition inside an effect.
-pub fn on_demand_backend_to_stop(reg: &ModelRegistry, model: &str) -> Option<ResolvedBackend> {
-    match reg.backend_for(model) {
+pub fn on_demand_backend_to_stop(
+    reg: &ModelRegistry,
+    model: &str,
+    excluded_tiers: &[terminus_rs::intake::serving::ServingBackend],
+    chosen_tier: Option<terminus_rs::intake::serving::ServingBackend>,
+) -> Option<ResolvedBackend> {
+    // ARCH-AWARE, and that matters: [`resolve_and_ensure`] STARTS the coder
+    // through the routing map's arch-aware selection, so a plain
+    // `backend_for` here could resolve a DIFFERENT backend than the one that was
+    // actually started — stopping something unrelated while the real coder stays
+    // resident. Start and stop must agree on which backend they mean.
+    match reg.backend_for_arch_aware(model, excluded_tiers, chosen_tier) {
         Some(b) if b.on_demand() => Some(to_resolved(b, None, None)),
         _ => None,
     }
@@ -277,11 +287,23 @@ pub fn on_demand_backend_to_stop(reg: &ModelRegistry, model: &str) -> Option<Res
 /// model has no on-demand backend to stop.
 pub async fn stop_on_demand_backend_for_model(
     registry: &Arc<Mutex<ModelRegistry>>,
+    routing_map: &Arc<Mutex<RoutingMap>>,
     model: &str,
 ) -> bool {
+    // Same lock ORDER as `resolve_and_ensure`: take the routing map first,
+    // extract small owned values, drop it, then take the registry. Holding both
+    // in the opposite order would be a lock-order inversion.
+    let (excluded_tiers, chosen_tier) = {
+        let routing = routing_map.lock().await;
+        let model_id = terminus_rs::intake::serving::ModelId::from(model);
+        (
+            routing.excluded_tiers(&model_id),
+            routing.chosen_backend(&model_id),
+        )
+    };
     let resolved = {
         let reg = registry.lock().await;
-        on_demand_backend_to_stop(&reg, model)
+        on_demand_backend_to_stop(&reg, model, &excluded_tiers, chosen_tier)
     };
     match resolved {
         Some(backend) => {
@@ -290,7 +312,13 @@ pub async fn stop_on_demand_backend_for_model(
                 model = %model,
                 "coder tier: stopping on-demand backend"
             );
-            lifecycle::stop(&backend);
+            // `lifecycle::stop` shells out SYNCHRONOUSLY (`systemctl stop` via
+            // `std::process::Command`). This runs on a detached teardown task
+            // spawned from the inference hot path, so leaving it on a runtime
+            // worker lets a process wait occupy a thread that an incoming user
+            // request may need. Move it to the blocking pool.
+            let b = backend.clone();
+            let _ = tokio::task::spawn_blocking(move || lifecycle::stop(&b)).await;
             true
         }
         None => false,
@@ -350,13 +378,84 @@ mod tests {
         assert!(reg.register_remote_api_model("the-assistant", "test", "ollama"));
 
         // CONTROL: an on-demand backend IS stoppable, else this test proves nothing.
-        let target = on_demand_backend_to_stop(&reg, "a-coder").expect("on-demand is stoppable");
+        let target =
+            on_demand_backend_to_stop(&reg, "a-coder", &[], None).expect("on-demand is stoppable");
         assert_eq!(target.name, "llama-gpu");
 
         // THE GUARD: the always-on assistant engine is never a stop target.
         assert!(
-            on_demand_backend_to_stop(&reg, "the-assistant").is_none(),
+            on_demand_backend_to_stop(&reg, "the-assistant", &[], None).is_none(),
             "stopping the always-on serve would take live Lumina down to make room for a review"
+        );
+    }
+
+    /// RVXR-01: STOP must resolve the SAME backend START did.
+    ///
+    /// `resolve_and_ensure` starts the coder through arch-aware selection, so a
+    /// plain `backend_for` here would resolve a DIFFERENT backend whenever the
+    /// registry tag is arch-excluded — stopping something unrelated while the
+    /// real coder stays resident and holding memory. Raised by the review panel;
+    /// this is the fixture where the two resolutions actually diverge (an empty
+    /// exclusion set makes them agree, which is why the first test missed it).
+    #[test]
+    fn the_stop_gate_resolves_the_same_backend_arch_aware_start_would() {
+        use crate::models::backends::Hardware;
+        use std::collections::HashMap;
+
+        let llama = Backend {
+            name: "llama-gpu".into(),
+            url: "http://localhost:8082".into(),
+            hardware: Hardware::Gpu,
+            kind: BackendKind::LlamaServer,
+            unit: None,
+            always_on: false,
+            idle_stop_secs: 600,
+            launch: None,
+            api_key_env: None,
+        };
+        let ollama = Backend {
+            name: "ollama".into(),
+            url: "http://localhost:11434".into(),
+            hardware: Hardware::Gpu,
+            kind: BackendKind::Ollama,
+            unit: Some("ollama.service".into()),
+            always_on: true,
+            idle_stop_secs: 0,
+            launch: None,
+            api_key_env: None,
+        };
+        let mut catalogue = HashMap::new();
+        catalogue.insert(llama.name.clone(), llama);
+        catalogue.insert(ollama.name.clone(), ollama);
+
+        let dir = std::env::temp_dir().join(format!("rvxr01-archstop-{}", std::process::id()));
+        let mut reg = ModelRegistry::new_with_backends(
+            dir.join("registry.json"),
+            dir.join("local"),
+            dir.join("archive"),
+            vec![],
+            catalogue,
+        );
+        // Tagged to the llama-server backend, but of an architecture llama.cpp
+        // cannot load — so arch-aware selection steers AWAY from that tag while a
+        // plain tag lookup would still name it.
+        assert!(reg.register_remote_api_model("odd-arch-model", "test", "llama-gpu"));
+        assert!(reg.record_served_arch("odd-arch-model", "gptoss"));
+
+        // CONTROL: the naive lookup really does name the on-demand backend, so
+        // the assertion below is testing a difference that exists.
+        assert_eq!(
+            reg.backend_for("odd-arch-model").map(|b| b.name.as_str()),
+            Some("llama-gpu"),
+            "fixture must be one where the two resolutions DIVERGE"
+        );
+
+        // Arch-aware selection sends this model to the always-on ollama serve, so
+        // there is no on-demand backend to stop. Stopping `llama-gpu` here would
+        // be stopping a backend this model is not being served on.
+        assert!(
+            on_demand_backend_to_stop(&reg, "odd-arch-model", &[], None).is_none(),
+            "stop must not target a backend arch-aware START would never have used"
         );
     }
 

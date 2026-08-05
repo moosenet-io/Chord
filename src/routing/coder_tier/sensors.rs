@@ -120,8 +120,10 @@ pub fn parse_gtt(used_raw: &str, total_raw: &str) -> Option<GttReading> {
 pub fn discover_gtt_paths() -> Option<(PathBuf, PathBuf)> {
     let explicit_used = std::env::var(GTT_USED_ENV).ok().filter(|s| !s.trim().is_empty());
     let explicit_total = std::env::var(GTT_TOTAL_ENV).ok().filter(|s| !s.trim().is_empty());
-    if let (Some(u), Some(t)) = (explicit_used, explicit_total) {
-        return Some((PathBuf::from(u.trim()), PathBuf::from(t.trim())));
+    match resolve_override(explicit_used.as_deref(), explicit_total.as_deref()) {
+        OverrideOutcome::Use(u, t) => return Some((u, t)),
+        OverrideOutcome::Partial => return None,
+        OverrideOutcome::None => {}
     }
     let entries = std::fs::read_dir(DRM_CLASS_DIR).ok()?;
     let mut cards: Vec<PathBuf> = entries
@@ -139,14 +141,67 @@ pub fn discover_gtt_paths() -> Option<(PathBuf, PathBuf)> {
         })
         .collect();
     cards.sort();
+    let mut found: Vec<(PathBuf, PathBuf)> = Vec::new();
     for card in cards {
         let used = card.join("device/mem_info_gtt_used");
         let total = card.join("device/mem_info_gtt_total");
         if used.is_file() && total.is_file() {
-            return Some((used, total));
+            found.push((used, total));
         }
     }
-    None
+    // These counters are PER-DEVICE, not host-wide. With more than one candidate
+    // card there is nothing here that ties a card to the device the coder backend
+    // will actually load on, so picking the lexicographically first one could
+    // authorise a load against a healthy IDLE GPU while the APU that will serve
+    // the model is full. Ambiguity fails CLOSED; the operator pins the pair with
+    // `CHORD_CODER_TIER_GTT_USED_PATH` / `..._TOTAL_PATH`.
+    select_sole_candidate(found)
+}
+
+/// What an explicit path override amounts to. Pure so both branches are tested.
+#[derive(Debug, PartialEq, Eq)]
+pub enum OverrideOutcome {
+    /// Both paths given — use them.
+    Use(PathBuf, PathBuf),
+    /// Exactly ONE path given. Fails CLOSED rather than falling back to
+    /// discovery: an operator who set one path meant to PIN the device, and
+    /// quietly auto-discovering the other half is how you end up measuring a
+    /// different GPU than the one that was configured.
+    Partial,
+    /// Neither given — discovery is appropriate.
+    None,
+}
+
+pub fn resolve_override(used: Option<&str>, total: Option<&str>) -> OverrideOutcome {
+    match (used, total) {
+        (Some(u), Some(t)) => {
+            OverrideOutcome::Use(PathBuf::from(u.trim()), PathBuf::from(t.trim()))
+        }
+        (None, None) => OverrideOutcome::None,
+        _ => OverrideOutcome::Partial,
+    }
+}
+
+/// Pick THE candidate card, or refuse.
+///
+/// These counters are PER-DEVICE, not host-wide. With more than one candidate
+/// there is nothing tying a card to the device the coder will actually load on,
+/// so picking the lexicographically first could authorise a load against a
+/// healthy IDLE GPU while the APU that serves the model is full. Ambiguity fails
+/// CLOSED; the operator pins the pair with the override env vars.
+pub fn select_sole_candidate(mut found: Vec<(PathBuf, PathBuf)>) -> Option<(PathBuf, PathBuf)> {
+    match found.len() {
+        1 => found.pop(),
+        0 => None,
+        n => {
+            tracing::warn!(
+                candidates = n,
+                "coder tier: multiple GPUs expose GTT counters — refusing to guess which one \
+                 serves the coder; set CHORD_CODER_TIER_GTT_USED_PATH/_TOTAL_PATH to pin it"
+            );
+            None
+        }
+    }
 }
 
 /// Read the live GTT capacity. `None` ⇒ cannot see the memory ⇒ the tier refuses
@@ -312,6 +367,30 @@ Committed_AS:    41943040 kB
             swap_used_gb: 0.0,
         };
         assert!(c.commit_ratio().is_none());
+    }
+
+    #[test]
+    fn ambiguous_multi_gpu_discovery_fails_closed() {
+        let a = (PathBuf::from("/a/used"), PathBuf::from("/a/total"));
+        let b = (PathBuf::from("/b/used"), PathBuf::from("/b/total"));
+        // CONTROL: exactly one candidate resolves, else the negatives are hollow.
+        assert_eq!(select_sole_candidate(vec![a.clone()]), Some(a.clone()));
+        // These counters are PER-DEVICE: with two GPUs, guessing could authorise
+        // a load against an idle card while the serving APU is full.
+        assert_eq!(select_sole_candidate(vec![a, b]), None);
+        assert_eq!(select_sole_candidate(vec![]), None);
+    }
+
+    #[test]
+    fn a_partial_path_override_fails_closed() {
+        assert_eq!(
+            resolve_override(Some("/u"), Some("/t")),
+            OverrideOutcome::Use(PathBuf::from("/u"), PathBuf::from("/t"))
+        );
+        assert_eq!(resolve_override(None, None), OverrideOutcome::None);
+        // Half-configured must NOT silently auto-discover the other half.
+        assert_eq!(resolve_override(Some("/u"), None), OverrideOutcome::Partial);
+        assert_eq!(resolve_override(None, Some("/t")), OverrideOutcome::Partial);
     }
 
     #[test]
