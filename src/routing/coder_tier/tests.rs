@@ -396,8 +396,8 @@ async fn assistant_request_returns_without_waiting_for_teardown() {
 
     // Open the gate and let it finish.
     gate.add_permits(OPEN);
-    for _ in 0..200 {
-        if h.env.restores.load(Ordering::SeqCst) > 0 {
+    for _ in 0..500 {
+        if matches!(tier.phase(), Phase::Cooldown { .. }) {
             break;
         }
         tokio::task::yield_now().await;
@@ -573,8 +573,11 @@ async fn assistant_capacity_is_restored_even_when_the_coder_stop_fails() {
     *env.stop_result.lock().unwrap() = Err("backend refused to stop".into());
 
     tier.note_assistant_request();
+    // Wait for the teardown to REACH ITS RESTING PHASE, not merely for the
+    // restore call — the phase write follows the restore, and asserting on the
+    // earlier of the two would be a race the test itself introduced.
     for _ in 0..500 {
-        if env.restores.load(Ordering::SeqCst) > 0 {
+        if matches!(tier.phase(), Phase::Cooldown { .. }) {
             break;
         }
         tokio::task::yield_now().await;
@@ -655,6 +658,25 @@ fn the_interrupt_signal_is_stable_and_machine_readable() {
         v["reason"],
         serde_json::json!("inference engine interrupted by user")
     );
+}
+
+#[test]
+fn request_classification_treats_an_unlabelled_request_as_a_user() {
+    use axum::http::{HeaderMap, HeaderValue};
+    let mut coder = HeaderMap::new();
+    coder.insert(LEASE_HEADER, HeaderValue::from_static("1"));
+    assert!(is_coder_traffic(&coder), "a review on a lease is coder traffic");
+
+    // The safe default is in the right direction: an unlabelled request counts as
+    // a user, so the worst case is an unnecessary eviction — never a missed one.
+    assert!(!is_coder_traffic(&HeaderMap::new()));
+    let mut other = HeaderMap::new();
+    other.insert("x-something-else", HeaderValue::from_static("1"));
+    assert!(!is_coder_traffic(&other));
+    // Presence, not value — the header is a classification, not a credential.
+    let mut empty_value = HeaderMap::new();
+    empty_value.insert(LEASE_HEADER, HeaderValue::from_static(""));
+    assert!(is_coder_traffic(&empty_value));
 }
 
 #[test]

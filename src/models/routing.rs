@@ -244,6 +244,22 @@ pub async fn stop_all_on_demand_backends(registry: &Arc<Mutex<ModelRegistry>>) -
     stopped
 }
 
+/// RVXR-01: the SAFETY GATE for [`stop_on_demand_backend_for_model`], separated
+/// from the side effect so it is unit-testable without stopping anything.
+///
+/// Returns the backend to stop, or `None` when there is nothing this function is
+/// permitted to stop. **An `always_on` backend always yields `None`** — the
+/// primary Ollama serve is the assistant's own engine, and stopping it to reclaim
+/// a coder's memory would take live Lumina down to make room for a review. That
+/// is the single most damaging thing this whole feature could do, so the gate is
+/// its own named, tested function rather than a condition inside an effect.
+pub fn on_demand_backend_to_stop(reg: &ModelRegistry, model: &str) -> Option<ResolvedBackend> {
+    match reg.backend_for(model) {
+        Some(b) if b.on_demand() => Some(to_resolved(b, None, None)),
+        _ => None,
+    }
+}
+
 /// RVXR-01: stop the ON-DEMAND backend serving exactly ONE model, via the same
 /// `to_resolved` + `lifecycle::stop` path as [`idle_stop_sweep`] and
 /// [`stop_all_on_demand_backends`] — a narrower address on the existing
@@ -265,10 +281,7 @@ pub async fn stop_on_demand_backend_for_model(
 ) -> bool {
     let resolved = {
         let reg = registry.lock().await;
-        match reg.backend_for(model) {
-            Some(b) if b.on_demand() => Some(to_resolved(b, None, None)),
-            _ => None,
-        }
+        on_demand_backend_to_stop(&reg, model)
     };
     match resolved {
         Some(backend) => {
@@ -289,6 +302,63 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use crate::models::backends::LaunchSpec;
+
+    /// RVXR-01: the coder tier must NEVER be able to stop the assistant's own
+    /// always-on engine. Both directions asserted — the control matters as much
+    /// as the guard: a gate that returns `None` for everything would also pass
+    /// the negative case while making the feature inert.
+    #[test]
+    fn the_stop_gate_refuses_always_on_backends_and_permits_on_demand_ones() {
+        use crate::models::backends::Hardware;
+        use std::collections::HashMap;
+
+        let on_demand = Backend {
+            name: "llama-gpu".into(),
+            url: "http://localhost:8082".into(),
+            hardware: Hardware::Gpu,
+            kind: BackendKind::LlamaServer,
+            unit: None,
+            always_on: false,
+            idle_stop_secs: 600,
+            launch: None,
+            api_key_env: None,
+        };
+        let always_on = Backend {
+            name: "ollama".into(),
+            url: "http://localhost:11434".into(),
+            hardware: Hardware::Gpu,
+            kind: BackendKind::Ollama,
+            unit: Some("ollama.service".into()),
+            always_on: true,
+            idle_stop_secs: 0,
+            launch: None,
+            api_key_env: None,
+        };
+        let mut catalogue = HashMap::new();
+        catalogue.insert(on_demand.name.clone(), on_demand.clone());
+        catalogue.insert(always_on.name.clone(), always_on.clone());
+
+        let dir = std::env::temp_dir().join(format!("rvxr01-stopgate-{}", std::process::id()));
+        let mut reg = ModelRegistry::new_with_backends(
+            dir.join("registry.json"),
+            dir.join("local"),
+            dir.join("archive"),
+            vec![],
+            catalogue,
+        );
+        assert!(reg.register_remote_api_model("a-coder", "test", "llama-gpu"));
+        assert!(reg.register_remote_api_model("the-assistant", "test", "ollama"));
+
+        // CONTROL: an on-demand backend IS stoppable, else this test proves nothing.
+        let target = on_demand_backend_to_stop(&reg, "a-coder").expect("on-demand is stoppable");
+        assert_eq!(target.name, "llama-gpu");
+
+        // THE GUARD: the always-on assistant engine is never a stop target.
+        assert!(
+            on_demand_backend_to_stop(&reg, "the-assistant").is_none(),
+            "stopping the always-on serve would take live Lumina down to make room for a review"
+        );
+    }
 
     #[test]
     fn to_resolved_maps_enums_and_launch() {
