@@ -127,7 +127,7 @@
 //!   it, so there is nothing for Terminus to decide about.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -244,6 +244,14 @@ pub trait CoderTierEnv: Send + Sync {
     /// Live `Committed_AS`/`CommitLimit`/swap-used. `None` ⇒ unreadable ⇒ the
     /// tier refuses to load (but does not evict — see `pressure_reason`).
     fn commit(&self) -> Option<CommitReading>;
+    /// Would `model` be served by an ON-DEMAND backend?
+    ///
+    /// A safety PRECONDITION the tier checks before loading, deliberately kept in
+    /// the seam so it is exercised by tests rather than living only in the
+    /// production impl: a coder that resolves to the ALWAYS-ON serve is running on
+    /// the assistant's own engine, and the stop gate will (correctly) refuse to
+    /// stop it — so it could never be evicted.
+    async fn coder_is_on_demand(&self, model: &str) -> bool;
     /// Start the coder through the EXISTING on-demand backend lifecycle.
     async fn start_coder(&self, model: &str) -> Result<(), String>;
     /// Stop it through the EXISTING lifecycle stop. MUST be idempotent.
@@ -279,6 +287,12 @@ struct Inner {
     leases: HashMap<String, CancelToken>,
     /// The model currently loaded/loading, when any.
     model: Option<String>,
+    /// How many teardown tasks are still RUNNING — including ones the
+    /// force-resolve budget has already abandoned. See
+    /// [`policy::Observation::teardown_inflight`]: a stop that is already in
+    /// flight cannot be un-issued by bumping a counter, so a new load must wait
+    /// for it to actually finish or the late stop lands on the NEW coder.
+    teardowns_inflight: usize,
 }
 
 /// The opportunistic coder tier.
@@ -292,6 +306,14 @@ pub struct CoderTier {
     interrupts: AtomicU64,
     loads: AtomicU64,
     evictions: AtomicU64,
+    /// Epoch seconds of the last ASSISTANT request, stamped by the hot-path hook.
+    ///
+    /// The tier keeps its OWN stamp rather than reading the global
+    /// `IdleController` counters, because those count EVERY admitted inference —
+    /// including a review's own calls on the coder. Reading them made the feature
+    /// self-defeating: a running review kept `idle_secs` near zero, so the very
+    /// next tick evicted the coder the review was using.
+    last_assistant_unix: AtomicI64,
     /// Previous swap-used reading, so the tick can derive a TREND. The level
     /// alone is not a signal; the growth between two observations is.
     last_swap_used_gb: Mutex<Option<f64>>,
@@ -323,11 +345,13 @@ impl CoderTier {
                 evict_epoch: 0,
                 leases: HashMap::new(),
                 model: None,
+                teardowns_inflight: 0,
             }),
             env,
             interrupts: AtomicU64::new(0),
             loads: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
+            last_assistant_unix: AtomicI64::new(crate::gpu_exclusive::now_epoch() as i64),
             last_swap_used_gb: Mutex::new(None),
         })
     }
@@ -350,6 +374,25 @@ impl CoderTier {
 
     pub fn epoch(&self) -> u64 {
         self.lock().epoch
+    }
+
+    /// Epoch seconds of the last ASSISTANT request seen by the hot-path hook.
+    pub fn last_assistant_unix(&self) -> i64 {
+        self.last_assistant_unix.load(Ordering::Relaxed)
+    }
+
+    /// How long since the last ASSISTANT request, for a tick at `now`.
+    ///
+    /// Derived from the tier's OWN stamp, never from `IdleController`'s counters:
+    /// those count EVERY admitted inference, including a review's own calls on the
+    /// coder, which made the feature self-defeating — a running review held
+    /// `idle_secs` near zero, so the next tick evicted the coder the review was
+    /// using. Only [`CoderTier::note_assistant_request`] moves this, and it is
+    /// called only for non-coder traffic.
+    pub fn assistant_idle_secs(&self, now: u64) -> u64 {
+        (now as i64)
+            .saturating_sub(self.last_assistant_unix())
+            .max(0) as u64
     }
 
     pub fn status(&self) -> CoderTierStatus {
@@ -388,6 +431,9 @@ impl CoderTier {
         // Read the clock BEFORE taking the lock: the critical section must contain
         // nothing but field writes.
         let now = crate::gpu_exclusive::now_epoch();
+        // Stamp BEFORE anything else: this is the authoritative record of user
+        // activity, and it is deliberately not shared with the coder's own calls.
+        self.last_assistant_unix.store(now as i64, Ordering::Relaxed);
         let (tokens, evict) = {
             let mut inner = self.lock();
             // Bump FIRST: any lease that has already generated output is invalid
@@ -411,6 +457,7 @@ impl CoderTier {
                     // test). It exists so that if concurrent teardowns ever become
                     // possible, each still gets a distinct generation.
                     inner.evict_epoch = inner.evict_epoch.wrapping_add(1);
+                    inner.teardowns_inflight += 1;
                     true
                 }
                 Phase::Arming { .. } => {
@@ -472,6 +519,7 @@ impl CoderTier {
         drop(inner);
         Some(Lease {
             secret,
+            settled: false,
             epoch,
             model,
             token,
@@ -531,6 +579,15 @@ impl CoderTier {
     #[cfg(test)]
     fn live_lease_count(&self) -> usize {
         self.lock().leases.len()
+    }
+
+    /// Test-only: age the assistant stamp, so a fixture can distinguish the
+    /// tier's own stamp from any global counter that happens to be seeded at the
+    /// same construction time (they coincide in a test process, which made two
+    /// mutants survive a fixture that could not tell them apart).
+    #[cfg(test)]
+    fn set_last_assistant_for_test(&self, unix: i64) {
+        self.last_assistant_unix.store(unix, Ordering::Relaxed);
     }
 
     /// Test-only: the current eviction generation.
@@ -604,6 +661,7 @@ impl CoderTier {
             swap_growth_gb: swap_growth,
             coder_gb,
             coder_resolved,
+            teardown_inflight: { self.lock().teardowns_inflight > 0 },
         };
 
         match decide(&self.cfg, phase, &obs) {
@@ -624,6 +682,22 @@ impl CoderTier {
             }
             Decision::Load => {
                 let Some(model) = model else { return };
+                // PRECONDITION: never take the window on the assistant's own
+                // engine. Checked before the phase moves, so a refusal is a clean
+                // no-op rather than a load that must be unwound.
+                if !self.env.coder_is_on_demand(&model).await {
+                    warn!(
+                        model = %model,
+                        "coder tier: resolved coder would run on the always-on assistant engine — refusing"
+                    );
+                    let mut inner = self.lock();
+                    if inner.phase == phase {
+                        inner.phase = Phase::Cooldown {
+                            until: now.saturating_add(self.cfg.cooldown_secs),
+                        };
+                    }
+                    return;
+                }
                 {
                     let mut inner = self.lock();
                     if inner.phase != phase {
@@ -641,29 +715,41 @@ impl CoderTier {
                 // mutant that deleted the second check survived precisely because
                 // the window is unreachable from a test seam. The fix is to remove
                 // the window rather than to write a test that cannot see it.
-                let lost_the_race = {
+                // NOTE: no logging inside this critical section. `tracing` macros
+                // can block on a synchronous subscriber's writer, and an incoming
+                // user acquires this same mutex on the hot path — so the section is
+                // strictly bounded field updates, and the logs happen after.
+                let outcome = {
                     let mut inner = self.lock();
                     if inner.phase == Phase::Loading {
                         match &started {
                             Ok(()) => {
                                 inner.phase = Phase::Ready;
                                 self.loads.fetch_add(1, Ordering::Relaxed);
-                                info!(model = %model,
-                                    "coder tier: coder loaded into the reaped window");
+                                Some(true)
                             }
-                            Err(e) => {
+                            Err(_) => {
                                 inner.phase = Phase::Cooldown {
                                     until: now.saturating_add(self.cfg.cooldown_secs),
                                 };
                                 inner.model = None;
-                                warn!(error = %e, "coder tier: coder load failed — cooling down");
+                                Some(false)
                             }
                         }
-                        false
                     } else {
-                        true
+                        None
                     }
                 };
+                match (&outcome, &started) {
+                    (Some(true), _) => {
+                        info!(model = %model, "coder tier: coder loaded into the reaped window")
+                    }
+                    (Some(false), Err(e)) => {
+                        warn!(error = %e, "coder tier: coder load failed — cooling down")
+                    }
+                    _ => {}
+                }
+                let lost_the_race = outcome.is_none();
                 if lost_the_race && started.is_ok() {
                     // A user arrived DURING the load and the eviction task has
                     // already run. Declining to install `Ready` is NOT enough: the
@@ -693,6 +779,7 @@ impl CoderTier {
                     inner.phase = Phase::Evicting { since: now };
                     inner.epoch = inner.epoch.wrapping_add(1);
                     inner.evict_epoch = inner.evict_epoch.wrapping_add(1);
+                    inner.teardowns_inflight += 1;
                     let gen = inner.evict_epoch;
                     (inner.leases.drain().map(|(_, t)| t).collect(), gen)
                 };
@@ -748,6 +835,15 @@ impl CoderTier {
     /// counter, and this task would then capture the NEW value and consider
     /// itself current. Capturing at request time closes that window.
     pub async fn run_eviction(self: &Arc<Self>, reason: EvictReason, my_evict_epoch: u64) {
+        self.run_eviction_inner(reason, my_evict_epoch).await;
+        // ALWAYS, on every exit path: only once this decrements can a new load
+        // begin, which is what stops a late `stop_coder` from hitting a newer
+        // cycle's coder.
+        let mut inner = self.lock();
+        inner.teardowns_inflight = inner.teardowns_inflight.saturating_sub(1);
+    }
+
+    async fn run_eviction_inner(self: &Arc<Self>, reason: EvictReason, my_evict_epoch: u64) {
         let model = {
             let inner = self.lock();
             // Already abandoned before we even started: do NOT stop anything. By
@@ -796,6 +892,9 @@ impl CoderTier {
 /// truncation into an explicit, machine-readable absence.
 pub struct Lease {
     secret: String,
+    /// Has this lease already been settled by `commit`/`abandon`? Drives the
+    /// [`Drop`] cleanup below.
+    settled: bool,
     epoch: u64,
     model: Option<String>,
     token: CancelToken,
@@ -831,8 +930,9 @@ impl Lease {
     /// The check is made under the tier lock and covers the whole generation
     /// window, not just its end — the epoch was bumped the moment the user
     /// arrived, so a lease that finished a microsecond later still loses.
-    pub fn commit<T>(self, output: T) -> LeaseOutcome<T> {
+    pub fn commit<T>(mut self, output: T) -> LeaseOutcome<T> {
         let ok = self.tier.settle_lease(&self.secret, self.epoch, &self.token);
+        self.settled = true;
         if ok {
             LeaseOutcome::Completed(output)
         } else {
@@ -842,14 +942,32 @@ impl Lease {
     }
 
     /// Abandon the lease without output (e.g. the generation itself errored).
-    pub fn abandon(self) {
+    pub fn abandon(mut self) {
         let _ = self.tier.settle_lease(&self.secret, self.epoch, &self.token);
+        self.settled = true;
     }
 
     /// The bearer credential this lease's inference calls must send in
     /// [`LEASE_HEADER`] so they are recognised as coder traffic.
     pub fn header_value(&self) -> &str {
         &self.secret
+    }
+}
+
+/// A lease that is DROPPED without being committed or abandoned — a panicking
+/// review, a cancelled task, a caller that simply forgot — must not leave its
+/// secret registered.
+///
+/// A stale registered secret keeps passing [`CoderTier::is_live_lease`], so a
+/// request bearing it stays classified as coder traffic and is exempt from
+/// pre-emption forever. That is the same hole as the original presence-only
+/// header check, reintroduced by a leak instead of by a forgery.
+impl Drop for Lease {
+    fn drop(&mut self) {
+        if !self.settled {
+            let mut inner = self.tier.lock();
+            inner.leases.remove(&self.secret);
+        }
     }
 }
 
@@ -907,10 +1025,18 @@ impl CoderTierEnv for AppStateCoderEnv {
         sensors::read_commit()
     }
 
+    async fn coder_is_on_demand(&self, model: &str) -> bool {
+        // The SAME arch-aware resolution stop uses, so start and stop can never
+        // disagree about which backend they mean.
+        crate::models::routing::model_has_on_demand_backend(
+            &self.state.model_registry,
+            &self.state.routing_map,
+            model,
+        )
+        .await
+    }
+
     async fn start_coder(&self, model: &str) -> Result<(), String> {
-        // The EXISTING on-demand start: resolve the model's backend and ensure it
-        // is up. This is the same call the chat path makes, so the coder is
-        // started by the one lifecycle that already knows how.
         crate::models::routing::resolve_and_ensure(
             &self.state.model_registry,
             &self.state.routing_map,
@@ -1024,13 +1150,10 @@ pub async fn tick_loop(tier: Arc<CoderTier>) {
     loop {
         tokio::time::sleep(interval).await;
         let now = crate::gpu_exclusive::now_epoch();
-        let idle = &*crate::admin::idle::IDLE_MODE;
-        let (serving, idle_secs) = crate::admin::idle::activity_summary(
-            idle.inflight_count(),
-            idle.last_activity_unix(),
-            now as i64,
-        );
-        tier.tick(now, idle_secs, serving).await;
+        // `assistant_inflight` is false here on purpose: the synchronous hot-path
+        // hook is the authoritative pre-emption, and any request that has STARTED
+        // has already moved the tier's stamp, so the tick needs only the idle age.
+        tier.tick(now, tier.assistant_idle_secs(now), false).await;
     }
 }
 

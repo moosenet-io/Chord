@@ -264,12 +264,12 @@ pub fn parse_meminfo(raw: &str) -> Option<CommitReading> {
     let kb_to_gb = |kb: f64| kb * 1024.0 / BYTES_PER_GIB;
     let committed_gb = kb_to_gb(committed_kb?);
     let commit_limit_gb = kb_to_gb(limit_kb?);
-    // Swap is optional on a host with none configured; absent ⇒ zero used, which
-    // is the truth, not a fail-closed case.
-    let swap_used_gb = match (swap_total_kb, swap_free_kb) {
-        (Some(t), Some(f)) => kb_to_gb((t - f).max(0.0)),
-        _ => 0.0,
-    };
+    // Swap fields are REQUIRED, not optional. A host with no swap still reports
+    // `SwapTotal: 0` / `SwapFree: 0` — the fields are PRESENT with a zero value.
+    // So their ABSENCE is a sensor failure, not evidence of zero usage, and
+    // treating it as zero would authorise a load with no readable swap-pressure
+    // signal. Fail closed.
+    let swap_used_gb = kb_to_gb((swap_total_kb? - swap_free_kb?).max(0.0));
     Some(CommitReading {
         committed_gb,
         commit_limit_gb,
@@ -343,20 +343,43 @@ Committed_AS:    41943040 kB
     fn meminfo_is_fail_closed_on_missing_commit_fields() {
         // MemAvailable alone is NOT enough — and must never be enough. This is
         // the counter that read 89.4 GB ten minutes before the host hung.
-        let only_available = "MemTotal: 131165244 kB\nMemAvailable: 93750000 kB\n";
+        //
+        // Swap fields are PRESENT here on purpose, so this isolates the
+        // Committed_AS/CommitLimit requirement. (Without them the reading would
+        // fail closed on the swap check instead, and a regression in the commit
+        // check would go unnoticed — which is exactly what happened once.)
+        let only_available =
+            "MemTotal: 131165244 kB\nMemAvailable: 93750000 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n";
         assert!(
             parse_meminfo(only_available).is_none(),
             "a reading without Committed_AS/CommitLimit must fail closed, not fall back to MemAvailable"
         );
+        // Each commit field required INDEPENDENTLY.
+        let no_limit =
+            "Committed_AS: 41943040 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n";
+        assert!(parse_meminfo(no_limit).is_none(), "CommitLimit is required");
+        let no_committed =
+            "CommitLimit: 90748446 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n";
+        assert!(parse_meminfo(no_committed).is_none(), "Committed_AS is required");
         assert!(parse_meminfo("").is_none());
         assert!(parse_meminfo("garbage without colons").is_none());
     }
 
     #[test]
-    fn a_host_with_no_swap_reports_zero_used_not_a_failure() {
-        let raw = "CommitLimit: 90748446 kB\nCommitted_AS: 41943040 kB\n";
-        let c = parse_meminfo(raw).expect("swap is optional");
+    fn a_host_with_no_swap_reports_zero_used_but_missing_fields_fail_closed() {
+        // A genuine no-swap host still PRINTS the fields, with zero values.
+        let no_swap =
+            "CommitLimit: 90748446 kB\nCommitted_AS: 41943040 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n";
+        let c = parse_meminfo(no_swap).expect("a real no-swap host parses");
         assert_eq!(c.swap_used_gb, 0.0);
+
+        // ABSENT fields are a broken sensor, not a zero — reading them as zero
+        // would authorise a load with no swap-pressure signal at all.
+        let missing = "CommitLimit: 90748446 kB\nCommitted_AS: 41943040 kB\n";
+        assert!(
+            parse_meminfo(missing).is_none(),
+            "missing swap fields must fail closed, not read as zero"
+        );
     }
 
     #[test]

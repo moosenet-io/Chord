@@ -40,6 +40,7 @@ struct FakeEnv {
     stop_entered: mpsc::UnboundedSender<()>,
     stop_gate: Arc<Semaphore>,
     restores: AtomicUsize,
+    coder_on_demand: std::sync::atomic::AtomicBool,
 }
 
 struct FakeHandles {
@@ -83,6 +84,7 @@ fn fake(coder: Option<&str>, size_gb: Option<f64>, free_gb: Option<f64>) -> Fake
         stop_entered: stop_tx,
         stop_gate: stop_gate.clone(),
         restores: AtomicUsize::new(0),
+        coder_on_demand: std::sync::atomic::AtomicBool::new(true),
     });
     FakeHandles {
         env,
@@ -117,6 +119,10 @@ impl CoderTierEnv for FakeEnv {
     }
     fn commit(&self) -> Option<CommitReading> {
         *self.commit.lock().unwrap()
+    }
+    async fn coder_is_on_demand(&self, _model: &str) -> bool {
+        tokio::task::yield_now().await;
+        self.coder_on_demand.load(Ordering::SeqCst)
     }
     async fn start_coder(&self, _model: &str) -> Result<(), String> {
         self.log("start");
@@ -601,6 +607,154 @@ async fn a_teardown_abandoned_mid_flight_does_not_write_the_phase() {
         "but it must not write a phase a newer cycle now owns"
     );
     assert!(tier.status().model.is_some(), "nor clear the newer model");
+}
+
+#[tokio::test]
+async fn the_tier_refuses_to_load_onto_the_always_on_assistant_engine() {
+    // `resolve_and_ensure` is general routing and can select the ALWAYS-ON serve
+    // for an untagged model or via an arch fallback. The tier would then be
+    // `Ready` on the assistant's own engine, with the stop gate (correctly)
+    // refusing to stop it — a coder that can never be evicted.
+    let h = fake(Some("a-coder"), Some(17.3), Some(50.0));
+    h.env
+        .coder_on_demand
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let tier = CoderTier::new(cfg_on(), h.env.clone());
+    tier.tick(1_000, 5_000, false).await;
+    tier.tick(2_000, 5_000, false).await;
+
+    assert_ne!(tier.phase(), Phase::Ready);
+    assert!(
+        !h.env.calls().contains(&"start"),
+        "it must refuse BEFORE starting anything, not unwind afterwards"
+    );
+
+    // CONTROL: the identical fixture loads once the backend is on-demand.
+    let h2 = fake(Some("a-coder"), Some(17.3), Some(50.0));
+    let tier2 = CoderTier::new(cfg_on(), h2.env.clone());
+    tier2.tick(1_000, 5_000, false).await;
+    tier2.tick(2_000, 5_000, false).await;
+    assert_eq!(tier2.phase(), Phase::Ready);
+}
+
+#[tokio::test]
+async fn the_tick_idle_age_comes_from_the_tiers_own_stamp() {
+    // The tier keeps its OWN stamp. Reading `IdleController`'s counters counted a
+    // review's own inference as user activity, so a running review kept idle_secs
+    // near zero and the next tick evicted the coder it was using.
+    //
+    // NOTE: the first version of this test was a LYING FIXTURE — it compared
+    // against a freshly-constructed tier whose stamp coincided with every global
+    // counter's seed, so "reads the global instead" and "never stamps at all"
+    // both still produced 0. The stamp is now aged to a value nothing else shares.
+    let (tier, _env, _gate, _rx) = ready_tier().await;
+    let now = crate::gpu_exclusive::now_epoch();
+
+    tier.set_last_assistant_for_test(now as i64 - 5_000);
+    assert_eq!(
+        tier.assistant_idle_secs(now),
+        5_000,
+        "the age must come from the tier's own stamp, not any global counter"
+    );
+
+    // A coder lease is NOT user activity and must not reset the age.
+    let lease = tier.try_acquire_lease().expect("lease");
+    assert_eq!(tier.assistant_idle_secs(now), 5_000);
+
+    // Only the ASSISTANT hook resets it.
+    tier.note_assistant_request();
+    assert_eq!(
+        tier.assistant_idle_secs(now),
+        0,
+        "the hot-path hook must actually stamp"
+    );
+    drop(lease);
+}
+
+#[tokio::test]
+async fn a_dropped_lease_does_not_leave_its_secret_valid_forever() {
+    // A lease that is dropped without commit/abandon — a panicking review, a
+    // cancelled task — must deregister. A leaked secret keeps passing
+    // `is_live_lease`, so a request bearing it stays exempt from pre-emption
+    // FOREVER: the same hole as the presence-only header check, reintroduced by a
+    // leak rather than a forgery.
+    use axum::http::{HeaderMap, HeaderValue};
+    let (tier, _env, _gate, _rx) = ready_tier().await;
+
+    let secret = {
+        let lease = tier.try_acquire_lease().expect("lease");
+        let secret = lease.header_value().to_string();
+        // CONTROL: live while the lease is alive.
+        assert_eq!(tier.live_lease_count(), 1);
+        let mut h = HeaderMap::new();
+        h.insert(LEASE_HEADER, HeaderValue::from_str(&secret).unwrap());
+        assert!(is_coder_traffic(&tier, &h));
+        secret
+        // lease dropped here, never committed
+    };
+
+    assert_eq!(tier.live_lease_count(), 0, "a dropped lease must deregister");
+    let mut h = HeaderMap::new();
+    h.insert(LEASE_HEADER, HeaderValue::from_str(&secret).unwrap());
+    assert!(
+        !is_coder_traffic(&tier, &h),
+        "a leaked secret must not stay valid — it would exempt a user forever"
+    );
+}
+
+#[tokio::test]
+async fn a_new_load_waits_for_an_outstanding_teardown() {
+    // The defect the generation guard could NOT reach: an abandoned teardown that
+    // is already inside `stop_coder` will still stop the backend it named. If a
+    // new cycle loaded in the meantime, that late stop kills the NEW coder. So a
+    // load must not begin while any teardown is still running.
+    let h = fake(Some("a-coder"), Some(17.3), Some(50.0));
+    let tier = CoderTier::new(cfg_on(), h.env.clone());
+    let cfg = cfg_on();
+    let t0 = crate::gpu_exclusive::now_epoch();
+    tier.tick(t0, 5_000, false).await;
+    tier.tick(t0 + 200, 5_000, false).await;
+    assert_eq!(tier.phase(), Phase::Ready);
+
+    // Wedge the teardown and force-resolve past its budget.
+    h.stop_gate.acquire_many(OPEN as u32).await.unwrap().forget();
+    let mut stop_entered = h.stop_entered;
+    tier.note_assistant_request();
+    // WAIT until the teardown is genuinely INSIDE `stop_coder` before abandoning
+    // it. That is the whole hazard: a teardown abandoned BEFORE it starts stops
+    // nothing and a later load is perfectly safe, so force-resolving too early
+    // would make this test pass without testing anything.
+    tokio::time::timeout(std::time::Duration::from_secs(5), stop_entered.recv())
+        .await
+        .expect("teardown reached the stop seam")
+        .expect("entered");
+    tier.tick(t0 + cfg.evict_budget_secs + 1, 5_000, false).await;
+    assert!(matches!(tier.phase(), Phase::Cooldown { .. }));
+
+    // Cooldown expires; the tier tries to run a whole new cycle while the old
+    // teardown is STILL wedged inside stop_coder.
+    let after = t0 + cfg.evict_budget_secs + cfg.cooldown_secs + 10;
+    tier.tick(after, 5_000, false).await; // Rest
+    tier.tick(after + 10, 5_000, false).await; // Arm
+    tier.tick(after + 10 + cfg.arm_confirm_secs, 5_000, false).await; // would Load
+    assert_ne!(
+        tier.phase(),
+        Phase::Ready,
+        "a new coder must NOT be loaded underneath an in-flight teardown"
+    );
+
+    // Once the teardown finishes, a load is allowed again.
+    h.stop_gate.add_permits(OPEN);
+    for _ in 0..500 {
+        tokio::task::yield_now().await;
+    }
+    tier.tick(after + 400, 5_000, false).await; // Arm
+    tier.tick(after + 400 + cfg.arm_confirm_secs, 5_000, false).await;
+    assert_eq!(
+        tier.phase(),
+        Phase::Ready,
+        "CONTROL: once the teardown is done the load proceeds, so the gate is not just 'never load'"
+    );
 }
 
 #[tokio::test]

@@ -285,6 +285,30 @@ pub fn on_demand_backend_to_stop(
 /// stopped backend is a successful no-op — the contract is the goal state "not
 /// running", exactly as in [`stop_all_on_demand_backends`]), `false` when the
 /// model has no on-demand backend to stop.
+/// RVXR-01: would `model` be served by an ON-DEMAND backend?
+///
+/// The precondition for the coder tier LOADING anything: a coder that resolves to
+/// the always-on serve is running on the assistant's own engine, and the stop gate
+/// will (correctly) refuse to stop it — so it could never be evicted. Uses the
+/// SAME arch-aware resolution as [`stop_on_demand_backend_for_model`], so start
+/// and stop can never disagree about which backend they mean.
+pub async fn model_has_on_demand_backend(
+    registry: &Arc<Mutex<ModelRegistry>>,
+    routing_map: &Arc<Mutex<RoutingMap>>,
+    model: &str,
+) -> bool {
+    let (excluded_tiers, chosen_tier) = {
+        let routing = routing_map.lock().await;
+        let model_id = terminus_rs::intake::serving::ModelId::from(model);
+        (
+            routing.excluded_tiers(&model_id),
+            routing.chosen_backend(&model_id),
+        )
+    };
+    let reg = registry.lock().await;
+    on_demand_backend_to_stop(&reg, model, &excluded_tiers, chosen_tier).is_some()
+}
+
 pub async fn stop_on_demand_backend_for_model(
     registry: &Arc<Mutex<ModelRegistry>>,
     routing_map: &Arc<Mutex<RoutingMap>>,

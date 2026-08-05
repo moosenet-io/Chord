@@ -235,6 +235,17 @@ pub struct Observation {
     /// Estimated ON-DISK size of the resolved coder, GiB. `None` ⇒ unknown.
     pub coder_gb: Option<f64>,
     pub coder_resolved: bool,
+    /// Is a teardown task still running (even one already abandoned by the
+    /// force-resolve budget)?
+    ///
+    /// A NEW load must not begin while one is, and the reason is a side effect the
+    /// bookkeeping generation cannot reach: an abandoned teardown that is already
+    /// INSIDE `stop_coder` will eventually stop the backend it named. If cooldown
+    /// expired and a new cycle loaded the same model in the meantime, that late
+    /// stop kills the NEW coder while the tier believes it is `Ready`. Guarding
+    /// the bookkeeping is not enough — the load has to wait for the old teardown
+    /// to actually finish.
+    pub teardown_inflight: bool,
 }
 
 /// Estimated RUNTIME footprint: on-disk size inflated by the measured factor.
@@ -293,6 +304,11 @@ pub fn pressure_reason(obs: &Observation, cfg: &CoderTierConfig) -> Option<Evict
 /// healthy pressure sensors — an unreadable `Committed_AS` blocks a load even
 /// though it would not force an eviction.
 pub fn can_admit(obs: &Observation, cfg: &CoderTierConfig) -> bool {
+    if obs.teardown_inflight {
+        // See `Observation::teardown_inflight` — a late stop from an abandoned
+        // teardown would land on the coder this load is about to start.
+        return false;
+    }
     if !coder_fits(obs, cfg) {
         return false;
     }
@@ -404,6 +420,7 @@ mod tests {
             swap_growth_gb: Some(0.0),
             coder_gb: Some(17.3),
             coder_resolved: true,
+            teardown_inflight: false,
         }
     }
 
@@ -426,6 +443,23 @@ mod tests {
     }
 
     // ── anti-thrash ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_load_waits_for_an_outstanding_teardown_to_actually_finish() {
+        // The bookkeeping generation cannot un-issue a `stop_coder` that is
+        // already in flight, so a new cycle must not start underneath one.
+        let cfg = cfg_on();
+        let mut obs = quiet(1_000);
+        obs.teardown_inflight = true;
+        assert!(!can_admit(&obs, &cfg));
+        assert_eq!(
+            decide(&cfg, Phase::Arming { armed_at: 0 }, &obs),
+            Decision::Hold
+        );
+        // CONTROL: the same observation admits once the teardown has finished.
+        obs.teardown_inflight = false;
+        assert!(can_admit(&obs, &cfg));
+    }
 
     #[test]
     fn never_loads_on_the_first_idle_tick() {
