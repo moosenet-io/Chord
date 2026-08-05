@@ -9,6 +9,7 @@
 //! it* mechanics.
 
 pub mod assistant_profile;
+pub mod coder_tier;
 pub mod lumina_alias;
 pub mod residency_snapshot;
 pub mod route_catalog;

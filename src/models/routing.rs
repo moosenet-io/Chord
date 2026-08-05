@@ -244,6 +244,46 @@ pub async fn stop_all_on_demand_backends(registry: &Arc<Mutex<ModelRegistry>>) -
     stopped
 }
 
+/// RVXR-01: stop the ON-DEMAND backend serving exactly ONE model, via the same
+/// `to_resolved` + `lifecycle::stop` path as [`idle_stop_sweep`] and
+/// [`stop_all_on_demand_backends`] — a narrower address on the existing
+/// primitive, not a second lifecycle.
+///
+/// **An always-on backend is NEVER stopped**, whatever the model claims: the
+/// primary Ollama serve is the assistant's own engine, and stopping it to reclaim
+/// a coder's memory would take the live assistant down to make room for a review.
+/// [`Backend::on_demand`] is the single gate, and it is the same one the idle
+/// sweep uses.
+///
+/// Returns `true` when an on-demand backend was addressed (stopping an already-
+/// stopped backend is a successful no-op — the contract is the goal state "not
+/// running", exactly as in [`stop_all_on_demand_backends`]), `false` when the
+/// model has no on-demand backend to stop.
+pub async fn stop_on_demand_backend_for_model(
+    registry: &Arc<Mutex<ModelRegistry>>,
+    model: &str,
+) -> bool {
+    let resolved = {
+        let reg = registry.lock().await;
+        match reg.backend_for(model) {
+            Some(b) if b.on_demand() => Some(to_resolved(b, None, None)),
+            _ => None,
+        }
+    };
+    match resolved {
+        Some(backend) => {
+            tracing::info!(
+                backend = %backend.name,
+                model = %model,
+                "coder tier: stopping on-demand backend"
+            );
+            lifecycle::stop(&backend);
+            true
+        }
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

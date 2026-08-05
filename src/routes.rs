@@ -882,6 +882,15 @@ pub async fn chat_completions(
         }
     };
 
+    // ── RVXR-01: the assistant always wins, immediately. ──────────────────────
+    // Placed BEFORE idle admission, the GPU gate, rate limiting, and any upstream
+    // work: an authenticated user request pre-empts an opportunistic review at the
+    // FIRST moment we know it is a user, not after it has queued behind anything.
+    // Synchronous, no `.await`, no I/O — one relaxed atomic load when the tier is
+    // off (the default). It never returns early and never changes this request's
+    // outcome; the coder teardown it may trigger runs detached.
+    crate::routing::coder_tier::note_inference_request(&headers);
+
     // ── BLD-09 idle-mode admission: join the closed-world drain (so `POST /admin/idle`
     // can drain before releasing) and lazily restore if idle. Once idle-mode has begun
     // entering (EnteringIdle), admission is refused with a retryable 503 so no new

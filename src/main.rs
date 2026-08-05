@@ -623,6 +623,17 @@ async fn main() {
         });
     }
 
+    // RVXR-01: install the opportunistic coder tier and start its observation
+    // loop. The tier is DEFAULT-OFF (`CHORD_CODER_TIER_ENABLED`); installing it
+    // while disabled costs one atomic load per inference request and nothing else,
+    // and makes `GET /admin/coder-tier` answer honestly instead of 404-ing.
+    {
+        let tier = chord_proxy::routing::coder_tier::init_global(state.clone());
+        tokio::spawn(async move {
+            chord_proxy::routing::coder_tier::tick_loop(tier).await;
+        });
+    }
+
     let control_port = config.control_port;
     let control_router = chord_proxy::control::build_control_router(state.clone());
 
