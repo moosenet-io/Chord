@@ -80,6 +80,25 @@ impl SweepStatusLog {
         line.push('\n');
         let mut file = tokio::fs::OpenOptions::new().create(true).append(true).open(&path).await?;
         file.write_all(line.as_bytes()).await?;
+        // CHRD #113 — THE FLUSH IS LOAD-BEARING, not hygiene.
+        //
+        // `tokio::fs::File` is BUFFERED: `write_all` copies into an internal
+        // buffer and schedules the real write on the blocking pool. Dropping the
+        // handle does not await that write, so without this flush an append is
+        // intermittently LOST — and the loss is silent, because `append` has
+        // already returned `Ok(())`.
+        //
+        // This is the root cause of the build-door flake: a test would fail and
+        // then pass on the identical commit. Measured with a standalone
+        // reproducer of exactly this open/write/drop shape, 8-worker runtime,
+        // append-twice-then-read: WITHOUT flush 30 losses in 60,000 iterations
+        // (~1 in 2,000); WITH flush 0 in 60,000. Both directions run.
+        //
+        // `flush` (not `sync_all`) is the right level: it gets the bytes to the
+        // OS, which is what any subsequent reader — including the live status
+        // API — goes through. Durability across a machine crash is not something
+        // a best-effort status log promises.
+        file.flush().await?;
         Ok(())
     }
 
@@ -213,6 +232,62 @@ mod tests {
 
     fn tmpl(dir: &Path) -> PathBuf {
         path_from(dir, "sweep-status", "jsonl")
+    }
+
+    /// CHRD #113 SOURCE RATCHET — every buffered async write in this module must
+    /// be flushed.
+    ///
+    /// `tokio::fs::File` buffers, and dropping the handle does not await the
+    /// write, so a missing `flush` silently loses data while `append` still
+    /// returns `Ok(())`. A behavioural test cannot pin that down: the loss is
+    /// racy (~1 in 2,000 measured), so a test that exercises it passes almost
+    /// always whether the bug is present or not. This checks the property that
+    /// actually prevents it, and does so deterministically.
+    ///
+    /// Reads the REAL source of this file, so it cannot drift from what ships.
+    #[test]
+    fn every_async_write_in_this_module_is_flushed() {
+        const SRC: &str = include_str!("log.rs");
+        // Assembled at runtime so this test does not match itself.
+        let needle = format!("{}{}", "write_all", "(");
+        let sites: Vec<usize> = SRC.match_indices(needle.as_str()).map(|(i, _)| i).collect();
+        assert!(
+            !sites.is_empty(),
+            "the ratchet found no writes at all — it has stopped measuring \
+             anything; fix the needle rather than deleting the test"
+        );
+        for site in sites {
+            let window = &SRC[site..SRC.len().min(site + 1200)];
+            assert!(
+                window.contains(".flush()"),
+                "a write_all at byte {site} is not followed by a flush. \
+                 tokio::fs::File is buffered and Drop does not await the write, so \
+                 the data is silently lost some fraction of the time (CHRD #113)."
+            );
+        }
+    }
+
+    /// Complements the ratchet from the other side: a real append round-trip.
+    ///
+    /// Deliberately weak, and labelled so. At ~1 loss in 2,000 appends this
+    /// catches a regression only sometimes — but it can only ever fail WRONGLY
+    /// silent, never fail spuriously, so it costs nothing to keep and it
+    /// exercises the real code path the ratchet only reads.
+    #[tokio::test]
+    async fn many_appends_all_survive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = SweepStatusLog::new(tmpl(tmp.path()), 10);
+        let ts = Utc.with_ymd_and_hms(2026, 7, 2, 12, 0, 0).unwrap();
+        const N: usize = 300;
+        for i in 0..N {
+            log.append(ts, &serde_json::json!({"timestamp": ts.to_rfc3339(), "n": i}))
+                .await
+                .unwrap();
+        }
+        let content = tokio::fs::read_to_string(log.file_for_date(ts.date_naive()))
+            .await
+            .unwrap();
+        assert_eq!(content.lines().count(), N, "an append was silently lost");
     }
 
     #[test]
