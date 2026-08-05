@@ -292,97 +292,22 @@ pub fn on_demand_backend_to_stop(
 /// will (correctly) refuse to stop it — so it could never be evicted. Uses the
 /// SAME arch-aware resolution as [`stop_on_demand_backend_for_model`], so start
 /// and stop can never disagree about which backend they mean.
-/// RVXR-01 SAFETY GATE — would starting an on-demand GPU backend take the
-/// ASSISTANT'S OWN ENGINE down with it?
 ///
-/// **Verified against terminus-rs 1.3.1 source, not inferred.**
-/// `intake::lifecycle::ensure_up` calls `free_gpu(keep)` for any backend with
-/// `hardware == "gpu"`, and `free_gpu` does:
+/// ## CHRD #112: the `free_gpu` refusal that used to live here is GONE, deliberately
+/// RVXR-01 added a second gate here: refuse to load AT ALL while any always-on GPU
+/// unit was registered, because `terminus-rs`'s `free_gpu` would `systemctl stop`
+/// it on a cold start. That was a shield over one caller, and on the live GPU host
+/// it refused every load — the coder tier could never run.
 ///
-/// ```text
-/// for (name, unit) in infer::gpu_backends() { if name == keep { continue }
-///     if let Some(unit) = unit { systemctl stop <unit> } ... }
-/// ```
+/// terminus-rs 1.3.2 fixes it at the point of action instead: `free_gpu` can only
+/// iterate `gpu_stop_guard::StoppableGpuBackend` values, and the only constructor
+/// of that type excludes always-on backends. There is no longer a caller-side check
+/// to keep, for this caller or any other, so keeping this one would misinform the
+/// next reader about a live hazard while disabling a working feature.
 ///
-/// `infer::gpu_backends()` **reads Chord's `model-registry.json` FROM DISK** and
-/// filters only on `hardware == "gpu"` — there is no `always_on` check. Chord
-/// seeds the primary Ollama serve as `hardware: Gpu, unit: Some("ollama.service")`.
-/// So a cold coder start would run `systemctl stop ollama.service` and take live
-/// Lumina down to make room for a review.
-///
-/// This is a REAL, PRE-EXISTING, cross-repo defect (CHRD #112): it already fires
-/// for any chat request routed to a GPU on-demand backend. RVXR-01 does not
-/// introduce it, but it would be the first thing to trigger it AUTOMATICALLY and
-/// UNATTENDED, on a timer. So the coder tier refuses to load while it exists.
-///
-/// ## It reads the FILE, deliberately
-/// An earlier version inspected the in-memory `ModelRegistry`. That is the wrong
-/// source of truth: `free_gpu` re-reads the file, so a file containing an
-/// always-on GPU unit absent from our snapshot would pass the gate and still be
-/// stopped. This mirrors `gpu_backends()` exactly — including its behaviour on a
-/// missing or unparseable file, where it yields NO backends and therefore stops
-/// nothing, which is genuinely safe rather than merely assumed to be.
-///
-/// ## KNOWN RESIDUAL: this is a check, not a lock (tracked on CHRD #112)
-/// The gate reads the registry file; `ensure_up`/`free_gpu` re-reads it moments
-/// later. A writer that adds an always-on GPU unit in that window would defeat
-/// the check. This is acknowledged, not overlooked — raised by the review panel,
-/// and **irreducible from inside Chord**: re-reading immediately before the start
-/// only narrows the window, because the start itself is what re-reads the file.
-/// Closing it properly requires the upstream fix (`free_gpu` must skip
-/// `always_on` backends), which is precisely why CHRD #112 exists and why this
-/// gate has no override.
-///
-/// Two things bound the residual today. First, the always-on entry is seeded at
-/// startup and is static in practice; nothing adds an always-on GPU unit at
-/// runtime. Second, and more decisively: on any host where the hazard is real
-/// (ollama registered always_on + gpu + unit) this gate ALREADY refuses every
-/// load, so there is no start to race. The window can only open on a host where
-/// no such backend is registered — where `free_gpu` would have nothing to stop
-/// either.
-///
-/// ## There is no override, deliberately
-/// An earlier version had an operator acknowledgement env var. It asserted an
-/// unverified claim — that the installed terminus-rs carries the upstream fix —
-/// and re-enabled a production outage if that claim was wrong. Raised in review
-/// and removed: when the upstream fix ships, the dependency bump and the removal
-/// of this gate are a CODE change that goes through review, not an env var an
-/// operator can set on a hunch.
-pub fn free_gpu_would_stop_an_always_on_backend(reg: &ModelRegistry) -> Option<String> {
-    let raw = std::fs::read_to_string(reg.path()).ok()?;
-    free_gpu_hazard_from_registry_json(&raw)
-}
-
-/// Pure core: given the raw `model-registry.json` text, name an always-on GPU
-/// backend that `free_gpu` would `systemctl stop`, if any.
-///
-/// Mirrors `infer::gpu_backends()`: an unparseable file yields no backends (it
-/// stops nothing), so it is not a hazard. Pure, so it is tested without touching
-/// the filesystem or the process environment.
-pub fn free_gpu_hazard_from_registry_json(raw: &str) -> Option<String> {
-    #[derive(serde::Deserialize)]
-    struct Entry {
-        #[serde(default)]
-        hardware: Option<String>,
-        #[serde(default)]
-        unit: Option<String>,
-        #[serde(default)]
-        always_on: bool,
-    }
-    #[derive(serde::Deserialize)]
-    struct RegFile {
-        #[serde(default)]
-        backends: std::collections::BTreeMap<String, Entry>,
-    }
-    let reg: RegFile = serde_json::from_str(raw).ok()?;
-    reg.backends
-        .into_iter()
-        .find(|(_, b)| {
-            b.always_on && b.hardware.as_deref() == Some("gpu") && b.unit.is_some()
-        })
-        .map(|(name, _)| name)
-}
-
+/// The removal is not taken on trust: `upstream_free_gpu_cannot_stop_the_always_on_engine`
+/// (below) asserts the contract against the terminus-rs actually linked into this
+/// build, and fails to COMPILE against a version that predates the fix.
 pub async fn model_has_on_demand_backend(
     registry: &Arc<Mutex<ModelRegistry>>,
     routing_map: &Arc<Mutex<RoutingMap>>,
@@ -397,14 +322,6 @@ pub async fn model_has_on_demand_backend(
         )
     };
     let reg = registry.lock().await;
-    if let Some(victim) = free_gpu_would_stop_an_always_on_backend(&reg) {
-        tracing::warn!(
-            would_stop = %victim,
-            "coder tier: refusing to load — starting an on-demand GPU backend would stop the \
-             always-on assistant engine (terminus-rs free_gpu has no always_on check; CHRD #112)"
-        );
-        return false;
-    }
     on_demand_backend_to_stop(&reg, model, &excluded_tiers, chosen_tier).is_some()
 }
 
@@ -520,63 +437,65 @@ mod tests {
     /// real coder stays resident and holding memory. Raised by the review panel;
     /// this is the fixture where the two resolutions actually diverge (an empty
     /// exclusion set makes them agree, which is why the first test missed it).
-    /// RVXR-01: `free_gpu` would `systemctl stop` an always-on GPU unit. The gate
-    /// reads the SAME registry FILE that `infer::gpu_backends()` reads — checking
-    /// our in-memory snapshot instead would pass a file we never looked at.
+    /// CHRD #112: the fix now lives UPSTREAM, so assert the upstream contract
+    /// against the `terminus-rs` actually linked into THIS build.
+    ///
+    /// This is what replaces the deleted Chord-side refusal, and it is a stronger
+    /// thing than the refusal was. The refusal was a check racing the file re-read
+    /// that `free_gpu` itself performs; this asserts that `free_gpu` cannot be
+    /// handed an always-on backend at all, because the only constructor of the
+    /// value it iterates excludes them.
+    ///
+    /// It is also the version ratchet: against a `terminus-rs` predating 1.3.2
+    /// this test does not COMPILE (`gpu_stop_guard` does not exist there), so a
+    /// dependency downgrade cannot quietly restore the hazard the refusal used to
+    /// cover.
     #[test]
-    fn the_free_gpu_gate_names_an_always_on_gpu_unit_from_the_registry_file() {
-        let hazardous = r#"{"backends":{
+    fn upstream_free_gpu_cannot_stop_the_always_on_engine() {
+        use terminus_rs::intake::gpu_stop_guard::stoppable_gpu_backends_from_json;
+
+        // Exactly the shape Chord seeds on the live GPU host.
+        let live = r#"{"backends":{
             "ollama":{"name":"ollama","url":"http://x","hardware":"gpu","kind":"ollama",
                       "unit":"ollama.service","always_on":true},
-            "llama-gpu":{"name":"llama-gpu","url":"http://y","hardware":"gpu",
-                         "kind":"llama-server","always_on":false}}}"#;
-        assert_eq!(
-            free_gpu_hazard_from_registry_json(hazardous).as_deref(),
-            Some("ollama")
-        );
-
-        // CONTROL: the same file without the always-on unit is NOT a hazard, so
-        // the gate is not simply "always refuse".
-        //
-        // `lemonade-coder` is the case that matters here: an ON-DEMAND GPU backend
-        // that DOES have a systemd unit. `free_gpu` stopping that is the whole
-        // point of the on-demand lifecycle and is perfectly safe — only stopping
-        // an ALWAYS-ON one is the hazard. A gate that ignored `always_on` would
-        // flag this and refuse forever.
-        let safe = r#"{"backends":{
             "llama-gpu":{"name":"llama-gpu","url":"http://y","hardware":"gpu",
                          "kind":"llama-server","always_on":false},
             "lemonade-coder":{"name":"lemonade-coder","url":"http://z","hardware":"gpu",
                               "kind":"llama-server","unit":"lemonade-coder.service",
                               "always_on":false}}}"#;
+
+        let stoppable = stoppable_gpu_backends_from_json(live, "llama-gpu");
         assert!(
-            free_gpu_hazard_from_registry_json(safe).is_none(),
-            "an ON-DEMAND GPU backend with a unit is not a hazard — stopping it is the design"
+            !stoppable.iter().any(|b| b.name() == "ollama"),
+            "starting a coder must never yield `systemctl stop ollama.service`: {stoppable:?}"
         );
 
-        // An always-on backend with NO unit is nothing free_gpu can stop.
-        let no_unit = r#"{"backends":{
-            "ollama":{"name":"ollama","url":"http://x","hardware":"gpu",
-                      "kind":"ollama","always_on":true}}}"#;
-        assert!(free_gpu_hazard_from_registry_json(no_unit).is_none());
-
-        // A non-GPU always-on backend is outside free_gpu's loop entirely.
-        let remote = r#"{"backends":{
-            "openrouter":{"name":"openrouter","url":"http://x","hardware":"cpu",
-                          "kind":"open-router","unit":"or.service","always_on":true}}}"#;
-        assert!(free_gpu_hazard_from_registry_json(remote).is_none());
-
-        // An unparseable file yields NO backends in `gpu_backends()`, so it stops
-        // nothing — mirrored here rather than assumed.
-        assert!(free_gpu_hazard_from_registry_json("not json").is_none());
-        assert!(free_gpu_hazard_from_registry_json("").is_none());
+        // CONTROL: on-demand GPU backends ARE still stoppable. Without this, a
+        // guard that refused everything would pass the assertion above while
+        // making GPU arbitration inert — every backend perpetually holding the GPU.
+        let names: Vec<&str> = stoppable.iter().map(|b| b.name()).collect();
+        assert_eq!(
+            names,
+            vec!["lemonade-coder"],
+            "an on-demand GPU backend with a unit must stay stoppable — that is the design"
+        );
     }
 
-    /// RVXR-01: the LOAD precondition must actually consult the free_gpu gate —
-    /// not merely have one available. Testing the gate in isolation left this
-    /// wiring undefended (a mutant that ignored it survived).
+    /// CHRD #112 reconciliation: the LOAD precondition no longer refuses just
+    /// because an always-on GPU engine is registered.
+    ///
+    /// This test is the inverse of the one it replaces, and that inversion IS the
+    /// decision. RVXR-01 asserted that adding `ollama` (gpu + always_on + unit) to
+    /// the registry made the coder unloadable — which on the live GPU host meant
+    /// always. With the upstream fix, starting the coder can no longer stop that
+    /// engine, so refusing would disable a working feature to guard a hazard that
+    /// no longer exists.
+    ///
+    /// Both directions are still asserted: the precondition must answer the
+    /// question it is actually for — "is there an on-demand backend to evict?" —
+    /// and still say NO when there is not.
     #[tokio::test]
-    async fn the_load_precondition_consults_the_free_gpu_gate() {
+    async fn the_load_precondition_ignores_a_registered_always_on_engine() {
         use crate::models::backends::Hardware;
         use std::collections::HashMap;
 
@@ -602,42 +521,45 @@ mod tests {
             launch: None,
             api_key_env: None,
         };
-        // The gate reads the registry FILE (the same source `free_gpu` reads), so
-        // each case needs a real one on disk.
-        let dir = std::env::temp_dir().join(format!("rvxr01-precond-{}", std::process::id()));
-        let build = |cat: HashMap<String, Backend>, tag: &str| {
+
+        let dir = std::env::temp_dir().join(format!("chrd112-precond-{}", std::process::id()));
+        let build = |cat: HashMap<String, Backend>, tag: &str, model_backend: &str| {
             let d = dir.join(tag);
             std::fs::create_dir_all(&d).unwrap();
-            let path = d.join("registry.json");
             let mut reg = ModelRegistry::new_with_backends(
-                path.clone(),
+                d.join("registry.json"),
                 d.join("local"),
                 d.join("archive"),
                 vec![],
                 cat,
             );
-            assert!(reg.register_remote_api_model("a-coder", "test", "llama-gpu"));
+            assert!(reg.register_remote_api_model("a-coder", "test", model_backend));
             reg.save().expect("registry file written");
             Arc::new(Mutex::new(reg))
         };
         let routing = Arc::new(Mutex::new(crate::serving::profile::RoutingMap::empty()));
 
-        // CONTROL: with no always-on GPU unit to clobber, the precondition passes.
-        let mut safe = HashMap::new();
-        safe.insert(coder_backend.name.clone(), coder_backend.clone());
-        assert!(
-            model_has_on_demand_backend(&build(safe, "safe"), &routing, "a-coder").await,
-            "CONTROL: an on-demand coder is loadable when nothing would be stopped"
-        );
-
-        // THE GATE: add the always-on assistant engine and the SAME coder is now
-        // refused, because starting it would `systemctl stop ollama.service`.
+        // THE RECONCILIATION: the always-on engine is registered, and the coder is
+        // loadable anyway. Under RVXR-01 this asserted the opposite.
         let mut hazardous = HashMap::new();
         hazardous.insert(coder_backend.name.clone(), coder_backend.clone());
         hazardous.insert(assistant_engine.name.clone(), assistant_engine.clone());
         assert!(
-            !model_has_on_demand_backend(&build(hazardous, "hazard"), &routing, "a-coder").await,
-            "the precondition must consult the free_gpu gate, not just the backend kind"
+            model_has_on_demand_backend(&build(hazardous, "with-engine", "llama-gpu"), &routing, "a-coder")
+                .await,
+            "starting the coder can no longer stop ollama.service (terminus-rs >= 1.3.2), \
+             so the presence of the always-on engine must not veto the load"
+        );
+
+        // CONTROL: the precondition still answers its own question. A model served
+        // BY the always-on engine has nothing on-demand to evict, so it is false —
+        // otherwise this test would pass for a precondition hardwired to `true`.
+        let mut only_engine = HashMap::new();
+        only_engine.insert(assistant_engine.name.clone(), assistant_engine.clone());
+        assert!(
+            !model_has_on_demand_backend(&build(only_engine, "engine-only", "ollama"), &routing, "a-coder")
+                .await,
+            "a model on the always-on engine has no on-demand backend to evict"
         );
     }
 

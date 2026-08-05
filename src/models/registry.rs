@@ -832,9 +832,13 @@ impl ModelRegistry {
         }
     }
 
-    /// The on-disk path this registry serializes to. Needed because terminus-rs's
-    /// `free_gpu` re-reads THIS FILE rather than any in-memory state, so a guard
-    /// against it must consult the same source of truth.
+    /// The on-disk path this registry serializes to.
+    ///
+    /// Added for the RVXR-01 `free_gpu` guard, which had to read the same FILE
+    /// terminus-rs re-reads rather than any in-memory snapshot. That guard is gone
+    /// (CHRD #112 fixed `free_gpu` upstream), but the accessor is kept: the fact
+    /// that terminus-rs consumes this file, not our in-memory state, is a real
+    /// property of the boundary and the next guard-shaped question will need it.
     pub fn path(&self) -> &std::path::Path {
         &self.path
     }
