@@ -539,6 +539,62 @@ async fn copy_model_files(
 ) -> Result<(), (PullError, Vec<PathBuf>)> {
     let mut published: Vec<PathBuf> = Vec::new();
 
+    // Manifest leaf — mirror its path relative to the archive manifests root.
+    // Resolved and STASHED before a single blob is copied (see the comment on
+    // the stash call below) — everything here through `stash_existing_manifest`
+    // depends only on `plan`, never on the blob loop, so there is no ordering
+    // cost to moving it first.
+    let archive_manifests = plan.archive_root.join("manifests");
+    let rel = match plan.archive_manifest.strip_prefix(&archive_manifests) {
+        Ok(r) => r.to_path_buf(),
+        Err(_) => {
+            return Err((
+                PullError::Io("archive manifest path outside manifests root".into()),
+                published,
+            ))
+        }
+    };
+    let dst_manifest = plan.local_root.join("manifests").join(&rel);
+    if let Some(parent) = dst_manifest.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return Err((PullError::Io(e.to_string()), published));
+        }
+    }
+    // Park the manifest that is already there, if any, BEFORE replacing it —
+    // and before touching a single blob. Publishing with `rename` guarantees
+    // the destination is never left partial; it does nothing for the previous
+    // CONTENT, which this attempt is about to replace wholesale. Without the
+    // stash, an attempt that publishes the manifest and is then abandoned
+    // leaves a manifest naming blobs that cleanup deletes — the exact state
+    // blobs-first-manifest-last exists to prevent, reached through the
+    // ownership filter (the PATH pre-existed, so cleanup keeps it) rather than
+    // through truncation. The filter reasons about paths; this is about
+    // content.
+    //
+    // Running this BEFORE the blob loop (not after, as originally written) is
+    // itself a correctness requirement, not just an optimization: every
+    // failure return in this function funnels into the caller's undo route
+    // (`undo_pull_attempt` / `cleanup_after_join_error`), which unconditionally
+    // calls `restore_manifest_backup` for `rel` — it has no way to know
+    // whether THIS attempt ever reached the stash step. If a blob copy failed
+    // before the stash ran, that restore would act on a backup this attempt
+    // never created (any pre-existing stale backup, e.g. one orphaned by
+    // eviction — see the round-6/7 fixes), resurrecting unrelated content at
+    // `dst_manifest` that this attempt never touched. Stashing first means
+    // that by the time any failure can be returned, this attempt has always
+    // either (a) staged a real backup of `dst`'s actual prior content, which a
+    // later restore correctly undoes, or (b) confirmed there was nothing at
+    // `dst` to stash, in which case any backup restore finds is stale by the
+    // same eviction argument and `stash_existing_manifest` has already
+    // cleared it — either way, restore_manifest_backup can no longer observe
+    // a backup this attempt did not itself just create.
+    if let Err(e) = stash_existing_manifest(&plan.local_root, &rel, &dst_manifest) {
+        return Err((
+            PullError::Io(format!("stash existing manifest: {e}")),
+            published,
+        ));
+    }
+
     // Blobs.
     let archive_blobs = plan.archive_root.join("blobs");
     let local_blobs = plan.local_root.join("blobs");
@@ -560,7 +616,8 @@ async fn copy_model_files(
         match copy_file_cancellable(&src, &dst, &cancel, &activity).await {
             Ok(true) => published.push(dst),
             // Cancelled → `dst` was never touched (the copy only ever wrote its
-            // own temp file, which it has already removed).
+            // own temp file, which it has already removed). The manifest WAS
+            // already stashed above; the caller's undo route restores it.
             Ok(false) => return Err((PullError::Io(CANCELLED.to_string()), published)),
             Err(e) => {
                 return Err((PullError::Io(format!("copy blob {fname}: {e}")), published));
@@ -568,37 +625,6 @@ async fn copy_model_files(
         }
     }
 
-    // Manifest leaf — mirror its path relative to the archive manifests root.
-    let archive_manifests = plan.archive_root.join("manifests");
-    let rel = match plan.archive_manifest.strip_prefix(&archive_manifests) {
-        Ok(r) => r.to_path_buf(),
-        Err(_) => {
-            return Err((
-                PullError::Io("archive manifest path outside manifests root".into()),
-                published,
-            ))
-        }
-    };
-    let dst_manifest = plan.local_root.join("manifests").join(&rel);
-    if let Some(parent) = dst_manifest.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return Err((PullError::Io(e.to_string()), published));
-        }
-    }
-    // Park the manifest that is already there, if any, BEFORE replacing it.
-    // Publishing with `rename` guarantees the destination is never left partial;
-    // it does nothing for the previous CONTENT, which this attempt is about to
-    // replace wholesale. Without the stash, an attempt that publishes the manifest
-    // and is then abandoned leaves a manifest naming blobs that cleanup deletes —
-    // the exact state blobs-first-manifest-last exists to prevent, reached through
-    // the ownership filter (the PATH pre-existed, so cleanup keeps it) rather than
-    // through truncation. The filter reasons about paths; this is about content.
-    if let Err(e) = stash_existing_manifest(&plan.local_root, &rel, &dst_manifest) {
-        return Err((
-            PullError::Io(format!("stash existing manifest: {e}")),
-            published,
-        ));
-    }
     match copy_file_cancellable(&plan.archive_manifest, &dst_manifest, &cancel, &activity).await {
         Ok(true) => published.push(dst_manifest),
         // The manifest never got published, so put the previous one straight back
@@ -2177,6 +2203,84 @@ mod tests {
              presence check is the only thing standing between \"nothing to \
              restore\" and clobbering an untouched destination on the very next \
              failure path"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blob_failure_before_the_old_stash_point_no_longer_resurrects_a_stale_backup() {
+        // The gap this closes (found by the T2 panel, round 7): `stash_existing_manifest`
+        // used to run only AFTER the entire blob-copy loop completed. Every
+        // failure return from `copy_model_files` funnels into the caller's undo
+        // route (`undo_pull_attempt`), which unconditionally calls
+        // `restore_manifest_backup` for this model's `rel` — it has no way to
+        // know whether THIS attempt ever reached the stash step. So a blob
+        // failure that returned BEFORE the old stash call left any pre-existing
+        // stale backup (e.g. one orphaned by eviction, per the round-6/7 fixes)
+        // completely untouched by this attempt, and the undo route would then
+        // resurrect it at `dst_manifest` — content this attempt never created
+        // and never touched, restored over a destination that may have been
+        // legitimately absent (evicted) or held something else entirely.
+        //
+        // Fixed by moving the stash call ahead of the blob loop, so by the time
+        // ANY failure can be returned, this attempt has always either staged a
+        // real backup of what was actually at `dst`, or (as here) confirmed
+        // there was nothing there and cleared any stale leftover — either way
+        // `restore_manifest_backup` can no longer observe a backup this
+        // attempt did not itself just create or clear.
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        let (archive, local) = (base.join("archive"), base.join("local"));
+        let model = make_model(&archive, "blobfail", "1", &[64]);
+        let rel = Path::new("registry.ollama.ai/library/blobfail/1");
+
+        // Force the very first blob copy to fail deterministically: delete the
+        // archive's config blob (the first digest `parse_manifest_blobs`
+        // collects) so `copy_file_cancellable` hits a real ENOENT before any
+        // blob is copied and long before the OLD stash call site would have
+        // run.
+        let cfg_blob = archive.join("blobs").join("sha256-blobfailcfg");
+        assert!(cfg_blob.exists(), "precondition: make_model wrote the config blob");
+        fs::remove_file(&cfg_blob).unwrap();
+
+        // `dst_manifest` is absent, as if this model had already been evicted —
+        // but a stale backup from that eviction's predecessor attempt persists.
+        let dst_manifest = local.join("manifests").join(rel);
+        let backup = manifest_backup_path(&local, rel).unwrap();
+        fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        fs::write(&backup, b"stale content from an attempt this pull has nothing to do with")
+            .unwrap();
+
+        let plan = plan_pull(&model, &archive, &local).unwrap();
+        let planned = planned_local_paths(&plan);
+        let pre_existing: HashSet<PathBuf> =
+            planned.iter().filter(|p| p.exists()).cloned().collect();
+
+        let (err, published) = copy_model_files(
+            plan.clone(),
+            Arc::new(AtomicBool::new(false)),
+            CopyActivity::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, PullError::Io(ref msg) if msg.contains("copy blob")),
+            "precondition: the forced failure must be the blob copy, not \
+             something else: {err:?}"
+        );
+
+        // The caller's real undo route.
+        undo_pull_attempt(&plan, rel, &published, &pre_existing);
+
+        assert!(
+            !dst_manifest.exists(),
+            "a blob failure must never resurrect unrelated stale content at \
+             dst_manifest — this attempt never touched it and dst was \
+             legitimately absent before this pull began"
+        );
+        assert!(
+            !backup.exists(),
+            "the stale backup must be cleared, not preserved for a future \
+             attempt to mistakenly restore"
         );
     }
 
