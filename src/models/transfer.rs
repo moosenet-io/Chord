@@ -751,7 +751,22 @@ fn stash_existing_manifest(root: &Path, rel: &Path, dst: &Path) -> std::io::Resu
     if let Some(parent) = backup.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::copy(dst, &backup)?;
+    // Stage-then-rename, same as every publish elsewhere in this module: a copy
+    // that fails partway (disk full, permission revoked mid-write) must never
+    // leave a PARTIAL file sitting at `backup`. `restore_manifest_backup`'s
+    // presence check is the only thing standing between "there is nothing to
+    // restore" and "clobber the still-untouched destination with a truncated
+    // backup" on the failure path this call's own `Err` returns into — so that
+    // check must never be able to see a half-written file.
+    let tmp = copy_temp_path(&backup);
+    if let Err(e) = std::fs::copy(dst, &tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, &backup) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(true)
 }
 
@@ -2068,6 +2083,41 @@ mod tests {
             fs::read(manifest_backup_path(root, rel).unwrap()).unwrap(),
             original,
             "the backup must also hold a full copy, so a restore is still possible"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_stash_never_leaves_a_partial_backup() {
+        // The gap this closes (found by the T2 panel, round 4): a stash-by-copy
+        // that fails partway used to still risk leaving a file sitting at the
+        // exact `backup` path, because `std::fs::copy` creates its destination
+        // up front and can fail mid-write (disk full, permission revoked). The
+        // ENTIRE safety of the restore path rests on `backup.exists()` meaning
+        // "there is something complete to restore" — a caller whose stash
+        // failed (`copy_model_files` never even attempts the manifest copy in
+        // that case) still unconditionally runs `undo_pull_attempt`, which would
+        // rename a half-written backup straight over a destination manifest
+        // this attempt never touched, corrupting a manifest that needed no
+        // restoring at all.
+        //
+        // Forced here by handing the stash a DIRECTORY as the "existing
+        // manifest" — `std::fs::copy` refuses a non-regular-file source, which
+        // exercises the exact copy-fails-before-completion path without needing
+        // root or a real disk-full condition.
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let rel = Path::new("registry.ollama.ai/library/faildir/1");
+        let dst = root.join("manifests").join(rel);
+        fs::create_dir_all(&dst).unwrap(); // exists, but is not a manifest file
+
+        stash_existing_manifest(root, rel, &dst).unwrap_err();
+
+        assert!(
+            !manifest_backup_path(root, rel).unwrap().exists(),
+            "a failed stash must leave NOTHING at the final backup path — that \
+             presence check is the only thing standing between \"nothing to \
+             restore\" and clobbering an untouched destination on the very next \
+             failure path"
         );
     }
 
