@@ -363,6 +363,14 @@ pub async fn archive_pull(
     // [`cleanup_attempt`] for the two preconditions this snapshot needs.
     let planned = planned_local_paths(&plan);
     let pre_existing: HashSet<PathBuf> = planned.iter().filter(|p| p.exists()).cloned().collect();
+    // The manifest's path relative to the manifests root, which is all the undo
+    // route needs to find the parked previous manifest (the backup name is
+    // deterministic, so no state has to survive the copy task to reach cleanup).
+    let manifest_rel = plan
+        .archive_manifest
+        .strip_prefix(plan.archive_root.join("manifests"))
+        .map(|r| r.to_path_buf())
+        .unwrap_or_default();
 
     // ── Copy archive → local as an owned, cancellable task ──
     //
@@ -390,13 +398,13 @@ pub async fn archive_pull(
             match tokio::time::timeout(COPY_CANCEL_GRACE, &mut copy_task).await {
                 // Stopped early: we have the exact list of what it published.
                 Ok(Ok(Err((_, published)))) => {
-                    cleanup_attempt(PULL_OP, &plan.name, &published, &pre_existing)
+                    undo_pull_attempt(&plan, &manifest_rel, &published, &pre_existing)
                 }
                 // Finished (or panicked) before it saw the cancel: no exact list,
                 // so fall back to every planned local path — minus the ones that
                 // were already there.
                 Ok(Ok(Ok(()))) | Ok(Err(_)) => {
-                    cleanup_attempt(PULL_OP, &plan.name, &planned, &pre_existing)
+                    undo_pull_attempt(&plan, &manifest_rel, &planned, &pre_existing)
                 }
                 Err(_) => {
                     // The copy is wedged inside a single chunk (only reachable on
@@ -430,13 +438,17 @@ pub async fn archive_pull(
     };
 
     match copy_res {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(())) => {
+            // The attempt stands: drop the previous manifest we parked.
+            commit_manifest_backup(&plan.local_root, &manifest_rel);
+            Ok(())
+        }
         Ok(Err((e, published))) => {
             // Mid-copy failure: reclaim what this attempt published, through the
             // SAME route (and the same pre-existing filter) as the timeout path.
             // Two cleanup routes with different safety rules is how one of them
             // ends up wrong — there is exactly one route.
-            cleanup_attempt(PULL_OP, &plan.name, &published, &pre_existing);
+            undo_pull_attempt(&plan, &manifest_rel, &published, &pre_existing);
             Err(e)
         }
         Err(join_err) => {
@@ -465,6 +477,33 @@ pub async fn archive_pull(
 
 /// Label used in [`cleanup_attempt`] logs for the cold→warm direction.
 const PULL_OP: &str = "archive pull (cold→warm)";
+
+/// The **one** route by which a failed pull undoes its filesystem effects.
+///
+/// Two things, in this order, and both are needed because they answer different
+/// questions:
+/// 1. **Restore** the manifest this attempt replaced. Cleanup's `pre_existing`
+///    filter reasons about PATHS — "was something here when we started" — and by
+///    that test the manifest destination is someone else's and must be kept. But
+///    the CONTENT at that path is now this attempt's, so keeping it is precisely
+///    wrong: it leaves a manifest Ollama will read naming blobs that step 2 is
+///    about to delete. Deleting it instead would discard a model entry this pull
+///    never owned. Restoring the previous one is the only outcome that is neither.
+/// 2. **Reclaim** the blobs this attempt published, filtered as always.
+///
+/// When there was no previous manifest the restore is a no-op and the manifest
+/// falls out of `pre_existing`, so step 2 removes it as this attempt's own — which
+/// is correct for that case and needs no special branch.
+fn undo_pull_attempt(
+    plan: &PullPlan,
+    manifest_rel: &Path,
+    candidates: &[PathBuf],
+    pre_existing: &HashSet<PathBuf>,
+) {
+    let dst_manifest = plan.local_root.join("manifests").join(manifest_rel);
+    restore_manifest_backup(&plan.local_root, manifest_rel, &dst_manifest);
+    cleanup_attempt(PULL_OP, &plan.name, candidates, pre_existing);
+}
 
 /// Copy the manifest + every referenced blob into the local root.
 ///
@@ -535,10 +574,34 @@ async fn copy_model_files(
             return Err((PullError::Io(e.to_string()), published));
         }
     }
+    // Park the manifest that is already there, if any, BEFORE replacing it.
+    // Publishing with `rename` guarantees the destination is never left partial;
+    // it does nothing for the previous CONTENT, which this attempt is about to
+    // replace wholesale. Without the stash, an attempt that publishes the manifest
+    // and is then abandoned leaves a manifest naming blobs that cleanup deletes —
+    // the exact state blobs-first-manifest-last exists to prevent, reached through
+    // the ownership filter (the PATH pre-existed, so cleanup keeps it) rather than
+    // through truncation. The filter reasons about paths; this is about content.
+    if let Err(e) = stash_existing_manifest(&plan.local_root, &rel, &dst_manifest) {
+        return Err((
+            PullError::Io(format!("stash existing manifest: {e}")),
+            published,
+        ));
+    }
     match copy_file_cancellable(&plan.archive_manifest, &dst_manifest, &cancel, &activity).await {
         Ok(true) => published.push(dst_manifest),
-        Ok(false) => return Err((PullError::Io(CANCELLED.to_string()), published)),
-        Err(e) => return Err((PullError::Io(format!("copy manifest: {e}")), published)),
+        // The manifest never got published, so put the previous one straight back
+        // and leave the tree exactly as found. The caller's undo route would do
+        // this too; doing it here keeps the returned `published` list honest —
+        // it never mentions a path this call did not change.
+        Ok(false) => {
+            restore_manifest_backup(&plan.local_root, &rel, &dst_manifest);
+            return Err((PullError::Io(CANCELLED.to_string()), published));
+        }
+        Err(e) => {
+            restore_manifest_backup(&plan.local_root, &rel, &dst_manifest);
+            return Err((PullError::Io(format!("copy manifest: {e}")), published));
+        }
     }
 
     Ok(())
@@ -626,6 +689,102 @@ pub(crate) fn cleanup_attempt(
         );
     }
     cleanup_partial(&to_clean);
+}
+
+/// Directory under a transfer's destination root where a manifest that is about
+/// to be replaced is parked, so a failed attempt can put the original back.
+///
+/// **Deliberately not the manifest's own directory**, even though that is where
+/// [`copy_file_cancellable`] stages its temp files. `registry::scan_manifest_tree`
+/// treats EVERY file leaf under `manifests/` as a model, with the filename as the
+/// tag and no dotfile filter — so a backup parked next to the manifest would be
+/// discovered as a phantom model (`park:.1.chord-mfbak`). A copy temp survives
+/// only for the duration of one copy; a backup survives a whole failed attempt,
+/// which is far too long a window for that.
+pub(crate) const MANIFEST_BACKUP_DIR: &str = ".chord-manifest-backup";
+
+/// Where the manifest at `rel` (relative to `<root>/manifests`) is parked while an
+/// attempt replaces it.
+///
+/// The name is **deterministic** — no pid, no sequence — so any cleanup route can
+/// find the backup without the attempt having to thread its state through. That is
+/// safe because every writer of a given root holds `DiskOpLock`, and pulls for one
+/// model are additionally serialised by the per-model lock, so two attempts can
+/// never be staging the same manifest at once.
+/// Returns `None` for an empty `rel`, which is not a manifest and must never be
+/// treated as one: the path would collapse to the backup DIRECTORY itself, and a
+/// restore would then `rename` that directory over `<root>/manifests` — clobbering
+/// the whole tree. Only reachable if a caller passes a manifest outside its
+/// manifests root, which the copy already rejects, so this is a guard against a
+/// future caller rather than a live path.
+fn manifest_backup_path(root: &Path, rel: &Path) -> Option<PathBuf> {
+    if rel.as_os_str().is_empty() {
+        return None;
+    }
+    let flat = rel.to_string_lossy().replace(['/', '\\'], "%");
+    Some(root.join(MANIFEST_BACKUP_DIR).join(flat))
+}
+
+/// Move the manifest currently at `dst` aside, so it can be restored if this
+/// attempt fails. No-op (returning `false`) when there is nothing there.
+///
+/// This is the counterpart to publishing the manifest with `rename`: staging
+/// protects the destination from a PARTIAL write, and this protects the previous
+/// CONTENT from a complete one.
+fn stash_existing_manifest(root: &Path, rel: &Path, dst: &Path) -> std::io::Result<bool> {
+    if !dst.exists() {
+        return Ok(false);
+    }
+    let backup = match manifest_backup_path(root, rel) {
+        Some(b) => b,
+        None => return Ok(false),
+    };
+    if let Some(parent) = backup.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::rename(dst, &backup)?;
+    Ok(true)
+}
+
+/// Put the previous manifest back, undoing a replacement this attempt made.
+/// No-op when this attempt never replaced one.
+fn restore_manifest_backup(root: &Path, rel: &Path, dst: &Path) {
+    let backup = match manifest_backup_path(root, rel) {
+        Some(b) => b,
+        None => return,
+    };
+    if !backup.exists() {
+        return;
+    }
+    if let Some(parent) = dst.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::rename(&backup, dst) {
+        tracing::warn!(
+            backup = %backup.display(),
+            dst = %dst.display(),
+            error = %e,
+            "failed to restore the previous manifest after a failed transfer"
+        );
+    }
+}
+
+/// Accept this attempt's manifest: drop the previous one. Called only once the
+/// attempt has actually succeeded.
+fn commit_manifest_backup(root: &Path, rel: &Path) {
+    let backup = match manifest_backup_path(root, rel) {
+        Some(b) => b,
+        None => return,
+    };
+    if backup.exists() {
+        if let Err(e) = std::fs::remove_file(&backup) {
+            tracing::warn!(
+                backup = %backup.display(),
+                error = %e,
+                "failed to remove the superseded manifest backup"
+            );
+        }
+    }
 }
 
 /// Handle a copy task that ended in a [`tokio::task::JoinError`] — a panic in the
@@ -1846,6 +2005,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn abandoned_pull_restores_the_previous_manifest() {
+        // The defect this closes: a pull that COMPLETES and is then abandoned
+        // (the timer fires just as the copy finishes, or a quiescent JoinError)
+        // cleans up over the planned superset. The manifest destination is in
+        // `pre_existing`, so the filter keeps it — but the content at that path is
+        // now this attempt's, naming blobs the same cleanup is deleting. That is
+        // exactly the state blobs-first-manifest-last exists to prevent, reached
+        // through the ownership filter instead of through truncation.
+        //
+        // Driven through the real functions in the real order rather than through
+        // the timer: `copy_model_files` to completion, then the same undo route
+        // `archive_pull`'s abandon branches call. The race that gets you here is
+        // not constructible; what it does once there is.
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        let (archive, local) = (base.join("archive"), base.join("local"));
+        make_model(&archive, "restore", "1", &[128]);
+
+        // A previous, DIFFERENT model entry already at the manifest destination,
+        // with its own blob already on disk.
+        let rel = Path::new("registry.ollama.ai/library/restore/1");
+        let dst_manifest = local.join("manifests").join(rel);
+        fs::create_dir_all(dst_manifest.parent().unwrap()).unwrap();
+        let original = b"{\"config\":{\"size\":3,\"digest\":\"sha256:old\"},\"layers\":[]}".to_vec();
+        fs::write(&dst_manifest, &original).unwrap();
+        let local_blobs = local.join("blobs");
+        fs::create_dir_all(&local_blobs).unwrap();
+        let old_blob = local_blobs.join("sha256-old");
+        fs::write(&old_blob, b"the previous entry's blob").unwrap();
+
+        let plan = plan_pull("restore:1", &archive, &local).unwrap();
+        let planned = planned_local_paths(&plan);
+        let pre_existing: HashSet<PathBuf> =
+            planned.iter().filter(|p| p.exists()).cloned().collect();
+        assert!(
+            pre_existing.contains(&dst_manifest),
+            "the manifest PATH must be in the snapshot — that is what made the \
+             filter keep this attempt's content"
+        );
+
+        // The copy runs to completion: blobs published, manifest replaced.
+        copy_model_files(
+            plan.clone(),
+            Arc::new(AtomicBool::new(false)),
+            CopyActivity::default(),
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            fs::read(&dst_manifest).unwrap(),
+            original,
+            "precondition: the attempt really did replace the manifest"
+        );
+
+        // ...and is then abandoned.
+        undo_pull_attempt(&plan, rel, &planned, &pre_existing);
+
+        assert_eq!(
+            fs::read(&dst_manifest).unwrap(),
+            original,
+            "an abandoned pull must leave the PREVIOUS manifest on disk — not its \
+             own (which names blobs that were just deleted), and not nothing \
+             (which would discard a model entry this pull never owned)"
+        );
+        assert!(
+            !local_blobs.join("sha256-restore0").exists(),
+            "this attempt's blobs must still be reclaimed"
+        );
+        assert!(old_blob.is_file(), "the previous entry's blob must survive");
+
+        // No debris, and in particular nothing left in the manifests tree: every
+        // file leaf under `manifests/` is a MODEL to `scan_manifest_tree`, which
+        // applies no dotfile filter, so a stray backup there would be discovered
+        // as a phantom model named after the file.
+        let leaves: Vec<String> = fs::read_dir(dst_manifest.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(leaves, vec!["1".to_string()], "stray file in the manifests tree");
+        assert!(
+            !manifest_backup_path(&local, rel).unwrap().exists(),
+            "the backup must be consumed by the restore, not left behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_pull_keeps_its_own_manifest_and_drops_the_backup() {
+        // The other half: the stash must not resurrect anything on the happy path.
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        let (archive, local) = (base.join("archive"), base.join("local"));
+        let model = make_model(&archive, "keep", "1", &[64]);
+
+        let rel = Path::new("registry.ollama.ai/library/keep/1");
+        let dst_manifest = local.join("manifests").join(rel);
+        fs::create_dir_all(dst_manifest.parent().unwrap()).unwrap();
+        fs::write(&dst_manifest, b"the stale previous entry").unwrap();
+
+        archive_pull(
+            &model,
+            &archive,
+            &local,
+            Duration::from_secs(30),
+            &FixedProbe(u64::MAX),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fs::read(&dst_manifest).unwrap(),
+            fs::read(archive.join("manifests").join(rel)).unwrap(),
+            "a successful pull must leave ITS manifest in place"
+        );
+        assert!(
+            !manifest_backup_path(&local, rel).unwrap().exists(),
+            "a successful pull must drop the previous manifest it parked"
+        );
+    }
+
+    #[tokio::test]
     async fn join_error_with_a_quiescent_writer_still_cleans_up() {
         // The other half: "delete nothing" applies only when quiescence cannot be
         // PROVEN. Once it can, a JoinError must still reclaim what the attempt
@@ -1884,13 +2165,24 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn pull_never_truncates_an_existing_local_manifest() {
-        // The pull side's truncation victim is the MANIFEST, not a blob: blobs
-        // that already exist locally are skipped outright (content-addressed), so
-        // they are never opened for writing — but the manifest is copied
-        // unconditionally, over whatever is already at that path. Writing it in
-        // place with a truncating `File::create` would destroy a manifest Ollama
-        // may be reading, and no deletion filter can see that: the damage is a
-        // mutation, not a deletion.
+        // The pull side's at-risk file is the MANIFEST, not a blob: blobs that
+        // already exist locally are skipped outright (content-addressed), so they
+        // are never opened for writing — but the manifest is copied
+        // unconditionally, over whatever is already at that path.
+        //
+        // What protects it is now TWO different mechanisms answering two different
+        // questions, and this test passes if either holds, so read the controls
+        // rather than this test to know which is which:
+        //   - temp-staging stops a PARTIAL write from ever reaching the
+        //     destination. Its control is
+        //     `cancelled_midcopy_never_mutates_an_existing_destination`, which
+        //     fails reliably when staging is removed. This test does NOT fail then
+        //     — the stash below already moved the original out of harm's way.
+        //   - the stash/restore stops a COMPLETE replacement from surviving an
+        //     abandoned attempt. Its control is
+        //     `abandoned_pull_restores_the_previous_manifest`.
+        // Removing both together fails this test, which is what "neither is
+        // redundant" means here.
         //
         // The archive manifest is swapped for a FIFO *after* planning (planning is
         // what reads it), so the copy parks inside the manifest write and the test
