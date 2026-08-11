@@ -503,7 +503,16 @@ fn undo_pull_attempt(
     pre_existing: &HashSet<PathBuf>,
 ) {
     let dst_manifest = plan.local_root.join("manifests").join(manifest_rel);
-    restore_manifest_backup(&plan.local_root, manifest_rel, &dst_manifest);
+    // If there was a backup to restore and the restore itself failed, we cannot
+    // tell whether `dst_manifest` still names this attempt's blobs or the
+    // previous ones — reclaiming `candidates` in that state risks deleting data
+    // a still-published manifest points at. Skip cleanup entirely rather than
+    // guess; the next transfer of this model, under the same lock, reconciles
+    // it, exactly as the not-quiescent JoinError branch already accepts for the
+    // same reason.
+    if !restore_manifest_backup(&plan.local_root, manifest_rel, &dst_manifest) {
+        return;
+    }
     cleanup_attempt(PULL_OP, &plan.name, candidates, pre_existing);
 }
 
@@ -751,6 +760,26 @@ fn stash_existing_manifest(root: &Path, rel: &Path, dst: &Path) -> std::io::Resu
     if let Some(parent) = backup.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // A backup already sitting at this path cannot belong to THIS attempt: the
+    // only way to reach here is at the very start of a fresh manifest copy,
+    // after any earlier attempt's own backup was already consumed by its
+    // commit or restore. Its presence means an earlier attempt was abandoned
+    // without being reconciled (the not-quiescent JoinError branch
+    // deliberately leaves everything in place). That content must never be
+    // mistaken for THIS attempt's stash: `rename` below is atomic, so if it
+    // fails it leaves whatever was already at `backup` completely untouched —
+    // and if that were left as a stale leftover, a later restore would
+    // clobber the current, valid destination with content that is not even
+    // its immediate predecessor. Clearing it first means our own failed
+    // rename leaves NOTHING at `backup`, which is the one state
+    // `restore_manifest_backup` already treats as safe.
+    if backup.exists() {
+        let _ = if backup.is_dir() {
+            std::fs::remove_dir_all(&backup)
+        } else {
+            std::fs::remove_file(&backup)
+        };
+    }
     // Stage-then-rename, same as every publish elsewhere in this module: a copy
     // that fails partway (disk full, permission revoked mid-write) must never
     // leave a PARTIAL file sitting at `backup`. `restore_manifest_backup`'s
@@ -771,25 +800,37 @@ fn stash_existing_manifest(root: &Path, rel: &Path, dst: &Path) -> std::io::Resu
 }
 
 /// Put the previous manifest back, undoing a replacement this attempt made.
-/// No-op when this attempt never replaced one.
-fn restore_manifest_backup(root: &Path, rel: &Path, dst: &Path) {
+/// A no-op that reports success when this attempt never replaced one.
+///
+/// Returns `false` only when a real backup existed and the restore rename
+/// itself failed — the one case in which the caller must NOT proceed to
+/// reclaim this attempt's blobs, since `dst` may still name them and we have
+/// no way to make it stop. Every other outcome (nothing to restore, or a
+/// restore that succeeded) returns `true`: it is safe to reclaim.
+fn restore_manifest_backup(root: &Path, rel: &Path, dst: &Path) -> bool {
     let backup = match manifest_backup_path(root, rel) {
         Some(b) => b,
-        None => return,
+        None => return true,
     };
     if !backup.exists() {
-        return;
+        return true;
     }
     if let Some(parent) = dst.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Err(e) = std::fs::rename(&backup, dst) {
-        tracing::warn!(
-            backup = %backup.display(),
-            dst = %dst.display(),
-            error = %e,
-            "failed to restore the previous manifest after a failed transfer"
-        );
+    match std::fs::rename(&backup, dst) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                backup = %backup.display(),
+                dst = %dst.display(),
+                error = %e,
+                "failed to restore the previous manifest after a failed transfer; \
+                 leaving it in place and skipping blob cleanup for this attempt — \
+                 deleting blobs a manifest may still name is worse than an orphan"
+            );
+            false
+        }
     }
 }
 
@@ -830,12 +871,15 @@ fn commit_manifest_backup(root: &Path, rel: &Path) {
 /// gone. Blobs-first-manifest-last is defeated by exactly one late `rename`.
 ///
 /// So: cancel, then *prove* the writer stopped before deleting anything.
-/// - Quiescent within `grace` → cleanup is provably safe; run the normal filtered
-///   [`cleanup_attempt`] and return `true`.
-/// - Not quiescent → we cannot prove ownership of a single path, so **delete
-///   nothing** and log the candidates, exactly as the cancellation-grace expiry
-///   does. An orphan blob or a stale scratch file costs disk and is reclaimed by
-///   the next transfer of this model under the lock; a resurrected manifest is a
+/// - Quiescent within `grace`, and any stashed manifest restores cleanly (or
+///   there was nothing to restore) → cleanup is provably safe; run the normal
+///   filtered [`cleanup_attempt`] and return `true`.
+/// - Not quiescent, OR quiescent but the manifest restore itself failed → we
+///   cannot prove ownership of a single path (or cannot prove `dst_manifest` no
+///   longer names this attempt's blobs), so **delete nothing** and log the
+///   candidates, exactly as the cancellation-grace expiry does. An orphan blob
+///   or a stale scratch file costs disk and is reclaimed by the next transfer of
+///   this model under the lock; a resurrected or still-published manifest is a
 ///   broken model entry that something else acts on.
 ///
 /// `grace` is a parameter rather than [`COPY_CANCEL_GRACE`] so the not-quiescent
@@ -867,10 +911,22 @@ pub(crate) async fn cleanup_after_join_error(
     if activity.wait_quiescent(grace).await {
         // Same order as `undo_pull_attempt`: restore before reclaim, so a manifest
         // this attempt stashed is never left orphaned in the backup dir while its
-        // blobs are removed out from under it.
+        // blobs are removed out from under it. And same rule as `undo_pull_attempt`:
+        // if a real backup existed and the restore rename itself failed, we cannot
+        // tell whether `dst_manifest` still names this attempt's blobs — skip
+        // cleanup rather than guess. The writer being quiescent only tells us it is
+        // safe to look; it says nothing about whether the restore itself succeeded.
         if !manifest_rel.as_os_str().is_empty() {
             let dst_manifest = root.join("manifests").join(manifest_rel);
-            restore_manifest_backup(root, manifest_rel, &dst_manifest);
+            if !restore_manifest_backup(root, manifest_rel, &dst_manifest) {
+                tracing::warn!(
+                    op = %op,
+                    model = %model,
+                    "manifest restore failed after a JoinError; skipping blob cleanup \
+                     rather than risk deleting data a still-published manifest names"
+                );
+                return false;
+            }
         }
         cleanup_attempt(op, model, candidates, pre_existing);
         return true;
@@ -2205,6 +2261,61 @@ mod tests {
         assert!(
             !manifest_backup_path(&local, rel).unwrap().exists(),
             "the backup must be consumed by the restore, not left behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_restore_skips_cleanup_instead_of_guessing() {
+        // The gap this closes (found by the T2 panel, round 5b): a failed
+        // restore was only logged — `undo_pull_attempt` proceeded to
+        // `cleanup_attempt` regardless, on the assumption that "restore was
+        // attempted" is as good as "restore succeeded". It is not: a failed
+        // `rename(&backup, dst)` leaves `dst` completely unchanged (rename is
+        // atomic — it never partially applies), so `dst` may still hold THIS
+        // attempt's manifest, still naming the very blobs cleanup is about to
+        // delete. Skipping cleanup on a failed restore is the same "don't
+        // delete when you can't prove it's safe" rule the not-quiescent
+        // JoinError branch already applies.
+        //
+        // Forced here by making `dst_manifest` a NON-EMPTY DIRECTORY: renaming
+        // a regular file onto it fails deterministically (ENOTEMPTY/EEXIST on
+        // Linux) without needing root or real disk pressure.
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        let (archive, local) = (base.join("archive"), base.join("local"));
+        make_model(&archive, "restorefail", "1", &[64]);
+
+        let rel = Path::new("registry.ollama.ai/library/restorefail/1");
+        let dst_manifest = local.join("manifests").join(rel);
+        fs::create_dir_all(&dst_manifest).unwrap(); // occupied, non-empty below
+        fs::write(dst_manifest.join("occupant"), b"blocks the rename").unwrap();
+
+        // A real backup exists at the deterministic path, as if an earlier
+        // stash had succeeded before this attempt's undo route ran.
+        let backup = manifest_backup_path(&local, rel).unwrap();
+        fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        fs::write(&backup, b"the manifest that should have been restored").unwrap();
+
+        let plan = plan_pull("restorefail:1", &archive, &local).unwrap();
+        let candidates = planned_local_paths(&plan);
+        let local_blobs = local.join("blobs");
+        fs::create_dir_all(&local_blobs).unwrap();
+        let this_attempts_blob = local_blobs.join("sha256-restorefail0");
+        fs::write(&this_attempts_blob, b"published by this attempt").unwrap();
+        let pre_existing: HashSet<PathBuf> = HashSet::new();
+
+        undo_pull_attempt(&plan, rel, &candidates, &pre_existing);
+
+        assert!(
+            this_attempts_blob.exists(),
+            "cleanup must be SKIPPED when the restore itself failed — deleting \
+             this attempt's blobs while dst_manifest may still name them (the \
+             rename never applied, so dst is unchanged) is worse than an orphan"
+        );
+        assert!(
+            backup.is_file(),
+            "the backup must be left in place too, since it was never consumed \
+             — a future retry or operator can still recover it"
         );
     }
 
