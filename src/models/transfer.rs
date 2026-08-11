@@ -466,6 +466,8 @@ pub async fn archive_pull(
                 COPY_CANCEL_GRACE,
                 &planned,
                 &pre_existing,
+                &plan.local_root,
+                &manifest_rel,
             )
             .await;
             Err(PullError::Io(format!(
@@ -725,12 +727,19 @@ fn manifest_backup_path(root: &Path, rel: &Path) -> Option<PathBuf> {
     Some(root.join(MANIFEST_BACKUP_DIR).join(flat))
 }
 
-/// Move the manifest currently at `dst` aside, so it can be restored if this
-/// attempt fails. No-op (returning `false`) when there is nothing there.
+/// Park a COPY of the manifest currently at `dst` aside, so it can be restored if
+/// this attempt fails. No-op (returning `false`) when there is nothing there.
 ///
-/// This is the counterpart to publishing the manifest with `rename`: staging
-/// protects the destination from a PARTIAL write, and this protects the previous
-/// CONTENT from a complete one.
+/// Deliberately a copy, not a move: [`copy_file_cancellable`] never requires `dst`
+/// to be absent — it always stages into its own temp path and only ever touches
+/// `dst` with the single atomic `rename` that publishes. So `dst` does not need to
+/// be vacated for that to work, and vacating it anyway would open a window, for
+/// the whole duration of the manifest copy, where the model has NO manifest on
+/// disk at all — any concurrent reader (Ollama, `registry::scan_manifest_tree`)
+/// would see it as missing rather than as its previous, still-valid version. A
+/// copy keeps `dst` serving the previous content right up to the moment the real
+/// publish atomically replaces it, matching the atomic-replacement guarantee the
+/// rest of this module relies on everywhere else.
 fn stash_existing_manifest(root: &Path, rel: &Path, dst: &Path) -> std::io::Result<bool> {
     if !dst.exists() {
         return Ok(false);
@@ -742,7 +751,7 @@ fn stash_existing_manifest(root: &Path, rel: &Path, dst: &Path) -> std::io::Resu
     if let Some(parent) = backup.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::rename(dst, &backup)?;
+    std::fs::copy(dst, &backup)?;
     Ok(true)
 }
 
@@ -816,6 +825,15 @@ fn commit_manifest_backup(root: &Path, rel: &Path) {
 ///
 /// `grace` is a parameter rather than [`COPY_CANCEL_GRACE`] so the not-quiescent
 /// branch is reachable in a test without a 30 s wait.
+///
+/// `root`/`manifest_rel` identify the manifest this attempt may have stashed
+/// (see [`stash_existing_manifest`]) — once the writer is proven quiescent we are
+/// in exactly the same position as [`undo_pull_attempt`]'s other two callers, and
+/// must restore it for the same reason: `pre_existing` reasons about paths, not
+/// content, so without an explicit restore a manifest this attempt stashed would
+/// stay orphaned in the backup dir while `cleanup_attempt` deletes the blobs a
+/// resurrected copy would still name.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn cleanup_after_join_error(
     op: &str,
     model: &str,
@@ -824,12 +842,21 @@ pub(crate) async fn cleanup_after_join_error(
     grace: Duration,
     candidates: &[PathBuf],
     pre_existing: &HashSet<PathBuf>,
+    root: &Path,
+    manifest_rel: &Path,
 ) -> bool {
     // Ask first, so the writer is already stopping while we wait — and so that if
     // it is between its final cancel check and its `rename`, that is the only
     // window left rather than the whole remainder of the file.
     cancel.store(true, Ordering::Relaxed);
     if activity.wait_quiescent(grace).await {
+        // Same order as `undo_pull_attempt`: restore before reclaim, so a manifest
+        // this attempt stashed is never left orphaned in the backup dir while its
+        // blobs are removed out from under it.
+        if !manifest_rel.as_os_str().is_empty() {
+            let dst_manifest = root.join("manifests").join(manifest_rel);
+            restore_manifest_backup(root, manifest_rel, &dst_manifest);
+        }
         cleanup_attempt(op, model, candidates, pre_existing);
         return true;
     }
@@ -1982,6 +2009,8 @@ mod tests {
             Duration::from_millis(300),
             &[published.clone(), shared.clone()],
             &pre_existing,
+            tmp.path(),
+            Path::new(""),
         )
         .await;
 
@@ -2002,6 +2031,44 @@ mod tests {
             "the flag must still be set, so the live writer stops rather than publishes"
         );
         drop(live_writer);
+    }
+
+    #[tokio::test]
+    async fn stash_leaves_the_manifest_readable_at_its_destination() {
+        // The TOCTOU this closes: `stash_existing_manifest` used to `rename` the
+        // manifest away, leaving `dst` completely ABSENT from disk for the whole
+        // duration of the manifest copy that follows — a real window in which a
+        // concurrent reader (Ollama listing/loading models, or
+        // `registry::scan_manifest_tree`) sees this model as missing rather than
+        // as its previous, still-valid version. `copy_file_cancellable` never
+        // needs `dst` absent — it always stages into its own temp path and only
+        // ever touches `dst` with the one atomic `rename` that publishes — so
+        // there is no reason for the stash to vacate it first.
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let rel = Path::new("registry.ollama.ai/library/toctou/1");
+        let dst = root.join("manifests").join(rel);
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        let original = b"a reader must be able to see this the whole time".to_vec();
+        fs::write(&dst, &original).unwrap();
+
+        assert!(stash_existing_manifest(root, rel, &dst).unwrap());
+
+        assert!(
+            dst.is_file(),
+            "the manifest must still be present at its destination immediately \
+             after stashing — a concurrent reader must never see it missing"
+        );
+        assert_eq!(
+            fs::read(&dst).unwrap(),
+            original,
+            "and its content must be untouched until the real publish replaces it"
+        );
+        assert_eq!(
+            fs::read(manifest_backup_path(root, rel).unwrap()).unwrap(),
+            original,
+            "the backup must also hold a full copy, so a restore is still possible"
+        );
     }
 
     #[tokio::test]
@@ -2148,6 +2215,8 @@ mod tests {
             Duration::from_millis(300),
             &[published.clone(), shared.clone()],
             &pre_existing,
+            tmp.path(),
+            Path::new(""),
         )
         .await;
 
@@ -2160,6 +2229,71 @@ mod tests {
         assert!(
             cancel.load(Ordering::Relaxed),
             "the cancel flag must be set on every join-error path, quiescent or not"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_error_with_a_quiescent_writer_restores_the_stashed_manifest() {
+        // The gap this closes: the quiescent branch of `cleanup_after_join_error`
+        // used to call only `cleanup_attempt`, never `restore_manifest_backup` —
+        // the one failure route that bypassed `undo_pull_attempt` entirely. A
+        // manifest this attempt stashed would stay orphaned in the backup dir
+        // forever: either the model entry goes missing (if the new manifest never
+        // published) or points at blobs this same cleanup call just deleted (if
+        // it did) — exactly the hazard blobs-first-manifest-last exists to
+        // prevent, reached through the one path that never restored.
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let rel = Path::new("registry.ollama.ai/library/joinrestore/1");
+        let dst_manifest = root.join("manifests").join(rel);
+        fs::create_dir_all(dst_manifest.parent().unwrap()).unwrap();
+        let original = b"the previous entry, parked before this attempt".to_vec();
+        fs::write(&dst_manifest, &original).unwrap();
+
+        // Stash it exactly as `copy_model_files` does before it starts the
+        // manifest copy, then simulate this attempt having already replaced the
+        // destination — whether the writer reached its publish `rename` before
+        // the panic is exactly what a `JoinError` cannot tell us, so the restore
+        // must be unconditional once quiescence is proven, not dependent on
+        // which side of that race we landed on.
+        assert!(stash_existing_manifest(root, rel, &dst_manifest).unwrap());
+        fs::write(&dst_manifest, b"this attempt's own, now-orphaned manifest").unwrap();
+
+        let published = root.join("blobs").join("sha256-thisattempt");
+        fs::create_dir_all(published.parent().unwrap()).unwrap();
+        fs::write(&published, b"a blob this attempt published").unwrap();
+        let pre_existing: HashSet<PathBuf> = HashSet::new();
+
+        let cancel: CopyCancel = Arc::new(AtomicBool::new(false));
+        let activity = CopyActivity::default(); // nothing in flight: quiescent immediately
+
+        let cleaned = cleanup_after_join_error(
+            PULL_OP,
+            "m:1",
+            &cancel,
+            &activity,
+            Duration::from_millis(300),
+            &[published.clone()],
+            &pre_existing,
+            root,
+            rel,
+        )
+        .await;
+
+        assert!(cleaned, "a quiescent writer makes cleanup provably safe");
+        assert_eq!(
+            fs::read(&dst_manifest).unwrap(),
+            original,
+            "a JoinError must restore the manifest this attempt stashed, not leave \
+             its own (orphaned) content and not leave nothing at all"
+        );
+        assert!(
+            !published.exists(),
+            "this attempt's blob must still be reclaimed"
+        );
+        assert!(
+            !manifest_backup_path(root, rel).unwrap().exists(),
+            "the backup must be consumed by the restore, not left behind"
         );
     }
 
