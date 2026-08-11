@@ -90,6 +90,18 @@ pub enum PullError {
     /// An I/O error during copy (partial files cleaned up).
     #[error("archive pull I/O error: {0}")]
     Io(String),
+    /// `stash_existing_manifest` could not clear a pre-existing manifest
+    /// backup and therefore never reached a known-safe state: no blob was
+    /// copied and this attempt created no backup of its own. The generic
+    /// undo/restore route must NOT run for this error — `restore_manifest_backup`
+    /// has no way to tell this untouched, possibly-stale backup apart from one
+    /// this attempt legitimately created, so restoring it would resurrect
+    /// content that predates this attempt (see round-9/10 history in
+    /// `stash_existing_manifest`'s doc comment). Every caller checks for this
+    /// variant and skips the restore step, leaving the local tree exactly as
+    /// found.
+    #[error("archive pull could not verify the previous manifest backup was safely cleared: {0}")]
+    StashUnsafe(String),
 }
 
 const BYTES_PER_GB: f64 = 1_073_741_824.0; // 1 GiB
@@ -397,14 +409,21 @@ pub async fn archive_pull(
             cancel.store(true, Ordering::Relaxed);
             match tokio::time::timeout(COPY_CANCEL_GRACE, &mut copy_task).await {
                 // Stopped early: we have the exact list of what it published.
-                Ok(Ok(Err((_, published)))) => {
-                    undo_pull_attempt(&plan, &manifest_rel, &published, &pre_existing)
+                Ok(Ok(Err((e, published)))) => {
+                    let restore_is_safe = !matches!(e, PullError::StashUnsafe(_));
+                    undo_pull_attempt(
+                        &plan,
+                        &manifest_rel,
+                        &published,
+                        &pre_existing,
+                        restore_is_safe,
+                    )
                 }
                 // Finished (or panicked) before it saw the cancel: no exact list,
                 // so fall back to every planned local path — minus the ones that
                 // were already there.
                 Ok(Ok(Ok(()))) | Ok(Err(_)) => {
-                    undo_pull_attempt(&plan, &manifest_rel, &planned, &pre_existing)
+                    undo_pull_attempt(&plan, &manifest_rel, &planned, &pre_existing, true)
                 }
                 Err(_) => {
                     // The copy is wedged inside a single chunk (only reachable on
@@ -448,7 +467,21 @@ pub async fn archive_pull(
             // SAME route (and the same pre-existing filter) as the timeout path.
             // Two cleanup routes with different safety rules is how one of them
             // ends up wrong — there is exactly one route.
-            undo_pull_attempt(&plan, &manifest_rel, &published, &pre_existing);
+            //
+            // `StashUnsafe` is the one exception to "always restore": it means
+            // `stash_existing_manifest` never reached a known-safe state (a
+            // pre-existing backup could not be cleared), so `published` is
+            // guaranteed empty and any content at the backup path is unverified
+            // — restoring it would resurrect content this attempt never
+            // touched. See `PullError::StashUnsafe`'s doc comment.
+            let restore_is_safe = !matches!(e, PullError::StashUnsafe(_));
+            undo_pull_attempt(
+                &plan,
+                &manifest_rel,
+                &published,
+                &pre_existing,
+                restore_is_safe,
+            );
             Err(e)
         }
         Err(join_err) => {
@@ -496,12 +529,28 @@ const PULL_OP: &str = "archive pull (cold→warm)";
 /// When there was no previous manifest the restore is a no-op and the manifest
 /// falls out of `pre_existing`, so step 2 removes it as this attempt's own — which
 /// is correct for that case and needs no special branch.
+///
+/// `restore_is_safe` gates step 1 (round 10): a caller passes `false` when the
+/// failure that led here is [`PullError::StashUnsafe`] — `stash_existing_manifest`
+/// never reached a known-safe state (a pre-existing backup could not be cleared),
+/// so any content sitting at the backup path is unverified, and this attempt
+/// never published a blob (`candidates` is guaranteed empty in that case). Both
+/// steps are skipped in that case: `restore_manifest_backup` cannot tell this
+/// untouched, possibly-stale backup apart from one this attempt legitimately
+/// created, so trusting `backup.exists()` there would resurrect content this
+/// attempt never touched. This is the same "leave everything in place" outcome
+/// the not-quiescent JoinError branch already accepts, reached through a
+/// different signal.
 fn undo_pull_attempt(
     plan: &PullPlan,
     manifest_rel: &Path,
     candidates: &[PathBuf],
     pre_existing: &HashSet<PathBuf>,
+    restore_is_safe: bool,
 ) {
+    if !restore_is_safe {
+        return;
+    }
     let dst_manifest = plan.local_root.join("manifests").join(manifest_rel);
     // If there was a backup to restore and the restore itself failed, we cannot
     // tell whether `dst_manifest` still names this attempt's blobs or the
@@ -588,9 +637,22 @@ async fn copy_model_files(
     // same eviction argument and `stash_existing_manifest` has already
     // cleared it — either way, restore_manifest_backup can no longer observe
     // a backup this attempt did not itself just create.
+    //
+    // (Round 10 correction to the claim above: (a) and (b) are the only two
+    // outcomes of `stash_existing_manifest` returning `Ok`. It can also
+    // return `Err` — when it fails to CLEAR a pre-existing stale backup in
+    // the first place (round-9 fix; see its doc comment) — and in that one
+    // case `backup` can still exist, unverified, when this function returns.
+    // `PullError::StashUnsafe` exists specifically to mark that case: every
+    // caller (`archive_pull`'s two undo-dispatch sites) checks for it and
+    // skips `undo_pull_attempt`/`restore_manifest_backup` entirely rather
+    // than let the generic route trust `backup.exists()` the way it safely
+    // can for (a)/(b). `published` is guaranteed empty here (no blob has
+    // been touched yet), so skipping cleanup as well as skipping restore
+    // costs nothing.
     if let Err(e) = stash_existing_manifest(&plan.local_root, &rel, &dst_manifest) {
         return Err((
-            PullError::Io(format!("stash existing manifest: {e}")),
+            PullError::StashUnsafe(format!("stash existing manifest: {e}")),
             published,
         ));
     }
@@ -2279,7 +2341,7 @@ mod tests {
         );
 
         // The caller's real undo route.
-        undo_pull_attempt(&plan, rel, &published, &pre_existing);
+        undo_pull_attempt(&plan, rel, &published, &pre_existing, true);
 
         assert!(
             !dst_manifest.exists(),
@@ -2409,6 +2471,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stash_unsafe_error_skips_restore_through_the_real_undo_route() {
+        // The gap this closes (found by the T2 panel, round 9): round 9 made
+        // `stash_existing_manifest` propagate a removal failure as `Err`
+        // instead of swallowing it, and claimed that was enough to stop the
+        // resurrection round-8's fix already covered. Both reviewers (codex
+        // AND agy, independently) traced the actual caller/undo sequence and
+        // showed it was NOT enough: `copy_model_files` converts the `Err` into
+        // a normal `PullError`, which `archive_pull` still hands to
+        // `undo_pull_attempt` UNCONDITIONALLY — and `undo_pull_attempt` calls
+        // `restore_manifest_backup`, which sees `backup.exists() == true`
+        // (the removal that failed left it there) and restores it to `dst`
+        // anyway. Propagating the error only moved WHERE the resurrection
+        // happened; it did not stop it.
+        //
+        // This test is the missing coverage both reviewers pointed out: the
+        // prior regression test (`a_failed_stale_backup_removal_is_reported_
+        // not_swallowed`) only called `stash_existing_manifest` directly, never
+        // exercising `undo_pull_attempt`/`restore_manifest_backup` at all — so
+        // it could not have caught this. This one drives the REAL sequence:
+        // `copy_model_files` (which now returns `PullError::StashUnsafe` for
+        // this failure) → the real `undo_pull_attempt`, gated on
+        // `!matches!(err, PullError::StashUnsafe(_))` exactly as
+        // `archive_pull` itself now does.
+        use std::os::unix::fs::PermissionsExt;
+
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        if unsafe { geteuid() } == 0 {
+            eprintln!(
+                "skipping a_stash_unsafe_error_skips_restore_through_the_real_undo_route: \
+                 running as root"
+            );
+            return;
+        }
+
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        let (archive, local) = (base.join("archive"), base.join("local"));
+        let model = make_model(&archive, "unremovable2", "1", &[64]);
+        let rel = Path::new("registry.ollama.ai/library/unremovable2/1");
+
+        // `dst_manifest` is absent, as if this model had already been evicted —
+        // but a stale, unrelated backup persists, and its parent directory is
+        // read-only, so THIS attempt's own stash step cannot clear it.
+        let dst_manifest = local.join("manifests").join(rel);
+        let backup = manifest_backup_path(&local, rel).unwrap();
+        let backup_parent = backup.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&backup_parent).unwrap();
+        fs::write(&backup, b"stale content this attempt never created or verified").unwrap();
+        let mut perms = fs::metadata(&backup_parent).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&backup_parent, perms).unwrap();
+
+        let plan = plan_pull(&model, &archive, &local).unwrap();
+        let planned = planned_local_paths(&plan);
+        let pre_existing: HashSet<PathBuf> =
+            planned.iter().filter(|p| p.exists()).cloned().collect();
+
+        let copy_result = copy_model_files(
+            plan.clone(),
+            Arc::new(AtomicBool::new(false)),
+            CopyActivity::default(),
+        )
+        .await;
+
+        // Restore write permission before any further filesystem work (the
+        // real undo route, and the tempdir's own cleanup) runs, no matter what
+        // the assertions below find.
+        let mut restore_perms = fs::metadata(&backup_parent).unwrap().permissions();
+        restore_perms.set_mode(0o755);
+        fs::set_permissions(&backup_parent, restore_perms).unwrap();
+
+        let (err, published) = copy_result.unwrap_err();
+        assert!(
+            matches!(err, PullError::StashUnsafe(_)),
+            "precondition: the forced failure must be the stash-clear step, \
+             surfaced as StashUnsafe, not something else: {err:?}"
+        );
+        assert!(
+            published.is_empty(),
+            "no blob is ever copied before the stash step runs"
+        );
+
+        // Exactly what `archive_pull` itself now does: gate the restore on
+        // whether this specific error is StashUnsafe.
+        let restore_is_safe = !matches!(err, PullError::StashUnsafe(_));
+        undo_pull_attempt(&plan, rel, &published, &pre_existing, restore_is_safe);
+
+        assert!(
+            !dst_manifest.exists(),
+            "a StashUnsafe failure must never resurrect unrelated stale \
+             content at dst_manifest — this attempt never verified the \
+             backup and dst was legitimately absent before this pull began"
+        );
+        assert!(
+            backup.exists(),
+            "the stale backup must be left exactly as found (untouched, not \
+             restored, not deleted) when this attempt could not verify it — \
+             the same 'when you can't prove it's safe, do nothing' outcome \
+             the not-quiescent JoinError branch already accepts"
+        );
+    }
+
+    #[tokio::test]
     async fn abandoned_pull_restores_the_previous_manifest() {
         // The defect this closes: a pull that COMPLETES and is then abandoned
         // (the timer fires just as the copy finishes, or a quiescent JoinError)
@@ -2464,7 +2631,7 @@ mod tests {
         );
 
         // ...and is then abandoned.
-        undo_pull_attempt(&plan, rel, &planned, &pre_existing);
+        undo_pull_attempt(&plan, rel, &planned, &pre_existing, true);
 
         assert_eq!(
             fs::read(&dst_manifest).unwrap(),
@@ -2535,7 +2702,7 @@ mod tests {
         fs::write(&this_attempts_blob, b"published by this attempt").unwrap();
         let pre_existing: HashSet<PathBuf> = HashSet::new();
 
-        undo_pull_attempt(&plan, rel, &candidates, &pre_existing);
+        undo_pull_attempt(&plan, rel, &candidates, &pre_existing, true);
 
         assert!(
             this_attempts_blob.exists(),
