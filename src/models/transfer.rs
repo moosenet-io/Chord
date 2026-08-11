@@ -750,35 +750,38 @@ fn manifest_backup_path(root: &Path, rel: &Path) -> Option<PathBuf> {
 /// publish atomically replaces it, matching the atomic-replacement guarantee the
 /// rest of this module relies on everywhere else.
 fn stash_existing_manifest(root: &Path, rel: &Path, dst: &Path) -> std::io::Result<bool> {
-    if !dst.exists() {
-        return Ok(false);
-    }
     let backup = match manifest_backup_path(root, rel) {
         Some(b) => b,
         None => return Ok(false),
     };
-    if let Some(parent) = backup.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     // A backup already sitting at this path cannot belong to THIS attempt: the
     // only way to reach here is at the very start of a fresh manifest copy,
     // after any earlier attempt's own backup was already consumed by its
     // commit or restore. Its presence means an earlier attempt was abandoned
     // without being reconciled (the not-quiescent JoinError branch
     // deliberately leaves everything in place). That content must never be
-    // mistaken for THIS attempt's stash: `rename` below is atomic, so if it
-    // fails it leaves whatever was already at `backup` completely untouched —
-    // and if that were left as a stale leftover, a later restore would
-    // clobber the current, valid destination with content that is not even
-    // its immediate predecessor. Clearing it first means our own failed
-    // rename leaves NOTHING at `backup`, which is the one state
-    // `restore_manifest_backup` already treats as safe.
+    // mistaken for THIS attempt's stash — including when `dst` is currently
+    // ABSENT: the destination can vanish out from under a stale backup
+    // (eviction removes the manifest leaf via `FsLocalEvictor` but has no
+    // reason to know about, or touch, this module's backup directory), so
+    // "nothing to stash right now" is not evidence the backup is fresh. This
+    // clear runs unconditionally, before the `dst.exists()` check below, so
+    // that case is covered too. Clearing it first also means: if the rename
+    // below fails, it leaves NOTHING at `backup` — the one state
+    // `restore_manifest_backup` already treats as safe — rather than stale
+    // content a later restore could mistake for this attempt's own.
     if backup.exists() {
         let _ = if backup.is_dir() {
             std::fs::remove_dir_all(&backup)
         } else {
             std::fs::remove_file(&backup)
         };
+    }
+    if !dst.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = backup.parent() {
+        std::fs::create_dir_all(parent)?;
     }
     // Stage-then-rename, same as every publish elsewhere in this module: a copy
     // that fails partway (disk full, permission revoked mid-write) must never
@@ -2174,6 +2177,48 @@ mod tests {
              presence check is the only thing standing between \"nothing to \
              restore\" and clobbering an untouched destination on the very next \
              failure path"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stash_with_no_destination_still_clears_a_stale_backup() {
+        // The gap this closes (found by the T2 panel, round 6): the stale-backup
+        // clear used to sit AFTER the `if !dst.exists() { return Ok(false); }`
+        // early return, so it was unreachable whenever the destination happened
+        // to be absent. That is not a rare case: a manifest this module
+        // previously stashed a backup for can vanish out from under that backup
+        // via local eviction (`FsLocalEvictor` removes the manifest leaf but has
+        // no reason to know about, or clean up, `.chord-manifest-backup`) — so
+        // "no current destination" is not evidence the backup is fresh.
+        //
+        // Left uncleared, a later attempt at the same model whose OWN manifest
+        // copy then failed would have its `copy_model_files`/`undo_pull_attempt`
+        // restore route find this stale backup, treat `backup.exists()` as
+        // proof of validity, and resurrect an unrelated, possibly-dangling
+        // manifest at `dst` — the exact hazard class this whole fix chain
+        // exists to prevent, just reached through eviction instead of a failed
+        // rename.
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let rel = Path::new("registry.ollama.ai/library/evicted/1");
+        let dst = root.join("manifests").join(rel); // deliberately never created
+
+        let backup = manifest_backup_path(root, rel).unwrap();
+        fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        fs::write(&backup, b"orphaned by an eviction that removed dst but not this").unwrap();
+
+        let staged = stash_existing_manifest(root, rel, &dst).unwrap();
+
+        assert!(
+            !staged,
+            "there was nothing at `dst` to stash, so this call published no \
+             new backup of its own"
+        );
+        assert!(
+            !backup.exists(),
+            "a stale backup left behind by eviction must be cleared even when \
+             `dst` is currently absent — otherwise a LATER attempt's failed \
+             manifest copy would restore this orphan as if it were valid"
         );
     }
 
