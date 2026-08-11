@@ -604,11 +604,6 @@ async fn copy_model_files(
         }
     };
     let dst_manifest = plan.local_root.join("manifests").join(&rel);
-    if let Some(parent) = dst_manifest.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return Err((PullError::Io(e.to_string()), published));
-        }
-    }
     // Park the manifest that is already there, if any, BEFORE replacing it —
     // and before touching a single blob. Publishing with `rename` guarantees
     // the destination is never left partial; it does nothing for the previous
@@ -650,11 +645,32 @@ async fn copy_model_files(
     // can for (a)/(b). `published` is guaranteed empty here (no blob has
     // been touched yet), so skipping cleanup as well as skipping restore
     // costs nothing.
+    //
+    // (Round 11 correction: this call must run BEFORE
+    // `create_dir_all(dst_manifest.parent())` below, not after — an ordering
+    // bug both round-10 reviewers independently found. `create_dir_all` can
+    // itself fail (EACCES, disk quota, a filesystem error) and return
+    // `PullError::Io`, a variant `archive_pull` treats as `restore_is_safe =
+    // true`. If that create_dir_all failure happened before
+    // `stash_existing_manifest` ever ran, any pre-existing stale backup would
+    // still be uncleared, and the generic undo route would resurrect it at
+    // `dst_manifest` anyway — the exact bug `StashUnsafe` was built to
+    // prevent, reached through a sibling error path `StashUnsafe` doesn't
+    // cover. `stash_existing_manifest` does not need `dst_manifest`'s parent
+    // to exist first: it only calls `dst.exists()` (never creates anything
+    // under it) and creates `backup`'s own parent directory independently
+    // (see `backup.parent()` handling inside it) — so there is no ordering
+    // dependency the other way, and running it first closes this gap.
     if let Err(e) = stash_existing_manifest(&plan.local_root, &rel, &dst_manifest) {
         return Err((
             PullError::StashUnsafe(format!("stash existing manifest: {e}")),
             published,
         ));
+    }
+    if let Some(parent) = dst_manifest.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return Err((PullError::Io(e.to_string()), published));
+        }
     }
 
     // Blobs.
@@ -2572,6 +2588,116 @@ mod tests {
              restored, not deleted) when this attempt could not verify it — \
              the same 'when you can't prove it's safe, do nothing' outcome \
              the not-quiescent JoinError branch already accepts"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_create_dir_all_failure_before_stash_no_longer_resurrects_a_stale_backup() {
+        // The gap this closes (found by the T2 panel, round 10 — BOTH codex and
+        // agy voted, but only agy caught this one as CRITICAL): round 10 added
+        // `PullError::StashUnsafe` to stop `stash_existing_manifest`'s OWN
+        // failures from routing through the generic undo/restore path. But
+        // `copy_model_files` ran `tokio::fs::create_dir_all(dst_manifest.parent())`
+        // BEFORE calling `stash_existing_manifest` at all — so a `create_dir_all`
+        // failure (permissions, disk quota, a filesystem error, or here: a path
+        // component that already exists as a non-directory) returned
+        // `PullError::Io` having never reached the stash step. `archive_pull`
+        // computes `restore_is_safe = !matches!(e, PullError::StashUnsafe(_))`,
+        // which is `true` for `PullError::Io` — so any pre-existing stale
+        // backup (e.g. one orphaned by eviction, per rounds 6/7) was left
+        // completely uncleared, and the generic undo route resurrected it at
+        // `dst_manifest` anyway. `StashUnsafe` covered the case where the stash
+        // step itself fails to clear a backup; it did nothing for the sibling
+        // case where a step BEFORE the stash step fails and the stash step
+        // never runs at all — the exact same resurrection hazard, reached one
+        // step earlier.
+        //
+        // Fixed by reordering `copy_model_files` so `stash_existing_manifest`
+        // runs BEFORE `create_dir_all(dst_manifest.parent())`, not after.
+        // `stash_existing_manifest` has no dependency on that parent directory
+        // existing (it only calls `dst.exists()`, and creates `backup`'s own
+        // parent independently), so there is no ordering requirement the other
+        // way — moving it first closes this gap.
+        //
+        // This test forces a REAL, deterministic `create_dir_all` failure that
+        // is not permission-based (this gate environment runs as root, where a
+        // read-only-directory technique is a no-op): it places a plain FILE at
+        // the exact path `dst_manifest`'s parent needs to become, so
+        // `create_dir_all` hits `ENOTDIR`/`AlreadyExists` regardless of
+        // privilege level. No root-skip guard is needed for that reason.
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        let (archive, local) = (base.join("archive"), base.join("local"));
+        let model = make_model(&archive, "mkdirfail", "1", &[64]);
+        let rel = Path::new("registry.ollama.ai/library/mkdirfail/1");
+
+        // `dst_manifest` is absent, as if this model had already been evicted —
+        // but a stale, unrelated backup persists.
+        let dst_manifest = local.join("manifests").join(rel);
+        let backup = manifest_backup_path(&local, rel).unwrap();
+        fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        fs::write(&backup, b"stale content this attempt never created or verified").unwrap();
+
+        // `dst_manifest`'s parent is `.../manifests/registry.ollama.ai/library/mkdirfail`.
+        // Create everything up to (not including) that leaf as real directories,
+        // then occupy the leaf itself with a plain file, so
+        // `create_dir_all(dst_manifest.parent())` cannot create it as a
+        // directory no matter who runs the test.
+        let parent = dst_manifest.parent().unwrap();
+        fs::create_dir_all(parent.parent().unwrap()).unwrap();
+        fs::write(parent, b"occupying the directory slot with a plain file").unwrap();
+
+        let plan = plan_pull(&model, &archive, &local).unwrap();
+        let planned = planned_local_paths(&plan);
+        let pre_existing: HashSet<PathBuf> =
+            planned.iter().filter(|p| p.exists()).cloned().collect();
+
+        let (err, published) = copy_model_files(
+            plan.clone(),
+            Arc::new(AtomicBool::new(false)),
+            CopyActivity::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, PullError::Io(_)) && !matches!(err, PullError::StashUnsafe(_)),
+            "precondition: the forced failure must be create_dir_all's Io error, \
+             not StashUnsafe — this test exercises the sibling path that ran \
+             before stash_existing_manifest was ever reached in round 10's \
+             code: {err:?}"
+        );
+        assert!(
+            published.is_empty(),
+            "no blob is ever copied before create_dir_all/stash run"
+        );
+
+        // Exactly what `archive_pull` itself now does: gate the restore on
+        // whether this specific error is StashUnsafe. It is not, so
+        // `restore_is_safe` is `true` here — this test's whole point is that
+        // being `true` must no longer matter, because `stash_existing_manifest`
+        // (now running first) has already cleared the stale backup by the time
+        // this Io error is ever returned.
+        let restore_is_safe = !matches!(err, PullError::StashUnsafe(_));
+        assert!(
+            restore_is_safe,
+            "precondition: PullError::Io must compute restore_is_safe = true — \
+             this test is only meaningful if the generic undo route is actually \
+             exercised, not skipped the same way StashUnsafe skips it"
+        );
+        undo_pull_attempt(&plan, rel, &published, &pre_existing, restore_is_safe);
+
+        assert!(
+            !dst_manifest.exists(),
+            "a create_dir_all failure before the stash step must never \
+             resurrect unrelated stale content at dst_manifest — this attempt \
+             never touched it and dst was legitimately absent before this \
+             pull began"
+        );
+        assert!(
+            !backup.exists(),
+            "the stale backup must have been cleared by stash_existing_manifest \
+             running BEFORE create_dir_all, not preserved for the generic undo \
+             route to mistakenly restore"
         );
     }
 
