@@ -457,6 +457,12 @@ pub async fn evict_to_archive(
                 COPY_CANCEL_GRACE,
                 &planned,
                 &pre_existing,
+                // Eviction (warm→cold) never stashes a manifest — that machinery
+                // is pull-side only (see the doc comment on
+                // `cleanup_after_join_error`) — so an empty `manifest_rel` makes
+                // the restore step a guaranteed no-op here.
+                &archive_root,
+                Path::new(""),
             )
             .await;
             return Err(EvictError::ArchiveCopy(
