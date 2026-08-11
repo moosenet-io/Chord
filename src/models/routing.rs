@@ -55,6 +55,14 @@ fn to_resolved(
         // sides naming the same variable instead of silently disagreeing.
         api_key_env: b.api_key_env.clone(),
         unit: b.unit.clone(),
+        // terminus-rs 1.3.2 (BT-01) added this field to its own ResolvedBackend
+        // for OpenRouter/JWT bearer-authenticated lifecycle handling. Chord's
+        // own bearer-key resolution (`resolve_and_ensure`, this module) already
+        // reads `Backend::api_key_env` directly and does not depend on this
+        // copy — but passing the same value through keeps the two structs
+        // faithful to each other rather than silently dropping known
+        // information the field exists to carry.
+        api_key_env: b.api_key_env.clone(),
         launch: b.launch.as_ref().map(|l| TLaunch {
             bin: l.bin.clone(),
             args: l.args.clone(),
