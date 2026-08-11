@@ -796,12 +796,22 @@ fn stash_existing_manifest(root: &Path, rel: &Path, dst: &Path) -> std::io::Resu
     // below fails, it leaves NOTHING at `backup` — the one state
     // `restore_manifest_backup` already treats as safe — rather than stale
     // content a later restore could mistake for this attempt's own.
+    // The removal's own result is NOT ignored: if it fails (permissions, a
+    // read-only filesystem, another fs error) `backup` may still exist
+    // afterward, and this function must not silently report "cleared" —
+    // that would let a later `restore_manifest_backup` call trust
+    // `backup.exists()` and resurrect content this attempt never verified
+    // as stale. Propagating the error here means this attempt's own
+    // failure return is what stops it: `copy_model_files` bails before
+    // touching a single blob, and this specific model is left exactly as
+    // it was found — untouched — rather than proceeding on an unverified
+    // clear.
     if backup.exists() {
-        let _ = if backup.is_dir() {
-            std::fs::remove_dir_all(&backup)
+        if backup.is_dir() {
+            std::fs::remove_dir_all(&backup)?;
         } else {
-            std::fs::remove_file(&backup)
-        };
+            std::fs::remove_file(&backup)?;
+        }
     }
     if !dst.exists() {
         return Ok(false);
@@ -2323,6 +2333,78 @@ mod tests {
             "a stale backup left behind by eviction must be cleared even when \
              `dst` is currently absent — otherwise a LATER attempt's failed \
              manifest copy would restore this orphan as if it were valid"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_stale_backup_removal_is_reported_not_swallowed() {
+        // The gap this closes (found by the T2 panel, round 8): the stale-backup
+        // clear discarded the removal's own `Result` via `let _ = ...`. If the
+        // removal itself failed (permissions, a read-only filesystem, another
+        // fs error) `backup` could still exist afterward, yet the function fell
+        // straight through to the `dst.exists()` check and, on an absent `dst`,
+        // returned `Ok(false)` — reporting "nothing to stash" while a stale,
+        // unverified backup was still sitting there for a later
+        // `restore_manifest_backup` call to trust and resurrect. That is the
+        // exact hazard class this whole fix chain exists to prevent, reached
+        // through a swallowed error instead of an unreachable code path.
+        //
+        // Forced here by making the backup's parent directory read-only, so the
+        // `remove_file` call fails with a real `EACCES` instead of a simulated
+        // error. Asserts the failure now propagates as `Err` — a swallowed
+        // error would have returned `Ok(false)` here instead.
+        use std::os::unix::fs::PermissionsExt;
+
+        // Root bypasses the DAC permission check this test relies on to force
+        // a genuine removal failure — under root the `remove_file` below would
+        // silently succeed anyway, and the test would prove nothing. Skip
+        // rather than assert something this environment cannot actually show.
+        // A bare `geteuid()` FFI call avoids pulling in a dependency-tree
+        // change (the `nix` crate is already a dependency but its `Uid` type
+        // is gated behind a "user" feature this workspace doesn't enable) for
+        // what a single libc symbol answers directly.
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        if unsafe { geteuid() } == 0 {
+            eprintln!("skipping a_failed_stale_backup_removal_is_reported_not_swallowed: running as root");
+            return;
+        }
+
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let rel = Path::new("registry.ollama.ai/library/unremovable/1");
+        let dst = root.join("manifests").join(rel); // absent, as after eviction
+
+        let backup = manifest_backup_path(root, rel).unwrap();
+        let backup_parent = backup.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&backup_parent).unwrap();
+        fs::write(&backup, b"stale content this attempt must not silently accept").unwrap();
+
+        // Read-only parent dir: unlinking an entry from it fails regardless of
+        // the entry's own permissions.
+        let mut perms = fs::metadata(&backup_parent).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&backup_parent, perms).unwrap();
+
+        let result = stash_existing_manifest(root, rel, &dst);
+
+        // Restore write permission before the tempdir's own cleanup runs, no
+        // matter which assertion below fires.
+        let mut restore_perms = fs::metadata(&backup_parent).unwrap().permissions();
+        restore_perms.set_mode(0o755);
+        fs::set_permissions(&backup_parent, restore_perms).unwrap();
+
+        assert!(
+            result.is_err(),
+            "a removal failure must propagate as an error, not be silently \
+             reported as `Ok(false)` (\"nothing to stash\") while the \
+             unverified stale backup is still on disk"
+        );
+        assert!(
+            backup.exists(),
+            "precondition check: the backup must genuinely still be present \
+             (removal genuinely failed) for this test to mean anything"
         );
     }
 
