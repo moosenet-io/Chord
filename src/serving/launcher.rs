@@ -18,7 +18,11 @@
 //!     actually needed (see [`rope_scaling_args`]); YARN-05: `--preserve-thinking`
 //!     / `--prompt-cache-all` when the row's `thinking` block requests
 //!     preservation on a model that `supports_thinking` and is `validated` (see
-//!     [`thinking_args`]). Health-checks `llama_server_url()`.
+//!     [`thinking_args`]); **CHRD-121: `-np <n>` / `--cont-batching`, emitted
+//!     ONLY when the row explicitly pins `parallel_slots`** (see
+//!     [`EnvSpec::parallel_slots`]) — with no pin, llama.cpp's own VRAM-aware
+//!     auto-selection is deliberately left alone. Health-checks
+//!     `llama_server_url()`.
 //!   - **ollama-rocm** ([`Runtime::Ollama`]): `ollama_bin()` `serve`; the GPU
 //!     `gfx_override` env; health-checks `ollama_primary_url()`.
 //!   - **genuine CPU** ([`Runtime::Cpu`]): `ollama_bin()` `serve` against the
@@ -461,6 +465,48 @@ fn warn_thinking_unsupported(thinking: &ThinkingConfig) {
     }
 }
 
+// ── CHRD-121: why there is NO size-tiered default slot count here ─────────────
+//
+// The first cut of CHRD-121 added a `default_parallel_slots(peak_gb)` table
+// (<8GB→8, ≤16GB→4, ≤24GB→3, else→2) applied to EVERY llama.cpp launch, on the
+// stated premise that "a model is otherwise pinned to llama.cpp's single-slot
+// default regardless of available VRAM."
+//
+// That premise was FALSE, and the table was deleted rather than retuned. Measured
+// directly against the binary this launcher actually execs (`/opt/lemonade/b1258/
+// llama-server` on <host>, 2026-08-15), launched with `-c 32768` and NO `-np`:
+//
+//     main: n_parallel is set to auto, using n_parallel = 4 and kv_unified = true
+//     llama_context: n_seq_max     = 4
+//     llama_context: n_ctx_seq     = 32768
+//
+// and from that build's own `--help`:
+//
+//     -np, --parallel N     number of server slots (default: -1, -1 = auto)
+//     -cb, --cont-batching  whether to enable continuous batching (default: enabled)
+//
+// So: the default is AUTO, not 1; auto already chose 4 slots on the live host;
+// and continuous batching is already on. Three consequences drove the deletion:
+//
+//   1. There was nothing to fix. No model was serving one slot.
+//   2. The table was a REGRESSION where it mattered. A 30B-class coder model
+//      (~18GB peak — the exact model CHRD-121 was opened for) landed in the
+//      3-slot tier, below the 4 slots auto already grants it. Large and
+//      unmeasured models fell to 2.
+//   3. Auto is better-informed than any table we can write here. llama.cpp picks
+//      n_parallel at launch with the real device inventory in hand (the same log
+//      prints `found 1 ROCm devices (Total VRAM: 122880 MiB)` immediately before
+//      the auto decision). A static tier computed from a STORED profile row
+//      (`vram_or_ram_peak_gb`, measured at some earlier time, ignorant of what
+//      else is resident right now) cannot beat that — it is precisely the
+//      unguarded-oversubscription hazard the CHRD-121 review panel flagged,
+//      dressed up as a mitigation.
+//
+// What survives is the part that was always sound: an operator can PIN an
+// explicit slot count per row via `env_json` when they know something llama.cpp's
+// auto-selection does not. Absent a pin, we emit no `-np` at all and leave auto
+// alone. See [`EnvSpec::parallel_slots`] for the (strict, fail-closed) parsing.
+
 /// Build the [`LaunchCommand`] for serving `entry` under a specific `runtime`.
 ///
 /// Reads every binary/endpoint from the SRV-01 config helpers (no literals) and
@@ -504,6 +550,23 @@ pub fn build_launch_command(
             // configured, supported, and validated (llama.cpp tier only).
             if let Some(thinking) = &env.thinking {
                 args.extend(thinking_args(thinking));
+            }
+            // CHRD-121: emit an explicit slot count ONLY when the row pins one.
+            // With no pin we emit nothing and llama.cpp's VRAM-aware auto-select
+            // decides (measured: auto chose 4 slots on <host>/b1258 — see the block
+            // comment above `build_launch_command`'s neighbours for the evidence).
+            // A pinned `1` is the documented opt-out: it means "serve this model
+            // single-slot", so we emit `-np 1` EXPLICITLY rather than emitting
+            // nothing — emitting nothing would hand the row back to auto, which
+            // is the opposite of what the operator asked for.
+            if let Some(slots) = env.parallel_slots {
+                args.push("-np".to_string());
+                args.push(slots.to_string());
+                // `--cont-batching` is already default-enabled on b1258, but it
+                // is stated explicitly alongside a deliberate pin so the argv is
+                // self-describing and does not silently change meaning if a
+                // future build flips that default.
+                args.push("--cont-batching".to_string());
             }
             let mut envs = Vec::new();
             if let Some(gfx) = resolve_gfx_override(env) {
@@ -1510,6 +1573,126 @@ mod tests {
         assert!(!s.contains("://") && !s.contains("invalid"));
         let _endpoints = set_runtime_endpoints();
     }
+
+    // ── CHRD-121: explicit parallel-slot pin (-np/--cont-batching) ─────────────
+    //
+    // NOTE on what these tests deliberately do NOT assert: there is no test for a
+    // "default" slot count, because CHRD-121 no longer computes one. With no pin
+    // the launcher emits no -np and llama.cpp's own VRAM-aware auto-selection
+    // decides (measured on <host>/b1258: auto = 4 slots). The absence of -np in the
+    // unpinned case is asserted by the pre-existing exact-match rope/yarn tests
+    // above, which are byte-for-byte unchanged from before this item — that is
+    // the real regression guard, and it is stronger than a bespoke test here.
+
+    #[test]
+    #[serial]
+    fn llama_command_emits_no_np_flag_when_row_pins_nothing() {
+        // The whole point of the CHRD-121 correction: an unpinned row must be
+        // left alone so llama.cpp auto-selects against real free VRAM.
+        let _endpoints = set_runtime_endpoints();
+        let e = entry("qwen3-coder:30b", ServingBackend::LlamaGpu, Runtime::LlamaCpp, "{}", false, None);
+        let cmd = build_launch_command(&e, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
+        assert!(!cmd.args.contains(&"-np".to_string()), "unpinned row must not pin slots");
+        assert!(!cmd.args.contains(&"--cont-batching".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn llama_command_emits_explicit_pin_under_every_key_name() {
+        let _endpoints = set_runtime_endpoints();
+        for (json, want) in [(r#"{"n_parallel":6}"#, "6"), (r#"{"parallel_slots":5}"#, "5"), (r#"{"np":7}"#, "7")] {
+            let e = entry("m", ServingBackend::LlamaGpu, Runtime::LlamaCpp, json, false, None);
+            let cmd = build_launch_command(&e, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
+            let pos = cmd.args.iter().position(|a| a == "-np").unwrap_or_else(|| panic!("-np emitted for {json}"));
+            assert_eq!(cmd.args.get(pos + 1).map(String::as_str), Some(want), "slot count for {json}");
+            assert!(cmd.args.contains(&"--cont-batching".to_string()), "cont-batching for {json}");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn llama_command_pinned_one_emits_explicit_np_1_not_silence() {
+        // Regression guard for the semantics correction: `1` means "serve this
+        // model single-slot". Emitting NOTHING would hand the row back to
+        // llama.cpp auto (4 slots on the live host) — the exact opposite.
+        let _endpoints = set_runtime_endpoints();
+        let e = entry("m", ServingBackend::LlamaGpu, Runtime::LlamaCpp, r#"{"n_parallel":1}"#, false, None);
+        let cmd = build_launch_command(&e, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
+        let pos = cmd.args.iter().position(|a| a == "-np").expect("-np 1 emitted explicitly");
+        assert_eq!(cmd.args.get(pos + 1).map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn envspec_parses_explicit_parallel_slots() {
+        assert_eq!(EnvSpec::parse(r#"{"n_parallel":3}"#).parallel_slots, Some(3));
+        assert_eq!(EnvSpec::parse(r#"{"parallel_slots":9}"#).parallel_slots, Some(9));
+        assert_eq!(EnvSpec::parse(r#"{"np":2}"#).parallel_slots, Some(2));
+        assert_eq!(EnvSpec::parse(r#"{"n_parallel":1}"#).parallel_slots, Some(1));
+        // Absent entirely is the ONLY input that means "let auto decide".
+        assert_eq!(EnvSpec::parse("{}").parallel_slots, None);
+    }
+
+    #[test]
+    fn envspec_parallel_slots_rejects_invalid_values_fail_closed() {
+        // T2 panel HIGH finding: every one of these silently became a DIFFERENT
+        // effective configuration under the original or_else/as_u64 chain.
+        for bad in [
+            r#"{"n_parallel":-1}"#,      // negative -> was: silent "absent" fallthrough
+            r#"{"n_parallel":0}"#,       // zero     -> was: Some(0), silent opt-out
+            r#"{"n_parallel":99999999999999}"#, // > u32::MAX -> was: silent fallthrough
+            r#"{"n_parallel":65}"#,      // above MAX_PARALLEL_SLOTS
+            r#"{"n_parallel":"four"}"#,  // wrong type
+            r#"{"n_parallel":2.5}"#,     // non-integer
+            r#"{"n_parallel":null}"#,    // present but null
+        ] {
+            assert_eq!(
+                EnvSpec::parse(bad).parallel_slots,
+                Some(1),
+                "invalid pin {bad} must fail CLOSED to single-slot, never to auto"
+            );
+        }
+        // Same rule on each of the other two key names, not just the primary.
+        assert_eq!(EnvSpec::parse(r#"{"parallel_slots":0}"#).parallel_slots, Some(1));
+        assert_eq!(EnvSpec::parse(r#"{"np":-3}"#).parallel_slots, Some(1));
+        // Upper bound is inclusive.
+        assert_eq!(EnvSpec::parse(r#"{"n_parallel":64}"#).parallel_slots, Some(64));
+    }
+
+    #[test]
+    fn envspec_malformed_primary_key_never_promotes_a_secondary_key() {
+        // THE finding that motivated the rewrite. Under the old or_else chain a
+        // malformed `n_parallel` looked ABSENT, so `np` silently won and the
+        // model came up with 6 slots the operator never asked for.
+        assert_eq!(
+            EnvSpec::parse(r#"{"n_parallel":-1,"np":6}"#).parallel_slots,
+            Some(1),
+            "malformed primary key must fail closed, NOT hand control to `np`"
+        );
+        assert_eq!(
+            EnvSpec::parse(r#"{"n_parallel":0,"parallel_slots":8,"np":6}"#).parallel_slots,
+            Some(1)
+        );
+        // Precedence among VALID keys is unchanged: presence order decides.
+        assert_eq!(EnvSpec::parse(r#"{"n_parallel":2,"np":6}"#).parallel_slots, Some(2));
+        assert_eq!(EnvSpec::parse(r#"{"parallel_slots":3,"np":6}"#).parallel_slots, Some(3));
+    }
+
+    #[test]
+    #[serial]
+    fn ollama_and_cpu_tiers_never_emit_np_flag() {
+        // NEGATIVE TEST: -np/--cont-batching are llama.cpp-only flags. Even with
+        // an explicit pin present, the ollama/CPU tiers must never emit them
+        // (those runtimes don't take -np at all).
+        let _endpoints = set_runtime_endpoints();
+        let e = entry("gemma4:9b", ServingBackend::OllamaGpu, Runtime::Ollama, r#"{"n_parallel":6}"#, false, None);
+        let cmd = build_launch_command(&e, Runtime::Ollama, "ignored").unwrap();
+        assert_eq!(cmd.args, vec!["serve".to_string()]);
+
+        let e2 = entry("small:3b", ServingBackend::Cpu, Runtime::Cpu, r#"{"n_parallel":6}"#, false, None);
+        let cmd2 = build_launch_command(&e2, Runtime::Cpu, "ignored").unwrap();
+        assert_eq!(cmd2.args, vec!["serve".to_string()]);
+    }
+
 
     #[test]
     fn launch_errors_carry_no_infra() {
