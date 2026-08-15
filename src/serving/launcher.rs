@@ -18,7 +18,12 @@
 //!     actually needed (see [`rope_scaling_args`]); YARN-05: `--preserve-thinking`
 //!     / `--prompt-cache-all` when the row's `thinking` block requests
 //!     preservation on a model that `supports_thinking` and is `validated` (see
-//!     [`thinking_args`]). Health-checks `llama_server_url()`.
+//!     [`thinking_args`]); **CHRD-121: `-np <n>` / `--cont-batching`** when the
+//!     resulting slot count is `> 1` — an explicit row `parallel_slots` wins,
+//!     otherwise a size-tiered default from the row's measured peak footprint
+//!     (see [`default_parallel_slots`]) so a model is no longer pinned to
+//!     llama.cpp's single-slot default regardless of available VRAM. Health-checks
+//!     `llama_server_url()`.
 //!   - **ollama-rocm** ([`Runtime::Ollama`]): `ollama_bin()` `serve`; the GPU
 //!     `gfx_override` env; health-checks `ollama_primary_url()`.
 //!   - **genuine CPU** ([`Runtime::Cpu`]): `ollama_bin()` `serve` against the
@@ -461,6 +466,33 @@ fn warn_thinking_unsupported(thinking: &ThinkingConfig) {
     }
 }
 
+/// CHRD-121: default llama.cpp continuous-batching parallel slot count applied
+/// when a row's `env_json` does not pin an explicit `parallel_slots`/`n_parallel`.
+/// Tiered by the model's measured peak footprint ([`ServingProfile::vram_or_ram_peak_gb`])
+/// rather than one flat number: a small 3-8B-class coder model can run far more
+/// concurrent slots than a 30B-class one on the same shared VRAM pool, so mixing
+/// model sizes should mean mixing parallelism, not capping everything at the
+/// large-model number. Chosen conservatively against <host>'s shared VRAM pool
+/// (~85GB free headroom after baseline residents) — llama.cpp's per-slot KV
+/// cache scales with context length × slot count, not full model-weight
+/// duplication, so these are not naive VRAM/model_size divisions; they leave
+/// headroom for KV-cache growth and other resident models. A row that needs to
+/// opt out entirely (e.g. a very large context where even the small-model tier
+/// would not fit) can still pin `parallel_slots: 1` explicitly in its
+/// `env_json`, and any row can pin an explicit count to override the tier.
+///
+/// Peak footprint unknown (`None`, no profile measurement yet) gets the most
+/// conservative non-degenerate tier — never guess a model is small.
+fn default_parallel_slots(peak_gb: Option<f64>) -> u32 {
+    match peak_gb {
+        Some(gb) if gb < 8.0 => 8,   // small 3-8B-class coder/chat models
+        Some(gb) if gb <= 16.0 => 4, // mid-size / lightly-quantized 8-14B-class
+        Some(gb) if gb <= 24.0 => 3, // 30B-class coder models (e.g. qwen3-coder:30b @ ~18GB)
+        Some(_) => 2,                // large models — most conservative non-degenerate tier
+        None => 2,                   // unmeasured — never assume a model is small
+    }
+}
+
 /// Build the [`LaunchCommand`] for serving `entry` under a specific `runtime`.
 ///
 /// Reads every binary/endpoint from the SRV-01 config helpers (no literals) and
@@ -504,6 +536,22 @@ pub fn build_launch_command(
             // configured, supported, and validated (llama.cpp tier only).
             if let Some(thinking) = &env.thinking {
                 args.extend(thinking_args(thinking));
+            }
+            // CHRD-121: continuous-batching parallel slot count. Explicit
+            // `parallel_slots` (including `Some(1)` to opt out) always wins;
+            // otherwise apply the size-tiered default so llama.cpp serves more
+            // than one concurrent request by default on a host with spare VRAM
+            // headroom (previously always defaulted to 1 slot regardless of
+            // model size or free VRAM).
+            let parallel_slots = env
+                .parallel_slots
+                .unwrap_or_else(|| default_parallel_slots(entry.profile.vram_or_ram_peak_gb));
+            if parallel_slots > 1 {
+                args.push("-np".to_string());
+                args.push(parallel_slots.to_string());
+                // Explicit even though recent llama.cpp builds imply this from
+                // -np > 1 — never rely on an implicit default across builds.
+                args.push("--cont-batching".to_string());
             }
             let mut envs = Vec::new();
             if let Some(gfx) = resolve_gfx_override(env) {
@@ -1090,6 +1138,8 @@ mod tests {
         );
         let cmd = build_launch_command(&e, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
         // Exact expected flag string (order matters — this is what's exec'd).
+        // CHRD-121: the default -np/--cont-batching pair is always appended last
+        // on the llama.cpp tier when no explicit parallel_slots is pinned.
         let expected: Vec<String> = [
             "--model", "/w/m.gguf",
             "--rope-scaling", "yarn",
@@ -1100,6 +1150,8 @@ mod tests {
             "--yarn-beta-slow", "1",
             "--yarn-beta-fast", "32",
             "--ctx-size", "131072",
+            "-np", "4",
+            "--cont-batching",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -1147,7 +1199,18 @@ mod tests {
             None,
         );
         let cmd = build_launch_command(&e, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
-        assert_eq!(cmd.args, vec!["--model".to_string(), "/w/m.gguf".to_string()]);
+        // CHRD-121: rope/yarn refusal is orthogonal to the default parallel
+        // slots, which still apply on the llama.cpp tier.
+        assert_eq!(
+            cmd.args,
+            vec![
+                "--model".to_string(),
+                "/w/m.gguf".to_string(),
+                "-np".to_string(),
+                "4".to_string(),
+                "--cont-batching".to_string(),
+            ]
+        );
         assert!(!cmd.args.iter().any(|a| a.starts_with("--rope") || a.starts_with("--yarn")));
         assert!(!cmd.args.contains(&"--ctx-size".to_string()));
 
@@ -1163,7 +1226,16 @@ mod tests {
             None,
         );
         let cmd2 = build_launch_command(&e2, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
-        assert_eq!(cmd2.args, vec!["--model".to_string(), "/w/m.gguf".to_string()]);
+        assert_eq!(
+            cmd2.args,
+            vec![
+                "--model".to_string(),
+                "/w/m.gguf".to_string(),
+                "-np".to_string(),
+                "4".to_string(),
+                "--cont-batching".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -1180,12 +1252,31 @@ mod tests {
             None,
         );
         let cmd = build_launch_command(&e, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
-        assert_eq!(cmd.args, vec!["--model".to_string(), "/w/m.gguf".to_string()]);
+        // CHRD-121: no scaling flags, but the default parallel slots still apply.
+        assert_eq!(
+            cmd.args,
+            vec![
+                "--model".to_string(),
+                "/w/m.gguf".to_string(),
+                "-np".to_string(),
+                "4".to_string(),
+                "--cont-batching".to_string(),
+            ]
+        );
 
         // No block at all — identical (unchanged) behavior.
         let e2 = entry("m", ServingBackend::LlamaGpu, Runtime::LlamaCpp, "{}", false, None);
         let cmd2 = build_launch_command(&e2, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
-        assert_eq!(cmd2.args, vec!["--model".to_string(), "/w/m.gguf".to_string()]);
+        assert_eq!(
+            cmd2.args,
+            vec![
+                "--model".to_string(),
+                "/w/m.gguf".to_string(),
+                "-np".to_string(),
+                "4".to_string(),
+                "--cont-batching".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -1509,6 +1600,124 @@ mod tests {
         let s = err.to_string();
         assert!(!s.contains("://") && !s.contains("invalid"));
         let _endpoints = set_runtime_endpoints();
+    }
+
+    // ── CHRD-121: parallel-slot count (-np/--cont-batching) ────────────────────
+
+    #[test]
+    fn default_parallel_slots_is_tiered_by_peak_footprint() {
+        assert_eq!(default_parallel_slots(Some(4.0)), 8, "small 3-8B-class model");
+        assert_eq!(default_parallel_slots(Some(7.99)), 8, "just under the small-model boundary");
+        assert_eq!(default_parallel_slots(Some(8.0)), 4, "boundary is inclusive on the mid tier");
+        assert_eq!(default_parallel_slots(Some(16.0)), 4, "mid tier upper boundary, inclusive");
+        assert_eq!(default_parallel_slots(Some(18.0)), 3, "30B-class coder, e.g. qwen3-coder:30b");
+        assert_eq!(default_parallel_slots(Some(24.0)), 3, "large tier upper boundary, inclusive");
+        assert_eq!(default_parallel_slots(Some(70.0)), 2, "very large model");
+        assert_eq!(default_parallel_slots(None), 2, "unmeasured — never assume small");
+    }
+
+    #[test]
+    #[serial]
+    fn llama_command_emits_np_and_cont_batching_by_default() {
+        let _endpoints = set_runtime_endpoints();
+        // entry() fixes vram_or_ram_peak_gb at 8.0 — the mid tier (4 slots).
+        let e = entry("qwen3-coder:30b", ServingBackend::LlamaGpu, Runtime::LlamaCpp, "{}", false, None);
+        let cmd = build_launch_command(&e, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
+        let pos = cmd.args.iter().position(|a| a == "-np").expect("-np emitted");
+        assert_eq!(cmd.args.get(pos + 1).map(String::as_str), Some("4"));
+        assert!(cmd.args.contains(&"--cont-batching".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn llama_command_explicit_parallel_slots_overrides_default() {
+        let _endpoints = set_runtime_endpoints();
+        let e = entry(
+            "m",
+            ServingBackend::LlamaGpu,
+            Runtime::LlamaCpp,
+            r#"{"n_parallel":6}"#,
+            false,
+            None,
+        );
+        let cmd = build_launch_command(&e, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
+        let pos = cmd.args.iter().position(|a| a == "-np").expect("-np emitted");
+        assert_eq!(cmd.args.get(pos + 1).map(String::as_str), Some("6"));
+
+        // Alternate key names accepted too.
+        let e2 = entry(
+            "m",
+            ServingBackend::LlamaGpu,
+            Runtime::LlamaCpp,
+            r#"{"parallel_slots":5}"#,
+            false,
+            None,
+        );
+        let cmd2 = build_launch_command(&e2, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
+        let pos2 = cmd2.args.iter().position(|a| a == "-np").expect("-np emitted");
+        assert_eq!(cmd2.args.get(pos2 + 1).map(String::as_str), Some("5"));
+
+        let e3 = entry("m", ServingBackend::LlamaGpu, Runtime::LlamaCpp, r#"{"np":7}"#, false, None);
+        let cmd3 = build_launch_command(&e3, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
+        let pos3 = cmd3.args.iter().position(|a| a == "-np").expect("-np emitted");
+        assert_eq!(cmd3.args.get(pos3 + 1).map(String::as_str), Some("7"));
+    }
+
+    #[test]
+    #[serial]
+    fn llama_command_explicit_parallel_slots_one_opts_out_no_np_flag() {
+        // NEGATIVE TEST: a row can still pin single-slot serving explicitly —
+        // no -np/--cont-batching at all, not even "-np 1".
+        let _endpoints = set_runtime_endpoints();
+        let e = entry(
+            "m",
+            ServingBackend::LlamaGpu,
+            Runtime::LlamaCpp,
+            r#"{"n_parallel":1}"#,
+            false,
+            None,
+        );
+        let cmd = build_launch_command(&e, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
+        assert!(!cmd.args.contains(&"-np".to_string()));
+        assert!(!cmd.args.contains(&"--cont-batching".to_string()));
+    }
+
+    #[test]
+    fn envspec_parses_parallel_slots_all_key_names() {
+        assert_eq!(EnvSpec::parse(r#"{"n_parallel":3}"#).parallel_slots, Some(3));
+        assert_eq!(EnvSpec::parse(r#"{"parallel_slots":9}"#).parallel_slots, Some(9));
+        assert_eq!(EnvSpec::parse(r#"{"np":2}"#).parallel_slots, Some(2));
+        assert_eq!(EnvSpec::parse("{}").parallel_slots, None);
+    }
+
+    #[test]
+    #[serial]
+    fn ollama_and_cpu_tiers_never_emit_np_flag() {
+        // NEGATIVE TEST: -np/--cont-batching are llama.cpp-only flags. Even with
+        // an explicit parallel_slots hint present, the ollama/CPU tiers must
+        // never emit them (those runtimes don't take -np at all).
+        let _endpoints = set_runtime_endpoints();
+        let e = entry(
+            "gemma4:9b",
+            ServingBackend::OllamaGpu,
+            Runtime::Ollama,
+            r#"{"n_parallel":6}"#,
+            false,
+            None,
+        );
+        let cmd = build_launch_command(&e, Runtime::Ollama, "ignored").unwrap();
+        assert_eq!(cmd.args, vec!["serve".to_string()]);
+
+        let e2 = entry(
+            "small:3b",
+            ServingBackend::Cpu,
+            Runtime::Cpu,
+            r#"{"n_parallel":6}"#,
+            false,
+            None,
+        );
+        let cmd2 = build_launch_command(&e2, Runtime::Cpu, "ignored").unwrap();
+        assert_eq!(cmd2.args, vec!["serve".to_string()]);
     }
 
     #[test]

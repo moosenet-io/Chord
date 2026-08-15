@@ -104,6 +104,14 @@ pub struct EnvSpec {
     /// no preservation/prefix-caching flags). See [`ThinkingConfig`] for the
     /// launcher's emission rules.
     pub thinking: Option<ThinkingConfig>,
+    /// CHRD-121: explicit llama.cpp continuous-batching parallel slot count
+    /// (`-np`). `None` ⇒ the launcher's own conservative default is applied
+    /// (llama.cpp tier only — ollama/CPU tiers ignore this). Parsed from
+    /// `n_parallel` / `parallel_slots` / `np`. A row may still pin `Some(1)`
+    /// explicitly to opt a specific model OUT of concurrent slots (e.g. a
+    /// model whose KV cache at the configured context is too large to
+    /// duplicate across slots within the host's free VRAM).
+    pub parallel_slots: Option<u32>,
 }
 
 /// YARN-01: the llama.cpp RoPE context-extension method a [`RopeScaling`] block
@@ -534,6 +542,15 @@ impl EnvSpec {
         let rope_scaling = parse_rope_scaling(obj);
         let thinking = parse_thinking(obj);
 
+        // CHRD-121: explicit parallel-slot count, accepting any of the three
+        // key names a runner might use.
+        let parallel_slots = obj
+            .get("n_parallel")
+            .and_then(|x| x.as_u64())
+            .or_else(|| obj.get("parallel_slots").and_then(|x| x.as_u64()))
+            .or_else(|| obj.get("np").and_then(|x| x.as_u64()))
+            .and_then(|n| u32::try_from(n).ok());
+
         EnvSpec {
             gfx_override,
             gfx_apply_host_default,
@@ -543,6 +560,7 @@ impl EnvSpec {
             n_ctx,
             rope_scaling,
             thinking,
+            parallel_slots,
         }
     }
 }
