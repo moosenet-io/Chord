@@ -506,13 +506,14 @@ const MAX_PARALLEL_SLOTS: u32 = 64;
 /// input into a *different effective configuration* in four distinct ways:
 ///
 ///   - `{"n_parallel": -1}` — `as_u64()` yields `None`, so the row fell through
-///     to the size-tiered default. A malformed pin silently became *more*
-///     concurrency than the operator asked for.
+///     to the "absent" path (in the first cut, a size-tiered default table; now,
+///     llama.cpp auto-selection). Either way a malformed pin silently became
+///     *more* concurrency than the operator asked for.
 ///   - `{"n_parallel": 0}` — yielded `Some(0)`, which the launcher's `> 1` guard
 ///     then read as a silent opt-out. Two different inputs (`0` and `1`) meant
 ///     the same thing, undocumented.
 ///   - a value above `u32::MAX` — `u32::try_from` failed, `.ok()` discarded the
-///     error, and again the tiered default silently applied.
+///     error, and again the row silently took the "absent" path.
 ///   - worst: `{"n_parallel": -1, "np": 6}` — because a malformed *primary* key
 ///     produced `None`, `or_else` treated it as ABSENT and silently PROMOTED the
 ///     secondary key. Precedence collapsed on exactly the inputs where it
@@ -534,9 +535,10 @@ const MAX_PARALLEL_SLOTS: u32 = 64;
 ///   3. Every rejection is surfaced with a `warn!` naming the key and the
 ///      offending value, so an invalid pin is observable rather than silent.
 ///
-/// Valid range is `1..=MAX_PARALLEL_SLOTS`. `1` remains the documented explicit
-/// opt-out. Absent entirely ⇒ `None` ⇒ the launcher applies its size-tiered
-/// default.
+/// Valid range is `1..=MAX_PARALLEL_SLOTS`. `1` is the documented explicit
+/// opt-out, emitted as a literal `-np 1`. Absent entirely ⇒ `None` ⇒ the
+/// launcher emits no `-np` at all and llama.cpp's VRAM-aware auto-selection
+/// decides (4 slots on <host>/b1258 as measured).
 fn parse_parallel_slots(obj: &serde_json::Map<String, serde_json::Value>) -> Option<u32> {
     // Rule 1: presence decides precedence, before any validation runs.
     let (key, raw) = ["n_parallel", "parallel_slots", "np"]
@@ -551,8 +553,9 @@ fn parse_parallel_slots(obj: &serde_json::Map<String, serde_json::Value>) -> Opt
             key = key,
             value = %raw,
             "serving profile: `{key}` is not a non-negative integer — refusing to guess; \
-             falling back to SINGLE-SLOT serving (no -np/--cont-batching). Fix the row's \
-             env_json, or omit the key entirely to get the size-tiered default."
+             falling back to SINGLE-SLOT serving (an explicit `-np 1 --cont-batching`). \
+             Fix the row's env_json, or omit the key entirely to leave llama.cpp's own \
+             VRAM-aware auto-selection in charge."
         );
         return Some(1);
     };
@@ -566,8 +569,9 @@ fn parse_parallel_slots(obj: &serde_json::Map<String, serde_json::Value>) -> Opt
                 max = MAX_PARALLEL_SLOTS,
                 "serving profile: `{key}` = {n} is outside the valid slot range \
                  1..={MAX_PARALLEL_SLOTS} — falling back to SINGLE-SLOT serving \
-                 (no -np/--cont-batching). Note 0 is NOT a synonym for the opt-out; \
-                 pin 1 explicitly to opt out."
+                 (an explicit `-np 1 --cont-batching`). Note 0 is NOT a synonym for \
+                 auto: omit the key entirely to leave llama.cpp's VRAM-aware \
+                 auto-selection in charge, or pin 1 to force single-slot."
             );
             Some(1)
         }

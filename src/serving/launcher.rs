@@ -1637,9 +1637,9 @@ mod tests {
         // T2 panel HIGH finding: every one of these silently became a DIFFERENT
         // effective configuration under the original or_else/as_u64 chain.
         for bad in [
-            r#"{"n_parallel":-1}"#,      // negative -> was: silent tiered default
+            r#"{"n_parallel":-1}"#,      // negative -> was: silent "absent" fallthrough
             r#"{"n_parallel":0}"#,       // zero     -> was: Some(0), silent opt-out
-            r#"{"n_parallel":99999999999999}"#, // > u32::MAX -> was: silent default
+            r#"{"n_parallel":99999999999999}"#, // > u32::MAX -> was: silent fallthrough
             r#"{"n_parallel":65}"#,      // above MAX_PARALLEL_SLOTS
             r#"{"n_parallel":"four"}"#,  // wrong type
             r#"{"n_parallel":2.5}"#,     // non-integer
