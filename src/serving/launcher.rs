@@ -1176,7 +1176,18 @@ mod tests {
             None,
         );
         let cmd = build_launch_command(&e, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
-        assert_eq!(cmd.args, vec!["--model".to_string(), "/w/m.gguf".to_string()]);
+        // CHRD-121: rope/yarn refusal is orthogonal to the default parallel
+        // slots, which still apply on the llama.cpp tier.
+        assert_eq!(
+            cmd.args,
+            vec![
+                "--model".to_string(),
+                "/w/m.gguf".to_string(),
+                "-np".to_string(),
+                "4".to_string(),
+                "--cont-batching".to_string(),
+            ]
+        );
         assert!(!cmd.args.iter().any(|a| a.starts_with("--rope") || a.starts_with("--yarn")));
         assert!(!cmd.args.contains(&"--ctx-size".to_string()));
     }
@@ -1292,11 +1303,14 @@ mod tests {
             None,
         );
         let cmd = build_launch_command(&e, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
+        // CHRD-121: default parallel slots still apply on top of the rope flags.
         let expected: Vec<String> = [
             "--model", "/w/m.gguf",
             "--rope-scaling", "linear",
             "--rope-scale", "2",
             "--ctx-size", "16384",
+            "-np", "4",
+            "--cont-batching",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -1322,7 +1336,18 @@ mod tests {
             None,
         );
         let cmd = build_launch_command(&e, Runtime::LlamaCpp, "/w/m.gguf").unwrap();
-        assert_eq!(cmd.args, vec!["--model".to_string(), "/w/m.gguf".to_string()]);
+        // CHRD-121: default parallel slots still apply even when the yarn
+        // no-op path emits no rope/ctx-size flags.
+        assert_eq!(
+            cmd.args,
+            vec![
+                "--model".to_string(),
+                "/w/m.gguf".to_string(),
+                "-np".to_string(),
+                "4".to_string(),
+                "--cont-batching".to_string(),
+            ]
+        );
     }
 
     #[test]
