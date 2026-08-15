@@ -104,13 +104,21 @@ pub struct EnvSpec {
     /// no preservation/prefix-caching flags). See [`ThinkingConfig`] for the
     /// launcher's emission rules.
     pub thinking: Option<ThinkingConfig>,
-    /// CHRD-121: explicit llama.cpp continuous-batching parallel slot count
-    /// (`-np`). `None` ⇒ the launcher's own conservative default is applied
-    /// (llama.cpp tier only — ollama/CPU tiers ignore this). Parsed from
-    /// `n_parallel` / `parallel_slots` / `np`. A row may still pin `Some(1)`
-    /// explicitly to opt a specific model OUT of concurrent slots (e.g. a
-    /// model whose KV cache at the configured context is too large to
-    /// duplicate across slots within the host's free VRAM).
+    /// CHRD-121: explicit llama.cpp server slot count (`-np`), llama.cpp tier
+    /// only — the ollama/CPU tiers ignore this entirely.
+    ///
+    /// `None` ⇒ emit no `-np` at all and let llama.cpp's own VRAM-aware
+    /// auto-selection decide. That is the intended default: measured on
+    /// <host>/b1258, auto picks 4 slots, having read real device VRAM at launch.
+    /// Chord deliberately does NOT second-guess it from a stored profile row.
+    ///
+    /// `Some(n)` ⇒ pin exactly `n` slots, for the cases an operator knows
+    /// something auto does not. `Some(1)` is the explicit opt-out (serve this
+    /// model single-slot) and is emitted as a literal `-np 1` — leaving the key
+    /// out instead would NOT opt out, it would hand the row back to auto.
+    ///
+    /// Parsed from `n_parallel` / `parallel_slots` / `np` by
+    /// [`parse_parallel_slots`], which is strict and fail-closed — see its docs.
     pub parallel_slots: Option<u32>,
 }
 
@@ -480,6 +488,92 @@ pub fn resolve_thinking_request(
 /// "missing required field" rejection case — an object with unrecognized or
 /// partially-present keys still yields a (conservatively all-`false`) config
 /// rather than being discarded outright.
+/// CHRD-121 review fix (T2 panel, unanimous HIGH from codex+agy+free): upper
+/// bound on an explicitly-pinned `parallel_slots`. llama.cpp allocates a KV-cache
+/// partition per slot, so an absurd pin (`{"np": 4000000}`) is never a legitimate
+/// operator intent — it is a typo or a malformed generator, and honoring it would
+/// hand `llama-server` an argument that either OOMs the host or is silently
+/// clamped by the server itself.
+const MAX_PARALLEL_SLOTS: u32 = 64;
+
+/// CHRD-121: explicit llama.cpp parallel-slot count from a row's `env_json`,
+/// accepting any of the three key names a runner might use
+/// (`n_parallel` / `parallel_slots` / `np`, in that precedence order).
+///
+/// **This function is deliberately strict, and it is the fix for the unanimous
+/// HIGH finding of the CHRD-121 T2 review panel.** The original implementation
+/// was an `or_else` chain of `as_u64()` calls, which silently converted invalid
+/// input into a *different effective configuration* in four distinct ways:
+///
+///   - `{"n_parallel": -1}` — `as_u64()` yields `None`, so the row fell through
+///     to the size-tiered default. A malformed pin silently became *more*
+///     concurrency than the operator asked for.
+///   - `{"n_parallel": 0}` — yielded `Some(0)`, which the launcher's `> 1` guard
+///     then read as a silent opt-out. Two different inputs (`0` and `1`) meant
+///     the same thing, undocumented.
+///   - a value above `u32::MAX` — `u32::try_from` failed, `.ok()` discarded the
+///     error, and again the tiered default silently applied.
+///   - worst: `{"n_parallel": -1, "np": 6}` — because a malformed *primary* key
+///     produced `None`, `or_else` treated it as ABSENT and silently PROMOTED the
+///     secondary key. Precedence collapsed on exactly the inputs where it
+///     mattered most.
+///
+/// The rules now are:
+///
+///   1. **Precedence is decided by key PRESENCE, not by value validity.** The
+///      first key present in `n_parallel`, `parallel_slots`, `np` order is the
+///      one that decides, full stop. A malformed primary key can never hand
+///      control to a secondary key.
+///   2. **A present-but-invalid value fails CLOSED to single-slot serving**
+///      (`Some(1)`, which the launcher emits as an explicit `-np 1`). It does
+///      NOT fall through to "absent", because absent means something different
+///      and more permissive: absent hands the row to llama.cpp's auto-selection,
+///      which on the live host chooses 4 slots. Garbled config must never yield
+///      MORE concurrency than a conservative reading of it; "I could not
+///      understand your pin" resolves to the safest slot count, not to auto.
+///   3. Every rejection is surfaced with a `warn!` naming the key and the
+///      offending value, so an invalid pin is observable rather than silent.
+///
+/// Valid range is `1..=MAX_PARALLEL_SLOTS`. `1` remains the documented explicit
+/// opt-out. Absent entirely ⇒ `None` ⇒ the launcher applies its size-tiered
+/// default.
+fn parse_parallel_slots(obj: &serde_json::Map<String, serde_json::Value>) -> Option<u32> {
+    // Rule 1: presence decides precedence, before any validation runs.
+    let (key, raw) = ["n_parallel", "parallel_slots", "np"]
+        .into_iter()
+        .find_map(|k| obj.get(k).map(|v| (k, v)))?;
+
+    // Rule 2/3: validate the value that key actually carries. `as_u64` rejects
+    // negatives, floats and non-numbers; the range check rejects 0 and absurd
+    // pins. Any failure is a loud, fail-closed `Some(1)`.
+    let Some(n) = raw.as_u64() else {
+        tracing::warn!(
+            key = key,
+            value = %raw,
+            "serving profile: `{key}` is not a non-negative integer — refusing to guess; \
+             falling back to SINGLE-SLOT serving (no -np/--cont-batching). Fix the row's \
+             env_json, or omit the key entirely to get the size-tiered default."
+        );
+        return Some(1);
+    };
+    let slots = u32::try_from(n).ok().filter(|s| (1..=MAX_PARALLEL_SLOTS).contains(s));
+    match slots {
+        Some(s) => Some(s),
+        None => {
+            tracing::warn!(
+                key = key,
+                value = n,
+                max = MAX_PARALLEL_SLOTS,
+                "serving profile: `{key}` = {n} is outside the valid slot range \
+                 1..={MAX_PARALLEL_SLOTS} — falling back to SINGLE-SLOT serving \
+                 (no -np/--cont-batching). Note 0 is NOT a synonym for the opt-out; \
+                 pin 1 explicitly to opt out."
+            );
+            Some(1)
+        }
+    }
+}
+
 fn parse_thinking(obj: &serde_json::Map<String, serde_json::Value>) -> Option<ThinkingConfig> {
     let t = obj.get("thinking")?.as_object()?;
     Some(ThinkingConfig {
@@ -542,14 +636,7 @@ impl EnvSpec {
         let rope_scaling = parse_rope_scaling(obj);
         let thinking = parse_thinking(obj);
 
-        // CHRD-121: explicit parallel-slot count, accepting any of the three
-        // key names a runner might use.
-        let parallel_slots = obj
-            .get("n_parallel")
-            .and_then(|x| x.as_u64())
-            .or_else(|| obj.get("parallel_slots").and_then(|x| x.as_u64()))
-            .or_else(|| obj.get("np").and_then(|x| x.as_u64()))
-            .and_then(|n| u32::try_from(n).ok());
+        let parallel_slots = parse_parallel_slots(obj);
 
         EnvSpec {
             gfx_override,
