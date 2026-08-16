@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 pub enum Language {
     Bash,
+    Go,
+    Java,
     Python,
     Rust,
     TypeScript,
@@ -30,6 +32,8 @@ impl Language {
     pub fn as_str(self) -> &'static str {
         match self {
             Language::Bash => "bash",
+            Language::Go => "go",
+            Language::Java => "java",
             Language::Python => "python",
             Language::Rust => "rust",
             Language::TypeScript => "typescript",
@@ -50,6 +54,32 @@ pub enum TaskShape {
     /// A change that spans multiple files or needs a whole-workspace view
     /// (matches the coder-sweep's `MultiFileBuild`-style "build_modify" cases).
     MultiFileBuild,
+    /// A change needing sustained reasoning over a large body of code — the
+    /// sweep's `deep` category. Added by CPROX-04 because the sweep records
+    /// this category distinctly; it is NOT a synonym for `MultiFileBuild`.
+    Deep,
+}
+
+impl TaskShape {
+    /// The `code_profile_runs.task_category` tag this shape corresponds to.
+    ///
+    /// These strings are the sweep's own category names, verified against the
+    /// live intake DB (the only populated values are `blitz`, `multi_file`,
+    /// and `deep`). CPROX-04's per-category ranking filters on this, so a
+    /// mismatch here silently degrades every request to the language-wide
+    /// fallback — [`task_category_tags_match_sweep_values`] pins them.
+    ///
+    /// Returning a tag is NOT a claim that the category has usable data: as of
+    /// CPROX-04, `multi_file` and `deep` have ZERO measured runs for every
+    /// model. The coverage gate in `coding_selector::rank_for_work_type`, not
+    /// this mapping, is what decides whether per-category data is actually used.
+    pub fn to_task_category(self) -> &'static str {
+        match self {
+            TaskShape::QuickEdit => "blitz",
+            TaskShape::MultiFileBuild => "multi_file",
+            TaskShape::Deep => "deep",
+        }
+    }
 }
 
 /// What kind of thinking the model needs to do, independent of task size.
@@ -109,9 +139,16 @@ impl WorkTypeCode {
 mod tests {
     use super::*;
 
-    const ALL_LANGUAGES: [Language; 4] =
-        [Language::Bash, Language::Python, Language::Rust, Language::TypeScript];
-    const ALL_TASK_SHAPES: [TaskShape; 2] = [TaskShape::QuickEdit, TaskShape::MultiFileBuild];
+    const ALL_LANGUAGES: [Language; 6] = [
+        Language::Bash,
+        Language::Go,
+        Language::Java,
+        Language::Python,
+        Language::Rust,
+        Language::TypeScript,
+    ];
+    const ALL_TASK_SHAPES: [TaskShape; 3] =
+        [TaskShape::QuickEdit, TaskShape::MultiFileBuild, TaskShape::Deep];
     const ALL_REASONING_NEEDS: [ReasoningNeed; 4] = [
         ReasoningNeed::Plan,
         ReasoningNeed::Enrich,
@@ -209,8 +246,37 @@ mod tests {
         // These MUST match `code_profile_runs.language` values exactly (see
         // terminus_rs::intake::code_v2 case manifests) — CPROX-02 filters on this.
         assert_eq!(Language::Bash.as_str(), "bash");
+        assert_eq!(Language::Go.as_str(), "go");
+        assert_eq!(Language::Java.as_str(), "java");
         assert_eq!(Language::Python.as_str(), "python");
         assert_eq!(Language::Rust.as_str(), "rust");
         assert_eq!(Language::TypeScript.as_str(), "typescript");
+    }
+
+    /// These tags are matched against `code_profile_runs.task_category` in
+    /// CPROX-04's per-category query. A silent rename here would not fail any
+    /// compile — it would just make every request quietly fall back to the
+    /// language-wide ranking while still reporting a shape was requested.
+    #[test]
+    fn task_category_tags_match_sweep_values() {
+        assert_eq!(TaskShape::QuickEdit.to_task_category(), "blitz");
+        assert_eq!(TaskShape::MultiFileBuild.to_task_category(), "multi_file");
+        assert_eq!(TaskShape::Deep.to_task_category(), "deep");
+    }
+
+    /// Go and Java are present in the sweep (285 runs each as of CPROX-04) but
+    /// were unexpressible before it — strict serde turned them into a hard 4xx.
+    #[test]
+    fn go_and_java_are_accepted_on_the_wire() {
+        for (tag, expected) in [("go", Language::Go), ("java", Language::Java)] {
+            let json = format!(
+                r#"{{"language":"{tag}","task_shape":"deep",
+                    "reasoning_need":"plan","context_depth_need":"long"}}"#
+            );
+            let wtc: WorkTypeCode = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("{tag} must deserialize, got {e}"));
+            assert_eq!(wtc.language, expected);
+            assert_eq!(wtc.task_shape, TaskShape::Deep);
+        }
     }
 }
