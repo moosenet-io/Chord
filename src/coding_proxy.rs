@@ -152,6 +152,13 @@ pub struct SelectedModel {
     pub measured_compile_count: i64,
     /// Same, for test results.
     pub measured_test_count: i64,
+    /// How many runs contributed to `avg_effective_score` — i.e. runs that are
+    /// BOTH scored and `finalized` (judged). Distinct from the two counts above
+    /// on purpose: `compiles`/`tests_pass` are written in intake Phase 1 and are
+    /// valid before judging, while the scores are patched in Phase 2. A caller
+    /// that reads a high `confidence` needs to know how much of it rests on
+    /// judged score data versus unjudged pass rates.
+    pub measured_score_count: i64,
 }
 
 /// Successful `/v1/coding/select` response.
@@ -264,6 +271,7 @@ pub async fn select_with_fallback(
                     mem_config: candidate.mem_config.clone(),
                     measured_compile_count: candidate.measured_compile_count,
                     measured_test_count: candidate.measured_test_count,
+                    measured_score_count: candidate.measured_score_count,
                 },
                 fallback_tier: tier,
                 candidates_considered: candidates.len(),
@@ -351,6 +359,7 @@ mod tests {
             test_pass_rate: Some(1.0),
             measured_compile_count: 10,
             measured_test_count: 10,
+            measured_score_count: 10,
             combined_score: score,
             yarn_bonus_applied: false,
         }

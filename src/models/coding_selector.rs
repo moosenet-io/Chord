@@ -36,15 +36,37 @@
 //! breakdown; that is no longer true — `code_profile_runs.task_category` is
 //! populated — but the data is very uneven, and the unevenness is a trap:
 //!
-//! - `blitz` is genuinely measured (live, language=rust: 20 models, a real
-//!   score spread of 0.06..4.92, `measured_compile_count` equal to `run_count`
-//!   for most).
-//! - `multi_file` and `deep` have ZERO measured runs for every one of the 17
-//!   models in each — and those rows carry `first_pass_score = 0`, a real zero
-//!   rather than a NULL. A naive `GROUP BY task_category` therefore returns a
-//!   complete-looking ranking in which everything ties at zero, and picking its
-//!   top entry means picking arbitrarily while presenting an absence as a
-//!   measurement.
+//! - `blitz` is genuinely measured (live, language=rust: 220 runs across 38
+//!   models, 151 with a recorded `compiles` value, a real score spread).
+//! - `multi_file` and `deep` are NOT measured for the languages this
+//!   constellation actually writes. Live counts of runs with a recorded
+//!   `compiles` value, by language and category:
+//!
+//!   | language   | blitz | multi_file | deep |
+//!   |------------|-------|------------|------|
+//!   | rust       | 151   | **0**      | **0** |
+//!   | python     | 64    | **0**      | **0** |
+//!   | typescript | 52    | **0**      | **0** |
+//!
+//!   Fleet-wide, `multi_file` does have 47 measured runs — but every one of
+//!   them is `go` (24) or `java` (23), and `deep` has zero in every language.
+//!   An earlier revision of this comment claimed a flat "ZERO for every model";
+//!   that was true for the languages checked and wrong as a global statement,
+//!   and it is corrected here rather than left to be discovered later.
+//!
+//!   The unmeasured rows still carry `first_pass_score = 0`, a real zero rather
+//!   than a NULL, so a naive `GROUP BY task_category` returns a complete-looking
+//!   ranking in which everything ties at zero: picking its top entry means
+//!   picking arbitrarily while presenting an absence as a measurement.
+//!
+//! - A fourth bucket matters and is easy to miss: **4804 of the 6100 rows have
+//!   `task_category IS NULL`**, and they hold 1220 of the 1662 measured compiles
+//!   fleet-wide — roughly 73% of ALL measurement in the table is uncategorized.
+//!   Those rows are correctly excluded from a per-category load (they cannot be
+//!   attributed to a category that was never recorded) but ARE included in the
+//!   language-wide fallback. This is a large part of why the fallback is so much
+//!   better-evidenced than any per-category load, and therefore why the coverage
+//!   gate below usually chooses it.
 //!
 //! So [`category_coverage_is_usable`] gates the per-category path, and every
 //! result carries a [`SelectionBasis`] saying which evidence it actually rests
@@ -184,6 +206,17 @@ pub struct CodeAggregate {
     /// Same hazard as [`measured_compile_count`] (live: `deepcoder:14b` rust
     /// reports `test_pass_rate = 1.00` from 5 measured of 16 runs).
     pub measured_test_count: i64,
+    /// How many runs backed [`avg_effective_score`](Self::avg_effective_score)
+    /// — i.e. how many were FINALIZED (judged).
+    ///
+    /// The same coverage discipline as the two counts above, applied to the
+    /// term that carries the largest weight (0.60) in [`combined_score`]. The
+    /// score aggregate is `FILTER (WHERE finalized)`ed because an unjudged row
+    /// holds a pre-judge score; that filter makes the score's `n` differ from
+    /// `run_count` AND from `measured_compile_count`, so it needs its own count
+    /// rather than borrowing either. Zero here with a non-zero `run_count`
+    /// means "runs exist, none judged" — an absence, not a low score.
+    pub measured_score_count: i64,
 }
 
 /// Source of `code_profile_runs` aggregates. Abstracted (mirrors
@@ -273,10 +306,13 @@ const MIN_QUALIFYING_CANDIDATES: usize = 3;
 
 /// Whether a category's aggregates carry enough real measurement to rank on.
 ///
-/// Verified against the live intake DB (language=rust): `blitz` passes — 20
-/// models, `measured_compile_count` equal to `run_count` for most, a real score
-/// spread of 0.06..4.92. `multi_file` and `deep` both fail — `compiles` is NULL
-/// on every run of all 17 models in each, so nothing qualifies.
+/// Verified against the live intake DB (language=rust): `blitz` passes — 220
+/// runs across 38 models, 151 of them with a recorded `compiles` value.
+/// `multi_file` (196 runs) and `deep` (120 runs) both fail: `compiles` is NULL
+/// on EVERY one of their runs, so no candidate reaches
+/// `MIN_MEASURED_RUNS_PER_CANDIDATE` and nothing qualifies. Same result for
+/// python and typescript. Fleet-wide `multi_file` does have 47 measured runs,
+/// but all of them are go or java.
 pub fn category_coverage_is_usable(aggregates: &[CodeAggregate]) -> bool {
     aggregates
         .iter()
@@ -317,6 +353,9 @@ pub struct CodingCandidate {
     pub measured_compile_count: i64,
     /// Carried through from [`CodeAggregate::measured_test_count`].
     pub measured_test_count: i64,
+    /// Carried through from [`CodeAggregate::measured_score_count`] — how many
+    /// judged runs back `avg_effective_score`, the heaviest scoring term.
+    pub measured_score_count: i64,
     /// `[0, 1]`-ish combined ranking score (see module docs). Higher is better.
     pub combined_score: f64,
     /// Whether the YaRN long-context bonus was applied to this candidate.
@@ -412,6 +451,7 @@ pub fn rank_candidates(
                 test_pass_rate: agg.test_pass_rate,
                 measured_compile_count: agg.measured_compile_count,
                 measured_test_count: agg.measured_test_count,
+                measured_score_count: agg.measured_score_count,
                 combined_score: combined,
                 yarn_bonus_applied: apply_bonus,
             }
@@ -530,8 +570,46 @@ impl CodeProfileSource for DbCodeProfileSource {
         // the per-category and language-wide loads rather than duplicating the
         // aggregate expressions in two near-identical queries that could drift.
         //
-        // `cpr.finalized` excludes in-flight runs (236 of 6100 live rows were
-        // being averaged into rankings before CPROX-04).
+        // `finalized` is applied PER METRIC, not as a row filter. An earlier
+        // revision of this query had a blanket `AND cpr.finalized`, described as
+        // "excludes in-flight runs". That description was wrong and the filter
+        // was harmful — corrected here after reading the writer.
+        //
+        // `finalized` does not mean "this run finished". The harness writes each
+        // row in two phases (`intake::storage`): Phase 1 inserts the run with
+        // `finalized = false` and ALREADY carries the real `compiles` /
+        // `tests_pass` results; Phase 2 is the idiom-judge pass, which patches
+        // `code_quality_score`, bumps `first_pass_score`/`retry_score`, and only
+        // then sets `finalized = true`. So `finalized = false` means "not yet
+        // judged", NOT "not yet measured".
+        //
+        // The blanket filter therefore discarded valid compile evidence. Live,
+        // language=rust category=blitz — the single best-measured category in
+        // the constellation's own language — the split is 87 measured compiles
+        // on finalized rows and 64 on unfinalized ones. The filter was throwing
+        // away 64 of 151, i.e. 42% of the evidence, from the one category that
+        // has any.
+        //
+        // But the two metric families genuinely differ, so they are treated
+        // differently rather than picking one blanket answer:
+        //   - `compiles` / `tests_pass` are Phase-1 facts. Every row counts.
+        //   - the effective score is Phase-2-adjusted, so an unfinalized row
+        //     holds a PRE-judge value that is systematically lower. Averaging
+        //     those in would bias a model down in proportion to how many of its
+        //     runs happen to be unjudged. Hence `FILTER (WHERE cpr.finalized)`
+        //     on the score aggregate only.
+        //
+        // `count(cpr.compiles)` / `count(cpr.tests_pass)` count NON-NULL values
+        // only — that is precisely the coverage signal `avg()` throws away, and
+        // the reason `measured_compile_count` exists. Do not "simplify" these
+        // to `count(*)`: that would restore the bug they were added to fix.
+        // `measured_score_count` applies the same discipline to the score term,
+        // which carries the largest weight (0.60) in `combined_score` and was
+        // the last place a rate could still be trusted without knowing its `n`.
+        //
+        // `$2 IS NULL OR cpr.task_category = $2` keeps one statement for both
+        // the per-category and language-wide loads rather than duplicating the
+        // aggregate expressions in two near-identical queries that could drift.
         let rows = sqlx::query(
             "SELECT mp.model_name AS model_id, \
                     cpr.backend_tag, \
@@ -539,13 +617,15 @@ impl CodeProfileSource for DbCodeProfileSource {
                     count(*) AS run_count, \
                     count(cpr.compiles) AS measured_compile_count, \
                     count(cpr.tests_pass) AS measured_test_count, \
-                    avg(coalesce(cpr.retry_score, cpr.first_pass_score)::float8) AS avg_effective_score, \
+                    count(coalesce(cpr.retry_score, cpr.first_pass_score)) \
+                        FILTER (WHERE cpr.finalized) AS measured_score_count, \
+                    avg(coalesce(cpr.retry_score, cpr.first_pass_score)::float8) \
+                        FILTER (WHERE cpr.finalized) AS avg_effective_score, \
                     avg(cpr.compiles::int::float8) AS compile_pass_rate, \
                     avg(cpr.tests_pass::int::float8) AS test_pass_rate \
              FROM code_profile_runs cpr \
              JOIN model_profiles mp ON mp.id = cpr.profile_id \
              WHERE cpr.language = $1 \
-               AND cpr.finalized \
                AND ($2::text IS NULL OR cpr.task_category = $2) \
              GROUP BY mp.model_name, cpr.backend_tag, cpr.mem_config",
         )
@@ -570,6 +650,7 @@ impl CodeProfileSource for DbCodeProfileSource {
                 test_pass_rate: r.get("test_pass_rate"),
                 measured_compile_count: r.get("measured_compile_count"),
                 measured_test_count: r.get("measured_test_count"),
+                measured_score_count: r.get("measured_score_count"),
             })
             .collect())
     }
@@ -713,6 +794,7 @@ mod tests {
             test_pass_rate: Some(test),
             measured_compile_count: measured_compile,
             measured_test_count: measured_test,
+            measured_score_count: measured_compile,
         }
     }
 
@@ -774,6 +856,7 @@ mod tests {
             test_pass_rate: None,
             measured_compile_count: 0,
             measured_test_count: 0,
+            measured_score_count: 0,
         };
         // 0.60*0 + 0.25*0.5 + 0.15*0.5 = 0.20 — and crucially not a panic/NaN.
         assert!((combined_score(&a) - 0.20).abs() < 1e-9);
@@ -1022,6 +1105,7 @@ mod cprox04_basis_tests {
             test_pass_rate: Some(1.0),
             measured_compile_count: n,
             measured_test_count: n,
+            measured_score_count: n,
         }
     }
 
@@ -1039,6 +1123,7 @@ mod cprox04_basis_tests {
             test_pass_rate: None,
             measured_compile_count: 0,
             measured_test_count: 0,
+            measured_score_count: 0,
         }
     }
 
