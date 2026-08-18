@@ -91,6 +91,51 @@ pub const DEFAULT_DRAIN_SECS: u64 = 30;
 /// if the compiler adopts a different holder label.
 pub const DEFAULT_COMPILER_LEASE_HOLDERS: &str = "compiler,build,bld";
 
+/// CHRD-135: default bound (seconds) on how long a compiler-build lease may defer
+/// the idle-mode watchdog WITHOUT a fresh heartbeat. A live compiler lease
+/// ([`is_compiler_lease`]) used to defer the watchdog UNCONDITIONALLY — no bound at
+/// all — for as long as `GPU_EXCLUSIVE` reported ANY holder matching a compiler
+/// pattern, even one whose last heartbeat was ancient. That let a stale/abandoned
+/// lease keep Chord parked off its default assistant-fleet mode forever.
+///
+/// This is now measured as ABSENCE OF RENEWAL, never elapsed time since idle was
+/// entered: a genuinely long-running build that keeps heartbeating
+/// (`POST /v1/gpu-exclusive/acquire`, same holder — a heartbeat refresh per
+/// [`crate::gpu_exclusive::AcquireDecision::Refresh`]) more often than this window
+/// is NEVER auto-reactivated mid-build (reverting mid-build would let models reload
+/// and eat the VRAM the lease exists to protect — the exact failure the lease
+/// prevents). Once `coder_activity_timeout` seconds pass with no fresh heartbeat,
+/// Chord reverts to its default assistant-fleet mode on its own.
+///
+/// 900s (15 minutes) matches the standing `idle_stop_secs` convention for
+/// on-demand backends (`lemonade-coder`, see `src/models/backends.rs`). Override
+/// with `CHORD_IDLE_CODER_ACTIVITY_TIMEOUT_SECS`.
+///
+/// **Coupling with `GPU_EXCLUSIVE`'s own TTL (review, round 2):** this value is
+/// meant as a FLOOR — "revert only after AT LEAST this much silence" — but the
+/// watchdog reads liveness through `GPU_EXCLUSIVE`, whose OWN, separately
+/// configured `ttl` ([`crate::gpu_exclusive::DEFAULT_TTL_SECS`], 600s by
+/// default, a shorter and UNRELATED knob governing when a different caller may
+/// steal the lock) would silently undercut this floor if used directly — a
+/// record could read as gone at 600s even though this constant promises 900.
+/// `watchdog_tick` (`src/admin/idle.rs`) closes that gap by computing its own
+/// holder-liveness against `effective_ttl = max(gpu.ttl(),
+/// coder_activity_timeout)`, so THIS value always wins whenever it is the
+/// larger of the two (the default case, 900 > 600) — see the doc on
+/// `watchdog_tick` for the full mechanics. Pinned by
+/// `watchdog_tick_default_ttls_honor_the_900s_coder_activity_floor` below.
+pub const DEFAULT_CODER_ACTIVITY_TIMEOUT_SECS: u64 = 900;
+
+/// Resolve the coder-activity (heartbeat-silence) timeout from
+/// `CHORD_IDLE_CODER_ACTIVITY_TIMEOUT_SECS` (seconds); a missing/blank/zero/
+/// unparseable value falls back to [`DEFAULT_CODER_ACTIVITY_TIMEOUT_SECS`].
+pub fn coder_activity_timeout_secs_from_env() -> u64 {
+    parse_positive_env(
+        "CHORD_IDLE_CODER_ACTIVITY_TIMEOUT_SECS",
+        DEFAULT_CODER_ACTIVITY_TIMEOUT_SECS,
+    )
+}
+
 /// Default hard budget (seconds) for the ENTIRE `enter_idle` release sequence
 /// (drain + stop backends + evict VRAM + demote). Bounding release under an explicit
 /// timeout — kept STRICTLY BELOW the stale-recovery threshold — makes it structurally
@@ -203,6 +248,85 @@ pub fn compiler_lease_held(now: u64) -> bool {
     }
 }
 
+/// CHRD-135 round-4: default substrings (case-insensitive) that identify a
+/// GPU-exclusive holder as a real MINT *coder-activity* lease — as opposed to a
+/// COMPILER build lease ([`DEFAULT_COMPILER_LEASE_HOLDERS`]), which is an
+/// entirely separate, independently-configured pattern set. Override with
+/// `CHORD_IDLE_CODER_ACTIVITY_HOLDERS` (comma-separated) if these labels drift.
+///
+/// **Why a separate set, not a widened `DEFAULT_COMPILER_LEASE_HOLDERS`:** that
+/// constant (and [`is_compiler_lease`]/[`compiler_lease_holders_from_env`]) is
+/// mirrored verbatim in Terminus `src/mint/idle.rs` and feeds MINT's own
+/// `decide_enter`/`decide_activate` — an UNCONDITIONAL, unrelated defer rule.
+/// Widening it to catch coder holders would silently change MINT's enter/defer
+/// behavior too. This set is used ONLY by the new floor branch in
+/// [`watchdog_tick_should_activate`] below — it never touches
+/// [`watchdog_should_activate`], [`is_compiler_lease`], or the compiler pattern
+/// set, so the existing compiler-lease defer semantics are unchanged byte for
+/// byte.
+///
+/// **Chosen default — `"coder,assistant"`:** covers `intake_coder_sweep` and
+/// `intake_coder_case` (via `coder`) and `intake_assistant_sweep` (via
+/// `assistant`) — three of the four real production `GPU_EXCLUSIVE` holder
+/// labels enumerated by MINT's own `mint_gpu_holders_from_env()` (Terminus
+/// `src/intake/{coder_sweep.rs,coder_case.rs,assistant/runner.rs}`). The
+/// COMPILER patterns (`compiler,build,bld`) are deliberately NOT folded in
+/// here — the Terminus compiler drives Chord via `admin_idle_enter`/`activate`
+/// directly (reason `"compiler-heavy-build"`) and never takes a
+/// `GPU_EXCLUSIVE` lease at all, so it emits no holder label or heartbeat for
+/// this set to match; conflating the two pattern sets would just re-widen the
+/// compiler set's blast radius for no benefit.
+///
+/// **`mint_breakfix` (Terminus `src/intake/breakfix.rs`, `BREAKFIX_GPU_HOLDER`)
+/// is deliberately EXCLUDED from the default, not an oversight.** An earlier
+/// revision of this constant included it on the reasoning that MINT enumerates
+/// it alongside the other three as "the same category" of heartbeat-bearing
+/// work — that reasoning does not actually establish the one fact that
+/// matters: HOW OFTEN a breakfix run renews its lease while genuinely still
+/// working. This module has no visibility into `breakfix.rs`'s renewal
+/// cadence (this change is scoped to Chord only). If a legitimate repair run
+/// goes quiet for stretches ≥ `coder_activity_timeout` (900s default) while
+/// still doing real work — plausible for a "repair" path that may wait on a
+/// slow external step between heartbeats, unlike a sweep loop — folding it
+/// into this set would let the floor revert Chord mid-repair, which is the
+/// exact failure mode ([`DEFAULT_CODER_ACTIVITY_TIMEOUT_SECS`]'s doc, and the
+/// compiler-lease floor before it) this whole mechanism exists to prevent.
+/// `mint_breakfix` does NOT match `DEFAULT_COMPILER_LEASE_HOLDERS` either, so
+/// excluding it here changes nothing about its behavior TODAY — it stays
+/// governed by the absolute watchdog deadline alone, exactly as before this
+/// item, until someone verifies its actual heartbeat cadence against Terminus
+/// source and either confirms it's safe to add here or gives it a
+/// `CHORD_IDLE_CODER_ACTIVITY_HOLDERS` override. Do not add `"breakfix"` back
+/// without that verification.
+pub const DEFAULT_CODER_ACTIVITY_HOLDERS: &str = "coder,assistant";
+
+/// The configured set of coder-activity holder substrings (lowercased), from
+/// `CHORD_IDLE_CODER_ACTIVITY_HOLDERS` or [`DEFAULT_CODER_ACTIVITY_HOLDERS`].
+/// Mirrors the shape of [`compiler_lease_holders_from_env`] exactly, but is a
+/// wholly independent knob — not a secret, not an infra identifier.
+pub fn coder_activity_holders_from_env() -> Vec<String> {
+    let raw = std::env::var("CHORD_IDLE_CODER_ACTIVITY_HOLDERS")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_CODER_ACTIVITY_HOLDERS.to_string());
+    raw.split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Does `holder` name a real MINT coder-activity lease (per `patterns`)?
+/// Case-insensitive substring match — same matching rule as
+/// [`is_compiler_lease`], intentionally duplicated rather than shared so that
+/// [`is_compiler_lease`] itself (and everything that calls it) stays byte-for-byte
+/// unchanged by this addition. Pure — fully unit-testable offline.
+pub fn is_coder_activity_holder(holder: &str, patterns: &[String]) -> bool {
+    let h = holder.to_ascii_lowercase();
+    patterns
+        .iter()
+        .any(|p| !p.is_empty() && h.contains(p.as_str()))
+}
+
 // ── Resume manifest ───────────────────────────────────────────────────────────
 
 /// What to restore when leaving idle, plus the bookkeeping the idle response and
@@ -224,6 +348,19 @@ pub struct ResumeManifest {
     pub resident_models: Vec<String>,
     /// `MemAvailable` (GiB) sampled just before release, for the freed-RAM delta.
     pub mem_available_before_gb: f64,
+    /// CHRD-135 defect #3: identity token for THIS idle episode, stamped by
+    /// [`IdleController::finish_enter`] from the `EnteringIdle` transition's own
+    /// generation counter — the caller's initializer value is always overwritten,
+    /// so any placeholder (including the pre-CHRD-135 absence of this field) is
+    /// safe. Lets an activation DECISION (e.g. the watchdog's) be pinned to the
+    /// SPECIFIC episode it evaluated: if a newer episode is current by the time the
+    /// activation actually runs, the CAS in
+    /// [`IdleController::begin_activate_for_episode`] refuses rather than cancels
+    /// it. `#[serde(default)]` so a manifest persisted by a pre-CHRD-135 binary
+    /// still deserializes across a rolling restart (defaults to `0`, harmless since
+    /// generation counters also reset to `0` on a fresh process).
+    #[serde(default)]
+    pub episode: u64,
 }
 
 impl ResumeManifest {
@@ -299,6 +436,80 @@ pub fn watchdog_should_activate(expired: bool, holder: Option<&str>, patterns: &
         Some(h) if is_compiler_lease(h, patterns) => false, // compiler build in progress → defer
         _ => true,                                          // no/other holder → auto-activate
     }
+}
+
+/// CHRD-135: has a compiler-build lease's heartbeat gone STALE — no renewal within
+/// `timeout` seconds of `now`? `saturating_sub` so a clock that briefly steps
+/// backwards reads as fresh (age 0), never spuriously stale — the same
+/// clock-safety discipline as [`crate::gpu_exclusive::LockRecord::is_expired`].
+/// Pure — no IO, no clock, exhaustively unit-testable.
+///
+/// Non-blocking review finding #5: `last_heartbeat == None` is treated as
+/// immediately stale (never a reason to defer) for callers that construct one
+/// directly or in a unit test. Via the ACTUAL production call path
+/// (`watchdog_tick` → `watchdog_tick_should_activate`), `LockRecord::last_heartbeat`
+/// is a non-`Option<u64>`, and `is_compiler` (hence this function) is only ever
+/// evaluated once a real `Some(holder)` was already matched — so that `None` arm
+/// is unreachable from `watchdog_loop` itself; it exists for this function's own
+/// direct callers (defensive default, and exercised by
+/// `coder_activity_stale_no_heartbeat_is_immediately_stale` below).
+pub fn coder_activity_stale(now: u64, last_heartbeat: Option<u64>, timeout: u64) -> bool {
+    match last_heartbeat {
+        None => true,
+        Some(hb) => now.saturating_sub(hb) >= timeout,
+    }
+}
+
+/// CHRD-135: the full per-tick watchdog decision, combining the ABSOLUTE watchdog
+/// deadline ([`watchdog_should_activate`]) with the CODER-ACTIVITY (heartbeat)
+/// window. `watchdog_should_activate` alone lets a live compiler lease defer the
+/// deadline UNCONDITIONALLY — this closes that gap: a compiler lease may defer
+/// PAST the absolute deadline only as long as it keeps heartbeating within
+/// `coder_activity_timeout`. The moment its heartbeat goes stale
+/// ([`coder_activity_stale`]), the watchdog activates regardless of the absolute
+/// deadline — so silence, not elapsed wall-clock time, is what bounds the defer.
+/// A non-compiler, non-coder-activity holder (or no holder) is unaffected — the
+/// absolute deadline alone governs that case exactly as before. Pure — fully
+/// unit-testable offline, and used by both `watchdog_loop` and its tests so the
+/// tested logic IS the production logic.
+///
+/// CHRD-135 round-4: `coder_activity_patterns` is a SEPARATE, independently
+/// configured set ([`DEFAULT_CODER_ACTIVITY_HOLDERS`]/
+/// [`coder_activity_holders_from_env`]) used ONLY here, in the floor branch —
+/// [`watchdog_should_activate`] above is called with `patterns` (the COMPILER
+/// set) exactly as before and is otherwise untouched. This closes the reachability
+/// gap where the floor branch's `is_compiler` check used the SAME compiler
+/// pattern set as the unconditional defer rule: every real production
+/// `GPU_EXCLUSIVE` holder label (`intake_coder_sweep`, `intake_coder_case`,
+/// `intake_assistant_sweep`, `mint_breakfix`) contains none of
+/// `compiler`/`build`/`bld`, so `is_compiler` was always `false` for real
+/// traffic and this whole floor was dead code in production — governed instead
+/// solely by the blind absolute `deadline_expired` one-shot timer. Adding the
+/// `is_coder_activity` disjunct only ever WIDENS when this function returns
+/// `true`; it can never turn a `true` into a `false`, so this change cannot make
+/// Chord stay idle any LONGER than it already does today — it can only make a
+/// tick that would have waited for the absolute deadline instead activate
+/// earlier, on genuine coder silence past `coder_activity_timeout`.
+pub fn watchdog_tick_should_activate(
+    now: u64,
+    deadline_expired: bool,
+    holder: Option<&str>,
+    holder_last_heartbeat: Option<u64>,
+    patterns: &[String],
+    coder_activity_patterns: &[String],
+    coder_activity_timeout: u64,
+) -> bool {
+    if watchdog_should_activate(deadline_expired, holder, patterns) {
+        return true;
+    }
+    let is_compiler = holder
+        .map(|h| is_compiler_lease(h, patterns))
+        .unwrap_or(false);
+    let is_coder_activity = holder
+        .map(|h| is_coder_activity_holder(h, coder_activity_patterns))
+        .unwrap_or(false);
+    (is_compiler || is_coder_activity)
+        && coder_activity_stale(now, holder_last_heartbeat, coder_activity_timeout)
 }
 
 /// CHORD-ACT-01 pure view: given the in-flight count, the last-activity epoch, and
@@ -405,6 +616,12 @@ pub enum BeginActivate {
     /// stays `Idle` (recoverable; a crash would reload `Idle`, consistent with memory).
     /// The caller should surface a retryable error and try again.
     PersistFailed,
+    /// CHRD-135 defect #3: an episode-guarded activate
+    /// ([`IdleController::begin_activate_for_episode`]) found the controller `Idle`
+    /// on a DIFFERENT episode than the one the caller's decision was made about —
+    /// i.e. a newer idle episode has been installed since. No-op: the caller's
+    /// stale decision must not cancel it.
+    Superseded,
 }
 
 /// Outcome of a full enter (begin+release+finish) against the live state.
@@ -669,7 +886,15 @@ impl IdleController {
     /// same-generation `EnteringIdle` this transition began — otherwise (watchdog
     /// recovered it, or a newer transition superseded it) it is a NO-OP returning
     /// `None`, so a stale commit can never clobber a newer phase.
-    fn finish_enter(&self, generation: u64, manifest: ResumeManifest) -> Option<ResumeManifest> {
+    fn finish_enter(
+        &self,
+        generation: u64,
+        mut manifest: ResumeManifest,
+    ) -> Option<ResumeManifest> {
+        // CHRD-135 defect #3: this transition's own generation IS the episode
+        // identity — always overwrite whatever the caller set (see the doc on
+        // `ResumeManifest::episode`).
+        manifest.episode = generation;
         let mut guard = self.inner.write().expect("idle lock poisoned");
         match &*guard {
             IdleState::EnteringIdle {
@@ -712,10 +937,25 @@ impl IdleController {
     /// while memory says `Activating`. When no state path is configured, persistence is
     /// a no-op and this gate is skipped (best-effort, as before). Only after the disk
     /// reads `Active` do we flip memory to `Activating`.
-    fn begin_activate_inner(&self) -> Result<(ResumeManifest, u64), BeginActivate> {
+    /// CHRD-135 defect #3: shared implementation for [`begin_activate_inner`]
+    /// (`expected_episode: None`, unconditional — the admin endpoint and
+    /// lazy-on-request path) and [`begin_activate_for_episode`]
+    /// (`expected_episode: Some(_)` — the watchdog path only). The episode check
+    /// and the rest of the CAS happen under ONE write-lock acquisition, so there is
+    /// no gap between "is this still the expected episode" and "commit the
+    /// transition" for a second caller to land in.
+    fn begin_activate_inner_impl(
+        &self,
+        expected_episode: Option<u64>,
+    ) -> Result<(ResumeManifest, u64), BeginActivate> {
         let mut guard = self.inner.write().expect("idle lock poisoned");
         match &*guard {
-            IdleState::Idle(_) => {
+            IdleState::Idle(m) => {
+                if let Some(expected) = expected_episode {
+                    if m.episode != expected {
+                        return Err(BeginActivate::Superseded);
+                    }
+                }
                 // HARD GATE: clear disk → Active BEFORE touching memory (still `Idle`).
                 if let Some(path) = self.state_path.as_deref() {
                     if let Err(e) = persist_state(path, &None) {
@@ -743,6 +983,22 @@ impl IdleController {
                 Err(BeginActivate::InTransition)
             }
         }
+    }
+
+    fn begin_activate_inner(&self) -> Result<(ResumeManifest, u64), BeginActivate> {
+        self.begin_activate_inner_impl(None)
+    }
+
+    /// CHRD-135 defect #3: like [`begin_activate_inner`](Self::begin_activate_inner),
+    /// but only wins the CAS if the live `Idle` manifest's `episode` still matches
+    /// `expected_episode` — see [`ResumeManifest::episode`] and
+    /// [`BeginActivate::Superseded`]. Used exclusively by the watchdog so a decision
+    /// made about episode N can never activate (and so cancel) episode N+1.
+    fn begin_activate_for_episode(
+        &self,
+        expected_episode: u64,
+    ) -> Result<(ResumeManifest, u64), BeginActivate> {
+        self.begin_activate_inner_impl(Some(expected_episode))
     }
 
     /// CAS `Idle → Activating`, returning the manifest to clear. Concurrent
@@ -1148,6 +1404,9 @@ pub async fn enter_idle(
         watchdog_deadline: now.saturating_add(watchdog_secs_from_env()),
         resident_models,
         mem_available_before_gb: report.mem_available_before_gb.unwrap_or(0.0),
+        // Overwritten by `finish_enter` with this transition's own generation —
+        // see `ResumeManifest::episode`.
+        episode: 0,
     };
     // Complete the transition: `EnteringIdle{gen} → Idle` (consumes the guard so its
     // Drop rollback becomes a no-op). Generation-guarded: if our transition was
@@ -1559,13 +1818,131 @@ pub async fn admin_activity_status(
 /// is deferred — a legitimately long build keeps Chord idle as long as it holds the
 /// GPU. A NON-compiler GPU holder (e.g. the intake sweep harness) does NOT extend the
 /// idle window. Follows the `idle_stop_sweep` spawn pattern in `main.rs`.
+/// CHRD-135: the per-tick STATE-MACHINE step — decision plus its CAS effect —
+/// taking `ctl`/`gpu` as explicit parameters so it runs identically against
+/// isolated test instances and the process globals, and so a test exercising it
+/// observes the SAME wiring `watchdog_loop` runs each tick, not a hand-rolled
+/// substitute (review, round 1, flagged exactly that gap in the original
+/// behavioral test). Returns `Some(cleared manifest)` if it activated
+/// (`Idle -> Active`), else `None` — deferred, nothing idle to act on, or the
+/// decision was superseded by a newer episode.
+///
+/// Defect #1 (review, round 1): a holder-liveness check must not treat an
+/// abandoned GPU_EXCLUSIVE record (heartbeat that stopped updating) as a live
+/// compiler holder deferring the revert forever — raw `.snapshot()` with the
+/// `expired` flag discarded did exactly that.
+///
+/// Defect #1 residual (review, round 2): fixing that by switching to
+/// `gpu.active_holder(now)` introduced a NEW bug — `active_holder` expires a
+/// record against GPU_EXCLUSIVE's OWN `ttl` ([`crate::gpu_exclusive::
+/// DEFAULT_TTL_SECS`], 600s by default), which is UNRELATED to and shorter than
+/// `coder_activity_timeout` (900s by default). Once the absolute deadline has
+/// passed, `active_holder` returning `None` at 600s of silence — well before the
+/// promised 900s floor — let the watchdog revert as early as 600s, silently
+/// violating "auto-revert only after AT LEAST 15 minutes of no coder activity."
+/// Fixed by computing liveness against `effective_ttl =
+/// max(gpu.ttl(), coder_activity_timeout)` here, LOCAL to this decision only —
+/// GPU_EXCLUSIVE's own (shorter) `ttl` still governs whether some OTHER caller
+/// may steal the lock; that is a separate, correctly-shorter concern this
+/// function does not touch. This guarantees the coder-activity floor documented
+/// on [`DEFAULT_CODER_ACTIVITY_TIMEOUT_SECS`] is never undercut by
+/// GPU_EXCLUSIVE's own TTL, however the two are configured.
+///
+/// Defect #3 (review, round 1): activation is EPISODE-GUARDED
+/// (`begin_activate_for_episode`), pinned to the `episode` captured in the SAME
+/// snapshot the decision was computed from. If a newer idle episode has been
+/// installed by the time the CAS actually runs, this is a no-op — a stale
+/// decision about a FORMER episode can never cancel a fresh one. This narrows,
+/// but does not fully eliminate, the analogous race against an external
+/// GPU_EXCLUSIVE re-acquire landing between the snapshot above and this CAS —
+/// closing that would require a real cross-subsystem lock the two globals don't
+/// share today; tracked as a known residual, not solved here.
+fn watchdog_tick(
+    ctl: &IdleController,
+    gpu: &crate::gpu_exclusive::GpuExclusive,
+    now: u64,
+    patterns: &[String],
+    coder_activity_patterns: &[String],
+    coder_activity_timeout: u64,
+) -> Option<ResumeManifest> {
+    let m = ctl.snapshot()?;
+    // Defect #1 residual (review, round 2): never let GPU_EXCLUSIVE's own,
+    // possibly-shorter TTL undercut the coder-activity floor — see the doc above.
+    let effective_ttl = gpu.ttl().max(coder_activity_timeout);
+    let holder = gpu.snapshot(now).and_then(|(r, _gpu_own_expired)| {
+        if r.is_expired(now, effective_ttl) {
+            None
+        } else {
+            Some(r)
+        }
+    });
+    let holder_label = holder.as_ref().map(|r| r.holder.as_str());
+    let holder_last_heartbeat = holder.as_ref().map(|r| r.last_heartbeat);
+    if !watchdog_tick_should_activate(
+        now,
+        m.watchdog_expired(now),
+        holder_label,
+        holder_last_heartbeat,
+        patterns,
+        coder_activity_patterns,
+        coder_activity_timeout,
+    ) {
+        return None;
+    }
+    match ctl.begin_activate_for_episode(m.episode) {
+        Ok((manifest, generation)) => {
+            ctl.finish_activate(generation);
+            Some(manifest)
+        }
+        Err(BeginActivate::AlreadyActive) | Err(BeginActivate::InTransition) => None,
+        Err(BeginActivate::Superseded) => {
+            // Expected/benign: a newer idle episode is now current, see the doc above.
+            None
+        }
+        Err(BeginActivate::PersistFailed) => {
+            // Non-blocking review finding #4: this WAS a silent `let _ =` discard —
+            // log it, since a persistently failing persist would otherwise retry
+            // every tick with no diagnostic at all.
+            warn!(
+                "idle-mode watchdog: episode-guarded activate aborted (persist-to-Active \
+                 failed) — will retry next tick"
+            );
+            None
+        }
+        Err(BeginActivate::Begin(_)) => {
+            // `BeginActivate::Begin` is only ever constructed by the OTHER wrapper
+            // (`IdleController::begin_activate`, the public non-episode-guarded
+            // entry point used by the HTTP handler) around a *successful* CAS — it
+            // is a `BeginActivate` value returned directly, never an `Err` payload
+            // out of `begin_activate_inner_impl`/`begin_activate_for_episode`
+            // (those return `Ok((ResumeManifest, u64))` on success instead), so
+            // this arm is unreachable from this path TODAY.
+            //
+            // Review, round 2: `unreachable!()` here is fail-DEADLY, not
+            // fail-safe — `watchdog_loop` is a spawned task with no supervisor,
+            // so a panic on an invariant that's unreachable only by convention
+            // (not by the type system) would permanently kill the exact
+            // mechanism this ticket exists to guarantee: the return to default
+            // mode. Degrade like the sibling `PersistFailed` arm instead — log
+            // and retry next tick — at zero behavioral cost today.
+            warn!(
+                "idle-mode watchdog: begin_activate_for_episode returned an unexpected \
+                 BeginActivate::Begin(_) payload — treating as a no-op and retrying next tick"
+            );
+            None
+        }
+    }
+}
+
 pub async fn watchdog_loop(state: Arc<crate::routes::AppState>, interval: Duration) {
     info!(
         interval_secs = interval.as_secs(),
         "idle-mode watchdog started"
     );
     let patterns = compiler_lease_holders_from_env();
+    let coder_activity_patterns = coder_activity_holders_from_env();
     let stale_secs = stale_transition_secs_from_env();
+    let coder_activity_timeout = coder_activity_timeout_secs_from_env();
     loop {
         tokio::time::sleep(interval).await;
         let now = now_epoch();
@@ -1580,19 +1957,44 @@ pub async fn watchdog_loop(state: Arc<crate::routes::AppState>, interval: Durati
             );
             continue;
         }
-        let Some(m) = IDLE_MODE.snapshot() else {
+        let Some(manifest) = watchdog_tick(
+            &IDLE_MODE,
+            &crate::gpu_exclusive::GPU_EXCLUSIVE,
+            now,
+            &patterns,
+            &coder_activity_patterns,
+            coder_activity_timeout,
+        ) else {
             continue;
         };
-        let holder = crate::gpu_exclusive::GPU_EXCLUSIVE.active_holder(now);
-        let holder_label = holder.as_ref().map(|r| r.holder.as_str());
-        if !watchdog_should_activate(m.watchdog_expired(now), holder_label, &patterns) {
-            continue;
-        }
         warn!(
-            reason = %m.reason,
-            "idle-mode watchdog: deadline passed with no active compiler lease — auto-activating (fail-safe)"
+            reason = %manifest.reason,
+            episode = manifest.episode,
+            "idle-mode watchdog: deadline passed (or the compiler lease's heartbeat went stale) \
+             with no active/renewing compiler lease — auto-activated (fail-safe)"
         );
-        let _ = activate(&state, "watchdog-timeout").await;
+        // Same side effect `activate()` runs on a real Activated outcome (TRTR-07):
+        // re-warm the assistant resident set now that we're back in serving mode.
+        //
+        // Audited CHRD-135 review, round 2: confirmed `activate() ==
+        // begin_activate_inner() + finish_activate() + this same info! log` (see
+        // `activate()`'s own "lazy reload means none today" comment) — i.e.
+        // `activate() == CAS + rewarm`, exactly matching this watchdog path. This
+        // hand-rolled call is NOT a divergent/incomplete substitute for
+        // `activate()`; it reproduces its full effect. Re-raise only with a new
+        // finding, not a re-read of the same call site.
+        let report = crate::routing::resident_set::global()
+            .rewarm(&state, "watchdog-timeout")
+            .await;
+        if report.changed {
+            info!(
+                reason = "watchdog-timeout",
+                warmed = report.warmed,
+                dropped = report.dropped,
+                failed = report.failed,
+                "idle-mode: assistant resident set re-warmed after the mode swap"
+            );
+        }
     }
 }
 
@@ -1608,11 +2010,35 @@ mod tests {
             watchdog_deadline: deadline,
             resident_models: vec!["qwen3-coder:30b".into()],
             mem_available_before_gb: 12.0,
+            episode: 0,
         }
     }
 
     fn holders() -> Vec<String> {
         vec!["compiler".into(), "build".into(), "bld".into()]
+    }
+
+    /// CHRD-135 round-5: the coder-activity pattern set for tests, DERIVED from
+    /// [`DEFAULT_CODER_ACTIVITY_HOLDERS`] by construction rather than hand-copied.
+    ///
+    /// The round-4 version hand-listed `["coder", "assistant", "breakfix"]` while
+    /// its doc claimed to mirror the default — but the default deliberately
+    /// EXCLUDES `breakfix`. That is the same lying-fixture class that hid the
+    /// round-3 dead-code bug: a helper that agrees with a rule production does not
+    /// actually apply. Deriving it here makes drift impossible: if the default
+    /// changes, every test using this helper changes with it.
+    ///
+    /// Parsing the constant (rather than calling
+    /// [`coder_activity_holders_from_env`]) also keeps callers HERMETIC — a
+    /// `CHORD_IDLE_CODER_ACTIVITY_HOLDERS` set in the test process cannot perturb
+    /// them. Tests that specifically want the env-resolving behavior should call
+    /// that function directly and say so.
+    fn coder_holders() -> Vec<String> {
+        DEFAULT_CODER_ACTIVITY_HOLDERS
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
     }
 
     // ── pure decisions ───────────────────────────────────────────────────────
@@ -1677,6 +2103,481 @@ mod tests {
         ));
         // Expired + no holder ⇒ auto-activate.
         assert!(watchdog_should_activate(true, None, &p));
+    }
+
+    // ── CHRD-135: coder-activity (heartbeat) bounded defer ───────────────────
+
+    #[test]
+    fn coder_activity_stale_no_heartbeat_is_immediately_stale() {
+        assert!(coder_activity_stale(1_000, None, 900));
+    }
+
+    #[test]
+    fn coder_activity_stale_within_window_is_fresh() {
+        assert!(!coder_activity_stale(1_000, Some(500), 900)); // 500s since heartbeat < 900
+    }
+
+    #[test]
+    fn coder_activity_stale_at_and_past_timeout() {
+        assert!(coder_activity_stale(1_400, Some(500), 900)); // exactly 900s ⇒ stale (>=)
+        assert!(coder_activity_stale(2_000, Some(500), 900)); // well past
+    }
+
+    #[test]
+    fn coder_activity_stale_clock_backwards_reads_fresh() {
+        // now < last_heartbeat (clock skew) ⇒ saturating_sub ⇒ age 0, never
+        // spuriously stale — same discipline as LockRecord::is_expired.
+        assert!(!coder_activity_stale(400, Some(1_000), 900));
+    }
+
+    #[test]
+    fn watchdog_tick_bounds_compiler_defer_by_heartbeat_silence() {
+        // THE BUG THIS CLOSES: `watchdog_should_activate` alone defers a compiler
+        // lease FOREVER regardless of how stale its heartbeat is, as long as ANY
+        // holder record matching the compiler patterns exists. The combined tick
+        // decision bounds that defer by genuine renewal.
+        let p = holders();
+        let cp = coder_holders();
+        let timeout = 900u64;
+
+        // Deadline not yet expired, heartbeat fresh (renewed 10s ago) ⇒ never activate.
+        assert!(!watchdog_tick_should_activate(
+            1_010,
+            false,
+            Some("compiler-build-7"),
+            Some(1_000),
+            &p,
+            &cp,
+            timeout
+        ));
+
+        // Deadline not yet expired, heartbeat stale (901s of silence) ⇒ ACTIVATE —
+        // the coder/build has gone silent past the safety window, even though the
+        // long absolute deadline hasn't been reached yet.
+        assert!(watchdog_tick_should_activate(
+            1_901,
+            false,
+            Some("compiler-build-7"),
+            Some(1_000),
+            &p,
+            &cp,
+            timeout
+        ));
+
+        // Deadline PASSED, but heartbeat still fresh (renewed 5s ago) ⇒ a live
+        // long-running build (past the absolute 1h deadline) must NOT be torn
+        // down mid-build — the hard safety constraint.
+        assert!(!watchdog_tick_should_activate(
+            5_005,
+            true,
+            Some("compiler-build-7"),
+            Some(5_000),
+            &p,
+            &cp,
+            timeout
+        ));
+
+        // A non-compiler holder past an EXPIRED deadline is unaffected by the
+        // heartbeat check — governed by the absolute deadline alone, exactly as
+        // before this change (the new coder-activity floor is additive and only
+        // ever reached when `watchdog_should_activate` itself would return
+        // false — see `watchdog_tick_should_activate`'s doc).
+        assert!(watchdog_tick_should_activate(
+            9_999,
+            true,
+            Some("intake_coder_sweep"),
+            Some(9_990),
+            &p,
+            &cp,
+            timeout
+        ));
+        // Same holder, deadline NOT expired, heartbeat fresh (9s old, well under
+        // the 900s floor) ⇒ still must not activate, even though this holder now
+        // matches the coder-activity pattern set too.
+        assert!(!watchdog_tick_should_activate(
+            9_999,
+            false,
+            Some("intake_coder_sweep"),
+            Some(9_990),
+            &p,
+            &cp,
+            timeout
+        ));
+
+        // No holder at all: absolute deadline alone.
+        assert!(watchdog_tick_should_activate(
+            9_999, true, None, None, &p, &cp, timeout
+        ));
+        assert!(!watchdog_tick_should_activate(
+            9_999, false, None, None, &p, &cp, timeout
+        ));
+    }
+
+    #[test]
+    fn coder_activity_holders_default_matches_real_production_gpu_labels() {
+        // CHRD-135 round-4: THE REGRESSION GUARD. Every prior round's fixture used
+        // a synthetic holder like "compiler-build-42" that can never occur in
+        // production — a lying fixture that agreed with a rule real traffic never
+        // exercises. This test pins the ACTUAL holder label strings the four real
+        // MINT GPU_EXCLUSIVE callers acquire (Terminus
+        // src/intake/{coder_sweep.rs,coder_case.rs,assistant/runner.rs,
+        // breakfix.rs}, enumerated together by `mint_gpu_holders_from_env()`) and
+        // asserts each is recognized by the default coder-activity pattern set —
+        // i.e. each one actually REACHES the floor branch in
+        // `watchdog_tick_should_activate`, not just some synthetic stand-in for it.
+        // Round-5: derived from the CONSTANT, not from the env-resolving wrapper,
+        // so a `CHORD_IDLE_CODER_ACTIVITY_HOLDERS` set in the test process cannot
+        // perturb this test. The assert_eq! below still pins the constant's actual
+        // value, so changing the default without revisiting this guard goes RED.
+        let cp = coder_holders();
+        assert_eq!(
+            cp,
+            vec!["coder".to_string(), "assistant".to_string()],
+            "sanity: this test must be exercising the real DEFAULT_CODER_ACTIVITY_HOLDERS"
+        );
+
+        // The three unambiguous "coder"/"assistant" sweep labels.
+        assert!(
+            is_coder_activity_holder("intake_coder_sweep", &cp),
+            "intake_coder_sweep (Terminus src/intake/coder_sweep.rs GPU_HOLDER) must reach \
+             the coder-activity floor"
+        );
+        assert!(
+            is_coder_activity_holder("intake_coder_case", &cp),
+            "intake_coder_case (Terminus src/intake/coder_case.rs GPU_HOLDER) must reach \
+             the coder-activity floor"
+        );
+        assert!(
+            is_coder_activity_holder("intake_assistant_sweep", &cp),
+            "intake_assistant_sweep (Terminus src/intake/assistant/runner.rs GPU_HOLDER) \
+             must reach the coder-activity floor"
+        );
+
+        // `mint_breakfix` (Terminus src/intake/breakfix.rs BREAKFIX_GPU_HOLDER):
+        // deliberately EXCLUDED from the default. Chord has no visibility into
+        // breakfix's actual heartbeat/renewal cadence, and folding a holder into
+        // this set makes it revert EARLIER on silence — safe for the sweep/assistant
+        // labels (renew frequently, per their own loop), but a mistake for a
+        // possibly-quiet repair path without first verifying its cadence against
+        // Terminus source. See the full reasoning on `DEFAULT_CODER_ACTIVITY_HOLDERS`.
+        assert!(
+            !is_coder_activity_holder("mint_breakfix", &cp),
+            "mint_breakfix must NOT reach the coder-activity floor via the DEFAULT pattern \
+             set — unverified heartbeat cadence, deliberately excluded pending that \
+             verification (see DEFAULT_CODER_ACTIVITY_HOLDERS doc); it remains governed by \
+             the absolute watchdog deadline alone, unchanged from before this item"
+        );
+
+        // None of the four real labels contain any COMPILER pattern — confirming
+        // the original finding: without this dedicated set, `is_compiler_lease`
+        // alone (the pre-round-4 gate on the floor branch) never matches any of
+        // them, and the floor was dead code for every real caller.
+        let compiler_patterns = holders();
+        for real_holder in [
+            "intake_coder_sweep",
+            "intake_coder_case",
+            "intake_assistant_sweep",
+            "mint_breakfix",
+        ] {
+            assert!(
+                !is_compiler_lease(real_holder, &compiler_patterns),
+                "{real_holder} must NOT match the COMPILER pattern set — that's the whole \
+                 reason a separate coder-activity set is needed"
+            );
+        }
+    }
+
+    #[test]
+    fn watchdog_tick_should_activate_reaches_floor_for_real_coder_holder_labels() {
+        // End-to-end (through the full per-tick decision function, not just
+        // `is_coder_activity_holder` in isolation): a REAL production holder label
+        // with a genuinely stale heartbeat must activate via the floor even though
+        // the absolute watchdog deadline has NOT yet expired — this is the exact
+        // "genuine last-activity tracking, not a blind one-shot deadline" behavior
+        // CHRD-135 exists to deliver, now actually reachable for real traffic.
+        let p = holders();
+        // Round-5: derived from the constant (see `coder_holders`) — hermetic.
+        let cp = coder_holders();
+        let timeout = 900u64;
+
+        // intake_coder_sweep, deadline not expired, heartbeat fresh (10s old) ⇒
+        // must NOT activate yet.
+        assert!(!watchdog_tick_should_activate(
+            1_010,
+            false,
+            Some("intake_coder_sweep"),
+            Some(1_000),
+            &p,
+            &cp,
+            timeout
+        ));
+
+        // Same holder, heartbeat now stale (901s of silence), deadline STILL not
+        // expired ⇒ must activate — silence, not the absolute deadline, is what
+        // bounds this now.
+        assert!(watchdog_tick_should_activate(
+            1_901,
+            false,
+            Some("intake_coder_sweep"),
+            Some(1_000),
+            &p,
+            &cp,
+            timeout
+        ));
+
+        // mint_breakfix: deliberately EXCLUDED from the default coder-activity
+        // set (unverified heartbeat cadence — see DEFAULT_CODER_ACTIVITY_HOLDERS
+        // doc), so with the deadline NOT yet expired it must NOT activate even
+        // with a heartbeat well past the 900s coder-activity window — the floor
+        // simply never engages for it today. It stays governed solely by the
+        // absolute deadline, exactly as it was before this item existed.
+        assert!(!watchdog_tick_should_activate(
+            1_901,
+            false,
+            Some("mint_breakfix"),
+            Some(1_000),
+            &p,
+            &cp,
+            timeout
+        ));
+        // ...but once the deadline itself expires, it activates immediately
+        // (unaffected/unchanged — the same "non-compiler, non-coder-activity
+        // holder" path any other unrecognized holder takes).
+        assert!(watchdog_tick_should_activate(
+            1_901,
+            true,
+            Some("mint_breakfix"),
+            Some(1_000),
+            &p,
+            &cp,
+            timeout
+        ));
+    }
+
+    #[test]
+    fn behavioral_coder_silence_reverts_state_machine_to_active() {
+        // BEHAVIORAL PROOF, not just the pure decision function (review, round 2 —
+        // ending on a hand-called `ctl.exit()` was the round-1 defect verbatim,
+        // still present as of round 1's fix): drive the REAL `IdleController`
+        // state machine plus a REAL (isolated, non-global) `GpuExclusive` instance
+        // through genuine coder heartbeats, calling `watchdog_tick` ITSELF — the
+        // exact function `watchdog_loop` calls every tick, decision AND its CAS
+        // effect together — and confirm the mode ACTUALLY flips back to `Active`
+        // (the default assistant-fleet mode) on its own once the heartbeats stop,
+        // and does NOT flip while they keep arriving. Time is INJECTED
+        // (`tick_now`/`now_past`), never slept.
+        use crate::gpu_exclusive::GpuExclusive;
+
+        let ctl = IdleController::new();
+        // GPU_EXCLUSIVE's OWN TTL is a different, unrelated concern (governs when a
+        // lock is takeable by someone else) — isolate the variable under test
+        // (heartbeat silence vs. the coder-activity timeout) by giving it no bound.
+        let gpu = GpuExclusive::new(u64::MAX);
+        let patterns = holders();
+        let coder_patterns = coder_holders();
+        let timeout = 900u64;
+
+        // Coder starts a heavy build: Chord drains into idle mode with a long
+        // absolute deadline, exactly as a real build would set.
+        let m = manifest("compiler-build-42", 0, 3600);
+        assert!(matches!(ctl.enter(m.clone()), EnterOutcome::Entered(_)));
+        assert_eq!(ctl.phase(), Phase::Idle);
+
+        // The build acquires the GPU-exclusive lease and heartbeats it every 300s
+        // (well under the 900s window) while genuinely progressing. Each tick
+        // calls `watchdog_tick` itself — the negative case (no revert) is now
+        // behavioral too, not just a predicate assertion.
+        for tick_now in [0u64, 300, 600, 900, 1_200, 1_500] {
+            gpu.acquire("compiler-build-42", tick_now); // fresh grant, then heartbeat refreshes
+            let result = watchdog_tick(&ctl, &gpu, tick_now, &patterns, &coder_patterns, timeout);
+            assert!(
+                result.is_none(),
+                "must NOT revert mid-build while heartbeats keep arriving (t={tick_now})"
+            );
+            assert_eq!(
+                ctl.phase(),
+                Phase::Idle,
+                "still idle — the build is still genuinely renewing (t={tick_now})"
+            );
+        }
+
+        // The build finishes (or crashes) at t=1500 and STOPS heartbeating — no
+        // further renewal arrives.
+        let last_heartbeat = 1_500u64;
+
+        // Advance the tracked clock past the window WITHOUT sleeping.
+        let now_past = last_heartbeat + timeout; // exactly at the 900s silence boundary
+        let cleared = watchdog_tick(&ctl, &gpu, now_past, &patterns, &coder_patterns, timeout)
+            .expect("coder silence past the window must actually revert");
+        assert_eq!(cleared.reason, "compiler-build-42");
+        assert_eq!(
+            ctl.phase(),
+            Phase::Active,
+            "Chord must actually be back in its default assistant-fleet mode"
+        );
+        assert!(!ctl.is_idle());
+    }
+
+    #[test]
+    fn watchdog_tick_treats_expired_gpu_record_as_no_holder() {
+        // Defect #1 (review, round 1): a genuinely ABANDONED GPU_EXCLUSIVE record
+        // (heartbeat that stopped updating, well past BOTH GPU_EXCLUSIVE's own TTL
+        // and the coder-activity timeout) must not defer an already-overdue revert
+        // forever. Drive `watchdog_tick` (the exact function `watchdog_loop` calls)
+        // directly, not just the pure decision fn.
+        //
+        // Values are realistic (GPU ttl=600 default, coder timeout=900 default) —
+        // NOT an artificially tiny ttl / huge timeout pair, because the round-2 fix
+        // (`effective_ttl = max(gpu.ttl(), coder_activity_timeout)`, see
+        // `watchdog_tick`'s doc) makes the coder-activity timeout the FLOOR on
+        // liveness, not GPU_EXCLUSIVE's own ttl — so "abandoned" now means silence
+        // past BOTH, exercised by `watchdog_tick_default_ttls_honor_the_900s_coder_activity_floor`
+        // below covers the boundary between the two; this test covers the
+        // unambiguous case: nobody has renewed in ages, by either standard.
+        use crate::gpu_exclusive::GpuExclusive;
+
+        let ctl = IdleController::new();
+        let gpu = GpuExclusive::new(600); // GPU_EXCLUSIVE default TTL
+        let patterns = holders();
+        let coder_patterns = coder_holders();
+        let coder_activity_timeout = 900u64; // coder-activity default
+
+        // Absolute deadline already passed by t=2000 — with NO live compiler
+        // holder, the watchdog must revert.
+        let m = manifest("compiler-build-expired", 0, 100);
+        assert!(matches!(ctl.enter(m.clone()), EnterOutcome::Entered(_)));
+
+        // The lease was acquired at t=0 and never renewed again.
+        gpu.acquire("compiler-build-expired", 0);
+
+        // At t=2000, 2000s of silence vastly exceeds BOTH the 600s GPU_EXCLUSIVE
+        // TTL and the 900s coder-activity floor — genuinely abandoned by any
+        // standard. The watchdog must revert on its overdue deadline instead of
+        // deferring on a dead record's stale heartbeat.
+        let now = 2000u64;
+
+        let result = watchdog_tick(&ctl, &gpu, now, &patterns, &coder_patterns, coder_activity_timeout);
+        assert!(
+            result.is_some(),
+            "a record abandoned well past both TTLs must not defer an already-overdue revert"
+        );
+        assert_eq!(
+            ctl.phase(),
+            Phase::Active,
+            "the state machine must have actually flipped back to Active"
+        );
+    }
+
+    #[test]
+    fn watchdog_tick_default_ttls_honor_the_900s_coder_activity_floor() {
+        // Review, round 2, blocking finding #3: with the REAL default TTLs
+        // (GPU_EXCLUSIVE ttl=600s, coder_activity_timeout=900s), the promised
+        // floor is "revert only after AT LEAST 900s of coder silence." Before this
+        // fix, `watchdog_tick` read holder-liveness through
+        // `gpu.active_holder(now)`, which expires a record at GPU_EXCLUSIVE's own
+        // (shorter) 600s TTL — so a build heartbeating, say, every 650s (well
+        // under the promised 900s floor, but over GPU_EXCLUSIVE's unrelated 600s
+        // TTL) would already read as "no holder" and revert at only ~600s of
+        // silence once the absolute deadline had passed. Pins the EFFECTIVE
+        // bound, not the constant.
+        use crate::gpu_exclusive::GpuExclusive;
+
+        let ctl = IdleController::new();
+        let gpu = GpuExclusive::new(crate::gpu_exclusive::DEFAULT_TTL_SECS); // 600s
+        let patterns = holders();
+        let coder_patterns = coder_holders();
+        let coder_activity_timeout = DEFAULT_CODER_ACTIVITY_TIMEOUT_SECS; // 900s
+        assert!(
+            crate::gpu_exclusive::DEFAULT_TTL_SECS < coder_activity_timeout,
+            "sanity: this test only means something when the GPU ttl is the \
+             SHORTER of the two, exactly the real default configuration"
+        );
+
+        // Absolute deadline already passed by the time we check (so ONLY the
+        // coder-activity heartbeat floor is what's deferring the revert).
+        let m = manifest("compiler-build-longhaul", 0, 10);
+        assert!(matches!(ctl.enter(m), EnterOutcome::Entered(_)));
+
+        let last_heartbeat = 0u64;
+        gpu.acquire("compiler-build-longhaul", last_heartbeat);
+
+        // At 650s of silence: past GPU_EXCLUSIVE's own 600s TTL, but comfortably
+        // under the promised 900s coder-activity floor. Must NOT revert — this is
+        // exactly the regression this finding describes.
+        let still_within_floor = last_heartbeat + 650;
+        assert!(
+            watchdog_tick(&ctl, &gpu, still_within_floor, &patterns, &coder_patterns, coder_activity_timeout)
+                .is_none(),
+            "650s of silence is past GPU_EXCLUSIVE's own 600s TTL but still under \
+             the promised 900s coder-activity floor — must NOT revert"
+        );
+        assert_eq!(
+            ctl.phase(),
+            Phase::Idle,
+            "still idle — 650s does not yet violate the 900s floor"
+        );
+
+        // At exactly 900s of silence: the coder-activity floor itself is now
+        // exceeded — must revert.
+        let at_floor = last_heartbeat + coder_activity_timeout;
+        let result = watchdog_tick(&ctl, &gpu, at_floor, &patterns, &coder_patterns, coder_activity_timeout);
+        assert!(
+            result.is_some(),
+            "900s of silence meets the coder-activity floor — must revert"
+        );
+        assert_eq!(ctl.phase(), Phase::Active);
+    }
+
+    #[test]
+    fn watchdog_tick_episode_guard_refuses_superseded_activation() {
+        // Defect #3 (review, round 1): an activation decision computed about idle
+        // episode N must not be able to cancel a idle episode N+1 that has since
+        // replaced it. Exercised directly at the CAS
+        // (`begin_activate_for_episode`) — the exact primitive `watchdog_tick`
+        // calls — rather than only through the pure decision function.
+        let ctl = IdleController::new();
+
+        let m1 = manifest("compiler-build-first", 0, 10);
+        let entered1 = match ctl.enter(m1) {
+            EnterOutcome::Entered(m) => m,
+            other => panic!("expected Entered, got {other:?}"),
+        };
+        let stale_episode = entered1.episode;
+
+        // The first build's idle episode ends (e.g. a normal activate) and a SECOND,
+        // distinct idle episode begins — simulating a fresh decision superseding a
+        // stale one still in flight.
+        assert!(matches!(ctl.exit(), ActivateOutcome::Activated(_)));
+        let m2 = manifest("compiler-build-second", 20, 30);
+        let entered2 = match ctl.enter(m2) {
+            EnterOutcome::Entered(m) => m,
+            other => panic!("expected Entered, got {other:?}"),
+        };
+        assert_ne!(
+            entered2.episode, stale_episode,
+            "sanity: the second episode really is a distinct identity"
+        );
+
+        // A decision computed against the FIRST (now stale) episode must refuse,
+        // not cancel the second episode's live idle state.
+        assert_eq!(
+            ctl.begin_activate_for_episode(stale_episode),
+            Err(BeginActivate::Superseded)
+        );
+        assert_eq!(
+            ctl.phase(),
+            Phase::Idle,
+            "the newer episode's Idle phase must be untouched by the stale decision"
+        );
+        assert_eq!(ctl.snapshot().unwrap(), entered2);
+
+        // The CURRENT episode's own decision, by contrast, must still win the CAS.
+        let (won, generation) = ctl
+            .begin_activate_for_episode(entered2.episode)
+            .expect("the current episode's own decision must win the CAS");
+        assert_eq!(won, entered2);
+        ctl.finish_activate(generation);
+        assert_eq!(ctl.phase(), Phase::Active);
     }
 
     // ── controller transitions (isolated instance, no globals) ───────────────
@@ -1846,6 +2747,7 @@ mod tests {
         // A SECOND enter begins — a brand-new, distinct generation.
         let second = ctl.try_begin_enter().expect("second transition begins");
         assert_eq!(ctl.phase(), Phase::EnteringIdle);
+        let second_generation = second.generation;
 
         // Drop the FIRST (stale) guard: its Drop→abort_enter must NOT touch the second
         // transition (generation mismatch), so we stay in EnteringIdle.
@@ -1856,11 +2758,16 @@ mod tests {
             "stale guard drop must not roll back the newer transition"
         );
 
-        // The second transition can still commit normally.
+        // The second transition can still commit normally. `commit` (via
+        // `finish_enter`) stamps `episode` from ITS OWN generation (CHRD-135 defect
+        // #3), overwriting the `0` placeholder the `manifest()` helper sets — so the
+        // expected value comes from the committed return, not the pre-commit
+        // literal.
         let m = manifest("compiler", 7, 9);
-        assert_eq!(second.commit(m.clone()), Some(m.clone()));
+        let committed = second.commit(m).expect("second transition still live");
+        assert_eq!(committed.episode, second_generation);
         assert!(ctl.is_idle());
-        assert_eq!(ctl.snapshot().unwrap(), m);
+        assert_eq!(ctl.snapshot().unwrap(), committed);
     }
 
     #[test]
@@ -1871,15 +2778,21 @@ mod tests {
         let stale = ctl.try_begin_enter().expect("first transition begins");
         let now = crate::gpu_exclusive::now_epoch();
         assert!(ctl.recover_stale_transition(now + 10_000, 120)); // → Active, gen bumped
-                                                                  // A newer enter takes over and reaches Idle.
+                                                                  // A newer enter takes over and reaches Idle. `enter` (via `finish_enter`)
+        // stamps `episode` from its own generation (CHRD-135 defect #3), so the
+        // expected manifest is the one `Entered` actually returns, not the
+        // pre-commit `fresh` literal (whose `episode: 0` placeholder is overwritten).
         let fresh = manifest("compiler", 1, 2);
-        assert!(matches!(ctl.enter(fresh.clone()), EnterOutcome::Entered(_)));
+        let entered = match ctl.enter(fresh) {
+            EnterOutcome::Entered(m) => m,
+            other => panic!("expected Entered, got {other:?}"),
+        };
         // The stale guard commits LATE: must be a no-op (None), not clobber fresh idle.
         let stale_m = manifest("stale", 99, 100);
         assert_eq!(stale.commit(stale_m), None);
         assert_eq!(
             ctl.snapshot().unwrap(),
-            fresh,
+            entered,
             "stale commit must not overwrite the newer manifest"
         );
     }
