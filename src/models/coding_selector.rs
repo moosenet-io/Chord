@@ -76,13 +76,17 @@
 //! Each `(model_id, backend_tag, mem_config)` group's `combined_score` is:
 //!
 //! ```text
-//! combined_score = 0.60 * (avg_effective_score / 5.0)
-//!                + 0.25 * shrunk(compile_pass_rate, measured_compile_count)
-//!                + 0.15 * shrunk(test_pass_rate,    measured_test_count)
+//! combined_score = 0.60 * shrunk(avg_effective_score / 5.0, measured_score_count)
+//!                + 0.25 * shrunk(compile_pass_rate,          measured_compile_count)
+//!                + 0.15 * shrunk(test_pass_rate,             measured_test_count)
 //! ```
 //!
-//! where `shrunk` pulls a rate toward a 0.5 prior in proportion to how little
-//! evidence backs it (see [`shrunk_rate`]). CPROX-04 added that: Postgres
+//! where `shrunk` pulls a value toward a 0.5 prior in proportion to how little
+//! evidence backs it (see [`shrunk_rate`]). The score term gets the same
+//! treatment as the two rates and for the same reason — it is the heaviest
+//! term, so an unjudged model scored `0.0` there was the largest single
+//! absent-measurement-as-result error the formula could make. CPROX-04 added
+//! that: Postgres
 //! `avg()` skips NULLs, so an unmeasured run silently leaves the denominator
 //! and a rate computed from 4 of 16 runs was previously trusted exactly as much
 //! as one computed from 30 of 30. Live, `OlympicCoder-32B` reads a perfect
@@ -363,11 +367,29 @@ pub struct CodingCandidate {
 }
 
 /// Compute the documented combined score for one aggregate. Pure — no I/O, no
-/// randomness, fully unit-testable. Missing rate/score fields degrade to `0.0`
-/// for that term (never `NaN`, never a panic) — an aggregate with no compile
-/// data at all just doesn't earn the compile-rate term's credit.
+/// randomness, fully unit-testable. Every term — both rates AND the effective
+/// score — is shrunk toward [`RATE_PRIOR_MEAN`] by the number of runs that
+/// actually measured it, so a missing or thinly-measured field degrades toward
+/// "no evidence" rather than toward "measured and failed" (never `NaN`, never a
+/// panic). An aggregate with no data at all scores the prior on every term.
 pub fn combined_score(agg: &CodeAggregate) -> f64 {
-    let effective = agg.avg_effective_score.unwrap_or(0.0) / 5.0;
+    // The effective score gets the SAME evidence discipline as the two rates,
+    // and for the same reason. `unwrap_or(0.0)` here used to hand a model with
+    // no judged runs a hard zero on the heaviest term (weight 0.60) — asserting
+    // "measured and failed" about a run nobody scored, which is the exact
+    // absent-measurement-as-result defect the rest of this module exists to
+    // remove. It also left `measured_score_count` computed, carried through
+    // three structs and documented as applying that discipline, while nothing
+    // ever read it.
+    //
+    // Normalised to 0..1 first (raw scores are on a 0-5 scale) so it shares
+    // `RATE_PRIOR_MEAN`/`RATE_PRIOR_STRENGTH` with the rates rather than
+    // needing a second, independently-drifting prior. The clamp is defensive
+    // against an out-of-range row; it is not expected to bind.
+    let effective = shrunk_rate(
+        agg.avg_effective_score.map(|s| (s / 5.0).clamp(0.0, 1.0)),
+        agg.measured_score_count,
+    );
     let compile = shrunk_rate(agg.compile_pass_rate, agg.measured_compile_count);
     let test = shrunk_rate(agg.test_pass_rate, agg.measured_test_count);
     WEIGHT_EFFECTIVE_SCORE * effective + WEIGHT_COMPILE_RATE * compile + WEIGHT_TEST_RATE * test
@@ -809,9 +831,21 @@ mod tests {
         // 16 measured runs at rate 1.0 → (1.0*16 + 0.5*5)/(16+5) = 18.5/21
         let shrunk_perfect = 18.5f64 / 21.0;
 
+        // ALL THREE terms are shrunk, including the effective score (5.0/5.0 =
+        // 1.0, backed by 16 judged runs). Before the score term was wired to
+        // `measured_score_count` this line read `0.60 * 1.0`, crediting a rate
+        // at full strength purely because it was a score rather than a rate.
         let a = agg("m", None, 5.0, 1.0, 1.0);
-        let expected_a = 0.60 * 1.0 + 0.25 * shrunk_perfect + 0.15 * shrunk_perfect;
-        assert!((combined_score(&a) - expected_a).abs() < 1e-9);
+        let expected_a = 0.60 * shrunk_perfect + 0.25 * shrunk_perfect + 0.15 * shrunk_perfect;
+        assert!(
+            (combined_score(&a) - expected_a).abs() < 1e-9,
+            "got {} want {}",
+            combined_score(&a),
+            expected_a
+        );
+        // …and that is strictly less than the unshrunk score the old formula
+        // gave the same aggregate, so this is a real discount, not a rename.
+        assert!(combined_score(&a) < 0.60 * 1.0 + 0.25 * shrunk_perfect + 0.15 * shrunk_perfect);
 
         // A rate of exactly the prior is unmoved by shrinkage at any n, so this
         // case pins the formula's midpoint independently of the sample count.
@@ -858,9 +892,34 @@ mod tests {
             measured_test_count: 0,
             measured_score_count: 0,
         };
-        // 0.60*0 + 0.25*0.5 + 0.15*0.5 = 0.20 — and crucially not a panic/NaN.
-        assert!((combined_score(&a) - 0.20).abs() < 1e-9);
+        // Every term degrades to the prior: 0.60*0.5 + 0.25*0.5 + 0.15*0.5 =
+        // 0.50 — and crucially not a panic/NaN.
+        //
+        // This test previously asserted 0.20, i.e. 0.60*0 for the score term:
+        // it carried the word "prior" in its name while pinning the heaviest
+        // term to ZERO for a model nobody had judged. That is the very claim
+        // ("measured and failed") the name says must not be made, so the
+        // expectation is corrected here, not relaxed.
+        assert!(
+            (combined_score(&a) - 0.50).abs() < 1e-9,
+            "got {}",
+            combined_score(&a)
+        );
         assert!(combined_score(&a).is_finite());
+        // A model with NO judged runs must not be outranked by one judged to be
+        // genuinely bad — "unknown" sits at the prior, "measured 0.0" sits below
+        // it. Before the score term was shrunk these two scored identically.
+        let measured_bad = CodeAggregate {
+            avg_effective_score: Some(0.0),
+            measured_score_count: 20,
+            ..a.clone()
+        };
+        assert!(
+            combined_score(&measured_bad) < combined_score(&a),
+            "measured-bad {} must rank below unmeasured {}",
+            combined_score(&measured_bad),
+            combined_score(&a)
+        );
     }
 
     #[test]
@@ -1139,8 +1198,16 @@ mod cprox04_basis_tests {
         let source = StaticCodeProfileSource::new(vec![measured("lang-wide", 1.0, 40)])
             .with_category(
                 "blitz",
+                // `blitz-a` is best on BOTH axes — highest score and most
+                // evidence — so the assertion below tests what this test is
+                // named for (the per-category basis and the no-leak rule) and
+                // not an incidental thin-vs-thick tie-break. With the original
+                // `blitz-a` at 12 runs, `blitz-b`'s 20 runs legitimately won on
+                // evidence weight; that trade-off has its own dedicated test
+                // (`thinly_measured_perfect_rate_loses_to_a_well_measured_slightly_worse_one`)
+                // and does not belong here.
                 vec![
-                    measured("blitz-a", 4.9, 12),
+                    measured("blitz-a", 4.9, 40),
                     measured("blitz-b", 4.5, 20),
                     measured("blitz-c", 3.8, 12),
                 ],

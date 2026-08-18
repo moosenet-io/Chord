@@ -212,26 +212,35 @@ impl DbScoreSource {
     /// mirroring `coding_selector`) and returns the model's BEST such score.
     async fn code_score(&self, model: &str) -> Option<f64> {
         use sqlx::Row;
-        // The measured-count columns and the per-metric `finalized` discipline
-        // are NOT optional decoration here: `combined_score` shrinks each rate
-        // toward the 0.5 prior by the count that backs it, so a count must be
-        // drawn from exactly the same population as the average it qualifies.
-        // Passing 0 for these (the only other way to satisfy the struct) would
-        // claim "no evidence" for every model and collapse every MINT code
-        // score toward the prior. See the long rationale on the identical
-        // aggregate in `coding_selector::DbCodeProfileSource::load_aggregates`:
-        // `count(<col>)` counts NON-NULL values only, and `finalized` gates the
-        // Phase-2-adjusted score term ONLY — `compiles`/`tests_pass` are
-        // Phase-1 facts and every row counts for them.
+        // The measured-count columns are NOT optional decoration here:
+        // `combined_score` shrinks every term toward the 0.5 prior by the count
+        // that backs it, so each count must be drawn from exactly the same
+        // population as the average it qualifies. Passing 0 for these (the only
+        // other way to satisfy the struct) would claim "no evidence" for every
+        // model and collapse every MINT code score to the prior. `count(<col>)`
+        // counts NON-NULL values only — that is precisely the coverage signal
+        // `avg()` throws away, and matches `avg()`'s own NULL handling row for
+        // row.
+        //
+        // DELIBERATELY NOT MIRRORED from
+        // `coding_selector::DbCodeProfileSource::load_aggregates`: its
+        // `FILTER (WHERE cpr.finalized)` on the score term. That filter is well
+        // argued there, but adding it here would change which runs MINT's live
+        // code score is computed over — a scoring-policy change, not something
+        // required to populate the new struct fields, and this path has no test
+        // to catch a reordering it caused. Both aggregates stay internally
+        // consistent (count and average over the same rows); aligning the score
+        // population across the two selectors is its own change and belongs in
+        // its own item.
         let rows = sqlx::query(
             "SELECT cpr.backend_tag, cpr.mem_config, \
                     count(*) AS run_count, \
                     count(cpr.compiles) AS measured_compile_count, \
                     count(cpr.tests_pass) AS measured_test_count, \
                     count(coalesce(cpr.retry_score, cpr.first_pass_score)) \
-                        FILTER (WHERE cpr.finalized) AS measured_score_count, \
+                        AS measured_score_count, \
                     avg(coalesce(cpr.retry_score, cpr.first_pass_score)::float8) \
-                        FILTER (WHERE cpr.finalized) AS avg_effective_score, \
+                        AS avg_effective_score, \
                     avg(cpr.compiles::int::float8) AS compile_pass_rate, \
                     avg(cpr.tests_pass::int::float8) AS test_pass_rate \
              FROM code_profile_runs cpr \
