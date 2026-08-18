@@ -91,6 +91,37 @@ pub const DEFAULT_DRAIN_SECS: u64 = 30;
 /// if the compiler adopts a different holder label.
 pub const DEFAULT_COMPILER_LEASE_HOLDERS: &str = "compiler,build,bld";
 
+/// CHRD-135: default bound (seconds) on how long a compiler-build lease may defer
+/// the idle-mode watchdog WITHOUT a fresh heartbeat. A live compiler lease
+/// ([`is_compiler_lease`]) used to defer the watchdog UNCONDITIONALLY — no bound at
+/// all — for as long as `GPU_EXCLUSIVE` reported ANY holder matching a compiler
+/// pattern, even one whose last heartbeat was ancient. That let a stale/abandoned
+/// lease keep Chord parked off its default assistant-fleet mode forever.
+///
+/// This is now measured as ABSENCE OF RENEWAL, never elapsed time since idle was
+/// entered: a genuinely long-running build that keeps heartbeating
+/// (`POST /v1/gpu-exclusive/acquire`, same holder — a heartbeat refresh per
+/// [`crate::gpu_exclusive::AcquireDecision::Refresh`]) more often than this window
+/// is NEVER auto-reactivated mid-build (reverting mid-build would let models reload
+/// and eat the VRAM the lease exists to protect — the exact failure the lease
+/// prevents). Once `coder_activity_timeout` seconds pass with no fresh heartbeat,
+/// Chord reverts to its default assistant-fleet mode on its own.
+///
+/// 900s (15 minutes) matches the standing `idle_stop_secs` convention for
+/// on-demand backends (`lemonade-coder`, see `src/models/backends.rs`). Override
+/// with `CHORD_IDLE_CODER_ACTIVITY_TIMEOUT_SECS`.
+pub const DEFAULT_CODER_ACTIVITY_TIMEOUT_SECS: u64 = 900;
+
+/// Resolve the coder-activity (heartbeat-silence) timeout from
+/// `CHORD_IDLE_CODER_ACTIVITY_TIMEOUT_SECS` (seconds); a missing/blank/zero/
+/// unparseable value falls back to [`DEFAULT_CODER_ACTIVITY_TIMEOUT_SECS`].
+pub fn coder_activity_timeout_secs_from_env() -> u64 {
+    parse_positive_env(
+        "CHORD_IDLE_CODER_ACTIVITY_TIMEOUT_SECS",
+        DEFAULT_CODER_ACTIVITY_TIMEOUT_SECS,
+    )
+}
+
 /// Default hard budget (seconds) for the ENTIRE `enter_idle` release sequence
 /// (drain + stop backends + evict VRAM + demote). Bounding release under an explicit
 /// timeout — kept STRICTLY BELOW the stale-recovery threshold — makes it structurally
@@ -299,6 +330,49 @@ pub fn watchdog_should_activate(expired: bool, holder: Option<&str>, patterns: &
         Some(h) if is_compiler_lease(h, patterns) => false, // compiler build in progress → defer
         _ => true,                                          // no/other holder → auto-activate
     }
+}
+
+/// CHRD-135: has a compiler-build lease's heartbeat gone STALE — no renewal within
+/// `timeout` seconds of `now`? `last_heartbeat == None` (a compiler-lease holder
+/// somehow reported with no heartbeat timestamp at all) is treated as stale
+/// immediately — never a reason to defer. `saturating_sub` so a clock that briefly
+/// steps backwards reads as fresh (age 0), never spuriously stale — the same
+/// clock-safety discipline as [`crate::gpu_exclusive::LockRecord::is_expired`].
+/// Pure — no IO, no clock, exhaustively unit-testable.
+pub fn coder_activity_stale(now: u64, last_heartbeat: Option<u64>, timeout: u64) -> bool {
+    match last_heartbeat {
+        None => true,
+        Some(hb) => now.saturating_sub(hb) >= timeout,
+    }
+}
+
+/// CHRD-135: the full per-tick watchdog decision, combining the ABSOLUTE watchdog
+/// deadline ([`watchdog_should_activate`]) with the CODER-ACTIVITY (heartbeat)
+/// window. `watchdog_should_activate` alone lets a live compiler lease defer the
+/// deadline UNCONDITIONALLY — this closes that gap: a compiler lease may defer
+/// PAST the absolute deadline only as long as it keeps heartbeating within
+/// `coder_activity_timeout`. The moment its heartbeat goes stale
+/// ([`coder_activity_stale`]), the watchdog activates regardless of the absolute
+/// deadline — so silence, not elapsed wall-clock time, is what bounds the defer.
+/// A non-compiler holder (or no holder) is unaffected — the absolute deadline
+/// alone governs that case exactly as before. Pure — fully unit-testable offline,
+/// and used by both `watchdog_loop` and its tests so the tested logic IS the
+/// production logic.
+pub fn watchdog_tick_should_activate(
+    now: u64,
+    deadline_expired: bool,
+    holder: Option<&str>,
+    holder_last_heartbeat: Option<u64>,
+    patterns: &[String],
+    coder_activity_timeout: u64,
+) -> bool {
+    if watchdog_should_activate(deadline_expired, holder, patterns) {
+        return true;
+    }
+    let is_compiler = holder
+        .map(|h| is_compiler_lease(h, patterns))
+        .unwrap_or(false);
+    is_compiler && coder_activity_stale(now, holder_last_heartbeat, coder_activity_timeout)
 }
 
 /// CHORD-ACT-01 pure view: given the in-flight count, the last-activity epoch, and
@@ -1566,6 +1640,7 @@ pub async fn watchdog_loop(state: Arc<crate::routes::AppState>, interval: Durati
     );
     let patterns = compiler_lease_holders_from_env();
     let stale_secs = stale_transition_secs_from_env();
+    let coder_activity_timeout = coder_activity_timeout_secs_from_env();
     loop {
         tokio::time::sleep(interval).await;
         let now = now_epoch();
@@ -1583,14 +1658,29 @@ pub async fn watchdog_loop(state: Arc<crate::routes::AppState>, interval: Durati
         let Some(m) = IDLE_MODE.snapshot() else {
             continue;
         };
-        let holder = crate::gpu_exclusive::GPU_EXCLUSIVE.active_holder(now);
-        let holder_label = holder.as_ref().map(|r| r.holder.as_str());
-        if !watchdog_should_activate(m.watchdog_expired(now), holder_label, &patterns) {
+        // CHRD-135: read the RAW lock record (holder + last_heartbeat) via `snapshot`,
+        // NOT `active_holder` — `active_holder` nils itself out once the lock's OWN
+        // (unrelated) TTL passes, which would silently drop the holder label/heartbeat
+        // we need for the coder-activity check below. `snapshot` always returns the
+        // record while one is present, regardless of that TTL.
+        let gpu_snapshot = crate::gpu_exclusive::GPU_EXCLUSIVE.snapshot(now);
+        let holder_label = gpu_snapshot.as_ref().map(|(r, _)| r.holder.as_str());
+        let holder_last_heartbeat = gpu_snapshot.as_ref().map(|(r, _)| r.last_heartbeat);
+        if !watchdog_tick_should_activate(
+            now,
+            m.watchdog_expired(now),
+            holder_label,
+            holder_last_heartbeat,
+            &patterns,
+            coder_activity_timeout,
+        ) {
             continue;
         }
         warn!(
             reason = %m.reason,
-            "idle-mode watchdog: deadline passed with no active compiler lease — auto-activating (fail-safe)"
+            holder = ?holder_label,
+            "idle-mode watchdog: deadline passed (or the compiler lease's heartbeat went stale) \
+             with no active/renewing compiler lease — auto-activating (fail-safe)"
         );
         let _ = activate(&state, "watchdog-timeout").await;
     }
@@ -1677,6 +1767,182 @@ mod tests {
         ));
         // Expired + no holder ⇒ auto-activate.
         assert!(watchdog_should_activate(true, None, &p));
+    }
+
+    // ── CHRD-135: coder-activity (heartbeat) bounded defer ───────────────────
+
+    #[test]
+    fn coder_activity_stale_no_heartbeat_is_immediately_stale() {
+        assert!(coder_activity_stale(1_000, None, 900));
+    }
+
+    #[test]
+    fn coder_activity_stale_within_window_is_fresh() {
+        assert!(!coder_activity_stale(1_000, Some(500), 900)); // 500s since heartbeat < 900
+    }
+
+    #[test]
+    fn coder_activity_stale_at_and_past_timeout() {
+        assert!(coder_activity_stale(1_400, Some(500), 900)); // exactly 900s ⇒ stale (>=)
+        assert!(coder_activity_stale(2_000, Some(500), 900)); // well past
+    }
+
+    #[test]
+    fn coder_activity_stale_clock_backwards_reads_fresh() {
+        // now < last_heartbeat (clock skew) ⇒ saturating_sub ⇒ age 0, never
+        // spuriously stale — same discipline as LockRecord::is_expired.
+        assert!(!coder_activity_stale(400, Some(1_000), 900));
+    }
+
+    #[test]
+    fn watchdog_tick_bounds_compiler_defer_by_heartbeat_silence() {
+        // THE BUG THIS CLOSES: `watchdog_should_activate` alone defers a compiler
+        // lease FOREVER regardless of how stale its heartbeat is, as long as ANY
+        // holder record matching the compiler patterns exists. The combined tick
+        // decision bounds that defer by genuine renewal.
+        let p = holders();
+        let timeout = 900u64;
+
+        // Deadline not yet expired, heartbeat fresh (renewed 10s ago) ⇒ never activate.
+        assert!(!watchdog_tick_should_activate(
+            1_010,
+            false,
+            Some("compiler-build-7"),
+            Some(1_000),
+            &p,
+            timeout
+        ));
+
+        // Deadline not yet expired, heartbeat stale (901s of silence) ⇒ ACTIVATE —
+        // the coder/build has gone silent past the safety window, even though the
+        // long absolute deadline hasn't been reached yet.
+        assert!(watchdog_tick_should_activate(
+            1_901,
+            false,
+            Some("compiler-build-7"),
+            Some(1_000),
+            &p,
+            timeout
+        ));
+
+        // Deadline PASSED, but heartbeat still fresh (renewed 5s ago) ⇒ a live
+        // long-running build (past the absolute 1h deadline) must NOT be torn
+        // down mid-build — the hard safety constraint.
+        assert!(!watchdog_tick_should_activate(
+            5_005,
+            true,
+            Some("compiler-build-7"),
+            Some(5_000),
+            &p,
+            timeout
+        ));
+
+        // A non-compiler holder is unaffected by the heartbeat check — governed by
+        // the absolute deadline alone, exactly as before this change.
+        assert!(watchdog_tick_should_activate(
+            9_999,
+            true,
+            Some("intake_coder_sweep"),
+            Some(9_990),
+            &p,
+            timeout
+        ));
+        assert!(!watchdog_tick_should_activate(
+            9_999,
+            false,
+            Some("intake_coder_sweep"),
+            Some(9_990),
+            &p,
+            timeout
+        ));
+
+        // No holder at all: absolute deadline alone.
+        assert!(watchdog_tick_should_activate(9_999, true, None, None, &p, timeout));
+        assert!(!watchdog_tick_should_activate(
+            9_999, false, None, None, &p, timeout
+        ));
+    }
+
+    #[test]
+    fn behavioral_coder_silence_reverts_state_machine_to_active() {
+        // BEHAVIORAL PROOF, not just the pure decision function: drive the REAL
+        // `IdleController` state machine plus a REAL (isolated, non-global)
+        // `GpuExclusive` instance through genuine coder heartbeats — using the
+        // exact production decision function (`watchdog_tick_should_activate`) the
+        // way `watchdog_loop` calls it every tick — and confirm the mode ACTUALLY
+        // flips back to `Active` (the default assistant-fleet mode) on its own once
+        // the heartbeats stop. Time is INJECTED (`tick_now`/`now_past`), never slept.
+        use crate::gpu_exclusive::GpuExclusive;
+
+        let ctl = IdleController::new();
+        // GPU_EXCLUSIVE's OWN TTL is a different, unrelated concern (governs when a
+        // lock is takeable by someone else) — isolate the variable under test
+        // (heartbeat silence vs. the coder-activity timeout) by giving it no bound.
+        let gpu = GpuExclusive::new(u64::MAX);
+        let patterns = holders();
+        let timeout = 900u64;
+
+        // Coder starts a heavy build: Chord drains into idle mode with a long
+        // absolute deadline, exactly as a real build would set.
+        let m = manifest("compiler-build-42", 0, 3600);
+        assert!(matches!(ctl.enter(m.clone()), EnterOutcome::Entered(_)));
+        assert_eq!(ctl.phase(), Phase::Idle);
+
+        // The build acquires the GPU-exclusive lease and heartbeats it every 300s
+        // (well under the 900s window) while genuinely progressing.
+        for tick_now in [0u64, 300, 600, 900, 1_200, 1_500] {
+            gpu.acquire("compiler-build-42", tick_now); // fresh grant, then heartbeat refreshes
+            let (record, _expired) = gpu.snapshot(tick_now).expect("lease held");
+            let should_activate = watchdog_tick_should_activate(
+                tick_now,
+                m.watchdog_expired(tick_now),
+                Some(record.holder.as_str()),
+                Some(record.last_heartbeat),
+                &patterns,
+                timeout,
+            );
+            assert!(
+                !should_activate,
+                "must NOT revert mid-build while heartbeats keep arriving (t={tick_now})"
+            );
+        }
+        assert_eq!(
+            ctl.phase(),
+            Phase::Idle,
+            "still idle — the build is still genuinely renewing"
+        );
+
+        // The build finishes (or crashes) at t=1500 and STOPS heartbeating — no
+        // further renewal arrives.
+        let last_heartbeat = 1_500u64;
+
+        // Advance the tracked clock past the window WITHOUT sleeping.
+        let now_past = last_heartbeat + timeout; // exactly at the 900s silence boundary
+        let (record, _expired) = gpu.snapshot(now_past).expect("stale lease record still present");
+        let should_activate = watchdog_tick_should_activate(
+            now_past,
+            m.watchdog_expired(now_past),
+            Some(record.holder.as_str()),
+            Some(record.last_heartbeat),
+            &patterns,
+            timeout,
+        );
+        assert!(
+            should_activate,
+            "must revert once the coder/build has gone silent for >= the timeout"
+        );
+
+        // Drive the SAME transition `watchdog_loop` performs on a positive tick.
+        match ctl.exit() {
+            ActivateOutcome::Activated(_) => {}
+            other => panic!("expected Activated, got {other:?}"),
+        }
+        assert_eq!(
+            ctl.phase(),
+            Phase::Active,
+            "Chord must actually be back in its default assistant-fleet mode"
+        );
+        assert!(!ctl.is_idle());
     }
 
     // ── controller transitions (isolated instance, no globals) ───────────────
