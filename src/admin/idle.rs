@@ -110,6 +110,20 @@ pub const DEFAULT_COMPILER_LEASE_HOLDERS: &str = "compiler,build,bld";
 /// 900s (15 minutes) matches the standing `idle_stop_secs` convention for
 /// on-demand backends (`lemonade-coder`, see `src/models/backends.rs`). Override
 /// with `CHORD_IDLE_CODER_ACTIVITY_TIMEOUT_SECS`.
+///
+/// **Coupling with `GPU_EXCLUSIVE`'s own TTL (review, round 2):** this value is
+/// meant as a FLOOR — "revert only after AT LEAST this much silence" — but the
+/// watchdog reads liveness through `GPU_EXCLUSIVE`, whose OWN, separately
+/// configured `ttl` ([`crate::gpu_exclusive::DEFAULT_TTL_SECS`], 600s by
+/// default, a shorter and UNRELATED knob governing when a different caller may
+/// steal the lock) would silently undercut this floor if used directly — a
+/// record could read as gone at 600s even though this constant promises 900.
+/// `watchdog_tick` (`src/admin/idle.rs`) closes that gap by computing its own
+/// holder-liveness against `effective_ttl = max(gpu.ttl(),
+/// coder_activity_timeout)`, so THIS value always wins whenever it is the
+/// larger of the two (the default case, 900 > 600) — see the doc on
+/// `watchdog_tick` for the full mechanics. Pinned by
+/// `watchdog_tick_default_ttls_honor_the_900s_coder_activity_floor` below.
 pub const DEFAULT_CODER_ACTIVITY_TIMEOUT_SECS: u64 = 900;
 
 /// Resolve the coder-activity (heartbeat-silence) timeout from
@@ -1711,15 +1725,26 @@ pub async fn admin_activity_status(
 /// (`Idle -> Active`), else `None` — deferred, nothing idle to act on, or the
 /// decision was superseded by a newer episode.
 ///
-/// Defect #1 (review, round 1): uses `gpu.active_holder(now)`, NOT `gpu.snapshot`
-/// with the `expired` flag discarded. An EXPIRED GPU_EXCLUSIVE record is, by that
-/// subsystem's own TTL, no longer a lease anyone else is bound to respect —
-/// `active_holder` already nils it out, so it is treated exactly like no holder at
-/// all (the pre-CHRD-135 behavior). Ignoring `expired` (the original mistake) cut
-/// both ways: a lingering dead record could force an instant revert on the very
-/// first tick, long before the real absolute deadline; or let a heartbeat that
-/// predates the record's own TTL keep deferring the deadline past the point
-/// GPU_EXCLUSIVE itself would let a different caller steal the lock.
+/// Defect #1 (review, round 1): a holder-liveness check must not treat an
+/// abandoned GPU_EXCLUSIVE record (heartbeat that stopped updating) as a live
+/// compiler holder deferring the revert forever — raw `.snapshot()` with the
+/// `expired` flag discarded did exactly that.
+///
+/// Defect #1 residual (review, round 2): fixing that by switching to
+/// `gpu.active_holder(now)` introduced a NEW bug — `active_holder` expires a
+/// record against GPU_EXCLUSIVE's OWN `ttl` ([`crate::gpu_exclusive::
+/// DEFAULT_TTL_SECS`], 600s by default), which is UNRELATED to and shorter than
+/// `coder_activity_timeout` (900s by default). Once the absolute deadline has
+/// passed, `active_holder` returning `None` at 600s of silence — well before the
+/// promised 900s floor — let the watchdog revert as early as 600s, silently
+/// violating "auto-revert only after AT LEAST 15 minutes of no coder activity."
+/// Fixed by computing liveness against `effective_ttl =
+/// max(gpu.ttl(), coder_activity_timeout)` here, LOCAL to this decision only —
+/// GPU_EXCLUSIVE's own (shorter) `ttl` still governs whether some OTHER caller
+/// may steal the lock; that is a separate, correctly-shorter concern this
+/// function does not touch. This guarantees the coder-activity floor documented
+/// on [`DEFAULT_CODER_ACTIVITY_TIMEOUT_SECS`] is never undercut by
+/// GPU_EXCLUSIVE's own TTL, however the two are configured.
 ///
 /// Defect #3 (review, round 1): activation is EPISODE-GUARDED
 /// (`begin_activate_for_episode`), pinned to the `episode` captured in the SAME
@@ -1738,7 +1763,16 @@ fn watchdog_tick(
     coder_activity_timeout: u64,
 ) -> Option<ResumeManifest> {
     let m = ctl.snapshot()?;
-    let holder = gpu.active_holder(now);
+    // Defect #1 residual (review, round 2): never let GPU_EXCLUSIVE's own,
+    // possibly-shorter TTL undercut the coder-activity floor — see the doc above.
+    let effective_ttl = gpu.ttl().max(coder_activity_timeout);
+    let holder = gpu.snapshot(now).and_then(|(r, _gpu_own_expired)| {
+        if r.is_expired(now, effective_ttl) {
+            None
+        } else {
+            Some(r)
+        }
+    });
     let holder_label = holder.as_ref().map(|r| r.holder.as_str());
     let holder_last_heartbeat = holder.as_ref().map(|r| r.last_heartbeat);
     if !watchdog_tick_should_activate(
@@ -1777,13 +1811,21 @@ fn watchdog_tick(
             // entry point used by the HTTP handler) around a *successful* CAS — it
             // is a `BeginActivate` value returned directly, never an `Err` payload
             // out of `begin_activate_inner_impl`/`begin_activate_for_episode`
-            // (those return `Ok((ResumeManifest, u64))` on success instead). This
-            // arm only exists because both call sites share the one `BeginActivate`
-            // type as their error/result payload; it is unreachable from this path.
-            unreachable!(
-                "begin_activate_for_episode never returns Err(BeginActivate::Begin(_)); \
-                 Begin is only constructed as a success value by begin_activate()"
-            )
+            // (those return `Ok((ResumeManifest, u64))` on success instead), so
+            // this arm is unreachable from this path TODAY.
+            //
+            // Review, round 2: `unreachable!()` here is fail-DEADLY, not
+            // fail-safe — `watchdog_loop` is a spawned task with no supervisor,
+            // so a panic on an invariant that's unreachable only by convention
+            // (not by the type system) would permanently kill the exact
+            // mechanism this ticket exists to guarantee: the return to default
+            // mode. Degrade like the sibling `PersistFailed` arm instead — log
+            // and retry next tick — at zero behavioral cost today.
+            warn!(
+                "idle-mode watchdog: begin_activate_for_episode returned an unexpected \
+                 BeginActivate::Begin(_) payload — treating as a no-op and retrying next tick"
+            );
+            None
         }
     }
 }
@@ -1827,6 +1869,14 @@ pub async fn watchdog_loop(state: Arc<crate::routes::AppState>, interval: Durati
         );
         // Same side effect `activate()` runs on a real Activated outcome (TRTR-07):
         // re-warm the assistant resident set now that we're back in serving mode.
+        //
+        // Audited CHRD-135 review, round 2: confirmed `activate() ==
+        // begin_activate_inner() + finish_activate() + this same info! log` (see
+        // `activate()`'s own "lazy reload means none today" comment) — i.e.
+        // `activate() == CAS + rewarm`, exactly matching this watchdog path. This
+        // hand-rolled call is NOT a divergent/incomplete substitute for
+        // `activate()`; it reproduces its full effect. Re-raise only with a new
+        // finding, not a re-read of the same call site.
         let report = crate::routing::resident_set::global()
             .rewarm(&state, "watchdog-timeout")
             .await;
@@ -2022,13 +2072,16 @@ mod tests {
 
     #[test]
     fn behavioral_coder_silence_reverts_state_machine_to_active() {
-        // BEHAVIORAL PROOF, not just the pure decision function: drive the REAL
-        // `IdleController` state machine plus a REAL (isolated, non-global)
-        // `GpuExclusive` instance through genuine coder heartbeats — using the
-        // exact production decision function (`watchdog_tick_should_activate`) the
-        // way `watchdog_loop` calls it every tick — and confirm the mode ACTUALLY
-        // flips back to `Active` (the default assistant-fleet mode) on its own once
-        // the heartbeats stop. Time is INJECTED (`tick_now`/`now_past`), never slept.
+        // BEHAVIORAL PROOF, not just the pure decision function (review, round 2 —
+        // ending on a hand-called `ctl.exit()` was the round-1 defect verbatim,
+        // still present as of round 1's fix): drive the REAL `IdleController`
+        // state machine plus a REAL (isolated, non-global) `GpuExclusive` instance
+        // through genuine coder heartbeats, calling `watchdog_tick` ITSELF — the
+        // exact function `watchdog_loop` calls every tick, decision AND its CAS
+        // effect together — and confirm the mode ACTUALLY flips back to `Active`
+        // (the default assistant-fleet mode) on its own once the heartbeats stop,
+        // and does NOT flip while they keep arriving. Time is INJECTED
+        // (`tick_now`/`now_past`), never slept.
         use crate::gpu_exclusive::GpuExclusive;
 
         let ctl = IdleController::new();
@@ -2046,28 +2099,22 @@ mod tests {
         assert_eq!(ctl.phase(), Phase::Idle);
 
         // The build acquires the GPU-exclusive lease and heartbeats it every 300s
-        // (well under the 900s window) while genuinely progressing.
+        // (well under the 900s window) while genuinely progressing. Each tick
+        // calls `watchdog_tick` itself — the negative case (no revert) is now
+        // behavioral too, not just a predicate assertion.
         for tick_now in [0u64, 300, 600, 900, 1_200, 1_500] {
             gpu.acquire("compiler-build-42", tick_now); // fresh grant, then heartbeat refreshes
-            let (record, _expired) = gpu.snapshot(tick_now).expect("lease held");
-            let should_activate = watchdog_tick_should_activate(
-                tick_now,
-                m.watchdog_expired(tick_now),
-                Some(record.holder.as_str()),
-                Some(record.last_heartbeat),
-                &patterns,
-                timeout,
-            );
+            let result = watchdog_tick(&ctl, &gpu, tick_now, &patterns, timeout);
             assert!(
-                !should_activate,
+                result.is_none(),
                 "must NOT revert mid-build while heartbeats keep arriving (t={tick_now})"
             );
+            assert_eq!(
+                ctl.phase(),
+                Phase::Idle,
+                "still idle — the build is still genuinely renewing (t={tick_now})"
+            );
         }
-        assert_eq!(
-            ctl.phase(),
-            Phase::Idle,
-            "still idle — the build is still genuinely renewing"
-        );
 
         // The build finishes (or crashes) at t=1500 and STOPS heartbeating — no
         // further renewal arrives.
@@ -2075,25 +2122,9 @@ mod tests {
 
         // Advance the tracked clock past the window WITHOUT sleeping.
         let now_past = last_heartbeat + timeout; // exactly at the 900s silence boundary
-        let (record, _expired) = gpu.snapshot(now_past).expect("stale lease record still present");
-        let should_activate = watchdog_tick_should_activate(
-            now_past,
-            m.watchdog_expired(now_past),
-            Some(record.holder.as_str()),
-            Some(record.last_heartbeat),
-            &patterns,
-            timeout,
-        );
-        assert!(
-            should_activate,
-            "must revert once the coder/build has gone silent for >= the timeout"
-        );
-
-        // Drive the SAME transition `watchdog_loop` performs on a positive tick.
-        match ctl.exit() {
-            ActivateOutcome::Activated(_) => {}
-            other => panic!("expected Activated, got {other:?}"),
-        }
+        let cleared = watchdog_tick(&ctl, &gpu, now_past, &patterns, timeout)
+            .expect("coder silence past the window must actually revert");
+        assert_eq!(cleared.reason, "compiler-build-42");
         assert_eq!(
             ctl.phase(),
             Phase::Active,
@@ -2104,51 +2135,110 @@ mod tests {
 
     #[test]
     fn watchdog_tick_treats_expired_gpu_record_as_no_holder() {
-        // Defect #1 (review, round 1): `watchdog_tick` must use
-        // `gpu.active_holder(now)`, which itself nils out a record past
-        // GPU_EXCLUSIVE's own TTL — NOT a raw `.snapshot()` with the `expired` flag
-        // discarded. Drive `watchdog_tick` (the exact function `watchdog_loop`
-        // calls) directly, not just the pure decision fn, so this actually exercises
-        // the fixed wiring, not a hand-rolled substitute.
+        // Defect #1 (review, round 1): a genuinely ABANDONED GPU_EXCLUSIVE record
+        // (heartbeat that stopped updating, well past BOTH GPU_EXCLUSIVE's own TTL
+        // and the coder-activity timeout) must not defer an already-overdue revert
+        // forever. Drive `watchdog_tick` (the exact function `watchdog_loop` calls)
+        // directly, not just the pure decision fn.
+        //
+        // Values are realistic (GPU ttl=600 default, coder timeout=900 default) —
+        // NOT an artificially tiny ttl / huge timeout pair, because the round-2 fix
+        // (`effective_ttl = max(gpu.ttl(), coder_activity_timeout)`, see
+        // `watchdog_tick`'s doc) makes the coder-activity timeout the FLOOR on
+        // liveness, not GPU_EXCLUSIVE's own ttl — so "abandoned" now means silence
+        // past BOTH, exercised by `watchdog_tick_default_ttls_honor_the_900s_coder_activity_floor`
+        // below covers the boundary between the two; this test covers the
+        // unambiguous case: nobody has renewed in ages, by either standard.
         use crate::gpu_exclusive::GpuExclusive;
 
         let ctl = IdleController::new();
-        let gpu = GpuExclusive::new(50); // short GPU_EXCLUSIVE TTL: 50s
+        let gpu = GpuExclusive::new(600); // GPU_EXCLUSIVE default TTL
         let patterns = holders();
-        // A huge coder-activity timeout: if the (buggy) code treated the expired
-        // record as a LIVE compiler holder with a fresh-looking heartbeat, it would
-        // defer forever and never activate — the wrong-direction failure mode.
-        let coder_activity_timeout = 100_000u64;
+        let coder_activity_timeout = 900u64; // coder-activity default
 
-        // Absolute deadline already passed by t=1000 — with NO live compiler holder,
-        // the watchdog must revert.
+        // Absolute deadline already passed by t=2000 — with NO live compiler
+        // holder, the watchdog must revert.
         let m = manifest("compiler-build-expired", 0, 100);
         assert!(matches!(ctl.enter(m.clone()), EnterOutcome::Entered(_)));
 
         // The lease was acquired at t=0 and never renewed again.
         gpu.acquire("compiler-build-expired", 0);
 
-        // At t=1000, 1000s since the last (only) heartbeat vastly exceeds the 50s
-        // GPU_EXCLUSIVE TTL — the record is EXPIRED. `active_holder` must read this
-        // as "no live holder", so the watchdog reverts on its overdue deadline
-        // instead of deferring on a dead record's stale heartbeat.
-        let now = 1000u64;
-        assert!(
-            gpu.active_holder(now).is_none(),
-            "sanity: the record really is expired by GPU_EXCLUSIVE's own TTL"
-        );
+        // At t=2000, 2000s of silence vastly exceeds BOTH the 600s GPU_EXCLUSIVE
+        // TTL and the 900s coder-activity floor — genuinely abandoned by any
+        // standard. The watchdog must revert on its overdue deadline instead of
+        // deferring on a dead record's stale heartbeat.
+        let now = 2000u64;
 
         let result = watchdog_tick(&ctl, &gpu, now, &patterns, coder_activity_timeout);
         assert!(
             result.is_some(),
-            "an expired GPU_EXCLUSIVE record must not be treated as a live compiler \
-             holder deferring an already-overdue revert"
+            "a record abandoned well past both TTLs must not defer an already-overdue revert"
         );
         assert_eq!(
             ctl.phase(),
             Phase::Active,
             "the state machine must have actually flipped back to Active"
         );
+    }
+
+    #[test]
+    fn watchdog_tick_default_ttls_honor_the_900s_coder_activity_floor() {
+        // Review, round 2, blocking finding #3: with the REAL default TTLs
+        // (GPU_EXCLUSIVE ttl=600s, coder_activity_timeout=900s), the promised
+        // floor is "revert only after AT LEAST 900s of coder silence." Before this
+        // fix, `watchdog_tick` read holder-liveness through
+        // `gpu.active_holder(now)`, which expires a record at GPU_EXCLUSIVE's own
+        // (shorter) 600s TTL — so a build heartbeating, say, every 650s (well
+        // under the promised 900s floor, but over GPU_EXCLUSIVE's unrelated 600s
+        // TTL) would already read as "no holder" and revert at only ~600s of
+        // silence once the absolute deadline had passed. Pins the EFFECTIVE
+        // bound, not the constant.
+        use crate::gpu_exclusive::GpuExclusive;
+
+        let ctl = IdleController::new();
+        let gpu = GpuExclusive::new(crate::gpu_exclusive::DEFAULT_TTL_SECS); // 600s
+        let patterns = holders();
+        let coder_activity_timeout = DEFAULT_CODER_ACTIVITY_TIMEOUT_SECS; // 900s
+        assert!(
+            crate::gpu_exclusive::DEFAULT_TTL_SECS < coder_activity_timeout,
+            "sanity: this test only means something when the GPU ttl is the \
+             SHORTER of the two, exactly the real default configuration"
+        );
+
+        // Absolute deadline already passed by the time we check (so ONLY the
+        // coder-activity heartbeat floor is what's deferring the revert).
+        let m = manifest("compiler-build-longhaul", 0, 10);
+        assert!(matches!(ctl.enter(m), EnterOutcome::Entered(_)));
+
+        let last_heartbeat = 0u64;
+        gpu.acquire("compiler-build-longhaul", last_heartbeat);
+
+        // At 650s of silence: past GPU_EXCLUSIVE's own 600s TTL, but comfortably
+        // under the promised 900s coder-activity floor. Must NOT revert — this is
+        // exactly the regression this finding describes.
+        let still_within_floor = last_heartbeat + 650;
+        assert!(
+            watchdog_tick(&ctl, &gpu, still_within_floor, &patterns, coder_activity_timeout)
+                .is_none(),
+            "650s of silence is past GPU_EXCLUSIVE's own 600s TTL but still under \
+             the promised 900s coder-activity floor — must NOT revert"
+        );
+        assert_eq!(
+            ctl.phase(),
+            Phase::Idle,
+            "still idle — 650s does not yet violate the 900s floor"
+        );
+
+        // At exactly 900s of silence: the coder-activity floor itself is now
+        // exceeded — must revert.
+        let at_floor = last_heartbeat + coder_activity_timeout;
+        let result = watchdog_tick(&ctl, &gpu, at_floor, &patterns, coder_activity_timeout);
+        assert!(
+            result.is_some(),
+            "900s of silence meets the coder-activity floor — must revert"
+        );
+        assert_eq!(ctl.phase(), Phase::Active);
     }
 
     #[test]
