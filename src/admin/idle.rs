@@ -255,6 +255,19 @@ pub struct ResumeManifest {
     pub resident_models: Vec<String>,
     /// `MemAvailable` (GiB) sampled just before release, for the freed-RAM delta.
     pub mem_available_before_gb: f64,
+    /// CHRD-135 defect #3: identity token for THIS idle episode, stamped by
+    /// [`IdleController::finish_enter`] from the `EnteringIdle` transition's own
+    /// generation counter — the caller's initializer value is always overwritten,
+    /// so any placeholder (including the pre-CHRD-135 absence of this field) is
+    /// safe. Lets an activation DECISION (e.g. the watchdog's) be pinned to the
+    /// SPECIFIC episode it evaluated: if a newer episode is current by the time the
+    /// activation actually runs, the CAS in
+    /// [`IdleController::begin_activate_for_episode`] refuses rather than cancels
+    /// it. `#[serde(default)]` so a manifest persisted by a pre-CHRD-135 binary
+    /// still deserializes across a rolling restart (defaults to `0`, harmless since
+    /// generation counters also reset to `0` on a fresh process).
+    #[serde(default)]
+    pub episode: u64,
 }
 
 impl ResumeManifest {
@@ -333,12 +346,20 @@ pub fn watchdog_should_activate(expired: bool, holder: Option<&str>, patterns: &
 }
 
 /// CHRD-135: has a compiler-build lease's heartbeat gone STALE — no renewal within
-/// `timeout` seconds of `now`? `last_heartbeat == None` (a compiler-lease holder
-/// somehow reported with no heartbeat timestamp at all) is treated as stale
-/// immediately — never a reason to defer. `saturating_sub` so a clock that briefly
-/// steps backwards reads as fresh (age 0), never spuriously stale — the same
+/// `timeout` seconds of `now`? `saturating_sub` so a clock that briefly steps
+/// backwards reads as fresh (age 0), never spuriously stale — the same
 /// clock-safety discipline as [`crate::gpu_exclusive::LockRecord::is_expired`].
 /// Pure — no IO, no clock, exhaustively unit-testable.
+///
+/// Non-blocking review finding #5: `last_heartbeat == None` is treated as
+/// immediately stale (never a reason to defer) for callers that construct one
+/// directly or in a unit test. Via the ACTUAL production call path
+/// (`watchdog_tick` → `watchdog_tick_should_activate`), `LockRecord::last_heartbeat`
+/// is a non-`Option<u64>`, and `is_compiler` (hence this function) is only ever
+/// evaluated once a real `Some(holder)` was already matched — so that `None` arm
+/// is unreachable from `watchdog_loop` itself; it exists for this function's own
+/// direct callers (defensive default, and exercised by
+/// `coder_activity_stale_no_heartbeat_is_immediately_stale` below).
 pub fn coder_activity_stale(now: u64, last_heartbeat: Option<u64>, timeout: u64) -> bool {
     match last_heartbeat {
         None => true,
@@ -479,6 +500,12 @@ pub enum BeginActivate {
     /// stays `Idle` (recoverable; a crash would reload `Idle`, consistent with memory).
     /// The caller should surface a retryable error and try again.
     PersistFailed,
+    /// CHRD-135 defect #3: an episode-guarded activate
+    /// ([`IdleController::begin_activate_for_episode`]) found the controller `Idle`
+    /// on a DIFFERENT episode than the one the caller's decision was made about —
+    /// i.e. a newer idle episode has been installed since. No-op: the caller's
+    /// stale decision must not cancel it.
+    Superseded,
 }
 
 /// Outcome of a full enter (begin+release+finish) against the live state.
@@ -743,7 +770,15 @@ impl IdleController {
     /// same-generation `EnteringIdle` this transition began — otherwise (watchdog
     /// recovered it, or a newer transition superseded it) it is a NO-OP returning
     /// `None`, so a stale commit can never clobber a newer phase.
-    fn finish_enter(&self, generation: u64, manifest: ResumeManifest) -> Option<ResumeManifest> {
+    fn finish_enter(
+        &self,
+        generation: u64,
+        mut manifest: ResumeManifest,
+    ) -> Option<ResumeManifest> {
+        // CHRD-135 defect #3: this transition's own generation IS the episode
+        // identity — always overwrite whatever the caller set (see the doc on
+        // `ResumeManifest::episode`).
+        manifest.episode = generation;
         let mut guard = self.inner.write().expect("idle lock poisoned");
         match &*guard {
             IdleState::EnteringIdle {
@@ -786,10 +821,25 @@ impl IdleController {
     /// while memory says `Activating`. When no state path is configured, persistence is
     /// a no-op and this gate is skipped (best-effort, as before). Only after the disk
     /// reads `Active` do we flip memory to `Activating`.
-    fn begin_activate_inner(&self) -> Result<(ResumeManifest, u64), BeginActivate> {
+    /// CHRD-135 defect #3: shared implementation for [`begin_activate_inner`]
+    /// (`expected_episode: None`, unconditional — the admin endpoint and
+    /// lazy-on-request path) and [`begin_activate_for_episode`]
+    /// (`expected_episode: Some(_)` — the watchdog path only). The episode check
+    /// and the rest of the CAS happen under ONE write-lock acquisition, so there is
+    /// no gap between "is this still the expected episode" and "commit the
+    /// transition" for a second caller to land in.
+    fn begin_activate_inner_impl(
+        &self,
+        expected_episode: Option<u64>,
+    ) -> Result<(ResumeManifest, u64), BeginActivate> {
         let mut guard = self.inner.write().expect("idle lock poisoned");
         match &*guard {
-            IdleState::Idle(_) => {
+            IdleState::Idle(m) => {
+                if let Some(expected) = expected_episode {
+                    if m.episode != expected {
+                        return Err(BeginActivate::Superseded);
+                    }
+                }
                 // HARD GATE: clear disk → Active BEFORE touching memory (still `Idle`).
                 if let Some(path) = self.state_path.as_deref() {
                     if let Err(e) = persist_state(path, &None) {
@@ -817,6 +867,22 @@ impl IdleController {
                 Err(BeginActivate::InTransition)
             }
         }
+    }
+
+    fn begin_activate_inner(&self) -> Result<(ResumeManifest, u64), BeginActivate> {
+        self.begin_activate_inner_impl(None)
+    }
+
+    /// CHRD-135 defect #3: like [`begin_activate_inner`](Self::begin_activate_inner),
+    /// but only wins the CAS if the live `Idle` manifest's `episode` still matches
+    /// `expected_episode` — see [`ResumeManifest::episode`] and
+    /// [`BeginActivate::Superseded`]. Used exclusively by the watchdog so a decision
+    /// made about episode N can never activate (and so cancel) episode N+1.
+    fn begin_activate_for_episode(
+        &self,
+        expected_episode: u64,
+    ) -> Result<(ResumeManifest, u64), BeginActivate> {
+        self.begin_activate_inner_impl(Some(expected_episode))
     }
 
     /// CAS `Idle → Activating`, returning the manifest to clear. Concurrent
@@ -1222,6 +1288,9 @@ pub async fn enter_idle(
         watchdog_deadline: now.saturating_add(watchdog_secs_from_env()),
         resident_models,
         mem_available_before_gb: report.mem_available_before_gb.unwrap_or(0.0),
+        // Overwritten by `finish_enter` with this transition's own generation —
+        // see `ResumeManifest::episode`.
+        episode: 0,
     };
     // Complete the transition: `EnteringIdle{gen} → Idle` (consumes the guard so its
     // Drop rollback becomes a no-op). Generation-guarded: if our transition was
@@ -1633,6 +1702,92 @@ pub async fn admin_activity_status(
 /// is deferred — a legitimately long build keeps Chord idle as long as it holds the
 /// GPU. A NON-compiler GPU holder (e.g. the intake sweep harness) does NOT extend the
 /// idle window. Follows the `idle_stop_sweep` spawn pattern in `main.rs`.
+/// CHRD-135: the per-tick STATE-MACHINE step — decision plus its CAS effect —
+/// taking `ctl`/`gpu` as explicit parameters so it runs identically against
+/// isolated test instances and the process globals, and so a test exercising it
+/// observes the SAME wiring `watchdog_loop` runs each tick, not a hand-rolled
+/// substitute (review, round 1, flagged exactly that gap in the original
+/// behavioral test). Returns `Some(cleared manifest)` if it activated
+/// (`Idle -> Active`), else `None` — deferred, nothing idle to act on, or the
+/// decision was superseded by a newer episode.
+///
+/// Defect #1 (review, round 1): uses `gpu.active_holder(now)`, NOT `gpu.snapshot`
+/// with the `expired` flag discarded. An EXPIRED GPU_EXCLUSIVE record is, by that
+/// subsystem's own TTL, no longer a lease anyone else is bound to respect —
+/// `active_holder` already nils it out, so it is treated exactly like no holder at
+/// all (the pre-CHRD-135 behavior). Ignoring `expired` (the original mistake) cut
+/// both ways: a lingering dead record could force an instant revert on the very
+/// first tick, long before the real absolute deadline; or let a heartbeat that
+/// predates the record's own TTL keep deferring the deadline past the point
+/// GPU_EXCLUSIVE itself would let a different caller steal the lock.
+///
+/// Defect #3 (review, round 1): activation is EPISODE-GUARDED
+/// (`begin_activate_for_episode`), pinned to the `episode` captured in the SAME
+/// snapshot the decision was computed from. If a newer idle episode has been
+/// installed by the time the CAS actually runs, this is a no-op — a stale
+/// decision about a FORMER episode can never cancel a fresh one. This narrows,
+/// but does not fully eliminate, the analogous race against an external
+/// GPU_EXCLUSIVE re-acquire landing between the snapshot above and this CAS —
+/// closing that would require a real cross-subsystem lock the two globals don't
+/// share today; tracked as a known residual, not solved here.
+fn watchdog_tick(
+    ctl: &IdleController,
+    gpu: &crate::gpu_exclusive::GpuExclusive,
+    now: u64,
+    patterns: &[String],
+    coder_activity_timeout: u64,
+) -> Option<ResumeManifest> {
+    let m = ctl.snapshot()?;
+    let holder = gpu.active_holder(now);
+    let holder_label = holder.as_ref().map(|r| r.holder.as_str());
+    let holder_last_heartbeat = holder.as_ref().map(|r| r.last_heartbeat);
+    if !watchdog_tick_should_activate(
+        now,
+        m.watchdog_expired(now),
+        holder_label,
+        holder_last_heartbeat,
+        patterns,
+        coder_activity_timeout,
+    ) {
+        return None;
+    }
+    match ctl.begin_activate_for_episode(m.episode) {
+        Ok((manifest, generation)) => {
+            ctl.finish_activate(generation);
+            Some(manifest)
+        }
+        Err(BeginActivate::AlreadyActive) | Err(BeginActivate::InTransition) => None,
+        Err(BeginActivate::Superseded) => {
+            // Expected/benign: a newer idle episode is now current, see the doc above.
+            None
+        }
+        Err(BeginActivate::PersistFailed) => {
+            // Non-blocking review finding #4: this WAS a silent `let _ =` discard —
+            // log it, since a persistently failing persist would otherwise retry
+            // every tick with no diagnostic at all.
+            warn!(
+                "idle-mode watchdog: episode-guarded activate aborted (persist-to-Active \
+                 failed) — will retry next tick"
+            );
+            None
+        }
+        Err(BeginActivate::Begin(_)) => {
+            // `BeginActivate::Begin` is only ever constructed by the OTHER wrapper
+            // (`IdleController::begin_activate`, the public non-episode-guarded
+            // entry point used by the HTTP handler) around a *successful* CAS — it
+            // is a `BeginActivate` value returned directly, never an `Err` payload
+            // out of `begin_activate_inner_impl`/`begin_activate_for_episode`
+            // (those return `Ok((ResumeManifest, u64))` on success instead). This
+            // arm only exists because both call sites share the one `BeginActivate`
+            // type as their error/result payload; it is unreachable from this path.
+            unreachable!(
+                "begin_activate_for_episode never returns Err(BeginActivate::Begin(_)); \
+                 Begin is only constructed as a success value by begin_activate()"
+            )
+        }
+    }
+}
+
 pub async fn watchdog_loop(state: Arc<crate::routes::AppState>, interval: Duration) {
     info!(
         interval_secs = interval.as_secs(),
@@ -1655,34 +1810,35 @@ pub async fn watchdog_loop(state: Arc<crate::routes::AppState>, interval: Durati
             );
             continue;
         }
-        let Some(m) = IDLE_MODE.snapshot() else {
-            continue;
-        };
-        // CHRD-135: read the RAW lock record (holder + last_heartbeat) via `snapshot`,
-        // NOT `active_holder` — `active_holder` nils itself out once the lock's OWN
-        // (unrelated) TTL passes, which would silently drop the holder label/heartbeat
-        // we need for the coder-activity check below. `snapshot` always returns the
-        // record while one is present, regardless of that TTL.
-        let gpu_snapshot = crate::gpu_exclusive::GPU_EXCLUSIVE.snapshot(now);
-        let holder_label = gpu_snapshot.as_ref().map(|(r, _)| r.holder.as_str());
-        let holder_last_heartbeat = gpu_snapshot.as_ref().map(|(r, _)| r.last_heartbeat);
-        if !watchdog_tick_should_activate(
+        let Some(manifest) = watchdog_tick(
+            &IDLE_MODE,
+            &crate::gpu_exclusive::GPU_EXCLUSIVE,
             now,
-            m.watchdog_expired(now),
-            holder_label,
-            holder_last_heartbeat,
             &patterns,
             coder_activity_timeout,
-        ) {
+        ) else {
             continue;
-        }
+        };
         warn!(
-            reason = %m.reason,
-            holder = ?holder_label,
+            reason = %manifest.reason,
+            episode = manifest.episode,
             "idle-mode watchdog: deadline passed (or the compiler lease's heartbeat went stale) \
-             with no active/renewing compiler lease — auto-activating (fail-safe)"
+             with no active/renewing compiler lease — auto-activated (fail-safe)"
         );
-        let _ = activate(&state, "watchdog-timeout").await;
+        // Same side effect `activate()` runs on a real Activated outcome (TRTR-07):
+        // re-warm the assistant resident set now that we're back in serving mode.
+        let report = crate::routing::resident_set::global()
+            .rewarm(&state, "watchdog-timeout")
+            .await;
+        if report.changed {
+            info!(
+                reason = "watchdog-timeout",
+                warmed = report.warmed,
+                dropped = report.dropped,
+                failed = report.failed,
+                "idle-mode: assistant resident set re-warmed after the mode swap"
+            );
+        }
     }
 }
 
@@ -1698,6 +1854,7 @@ mod tests {
             watchdog_deadline: deadline,
             resident_models: vec!["qwen3-coder:30b".into()],
             mem_available_before_gb: 12.0,
+            episode: 0,
         }
     }
 
@@ -1945,6 +2102,107 @@ mod tests {
         assert!(!ctl.is_idle());
     }
 
+    #[test]
+    fn watchdog_tick_treats_expired_gpu_record_as_no_holder() {
+        // Defect #1 (review, round 1): `watchdog_tick` must use
+        // `gpu.active_holder(now)`, which itself nils out a record past
+        // GPU_EXCLUSIVE's own TTL — NOT a raw `.snapshot()` with the `expired` flag
+        // discarded. Drive `watchdog_tick` (the exact function `watchdog_loop`
+        // calls) directly, not just the pure decision fn, so this actually exercises
+        // the fixed wiring, not a hand-rolled substitute.
+        use crate::gpu_exclusive::GpuExclusive;
+
+        let ctl = IdleController::new();
+        let gpu = GpuExclusive::new(50); // short GPU_EXCLUSIVE TTL: 50s
+        let patterns = holders();
+        // A huge coder-activity timeout: if the (buggy) code treated the expired
+        // record as a LIVE compiler holder with a fresh-looking heartbeat, it would
+        // defer forever and never activate — the wrong-direction failure mode.
+        let coder_activity_timeout = 100_000u64;
+
+        // Absolute deadline already passed by t=1000 — with NO live compiler holder,
+        // the watchdog must revert.
+        let m = manifest("compiler-build-expired", 0, 100);
+        assert!(matches!(ctl.enter(m.clone()), EnterOutcome::Entered(_)));
+
+        // The lease was acquired at t=0 and never renewed again.
+        gpu.acquire("compiler-build-expired", 0);
+
+        // At t=1000, 1000s since the last (only) heartbeat vastly exceeds the 50s
+        // GPU_EXCLUSIVE TTL — the record is EXPIRED. `active_holder` must read this
+        // as "no live holder", so the watchdog reverts on its overdue deadline
+        // instead of deferring on a dead record's stale heartbeat.
+        let now = 1000u64;
+        assert!(
+            gpu.active_holder(now).is_none(),
+            "sanity: the record really is expired by GPU_EXCLUSIVE's own TTL"
+        );
+
+        let result = watchdog_tick(&ctl, &gpu, now, &patterns, coder_activity_timeout);
+        assert!(
+            result.is_some(),
+            "an expired GPU_EXCLUSIVE record must not be treated as a live compiler \
+             holder deferring an already-overdue revert"
+        );
+        assert_eq!(
+            ctl.phase(),
+            Phase::Active,
+            "the state machine must have actually flipped back to Active"
+        );
+    }
+
+    #[test]
+    fn watchdog_tick_episode_guard_refuses_superseded_activation() {
+        // Defect #3 (review, round 1): an activation decision computed about idle
+        // episode N must not be able to cancel a idle episode N+1 that has since
+        // replaced it. Exercised directly at the CAS
+        // (`begin_activate_for_episode`) — the exact primitive `watchdog_tick`
+        // calls — rather than only through the pure decision function.
+        let ctl = IdleController::new();
+
+        let m1 = manifest("compiler-build-first", 0, 10);
+        let entered1 = match ctl.enter(m1) {
+            EnterOutcome::Entered(m) => m,
+            other => panic!("expected Entered, got {other:?}"),
+        };
+        let stale_episode = entered1.episode;
+
+        // The first build's idle episode ends (e.g. a normal activate) and a SECOND,
+        // distinct idle episode begins — simulating a fresh decision superseding a
+        // stale one still in flight.
+        assert!(matches!(ctl.exit(), ActivateOutcome::Activated(_)));
+        let m2 = manifest("compiler-build-second", 20, 30);
+        let entered2 = match ctl.enter(m2) {
+            EnterOutcome::Entered(m) => m,
+            other => panic!("expected Entered, got {other:?}"),
+        };
+        assert_ne!(
+            entered2.episode, stale_episode,
+            "sanity: the second episode really is a distinct identity"
+        );
+
+        // A decision computed against the FIRST (now stale) episode must refuse,
+        // not cancel the second episode's live idle state.
+        assert_eq!(
+            ctl.begin_activate_for_episode(stale_episode),
+            Err(BeginActivate::Superseded)
+        );
+        assert_eq!(
+            ctl.phase(),
+            Phase::Idle,
+            "the newer episode's Idle phase must be untouched by the stale decision"
+        );
+        assert_eq!(ctl.snapshot().unwrap(), entered2);
+
+        // The CURRENT episode's own decision, by contrast, must still win the CAS.
+        let (won, generation) = ctl
+            .begin_activate_for_episode(entered2.episode)
+            .expect("the current episode's own decision must win the CAS");
+        assert_eq!(won, entered2);
+        ctl.finish_activate(generation);
+        assert_eq!(ctl.phase(), Phase::Active);
+    }
+
     // ── controller transitions (isolated instance, no globals) ───────────────
 
     #[test]
@@ -2112,6 +2370,7 @@ mod tests {
         // A SECOND enter begins — a brand-new, distinct generation.
         let second = ctl.try_begin_enter().expect("second transition begins");
         assert_eq!(ctl.phase(), Phase::EnteringIdle);
+        let second_generation = second.generation;
 
         // Drop the FIRST (stale) guard: its Drop→abort_enter must NOT touch the second
         // transition (generation mismatch), so we stay in EnteringIdle.
@@ -2122,11 +2381,16 @@ mod tests {
             "stale guard drop must not roll back the newer transition"
         );
 
-        // The second transition can still commit normally.
+        // The second transition can still commit normally. `commit` (via
+        // `finish_enter`) stamps `episode` from ITS OWN generation (CHRD-135 defect
+        // #3), overwriting the `0` placeholder the `manifest()` helper sets — so the
+        // expected value comes from the committed return, not the pre-commit
+        // literal.
         let m = manifest("compiler", 7, 9);
-        assert_eq!(second.commit(m.clone()), Some(m.clone()));
+        let committed = second.commit(m).expect("second transition still live");
+        assert_eq!(committed.episode, second_generation);
         assert!(ctl.is_idle());
-        assert_eq!(ctl.snapshot().unwrap(), m);
+        assert_eq!(ctl.snapshot().unwrap(), committed);
     }
 
     #[test]
@@ -2137,15 +2401,21 @@ mod tests {
         let stale = ctl.try_begin_enter().expect("first transition begins");
         let now = crate::gpu_exclusive::now_epoch();
         assert!(ctl.recover_stale_transition(now + 10_000, 120)); // → Active, gen bumped
-                                                                  // A newer enter takes over and reaches Idle.
+                                                                  // A newer enter takes over and reaches Idle. `enter` (via `finish_enter`)
+        // stamps `episode` from its own generation (CHRD-135 defect #3), so the
+        // expected manifest is the one `Entered` actually returns, not the
+        // pre-commit `fresh` literal (whose `episode: 0` placeholder is overwritten).
         let fresh = manifest("compiler", 1, 2);
-        assert!(matches!(ctl.enter(fresh.clone()), EnterOutcome::Entered(_)));
+        let entered = match ctl.enter(fresh) {
+            EnterOutcome::Entered(m) => m,
+            other => panic!("expected Entered, got {other:?}"),
+        };
         // The stale guard commits LATE: must be a no-op (None), not clobber fresh idle.
         let stale_m = manifest("stale", 99, 100);
         assert_eq!(stale.commit(stale_m), None);
         assert_eq!(
             ctl.snapshot().unwrap(),
-            fresh,
+            entered,
             "stale commit must not overwrite the newer manifest"
         );
     }
