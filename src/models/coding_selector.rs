@@ -1000,10 +1000,17 @@ mod tests {
             context_depth_need: ContextDepthNeed::Long,
         };
         let ranked = rank_for_work_type(&source, &wtc).await.expect("ranks");
-        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked.candidates.len(), 2);
         // model-b has both a higher base score AND the yarn bonus.
-        assert_eq!(ranked[0].model_id, "model-b");
-        assert!(ranked[0].yarn_bonus_applied);
+        assert_eq!(ranked.candidates[0].model_id, "model-b");
+        assert!(ranked.candidates[0].yarn_bonus_applied);
+        // …and the selection reports the evidence it actually rests on: no
+        // `multi_file` fixture was registered, so the per-category load is
+        // empty, and the language-wide set has only 2 candidates — below
+        // MIN_QUALIFYING_CANDIDATES. That is InsufficientData, not a silently
+        // presented per-category ranking, and the requested shape is named.
+        assert_eq!(ranked.basis, SelectionBasis::InsufficientData);
+        assert_eq!(ranked.requested_category, "multi_file");
     }
 
     #[tokio::test]
