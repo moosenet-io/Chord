@@ -58,7 +58,9 @@ use serde::Serialize;
 use tracing::warn;
 
 use crate::models::backends::{seed_from_env, Backend};
-use crate::models::coding_selector::{rank_for_work_type, CodeProfileSource, CodingCandidate, SelectorError};
+use crate::models::coding_selector::{
+    rank_for_work_type, CodeProfileSource, CodingCandidate, RankedSelection, SelectorError,
+};
 use crate::models::work_type::WorkTypeCode;
 
 /// Health-checker abstraction, reusing [`crate::serving::launcher::HealthChecker`]
@@ -143,6 +145,20 @@ pub struct SelectedModel {
     /// is more confident.
     pub confidence: f64,
     pub mem_config: Option<String>,
+    /// How many runs actually recorded a compile result for this model. A high
+    /// `confidence` on a low count is weak evidence, and the caller cannot tell
+    /// the two apart without this — see `coding_selector::CodeAggregate::
+    /// measured_compile_count` for the live case that motivated it.
+    pub measured_compile_count: i64,
+    /// Same, for test results.
+    pub measured_test_count: i64,
+    /// How many runs contributed to `avg_effective_score` — i.e. runs that are
+    /// BOTH scored and `finalized` (judged). Distinct from the two counts above
+    /// on purpose: `compiles`/`tests_pass` are written in intake Phase 1 and are
+    /// valid before judging, while the scores are patched in Phase 2. A caller
+    /// that reads a high `confidence` needs to know how much of it rests on
+    /// judged score data versus unjudged pass rates.
+    pub measured_score_count: i64,
 }
 
 /// Successful `/v1/coding/select` response.
@@ -155,6 +171,14 @@ pub struct CodingSelectResponse {
     /// the `(N+1)`th one tried (CPROX-04's fallback tier).
     pub fallback_tier: usize,
     pub candidates_considered: usize,
+    /// What evidence the ranking rests on. A caller MUST NOT present a
+    /// `language_fallback` or `insufficient_data` pick as a task-shape-specific
+    /// recommendation — as of CPROX-04 every `multi_file` and `deep` request
+    /// takes the fallback path, because those categories have no measured runs.
+    pub basis: crate::models::coding_selector::SelectionBasis,
+    /// The sweep category that was asked for (`blitz`/`multi_file`/`deep`),
+    /// present even on a fallback so the caller sees WHICH shape lacked data.
+    pub requested_category: String,
 }
 
 /// A `/v1/coding/select` failure. Every variant maps to a specific, documented
@@ -213,11 +237,17 @@ impl From<SelectorError> for CodingSelectError {
 /// candidates, a backend map, and a health checker, try each candidate's
 /// resolved backend in order and return the first healthy one. Pure enough to
 /// unit test with a scripted [`HealthChecker`] — no HTTP server, no Postgres.
+///
+/// Takes the whole [`RankedSelection`] rather than a bare candidate slice so
+/// the evidence basis travels with the candidates it describes — there is only
+/// one construction site for [`CodingSelectResponse`], and it cannot build one
+/// without a basis.
 pub async fn select_with_fallback(
-    candidates: &[CodingCandidate],
+    selection: &RankedSelection,
     backends: &HashMap<String, Backend>,
     health: &dyn HealthChecker,
 ) -> Result<CodingSelectResponse, CodingSelectError> {
+    let candidates = &selection.candidates;
     if candidates.is_empty() {
         return Err(CodingSelectError::NoCandidates);
     }
@@ -239,9 +269,14 @@ pub async fn select_with_fallback(
                     backend: resolution.name,
                     confidence: candidate.combined_score,
                     mem_config: candidate.mem_config.clone(),
+                    measured_compile_count: candidate.measured_compile_count,
+                    measured_test_count: candidate.measured_test_count,
+                    measured_score_count: candidate.measured_score_count,
                 },
                 fallback_tier: tier,
                 candidates_considered: candidates.len(),
+                basis: selection.basis,
+                requested_category: selection.requested_category.clone(),
             });
         }
         warn!(
@@ -274,15 +309,15 @@ pub async fn coding_select(
         return CodingSelectError::NotConfigured.into_response();
     };
 
-    let candidates = match rank_for_work_type(source.as_ref(), &work_type).await {
-        Ok(c) => c,
+    let selection = match rank_for_work_type(source.as_ref(), &work_type).await {
+        Ok(s) => s,
         Err(e) => return CodingSelectError::from(e).into_response(),
     };
 
     let backends = seed_from_env();
     let health = HttpHealthChecker::new(state.http_client.clone());
 
-    match select_with_fallback(&candidates, &backends, &health).await {
+    match select_with_fallback(&selection, &backends, &health).await {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(e) => e.into_response(),
     }
@@ -322,8 +357,24 @@ mod tests {
             avg_effective_score: Some(4.0),
             compile_pass_rate: Some(1.0),
             test_pass_rate: Some(1.0),
+            measured_compile_count: 10,
+            measured_test_count: 10,
+            measured_score_count: 10,
             combined_score: score,
             yarn_bonus_applied: false,
+        }
+    }
+
+    /// Wrap a bare candidate slice as a [`RankedSelection`] for the fallback
+    /// tests, which are about health-check walking rather than about evidence.
+    /// PerCategory is the neutral choice here: these tests assert nothing about
+    /// the basis, and using it keeps them from accidentally encoding a fallback
+    /// as the expected norm.
+    fn selection(candidates: &[CodingCandidate]) -> RankedSelection {
+        RankedSelection {
+            candidates: candidates.to_vec(),
+            basis: crate::models::coding_selector::SelectionBasis::PerCategory,
+            requested_category: "blitz".to_string(),
         }
     }
 
@@ -381,7 +432,7 @@ mod tests {
             calls: Default::default(),
         };
 
-        let resp = select_with_fallback(&candidates, &backends, &health).await.expect("selected");
+        let resp = select_with_fallback(&selection(&candidates), &backends, &health).await.expect("selected");
         assert_eq!(resp.selected.model_id, "best-model");
         assert_eq!(resp.fallback_tier, 0);
         assert_eq!(resp.candidates_considered, 2);
@@ -403,7 +454,7 @@ mod tests {
             calls: Default::default(),
         };
 
-        let resp = select_with_fallback(&candidates, &backends, &health).await.expect("selected");
+        let resp = select_with_fallback(&selection(&candidates), &backends, &health).await.expect("selected");
         assert_eq!(resp.selected.model_id, "cpu-model");
         assert_eq!(resp.fallback_tier, 1, "must record that tier 0 was skipped");
     }
@@ -415,7 +466,7 @@ mod tests {
         let candidates = vec![candidate("only-model", None, 0.9)];
         let health = ScriptedHealth { healthy: vec![], calls: Default::default() };
 
-        let err = select_with_fallback(&candidates, &backends, &health).await.unwrap_err();
+        let err = select_with_fallback(&selection(&candidates), &backends, &health).await.unwrap_err();
         assert_eq!(err, CodingSelectError::AllCandidatesUnavailable { candidates_tried: 1 });
     }
 
@@ -423,7 +474,7 @@ mod tests {
     async fn select_with_fallback_empty_candidates_is_no_candidates_error() {
         let backends: HashMap<String, Backend> = HashMap::new();
         let health = ScriptedHealth { healthy: vec![], calls: Default::default() };
-        let err = select_with_fallback(&[], &backends, &health).await.unwrap_err();
+        let err = select_with_fallback(&selection(&[]), &backends, &health).await.unwrap_err();
         assert_eq!(err, CodingSelectError::NoCandidates);
     }
 
@@ -442,7 +493,7 @@ mod tests {
             healthy: vec!["http://ollama.local/health".to_string()],
             calls: Default::default(),
         };
-        let resp = select_with_fallback(&candidates, &backends, &health).await.expect("selected");
+        let resp = select_with_fallback(&selection(&candidates), &backends, &health).await.expect("selected");
         assert_eq!(resp.selected.model_id, "cpu-model");
     }
 
@@ -453,7 +504,7 @@ mod tests {
         let candidates = vec![candidate("a", None, 0.9), candidate("b", None, 0.5)];
         let calls = std::sync::Mutex::new(Vec::new());
         let health = ScriptedHealth { healthy: vec![], calls };
-        let _ = select_with_fallback(&candidates, &backends, &health).await;
+        let _ = select_with_fallback(&selection(&candidates), &backends, &health).await;
         let calls = health.calls.lock().unwrap();
         assert_eq!(calls.len(), 2, "both candidates should have been tried in order");
     }
@@ -479,7 +530,7 @@ mod tests {
             healthy: vec!["http://ollama.local/health".to_string()],
             calls: Default::default(),
         };
-        let resp = select_with_fallback(&candidates, &backends, &health).await.unwrap();
+        let resp = select_with_fallback(&selection(&candidates), &backends, &health).await.unwrap();
         // tier0 is skipped for lack of backend config (not a health failure),
         // but it still occupied ranked-list index 0, so fallback_tier is 1.
         assert_eq!(resp.fallback_tier, 1);
