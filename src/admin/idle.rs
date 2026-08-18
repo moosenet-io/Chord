@@ -248,6 +248,68 @@ pub fn compiler_lease_held(now: u64) -> bool {
     }
 }
 
+/// CHRD-135 round-4: default substrings (case-insensitive) that identify a
+/// GPU-exclusive holder as a real MINT *coder-activity* lease — as opposed to a
+/// COMPILER build lease ([`DEFAULT_COMPILER_LEASE_HOLDERS`]), which is an
+/// entirely separate, independently-configured pattern set. Override with
+/// `CHORD_IDLE_CODER_ACTIVITY_HOLDERS` (comma-separated) if these labels drift.
+///
+/// **Why a separate set, not a widened `DEFAULT_COMPILER_LEASE_HOLDERS`:** that
+/// constant (and [`is_compiler_lease`]/[`compiler_lease_holders_from_env`]) is
+/// mirrored verbatim in Terminus `src/mint/idle.rs` and feeds MINT's own
+/// `decide_enter`/`decide_activate` — an UNCONDITIONAL, unrelated defer rule.
+/// Widening it to catch coder holders would silently change MINT's enter/defer
+/// behavior too. This set is used ONLY by the new floor branch in
+/// [`watchdog_tick_should_activate`] below — it never touches
+/// [`watchdog_should_activate`], [`is_compiler_lease`], or the compiler pattern
+/// set, so the existing compiler-lease defer semantics are unchanged byte for
+/// byte.
+///
+/// **Chosen default — `"coder,assistant,breakfix"`:** these three substrings
+/// cover exactly the four real production `GPU_EXCLUSIVE` holder labels
+/// enumerated by MINT's own `mint_gpu_holders_from_env()` (Terminus
+/// `src/intake/{coder_sweep.rs,coder_case.rs,assistant/runner.rs,breakfix.rs}`):
+/// `intake_coder_sweep` and `intake_coder_case` (via `coder`),
+/// `intake_assistant_sweep` (via `assistant`), and `mint_breakfix` (via
+/// `breakfix`). `mint_breakfix` is deliberately INCLUDED, not left out: it is
+/// enumerated by MINT alongside the other three as the same category of
+/// heartbeat-bearing GPU-exclusive work (an automated coder-adjacent sweep, not
+/// a build), so it gets the same last-activity floor rather than being silently
+/// exempted from it. The COMPILER patterns (`compiler,build,bld`) are
+/// deliberately NOT folded in here — the Terminus compiler drives Chord via
+/// `admin_idle_enter`/`activate` directly (reason `"compiler-heavy-build"`) and
+/// never takes a `GPU_EXCLUSIVE` lease at all, so it emits no holder label or
+/// heartbeat for this set to match; conflating the two pattern sets would just
+/// re-widen the compiler set's blast radius for no benefit.
+pub const DEFAULT_CODER_ACTIVITY_HOLDERS: &str = "coder,assistant,breakfix";
+
+/// The configured set of coder-activity holder substrings (lowercased), from
+/// `CHORD_IDLE_CODER_ACTIVITY_HOLDERS` or [`DEFAULT_CODER_ACTIVITY_HOLDERS`].
+/// Mirrors the shape of [`compiler_lease_holders_from_env`] exactly, but is a
+/// wholly independent knob — not a secret, not an infra identifier.
+pub fn coder_activity_holders_from_env() -> Vec<String> {
+    let raw = std::env::var("CHORD_IDLE_CODER_ACTIVITY_HOLDERS")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_CODER_ACTIVITY_HOLDERS.to_string());
+    raw.split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Does `holder` name a real MINT coder-activity lease (per `patterns`)?
+/// Case-insensitive substring match — same matching rule as
+/// [`is_compiler_lease`], intentionally duplicated rather than shared so that
+/// [`is_compiler_lease`] itself (and everything that calls it) stays byte-for-byte
+/// unchanged by this addition. Pure — fully unit-testable offline.
+pub fn is_coder_activity_holder(holder: &str, patterns: &[String]) -> bool {
+    let h = holder.to_ascii_lowercase();
+    patterns
+        .iter()
+        .any(|p| !p.is_empty() && h.contains(p.as_str()))
+}
+
 // ── Resume manifest ───────────────────────────────────────────────────────────
 
 /// What to restore when leaving idle, plus the bookkeeping the idle response and
@@ -389,16 +451,35 @@ pub fn coder_activity_stale(now: u64, last_heartbeat: Option<u64>, timeout: u64)
 /// `coder_activity_timeout`. The moment its heartbeat goes stale
 /// ([`coder_activity_stale`]), the watchdog activates regardless of the absolute
 /// deadline — so silence, not elapsed wall-clock time, is what bounds the defer.
-/// A non-compiler holder (or no holder) is unaffected — the absolute deadline
-/// alone governs that case exactly as before. Pure — fully unit-testable offline,
-/// and used by both `watchdog_loop` and its tests so the tested logic IS the
-/// production logic.
+/// A non-compiler, non-coder-activity holder (or no holder) is unaffected — the
+/// absolute deadline alone governs that case exactly as before. Pure — fully
+/// unit-testable offline, and used by both `watchdog_loop` and its tests so the
+/// tested logic IS the production logic.
+///
+/// CHRD-135 round-4: `coder_activity_patterns` is a SEPARATE, independently
+/// configured set ([`DEFAULT_CODER_ACTIVITY_HOLDERS`]/
+/// [`coder_activity_holders_from_env`]) used ONLY here, in the floor branch —
+/// [`watchdog_should_activate`] above is called with `patterns` (the COMPILER
+/// set) exactly as before and is otherwise untouched. This closes the reachability
+/// gap where the floor branch's `is_compiler` check used the SAME compiler
+/// pattern set as the unconditional defer rule: every real production
+/// `GPU_EXCLUSIVE` holder label (`intake_coder_sweep`, `intake_coder_case`,
+/// `intake_assistant_sweep`, `mint_breakfix`) contains none of
+/// `compiler`/`build`/`bld`, so `is_compiler` was always `false` for real
+/// traffic and this whole floor was dead code in production — governed instead
+/// solely by the blind absolute `deadline_expired` one-shot timer. Adding the
+/// `is_coder_activity` disjunct only ever WIDENS when this function returns
+/// `true`; it can never turn a `true` into a `false`, so this change cannot make
+/// Chord stay idle any LONGER than it already does today — it can only make a
+/// tick that would have waited for the absolute deadline instead activate
+/// earlier, on genuine coder silence past `coder_activity_timeout`.
 pub fn watchdog_tick_should_activate(
     now: u64,
     deadline_expired: bool,
     holder: Option<&str>,
     holder_last_heartbeat: Option<u64>,
     patterns: &[String],
+    coder_activity_patterns: &[String],
     coder_activity_timeout: u64,
 ) -> bool {
     if watchdog_should_activate(deadline_expired, holder, patterns) {
@@ -407,7 +488,11 @@ pub fn watchdog_tick_should_activate(
     let is_compiler = holder
         .map(|h| is_compiler_lease(h, patterns))
         .unwrap_or(false);
-    is_compiler && coder_activity_stale(now, holder_last_heartbeat, coder_activity_timeout)
+    let is_coder_activity = holder
+        .map(|h| is_coder_activity_holder(h, coder_activity_patterns))
+        .unwrap_or(false);
+    (is_compiler || is_coder_activity)
+        && coder_activity_stale(now, holder_last_heartbeat, coder_activity_timeout)
 }
 
 /// CHORD-ACT-01 pure view: given the in-flight count, the last-activity epoch, and
@@ -1760,6 +1845,7 @@ fn watchdog_tick(
     gpu: &crate::gpu_exclusive::GpuExclusive,
     now: u64,
     patterns: &[String],
+    coder_activity_patterns: &[String],
     coder_activity_timeout: u64,
 ) -> Option<ResumeManifest> {
     let m = ctl.snapshot()?;
@@ -1781,6 +1867,7 @@ fn watchdog_tick(
         holder_label,
         holder_last_heartbeat,
         patterns,
+        coder_activity_patterns,
         coder_activity_timeout,
     ) {
         return None;
@@ -1836,6 +1923,7 @@ pub async fn watchdog_loop(state: Arc<crate::routes::AppState>, interval: Durati
         "idle-mode watchdog started"
     );
     let patterns = compiler_lease_holders_from_env();
+    let coder_activity_patterns = coder_activity_holders_from_env();
     let stale_secs = stale_transition_secs_from_env();
     let coder_activity_timeout = coder_activity_timeout_secs_from_env();
     loop {
@@ -1857,6 +1945,7 @@ pub async fn watchdog_loop(state: Arc<crate::routes::AppState>, interval: Durati
             &crate::gpu_exclusive::GPU_EXCLUSIVE,
             now,
             &patterns,
+            &coder_activity_patterns,
             coder_activity_timeout,
         ) else {
             continue;
@@ -1910,6 +1999,13 @@ mod tests {
 
     fn holders() -> Vec<String> {
         vec!["compiler".into(), "build".into(), "bld".into()]
+    }
+
+    /// CHRD-135 round-4: the coder-activity pattern set, mirroring
+    /// [`DEFAULT_CODER_ACTIVITY_HOLDERS`] for tests that want to spell the
+    /// patterns explicitly rather than go through the env-resolving wrapper.
+    fn coder_holders() -> Vec<String> {
+        vec!["coder".into(), "assistant".into(), "breakfix".into()]
     }
 
     // ── pure decisions ───────────────────────────────────────────────────────
@@ -2008,6 +2104,7 @@ mod tests {
         // holder record matching the compiler patterns exists. The combined tick
         // decision bounds that defer by genuine renewal.
         let p = holders();
+        let cp = coder_holders();
         let timeout = 900u64;
 
         // Deadline not yet expired, heartbeat fresh (renewed 10s ago) ⇒ never activate.
@@ -2017,6 +2114,7 @@ mod tests {
             Some("compiler-build-7"),
             Some(1_000),
             &p,
+            &cp,
             timeout
         ));
 
@@ -2029,6 +2127,7 @@ mod tests {
             Some("compiler-build-7"),
             Some(1_000),
             &p,
+            &cp,
             timeout
         ));
 
@@ -2041,32 +2140,172 @@ mod tests {
             Some("compiler-build-7"),
             Some(5_000),
             &p,
+            &cp,
             timeout
         ));
 
-        // A non-compiler holder is unaffected by the heartbeat check — governed by
-        // the absolute deadline alone, exactly as before this change.
+        // A non-compiler holder past an EXPIRED deadline is unaffected by the
+        // heartbeat check — governed by the absolute deadline alone, exactly as
+        // before this change (the new coder-activity floor is additive and only
+        // ever reached when `watchdog_should_activate` itself would return
+        // false — see `watchdog_tick_should_activate`'s doc).
         assert!(watchdog_tick_should_activate(
             9_999,
             true,
             Some("intake_coder_sweep"),
             Some(9_990),
             &p,
+            &cp,
             timeout
         ));
+        // Same holder, deadline NOT expired, heartbeat fresh (9s old, well under
+        // the 900s floor) ⇒ still must not activate, even though this holder now
+        // matches the coder-activity pattern set too.
         assert!(!watchdog_tick_should_activate(
             9_999,
             false,
             Some("intake_coder_sweep"),
             Some(9_990),
             &p,
+            &cp,
             timeout
         ));
 
         // No holder at all: absolute deadline alone.
-        assert!(watchdog_tick_should_activate(9_999, true, None, None, &p, timeout));
+        assert!(watchdog_tick_should_activate(
+            9_999, true, None, None, &p, &cp, timeout
+        ));
         assert!(!watchdog_tick_should_activate(
-            9_999, false, None, None, &p, timeout
+            9_999, false, None, None, &p, &cp, timeout
+        ));
+    }
+
+    #[test]
+    fn coder_activity_holders_default_matches_real_production_gpu_labels() {
+        // CHRD-135 round-4: THE REGRESSION GUARD. Every prior round's fixture used
+        // a synthetic holder like "compiler-build-42" that can never occur in
+        // production — a lying fixture that agreed with a rule real traffic never
+        // exercises. This test pins the ACTUAL holder label strings the four real
+        // MINT GPU_EXCLUSIVE callers acquire (Terminus
+        // src/intake/{coder_sweep.rs,coder_case.rs,assistant/runner.rs,
+        // breakfix.rs}, enumerated together by `mint_gpu_holders_from_env()`) and
+        // asserts each is recognized by the default coder-activity pattern set —
+        // i.e. each one actually REACHES the floor branch in
+        // `watchdog_tick_should_activate`, not just some synthetic stand-in for it.
+        let cp = coder_activity_holders_from_env();
+        assert_eq!(
+            cp,
+            vec!["coder".to_string(), "assistant".to_string(), "breakfix".to_string()],
+            "sanity: this test must be exercising the real DEFAULT_CODER_ACTIVITY_HOLDERS, \
+             not some overridden env value"
+        );
+
+        // The three unambiguous "coder"/"assistant" sweep labels.
+        assert!(
+            is_coder_activity_holder("intake_coder_sweep", &cp),
+            "intake_coder_sweep (Terminus src/intake/coder_sweep.rs GPU_HOLDER) must reach \
+             the coder-activity floor"
+        );
+        assert!(
+            is_coder_activity_holder("intake_coder_case", &cp),
+            "intake_coder_case (Terminus src/intake/coder_case.rs GPU_HOLDER) must reach \
+             the coder-activity floor"
+        );
+        assert!(
+            is_coder_activity_holder("intake_assistant_sweep", &cp),
+            "intake_assistant_sweep (Terminus src/intake/assistant/runner.rs GPU_HOLDER) \
+             must reach the coder-activity floor"
+        );
+
+        // `mint_breakfix` (Terminus src/intake/breakfix.rs BREAKFIX_GPU_HOLDER):
+        // deliberately CHOSEN TO MATCH. It is enumerated by MINT's own
+        // `mint_gpu_holders_from_env()` alongside the other three as the same
+        // category of heartbeat-bearing GPU-exclusive work (an automated
+        // coder-adjacent sweep, not a compiler build), so it gets the same
+        // last-activity floor rather than being silently exempted from it — see
+        // the justification on `DEFAULT_CODER_ACTIVITY_HOLDERS` for the full
+        // reasoning.
+        assert!(
+            is_coder_activity_holder("mint_breakfix", &cp),
+            "mint_breakfix (Terminus src/intake/breakfix.rs BREAKFIX_GPU_HOLDER) must reach \
+             the coder-activity floor — deliberately included, see DEFAULT_CODER_ACTIVITY_HOLDERS doc"
+        );
+
+        // None of the four real labels contain any COMPILER pattern — confirming
+        // the original finding: without this dedicated set, `is_compiler_lease`
+        // alone (the pre-round-4 gate on the floor branch) never matches any of
+        // them, and the floor was dead code for every real caller.
+        let compiler_patterns = holders();
+        for real_holder in [
+            "intake_coder_sweep",
+            "intake_coder_case",
+            "intake_assistant_sweep",
+            "mint_breakfix",
+        ] {
+            assert!(
+                !is_compiler_lease(real_holder, &compiler_patterns),
+                "{real_holder} must NOT match the COMPILER pattern set — that's the whole \
+                 reason a separate coder-activity set is needed"
+            );
+        }
+    }
+
+    #[test]
+    fn watchdog_tick_should_activate_reaches_floor_for_real_coder_holder_labels() {
+        // End-to-end (through the full per-tick decision function, not just
+        // `is_coder_activity_holder` in isolation): a REAL production holder label
+        // with a genuinely stale heartbeat must activate via the floor even though
+        // the absolute watchdog deadline has NOT yet expired — this is the exact
+        // "genuine last-activity tracking, not a blind one-shot deadline" behavior
+        // CHRD-135 exists to deliver, now actually reachable for real traffic.
+        let p = holders();
+        let cp = coder_activity_holders_from_env();
+        let timeout = 900u64;
+
+        // intake_coder_sweep, deadline not expired, heartbeat fresh (10s old) ⇒
+        // must NOT activate yet.
+        assert!(!watchdog_tick_should_activate(
+            1_010,
+            false,
+            Some("intake_coder_sweep"),
+            Some(1_000),
+            &p,
+            &cp,
+            timeout
+        ));
+
+        // Same holder, heartbeat now stale (901s of silence), deadline STILL not
+        // expired ⇒ must activate — silence, not the absolute deadline, is what
+        // bounds this now.
+        assert!(watchdog_tick_should_activate(
+            1_901,
+            false,
+            Some("intake_coder_sweep"),
+            Some(1_000),
+            &p,
+            &cp,
+            timeout
+        ));
+
+        // mint_breakfix: same shape, confirming the deliberately-included fourth
+        // label reaches the floor identically.
+        assert!(!watchdog_tick_should_activate(
+            1_010,
+            false,
+            Some("mint_breakfix"),
+            Some(1_000),
+            &p,
+            &cp,
+            timeout
+        ));
+        assert!(watchdog_tick_should_activate(
+            1_901,
+            false,
+            Some("mint_breakfix"),
+            Some(1_000),
+            &p,
+            &cp,
+            timeout
         ));
     }
 
@@ -2090,6 +2329,7 @@ mod tests {
         // (heartbeat silence vs. the coder-activity timeout) by giving it no bound.
         let gpu = GpuExclusive::new(u64::MAX);
         let patterns = holders();
+        let coder_patterns = coder_holders();
         let timeout = 900u64;
 
         // Coder starts a heavy build: Chord drains into idle mode with a long
@@ -2104,7 +2344,7 @@ mod tests {
         // behavioral too, not just a predicate assertion.
         for tick_now in [0u64, 300, 600, 900, 1_200, 1_500] {
             gpu.acquire("compiler-build-42", tick_now); // fresh grant, then heartbeat refreshes
-            let result = watchdog_tick(&ctl, &gpu, tick_now, &patterns, timeout);
+            let result = watchdog_tick(&ctl, &gpu, tick_now, &patterns, &coder_patterns, timeout);
             assert!(
                 result.is_none(),
                 "must NOT revert mid-build while heartbeats keep arriving (t={tick_now})"
@@ -2122,7 +2362,7 @@ mod tests {
 
         // Advance the tracked clock past the window WITHOUT sleeping.
         let now_past = last_heartbeat + timeout; // exactly at the 900s silence boundary
-        let cleared = watchdog_tick(&ctl, &gpu, now_past, &patterns, timeout)
+        let cleared = watchdog_tick(&ctl, &gpu, now_past, &patterns, &coder_patterns, timeout)
             .expect("coder silence past the window must actually revert");
         assert_eq!(cleared.reason, "compiler-build-42");
         assert_eq!(
@@ -2154,6 +2394,7 @@ mod tests {
         let ctl = IdleController::new();
         let gpu = GpuExclusive::new(600); // GPU_EXCLUSIVE default TTL
         let patterns = holders();
+        let coder_patterns = coder_holders();
         let coder_activity_timeout = 900u64; // coder-activity default
 
         // Absolute deadline already passed by t=2000 — with NO live compiler
@@ -2170,7 +2411,7 @@ mod tests {
         // deferring on a dead record's stale heartbeat.
         let now = 2000u64;
 
-        let result = watchdog_tick(&ctl, &gpu, now, &patterns, coder_activity_timeout);
+        let result = watchdog_tick(&ctl, &gpu, now, &patterns, &coder_patterns, coder_activity_timeout);
         assert!(
             result.is_some(),
             "a record abandoned well past both TTLs must not defer an already-overdue revert"
@@ -2199,6 +2440,7 @@ mod tests {
         let ctl = IdleController::new();
         let gpu = GpuExclusive::new(crate::gpu_exclusive::DEFAULT_TTL_SECS); // 600s
         let patterns = holders();
+        let coder_patterns = coder_holders();
         let coder_activity_timeout = DEFAULT_CODER_ACTIVITY_TIMEOUT_SECS; // 900s
         assert!(
             crate::gpu_exclusive::DEFAULT_TTL_SECS < coder_activity_timeout,
@@ -2219,7 +2461,7 @@ mod tests {
         // exactly the regression this finding describes.
         let still_within_floor = last_heartbeat + 650;
         assert!(
-            watchdog_tick(&ctl, &gpu, still_within_floor, &patterns, coder_activity_timeout)
+            watchdog_tick(&ctl, &gpu, still_within_floor, &patterns, &coder_patterns, coder_activity_timeout)
                 .is_none(),
             "650s of silence is past GPU_EXCLUSIVE's own 600s TTL but still under \
              the promised 900s coder-activity floor — must NOT revert"
@@ -2233,7 +2475,7 @@ mod tests {
         // At exactly 900s of silence: the coder-activity floor itself is now
         // exceeded — must revert.
         let at_floor = last_heartbeat + coder_activity_timeout;
-        let result = watchdog_tick(&ctl, &gpu, at_floor, &patterns, coder_activity_timeout);
+        let result = watchdog_tick(&ctl, &gpu, at_floor, &patterns, &coder_patterns, coder_activity_timeout);
         assert!(
             result.is_some(),
             "900s of silence meets the coder-activity floor — must revert"
