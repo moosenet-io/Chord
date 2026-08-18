@@ -2018,11 +2018,27 @@ mod tests {
         vec!["compiler".into(), "build".into(), "bld".into()]
     }
 
-    /// CHRD-135 round-4: the coder-activity pattern set, mirroring
-    /// [`DEFAULT_CODER_ACTIVITY_HOLDERS`] for tests that want to spell the
-    /// patterns explicitly rather than go through the env-resolving wrapper.
+    /// CHRD-135 round-5: the coder-activity pattern set for tests, DERIVED from
+    /// [`DEFAULT_CODER_ACTIVITY_HOLDERS`] by construction rather than hand-copied.
+    ///
+    /// The round-4 version hand-listed `["coder", "assistant", "breakfix"]` while
+    /// its doc claimed to mirror the default — but the default deliberately
+    /// EXCLUDES `breakfix`. That is the same lying-fixture class that hid the
+    /// round-3 dead-code bug: a helper that agrees with a rule production does not
+    /// actually apply. Deriving it here makes drift impossible: if the default
+    /// changes, every test using this helper changes with it.
+    ///
+    /// Parsing the constant (rather than calling
+    /// [`coder_activity_holders_from_env`]) also keeps callers HERMETIC — a
+    /// `CHORD_IDLE_CODER_ACTIVITY_HOLDERS` set in the test process cannot perturb
+    /// them. Tests that specifically want the env-resolving behavior should call
+    /// that function directly and say so.
     fn coder_holders() -> Vec<String> {
-        vec!["coder".into(), "assistant".into(), "breakfix".into()]
+        DEFAULT_CODER_ACTIVITY_HOLDERS
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
     }
 
     // ── pure decisions ───────────────────────────────────────────────────────
@@ -2209,12 +2225,15 @@ mod tests {
         // asserts each is recognized by the default coder-activity pattern set —
         // i.e. each one actually REACHES the floor branch in
         // `watchdog_tick_should_activate`, not just some synthetic stand-in for it.
-        let cp = coder_activity_holders_from_env();
+        // Round-5: derived from the CONSTANT, not from the env-resolving wrapper,
+        // so a `CHORD_IDLE_CODER_ACTIVITY_HOLDERS` set in the test process cannot
+        // perturb this test. The assert_eq! below still pins the constant's actual
+        // value, so changing the default without revisiting this guard goes RED.
+        let cp = coder_holders();
         assert_eq!(
             cp,
             vec!["coder".to_string(), "assistant".to_string()],
-            "sanity: this test must be exercising the real DEFAULT_CODER_ACTIVITY_HOLDERS, \
-             not some overridden env value"
+            "sanity: this test must be exercising the real DEFAULT_CODER_ACTIVITY_HOLDERS"
         );
 
         // The three unambiguous "coder"/"assistant" sweep labels.
@@ -2277,7 +2296,8 @@ mod tests {
         // "genuine last-activity tracking, not a blind one-shot deadline" behavior
         // CHRD-135 exists to deliver, now actually reachable for real traffic.
         let p = holders();
-        let cp = coder_activity_holders_from_env();
+        // Round-5: derived from the constant (see `coder_holders`) — hermetic.
+        let cp = coder_holders();
         let timeout = 900u64;
 
         // intake_coder_sweep, deadline not expired, heartbeat fresh (10s old) ⇒
