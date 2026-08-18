@@ -265,23 +265,40 @@ pub fn compiler_lease_held(now: u64) -> bool {
 /// set, so the existing compiler-lease defer semantics are unchanged byte for
 /// byte.
 ///
-/// **Chosen default — `"coder,assistant,breakfix"`:** these three substrings
-/// cover exactly the four real production `GPU_EXCLUSIVE` holder labels
-/// enumerated by MINT's own `mint_gpu_holders_from_env()` (Terminus
-/// `src/intake/{coder_sweep.rs,coder_case.rs,assistant/runner.rs,breakfix.rs}`):
-/// `intake_coder_sweep` and `intake_coder_case` (via `coder`),
-/// `intake_assistant_sweep` (via `assistant`), and `mint_breakfix` (via
-/// `breakfix`). `mint_breakfix` is deliberately INCLUDED, not left out: it is
-/// enumerated by MINT alongside the other three as the same category of
-/// heartbeat-bearing GPU-exclusive work (an automated coder-adjacent sweep, not
-/// a build), so it gets the same last-activity floor rather than being silently
-/// exempted from it. The COMPILER patterns (`compiler,build,bld`) are
-/// deliberately NOT folded in here — the Terminus compiler drives Chord via
-/// `admin_idle_enter`/`activate` directly (reason `"compiler-heavy-build"`) and
-/// never takes a `GPU_EXCLUSIVE` lease at all, so it emits no holder label or
-/// heartbeat for this set to match; conflating the two pattern sets would just
-/// re-widen the compiler set's blast radius for no benefit.
-pub const DEFAULT_CODER_ACTIVITY_HOLDERS: &str = "coder,assistant,breakfix";
+/// **Chosen default — `"coder,assistant"`:** covers `intake_coder_sweep` and
+/// `intake_coder_case` (via `coder`) and `intake_assistant_sweep` (via
+/// `assistant`) — three of the four real production `GPU_EXCLUSIVE` holder
+/// labels enumerated by MINT's own `mint_gpu_holders_from_env()` (Terminus
+/// `src/intake/{coder_sweep.rs,coder_case.rs,assistant/runner.rs}`). The
+/// COMPILER patterns (`compiler,build,bld`) are deliberately NOT folded in
+/// here — the Terminus compiler drives Chord via `admin_idle_enter`/`activate`
+/// directly (reason `"compiler-heavy-build"`) and never takes a
+/// `GPU_EXCLUSIVE` lease at all, so it emits no holder label or heartbeat for
+/// this set to match; conflating the two pattern sets would just re-widen the
+/// compiler set's blast radius for no benefit.
+///
+/// **`mint_breakfix` (Terminus `src/intake/breakfix.rs`, `BREAKFIX_GPU_HOLDER`)
+/// is deliberately EXCLUDED from the default, not an oversight.** An earlier
+/// revision of this constant included it on the reasoning that MINT enumerates
+/// it alongside the other three as "the same category" of heartbeat-bearing
+/// work — that reasoning does not actually establish the one fact that
+/// matters: HOW OFTEN a breakfix run renews its lease while genuinely still
+/// working. This module has no visibility into `breakfix.rs`'s renewal
+/// cadence (this change is scoped to Chord only). If a legitimate repair run
+/// goes quiet for stretches ≥ `coder_activity_timeout` (900s default) while
+/// still doing real work — plausible for a "repair" path that may wait on a
+/// slow external step between heartbeats, unlike a sweep loop — folding it
+/// into this set would let the floor revert Chord mid-repair, which is the
+/// exact failure mode ([`DEFAULT_CODER_ACTIVITY_TIMEOUT_SECS`]'s doc, and the
+/// compiler-lease floor before it) this whole mechanism exists to prevent.
+/// `mint_breakfix` does NOT match `DEFAULT_COMPILER_LEASE_HOLDERS` either, so
+/// excluding it here changes nothing about its behavior TODAY — it stays
+/// governed by the absolute watchdog deadline alone, exactly as before this
+/// item, until someone verifies its actual heartbeat cadence against Terminus
+/// source and either confirms it's safe to add here or gives it a
+/// `CHORD_IDLE_CODER_ACTIVITY_HOLDERS` override. Do not add `"breakfix"` back
+/// without that verification.
+pub const DEFAULT_CODER_ACTIVITY_HOLDERS: &str = "coder,assistant";
 
 /// The configured set of coder-activity holder substrings (lowercased), from
 /// `CHORD_IDLE_CODER_ACTIVITY_HOLDERS` or [`DEFAULT_CODER_ACTIVITY_HOLDERS`].
@@ -2195,7 +2212,7 @@ mod tests {
         let cp = coder_activity_holders_from_env();
         assert_eq!(
             cp,
-            vec!["coder".to_string(), "assistant".to_string(), "breakfix".to_string()],
+            vec!["coder".to_string(), "assistant".to_string()],
             "sanity: this test must be exercising the real DEFAULT_CODER_ACTIVITY_HOLDERS, \
              not some overridden env value"
         );
@@ -2218,17 +2235,18 @@ mod tests {
         );
 
         // `mint_breakfix` (Terminus src/intake/breakfix.rs BREAKFIX_GPU_HOLDER):
-        // deliberately CHOSEN TO MATCH. It is enumerated by MINT's own
-        // `mint_gpu_holders_from_env()` alongside the other three as the same
-        // category of heartbeat-bearing GPU-exclusive work (an automated
-        // coder-adjacent sweep, not a compiler build), so it gets the same
-        // last-activity floor rather than being silently exempted from it — see
-        // the justification on `DEFAULT_CODER_ACTIVITY_HOLDERS` for the full
-        // reasoning.
+        // deliberately EXCLUDED from the default. Chord has no visibility into
+        // breakfix's actual heartbeat/renewal cadence, and folding a holder into
+        // this set makes it revert EARLIER on silence — safe for the sweep/assistant
+        // labels (renew frequently, per their own loop), but a mistake for a
+        // possibly-quiet repair path without first verifying its cadence against
+        // Terminus source. See the full reasoning on `DEFAULT_CODER_ACTIVITY_HOLDERS`.
         assert!(
-            is_coder_activity_holder("mint_breakfix", &cp),
-            "mint_breakfix (Terminus src/intake/breakfix.rs BREAKFIX_GPU_HOLDER) must reach \
-             the coder-activity floor — deliberately included, see DEFAULT_CODER_ACTIVITY_HOLDERS doc"
+            !is_coder_activity_holder("mint_breakfix", &cp),
+            "mint_breakfix must NOT reach the coder-activity floor via the DEFAULT pattern \
+             set — unverified heartbeat cadence, deliberately excluded pending that \
+             verification (see DEFAULT_CODER_ACTIVITY_HOLDERS doc); it remains governed by \
+             the absolute watchdog deadline alone, unchanged from before this item"
         );
 
         // None of the four real labels contain any COMPILER pattern — confirming
@@ -2287,10 +2305,14 @@ mod tests {
             timeout
         ));
 
-        // mint_breakfix: same shape, confirming the deliberately-included fourth
-        // label reaches the floor identically.
+        // mint_breakfix: deliberately EXCLUDED from the default coder-activity
+        // set (unverified heartbeat cadence — see DEFAULT_CODER_ACTIVITY_HOLDERS
+        // doc), so with the deadline NOT yet expired it must NOT activate even
+        // with a heartbeat well past the 900s coder-activity window — the floor
+        // simply never engages for it today. It stays governed solely by the
+        // absolute deadline, exactly as it was before this item existed.
         assert!(!watchdog_tick_should_activate(
-            1_010,
+            1_901,
             false,
             Some("mint_breakfix"),
             Some(1_000),
@@ -2298,9 +2320,12 @@ mod tests {
             &cp,
             timeout
         ));
+        // ...but once the deadline itself expires, it activates immediately
+        // (unaffected/unchanged — the same "non-compiler, non-coder-activity
+        // holder" path any other unrecognized holder takes).
         assert!(watchdog_tick_should_activate(
             1_901,
-            false,
+            true,
             Some("mint_breakfix"),
             Some(1_000),
             &p,
